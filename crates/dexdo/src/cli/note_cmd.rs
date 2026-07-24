@@ -403,6 +403,9 @@ const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
 #[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
     "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414";
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
+    "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571";
 
 #[cfg(feature = "shellnet")]
 fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> {
@@ -412,12 +415,16 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
         .or_else(|| code_hash.strip_prefix("0X"))
         .unwrap_or(code_hash)
         .to_ascii_lowercase();
-    if code_hash == NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH {
+    if code_hash == NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH
+        || code_hash == NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH
+    {
         return Ok(());
     }
     bail!(
         "unsupported funding wallet code_hash {code_hash}; dexdo note deploy supports only \
-         UpdateCustodianMultisigWallet {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
+         UpdateCustodianMultisigWallet code hashes \
+         {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH} and \
+         {NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
     )
 }
 
@@ -778,11 +785,7 @@ fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
 
 #[cfg(feature = "shellnet")]
 fn note_deploy_resume_error(funding_multisig_address: &str, error: anyhow::Error) -> anyhow::Error {
-    if is_note_deploy_wallet_submit_busy_error(&error) {
-        note_deploy_error(funding_multisig_address, error)
-    } else {
-        anyhow::anyhow!("deploy PrivateNote from wallet {funding_multisig_address}: {error}")
-    }
+    note_deploy_error(funding_multisig_address, error)
 }
 
 #[cfg(feature = "shellnet")]
@@ -1850,6 +1853,39 @@ struct NoteDeployProductionOps<'a> {
 }
 
 #[cfg(feature = "shellnet")]
+#[derive(serde::Serialize)]
+struct NoteDeployResult<'a> {
+    schema: &'static str,
+    status: &'static str,
+    note_addr: &'a str,
+    nominal: &'a str,
+    token_type: u32,
+    pool_path: String,
+    note_count: usize,
+    error: Option<&'a str>,
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_json_result(
+    note_addr: &str,
+    nominal: &str,
+    token_type: u32,
+    pool_path: &std::path::Path,
+    note_count: usize,
+) -> Result<String> {
+    Ok(serde_json::to_string(&NoteDeployResult {
+        schema: crate::cli::machine::NOTE_DEPLOY_SCHEMA,
+        status: "deployed",
+        note_addr,
+        nominal,
+        token_type,
+        pool_path: pool_path.display().to_string(),
+        note_count,
+        error: None,
+    })?)
+}
+
+#[cfg(feature = "shellnet")]
 #[async_trait::async_trait(?Send)]
 impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState> {
@@ -1989,15 +2025,28 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
                 self.pool_path.display()
             )
         })?;
-        println!(
-            "note deployed -> PrivateNote {note_addr} ({} {}); folded into --pool {} ({} note(s)). Recovery state is \
-             at {}. The owner secret is stored in the pool for the seller/buyer -- keep both files private.",
-            state.nominal,
-            state.token_type,
-            self.pool_path.display(),
-            n,
-            self.recovery_path.display()
-        );
+        if self.args.json {
+            println!(
+                "{}",
+                note_deploy_json_result(
+                    &note_addr,
+                    &state.nominal,
+                    state.token_type,
+                    self.pool_path,
+                    n,
+                )?
+            );
+        } else {
+            println!(
+                "note deployed -> PrivateNote {note_addr} ({} {}); folded into --pool {} ({} note(s)). Recovery state is \
+                 at {}. The owner secret is stored in the pool for the seller/buyer -- keep both files private.",
+                state.nominal,
+                state.token_type,
+                self.pool_path.display(),
+                n,
+                self.recovery_path.display()
+            );
+        }
         Ok(())
     }
 }
@@ -2565,16 +2614,44 @@ mod tests {
             !dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON.contains("dapp_id"),
             "UpdateCustodian ABI must not grow a Generic-wallet dapp_id"
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_accepts_legacy_update_custodian_code_hash() {
         super::ensure_note_deploy_update_custodian_code_hash(&format!(
             "0X{}",
             super::NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH.to_ascii_uppercase()
         ))
-        .expect("canonical UpdateCustodian hash");
+        .expect("legacy UpdateCustodian hash");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_accepts_managed_update_custodian_code_hash() {
+        super::ensure_note_deploy_update_custodian_code_hash(
+            super::NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH,
+        )
+        .expect("managed UpdateCustodian hash");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_rejects_generic_multisig_code_hash() {
         let error = super::ensure_note_deploy_update_custodian_code_hash(
             "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
         )
         .expect_err("Generic Multisig must be unsupported")
         .to_string();
+        assert!(error.contains("supports only UpdateCustodian"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_rejects_unknown_wallet_code_hash() {
+        let error = super::ensure_note_deploy_update_custodian_code_hash(&"00".repeat(32))
+            .expect_err("unknown wallet must be unsupported")
+            .to_string();
         assert!(error.contains("supports only UpdateCustodian"), "{error}");
     }
 
@@ -2590,6 +2667,7 @@ mod tests {
             .expect("connect offline fixture endpoint");
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
         let args = super::NoteDeployArgs {
+            json: false,
             multisig_address: funding_wallet.clone(),
             multisig_key: Some(key_path),
             multisig_seed_file: None,
@@ -3100,6 +3178,17 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
+    fn note_deploy_exit_code_520_is_not_wallet_busy() {
+        let raw = anyhow::anyhow!("wallet submit failed with exit code 520");
+
+        assert!(!crate::cli::commands::is_note_deploy_wallet_busy_error(
+            &raw
+        ));
+        assert!(!super::is_note_deploy_wallet_submit_busy_error(&raw));
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
     fn note_deploy_root_pn_compute_revert_is_not_wallet_busy_and_keeps_cause() {
         let raw = anyhow::anyhow!(
             "deployPrivateNote reverted: tvm_error exit_code=60 contract execution failed"
@@ -3115,6 +3204,57 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
+    fn note_deploy_history_proof_403_is_actionable_without_relabeling_other_errors() {
+        for raw in [
+            "RootPN.deployPrivateNote: block manager rejected message code=TVM_ERROR; \
+             exit_code=403 (dex::ERR_INVALID_HISTORY_PROOF)",
+            "RootPN.deployPrivateNote failed: ERR_INVALID_HISTORY_PROOF",
+        ] {
+            let error = crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw))
+                .to_string();
+            assert!(
+                error.contains("history proof expired (exit 403)"),
+                "{error}"
+            );
+            assert!(
+                error.contains("Re-run the same `note deploy` command"),
+                "{error}"
+            );
+            assert!(error.contains("HALO2_ATTEMPT_LAYERS=1"), "{error}");
+            assert!(
+                error.contains(raw),
+                "raw SDK error must be retained: {error}"
+            );
+        }
+
+        let raw = "RootPN.deployPrivateNote: network request timed out";
+        let error =
+            crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw)).to_string();
+        assert_eq!(
+            error,
+            format!("deploy PrivateNote from wallet 0:wallet: {raw}")
+        );
+        assert!(!error.contains("history proof expired"), "{error}");
+        assert!(!error.contains("Re-run"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_unrelated_errors_are_not_relabeled_as_history_proof_expired() {
+        for raw in [
+            "UpdateCustodianMultisigWallet.sendTransaction failed: exit_code=403",
+            "prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover",
+            "wallet submit failed: exit_code=52 replay protection exception",
+            "generic SDK transport error",
+        ] {
+            let error = crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw))
+                .to_string();
+            assert!(!error.contains("history proof expired"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
     fn note_deploy_prover_and_later_stage_replay_errors_are_not_relabeled() {
         let prover = anyhow::anyhow!("prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover");
         assert!(!crate::cli::commands::is_note_deploy_wallet_busy_error(
@@ -3126,12 +3266,16 @@ mod tests {
             "{prover_error}"
         );
         assert!(!prover_error.contains("wallet busy"), "{prover_error}");
+        assert!(
+            !prover_error.contains("history proof expired"),
+            "{prover_error}"
+        );
 
         let later_stage = anyhow::anyhow!(
             "RootPN.deployPrivateNote: block manager rejected message code=TVM_ERROR; \
              exit_code=52 replay protection exception"
         );
-        assert!(crate::cli::commands::is_note_deploy_wallet_busy_error(
+        assert!(!crate::cli::commands::is_note_deploy_wallet_busy_error(
             &later_stage
         ));
         assert!(!super::is_note_deploy_wallet_submit_busy_error(
@@ -3140,8 +3284,8 @@ mod tests {
         let later_stage_error =
             super::note_deploy_resume_error("0:wallet", later_stage).to_string();
         assert!(later_stage_error.contains("RootPN.deployPrivateNote"));
-        assert!(later_stage_error.contains("exit_code=52"));
         assert!(!later_stage_error.contains("wallet busy"));
+        assert!(!later_stage_error.contains("history proof expired"));
     }
 
     #[cfg(feature = "shellnet")]
@@ -3999,5 +4143,33 @@ mod tests {
                 "run_note_balance contains forbidden write/key path {forbidden}: {body}"
             );
         }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_json_is_one_object_with_documented_fields() {
+        let rendered = super::note_deploy_json_result(
+            "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "N100",
+            1,
+            std::path::Path::new("pn_pool.json"),
+            1,
+        )
+        .expect("serialize note deploy result");
+        assert_eq!(rendered.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON object");
+        assert!(value.is_object());
+        assert_eq!(value["schema"], "dexdo.note_deploy.v1");
+        assert_eq!(value["status"], "deployed");
+        assert_eq!(
+            value["note_addr"],
+            "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(value["nominal"], "N100");
+        assert_eq!(value["token_type"], 1);
+        assert_eq!(value["pool_path"], "pn_pool.json");
+        assert_eq!(value["note_count"], 1);
+        assert!(value["error"].is_null());
+        assert_eq!(value.as_object().expect("object").len(), 8);
     }
 }

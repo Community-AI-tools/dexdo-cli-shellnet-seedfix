@@ -2440,7 +2440,121 @@ fn wrong_role(method: &str, want: &str) -> ChainError {
 /// Both the book-address derivation here and the seller's tick-finalization cadence read this one value.
 pub const MODEL_TICK_SIZE: u128 = crate::params::DobParams::canonical().tick_size as u128;
 
+fn cleanup_unopened_confirmed(state: Option<&Value>) -> bool {
+    state.is_none_or(|st| !st["funded"].as_bool().unwrap_or(true))
+}
+
+async fn wait_cleanup_unopened_with<Read, ReadFuture, Pause, PauseFuture>(
+    tc: &str,
+    mut read: Read,
+    mut pause: Pause,
+) -> Result<(), ChainError>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Result<Option<Value>, ChainError>>,
+    Pause: FnMut() -> PauseFuture,
+    PauseFuture: std::future::Future<Output = ()>,
+{
+    for _ in 0..40 {
+        let state = read().await?;
+        if cleanup_unopened_confirmed(state.as_ref()) {
+            return Ok(());
+        }
+        pause().await;
+    }
+    Err(ChainError::Chain(format!(
+        "TC {tc}: cleanupUnopened outcome is bounded-ambiguous; state remained unchanged at funded=true through the observation window"
+    )))
+}
+
 impl RealChainBackend {
+    /// Bounded read-only confirmation for an already-submitted `streamCleanup`.
+    pub async fn wait_cleanup_unopened(&self, tc: &Address) -> Result<(), ChainError> {
+        wait_cleanup_unopened_with(
+            &tc.to_string(),
+            || async { self.token_contract_state(tc).await.map_err(map_err) },
+            || tokio::time::sleep(std::time::Duration::from_secs(3)),
+        )
+        .await
+    }
+
+    async fn raw_resting_sell_orders_for_tc(
+        &self,
+        order_book: &Address,
+        token_contract: &Address,
+    ) -> Result<Vec<OrderBookOrder>> {
+        let Some(stats) = self.inference_orderbook_stats(order_book).await? else {
+            return Ok(Vec::new());
+        };
+        let next_order_id = order_u128(&stats, &["nextOrderId"]).ok_or_else(|| {
+            anyhow!("InferenceOrderBook {order_book} getStats missing/invalid nextOrderId: {stats}")
+        })?;
+        let wanted = token_contract.with_workchain();
+        let mut orders = Vec::new();
+        for order_id in 1..next_order_id {
+            let Some(raw) = self.inference_orderbook_order(order_book, order_id).await? else {
+                continue;
+            };
+            let ticks = order_u128(&raw, &["amount"]).ok_or_else(|| {
+                anyhow!(
+                    "InferenceOrderBook {order_book} getOrder({order_id}) missing/invalid amount; \
+                     cannot prove whether TokenContract {wanted} already has a resting SELL: {raw}"
+                )
+            })?;
+            if ticks == 0 {
+                continue;
+            }
+            let is_buy = raw["isBuy"].as_bool().ok_or_else(|| {
+                anyhow!(
+                    "InferenceOrderBook {order_book} getOrder({order_id}) missing/invalid isBuy; \
+                     cannot prove whether TokenContract {wanted} already has a resting SELL: {raw}"
+                )
+            })?;
+            if is_buy {
+                continue;
+            }
+            let raw_tc = raw["tokenContract"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "InferenceOrderBook {order_book} active SELL getOrder({order_id}) has no \
+                         tokenContract; cannot prove uniqueness for TokenContract {wanted}: {raw}"
+                    )
+                })?;
+            let parsed_tc = Address::parse(raw_tc).map_err(|error| {
+                anyhow!(
+                    "InferenceOrderBook {order_book} active SELL getOrder({order_id}) has invalid \
+                     tokenContract {raw_tc}: {error}"
+                )
+            })?;
+            if !parsed_tc.with_workchain().eq_ignore_ascii_case(&wanted) {
+                continue;
+            }
+            let parsed = orderbook_order_from_getter(order_id, &raw)
+                .map_err(|error| {
+                    anyhow!(
+                        "InferenceOrderBook {order_book} raw SELL for TokenContract {wanted} is \
+                         incomplete: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "InferenceOrderBook {order_book} raw SELL for TokenContract {wanted} \
+                         disappeared while being classified"
+                    )
+                })?;
+            if !parsed.is_resting_ask() {
+                return Err(anyhow!(
+                    "InferenceOrderBook {order_book} getOrder({order_id}) for TokenContract {wanted} \
+                     is not an active unmatched SELL"
+                ));
+            }
+            orders.push(parsed);
+        }
+        Ok(orders)
+    }
+
     pub async fn inference_orderbook_snapshot(
         &self,
         order_book: &Address,
@@ -2897,31 +3011,11 @@ impl ChainBackend for RealDealBackend {
             .stream_cleanup(&self.ctx.buyer_note, &self.ctx.buyer_keys, &tc)
             .await
             .map_err(map_err)?;
-        for _ in 0..40 {
-            match self
-                .chain
-                .token_contract_state(&tc)
-                .await
-                .map_err(map_err)?
-            {
-                None => {
-                    return Ok(Settlement::SellerNoShow {
-                        to_buyer_refund: (frozen + deposit) as Shell,
-                        seller_commission_returned: commission as Shell,
-                    })
-                }
-                Some(st) if !st["funded"].as_bool().unwrap_or(true) => {
-                    return Ok(Settlement::SellerNoShow {
-                        to_buyer_refund: (frozen + deposit) as Shell,
-                        seller_commission_returned: commission as Shell,
-                    })
-                }
-                Some(_) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
-            }
-        }
-        Err(ChainError::Chain(format!(
-            "TC {tc}: cleanupUnopened did not clear funded state within the allotted time"
-        )))
+        self.chain.wait_cleanup_unopened(&tc).await?;
+        Ok(Settlement::SellerNoShow {
+            to_buyer_refund: (frozen + deposit) as Shell,
+            seller_commission_returned: commission as Shell,
+        })
     }
 
     async fn deal_state(
@@ -3413,6 +3507,27 @@ impl ChainBackend for RealSellerBackend {
             ))
         })?;
         Ok(Some((price, ticks)))
+    }
+
+    async fn raw_resting_sell_orders_for_tc(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Vec<OrderBookOrder>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let order_book = retry_seller_read("seller raw order-book address", || async {
+            self.chain
+                .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
+                .await
+                .map_err(map_err)
+        })
+        .await?;
+        retry_seller_read("seller raw exact-TC SELL rows", || async {
+            self.chain
+                .raw_resting_sell_orders_for_tc(&order_book, &tc)
+                .await
+                .map_err(map_err)
+        })
+        .await
     }
 
     async fn read_openable_match_now(
@@ -4486,6 +4601,41 @@ impl ChainBackend for RealBuyerBackend {
 
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot> {
         real_tc_snapshot(&self.chain, token_contract).await
+    }
+}
+
+#[cfg(test)]
+mod cleanup_observer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delayed_cleanup_visibility_accepts_absent_or_unfunded_after_present_read() {
+        for terminal in [None, Some(json!({ "funded": false }))] {
+            let mut reads = [Some(json!({ "funded": true })), terminal].into_iter();
+            let outcome = wait_cleanup_unopened_with(
+                "test-tc",
+                || std::future::ready(Ok(reads.next().expect("observer read"))),
+                || std::future::ready(()),
+            )
+            .await;
+            assert!(outcome.is_ok(), "terminal cleanup state must succeed");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_still_funded_window_is_ambiguous_instead_of_success_or_hang() {
+        let mut reads = std::iter::repeat_n(Some(json!({ "funded": true })), 40);
+        let outcome = wait_cleanup_unopened_with(
+            "test-tc",
+            || std::future::ready(Ok(reads.next().expect("observer read"))),
+            || std::future::ready(()),
+        )
+        .await;
+        let error = outcome.expect_err("40 funded reads must not report cleanup success");
+        assert!(
+            error.to_string().contains("bounded-ambiguous"),
+            "observer must return the explicit bounded-ambiguous outcome: {error}"
+        );
     }
 }
 

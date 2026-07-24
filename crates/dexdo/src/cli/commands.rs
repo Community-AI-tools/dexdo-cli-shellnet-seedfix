@@ -147,7 +147,7 @@ fn persist_runtime_deal_handle(
     let market = input.market_path.map(load_market).transpose()?;
     let h = deals::DealHandle {
         version: deals::DEAL_HANDLE_VERSION,
-        handle: deals::make_handle_id(input.token_contract),
+        handle: deals::make_handle_id(input.token_contract, input.role),
         role: input.role,
         network: network.to_string(),
         token_contract: input.token_contract.to_string(),
@@ -425,12 +425,29 @@ fn persist_pool_recovery_record_locked(record: &PoolRecoveryRecord) -> Result<()
 pub(crate) fn is_note_deploy_wallet_busy_error(error: &anyhow::Error) -> bool {
     let msg = error.to_string().to_ascii_lowercase();
     let norm = msg.replace(['_', '=', ':', '-'], " ");
+    let exit_code_52 = norm.split("exit code").skip(1).any(|suffix| {
+        suffix
+            .trim_start()
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .and_then(|code| code.parse::<u32>().ok())
+            == Some(52)
+    });
     // bare `tvm_error` is not a busy signal; matching it masked real
     // deployPrivateNote reverts behind retries that never surfaced the cause.
-    norm.contains("replay protection")
-        || norm.contains("exit code 52")
-        || norm.contains("nonce")
-        || norm.contains("seqno")
+    !msg.contains("rootpn.deployprivatenote")
+        && (norm.contains("replay protection")
+            || exit_code_52
+            || norm.contains("nonce")
+            || norm.contains("seqno"))
+}
+
+#[cfg(feature = "shellnet")]
+fn is_note_deploy_history_proof_expired_error(error: &anyhow::Error) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    let normalized = msg.replace(['_', '=', ':', '-'], " ");
+    msg.contains("err_invalid_history_proof")
+        || (msg.contains("rootpn.deployprivatenote") && normalized.contains("exit code 403"))
 }
 
 #[cfg(feature = "shellnet")]
@@ -438,7 +455,14 @@ pub(crate) fn note_deploy_error(
     funding_multisig_address: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    if is_note_deploy_wallet_busy_error(&error) {
+    if is_note_deploy_history_proof_expired_error(&error) {
+        anyhow::anyhow!(
+            "note deploy failed: history proof expired (exit 403) -- the layer-0 root aged out of the node's \
+             ~2-minute window (common on slow/ARM clients). Re-run the same `note deploy` command to retry; \
+             if it persists, set HALO2_ATTEMPT_LAYERS=1. Raw error: deploy PrivateNote from wallet \
+             {funding_multisig_address}: {error}"
+        )
+    } else if is_note_deploy_wallet_busy_error(&error) {
         anyhow::anyhow!(
             "note deploy wallet busy/out-of-sync for funding wallet {funding_multisig_address}: a previous \
              wallet transaction is likely still pending or the wallet nonce cache is stale. Retry after the prior \
@@ -514,7 +538,6 @@ pub(crate) async fn enforce_model_registry_policy(
     bail!("ModelRegistry validation requires a shellnet build")
 }
 
-#[cfg(feature = "shellnet")]
 fn role_arg_to_handle(role: DealRoleArg) -> deals::DealHandleRole {
     match role {
         DealRoleArg::Buyer => deals::DealHandleRole::Buyer,
@@ -530,7 +553,12 @@ pub(crate) fn load_deal_target(
     raw_note_addr: Option<String>,
 ) -> Result<DealTarget> {
     let dir = deals::resolve_deals_dir(deals_dir)?;
-    if let Some((_path, handle)) = deals::resolve_deal_ref(input, &dir)? {
+    if let Some((_path, handle)) = deals::resolve_deal_ref(
+        input,
+        &dir,
+        raw_role.map(role_arg_to_handle),
+        raw_note_addr.as_deref(),
+    )? {
         let role = handle.role;
         let token_contract = handle.token_contract.clone();
         let note_addr = Some(handle.note_addr.clone());
@@ -615,8 +643,27 @@ async fn shellnet_doctor_report(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let market = market.map(load_market).transpose()?;
-    let chain = dexdo_core::RealChainBackend::connect_with_endpoint(contracts, endpoint)?;
+    let chain = dexdo_core::RealChainBackend::connect_with_endpoint(contracts, endpoint)
+        .map_err(|error| doctor_contracts_error(std::path::Path::new(contracts), error))?;
     chain.doctor(market.as_ref()).await
+}
+
+#[cfg(feature = "shellnet")]
+fn doctor_contracts_error(path: &std::path::Path, error: anyhow::Error) -> anyhow::Error {
+    let not_found = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if not_found {
+        anyhow::anyhow!(
+            "contracts manifest {} not found; run `dexdo doctor` from the repository root or pass \
+             `--contracts <path>` to the downloaded deployed.shellnet.json",
+            path.display()
+        )
+    } else {
+        error
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -815,7 +862,37 @@ pub(crate) async fn resolve_order_book_target(
     chain
         .inference_orderbook_address(&note, &target.model_hash, dexdo_core::MODEL_TICK_SIZE)
         .await
+        .map_err(|error| market_note_getter_error(note_addr, chain.client().endpoint(), error))
         .map(|address| address.with_workchain())
+}
+
+#[cfg(feature = "shellnet")]
+fn market_note_getter_error(
+    note_addr: &str,
+    endpoint: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    let exit_code = message
+        .split_once("exit code:")
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok());
+    let getter_exit_60 =
+        message.contains("run_tvm getter getinferenceorderbookaddress") && exit_code == Some(60);
+    if message == "note is not active" {
+        anyhow::anyhow!(
+            "note {note_addr} not found or not initialized on {endpoint}; verify `--note-addr` and \
+             the shellnet endpoint"
+        )
+    } else if getter_exit_60 {
+        anyhow::anyhow!(
+            "market lookup failed for note {note_addr} on {endpoint} \
+             (getInferenceOrderBookAddress exit 60) -- verify the note address is a deployed, \
+             initialized order-book note"
+        )
+    } else {
+        error
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -1022,7 +1099,12 @@ pub(crate) fn resolve_mock_deal_target(
     raw_note_addr: Option<String>,
 ) -> Result<MockDealTarget> {
     let dir = deals::resolve_deals_dir(deals_dir)?;
-    if let Some((_path, handle)) = deals::resolve_deal_ref(input, &dir)? {
+    if let Some((_path, handle)) = deals::resolve_deal_ref(
+        input,
+        &dir,
+        raw_role.map(role_arg_to_handle),
+        raw_note_addr.as_deref(),
+    )? {
         return Ok(MockDealTarget {
             token_contract: handle.token_contract.clone(),
             role: Some(handle_role_to_arg(handle.role)),
@@ -1068,14 +1150,14 @@ pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> St
         Some(deals::DealHandleRole::Seller) => {
             "next=no_destroy_yet reason=deal_not_stopped".to_string()
         }
+        Some(deals::DealHandleRole::Buyer) if s.kind == deals::DealStateKind::Stopped => {
+            "next=none reason=deal_already_terminal".to_string()
+        }
         Some(deals::DealHandleRole::Buyer) if s.opened => format!(
             "next=stream_stop_or_reclaim_after_timeout command=`dexdo close {deal} --note-key <buyer-key>`"
         ),
         Some(deals::DealHandleRole::Buyer) if s.funded && !s.probe_accepted => {
             format!("next=cleanup_unopened_after_timeout command=`dexdo close {deal} --note-key <buyer-key>`")
-        }
-        Some(deals::DealHandleRole::Buyer) if s.kind == deals::DealStateKind::Stopped => {
-            "next=seller_destroy reason=buyer_already_stopped".to_string()
         }
         Some(deals::DealHandleRole::Buyer) => {
             "next=cancel_resting_bid_or_wait_match reason=deal_not_funded".to_string()
@@ -1401,4 +1483,103 @@ pub(crate) fn now_unix_secs() -> Result<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
         .as_secs())
+}
+
+#[cfg(all(test, feature = "shellnet"))]
+mod actionable_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn doctor_missing_contracts_manifest_names_path_and_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("contracts/deployed.shellnet.json");
+
+        let error = shellnet_doctor_report("shellnet", None, &missing, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&missing.display().to_string()));
+        assert!(error.contains("run `dexdo doctor` from the repository root"));
+        assert!(error.contains("`--contracts <path>`"));
+        assert!(!error.starts_with("No such file or directory"));
+    }
+
+    #[test]
+    fn market_missing_note_getter_is_actionable_but_other_errors_pass_through() {
+        let note = "0:0000000000000000000000000000000000000000000000000000000000000001";
+        let mapped = market_note_getter_error(
+            note,
+            "https://shellnet.example",
+            anyhow::anyhow!("note is not active"),
+        )
+        .to_string();
+        let expected = format!(
+            "note {note} not found or not initialized on https://shellnet.example; verify \
+             `--note-addr` and the shellnet endpoint"
+        );
+        assert_eq!(mapped, expected);
+
+        let exit_60_expected = format!(
+            "market lookup failed for note {note} on https://shellnet.example \
+             (getInferenceOrderBookAddress exit 60) -- verify the note address is a deployed, \
+             initialized order-book note"
+        );
+        let exit_60 = anyhow::anyhow!(
+            "run_tvm getter getInferenceOrderBookAddress: Contract execution was terminated with \
+             error: Unknown error, exit code: 60 (Contract has no fallback function but function ID \
+             is wrong)"
+        );
+        assert_eq!(
+            market_note_getter_error(note, "https://shellnet.example", exit_60).to_string(),
+            exit_60_expected
+        );
+
+        let exit_600_message = "run_tvm getter getInferenceOrderBookAddress: Contract execution was \
+            terminated with error: Unknown error, exit code: 600 (Contract has no fallback function \
+            but function ID is wrong)";
+        assert_eq!(
+            market_note_getter_error(
+                note,
+                "https://shellnet.example",
+                anyhow::anyhow!(exit_600_message)
+            )
+            .to_string(),
+            exit_600_message
+        );
+
+        let exit_601_message = "run_tvm getter getInferenceOrderBookAddress: Contract execution was \
+            terminated with error: Unknown error, exit code: 601 (Contract has no fallback function \
+            but function ID is wrong)";
+        assert_eq!(
+            market_note_getter_error(
+                note,
+                "https://shellnet.example",
+                anyhow::anyhow!(exit_601_message)
+            )
+            .to_string(),
+            exit_601_message
+        );
+
+        let exit_160_message = "run_tvm getter getInferenceOrderBookAddress: Contract execution was \
+            terminated with error: Unknown error, exit code: 160 (Contract has no fallback function \
+            but function ID is wrong)";
+        assert_eq!(
+            market_note_getter_error(
+                note,
+                "https://shellnet.example",
+                anyhow::anyhow!(exit_160_message)
+            )
+            .to_string(),
+            exit_160_message
+        );
+
+        let different = anyhow::anyhow!(
+            "run_tvm getter getInferenceOrderBookAddress: transport connection refused"
+        );
+        assert_eq!(
+            market_note_getter_error(note, "https://shellnet.example", different).to_string(),
+            "run_tvm getter getInferenceOrderBookAddress: transport connection refused"
+        );
+    }
 }

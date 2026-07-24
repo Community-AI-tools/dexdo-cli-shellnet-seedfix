@@ -13,8 +13,10 @@ committed.
 If any command fails, run `dexdo doctor` first -- it reports the shellnet version, manifest
 freshness, and whether your `policy.json` is complete.
 
-**Prerequisites:** a deployed multisig wallet holding test tokens plus its seed phrase (or key
-file), and a model access key (for example `GROQ_API_KEY`).
+**Prerequisites:** a deployed and funded UpdateCustodian multisig wallet holding test tokens plus its
+seed phrase (or key file), and a model access key (for example `GROQ_API_KEY`). The wallet must have
+exactly one custodian whose public key matches the supplied funding key. Other wallet contract types
+are not currently supported, and the CLI does not create or fund the multisig.
 
 ---
 
@@ -64,7 +66,12 @@ dexdo note deploy \
 
 Use `--multisig-key /path/to/wallet.key` (a file with the 32-byte hex secret) instead of
 `--multisig-seed-file` if you hold the raw key. `pn_pool.json` holds the note owner secret -- keep it
-private, never commit it.
+private, never commit it. `dexdo note deploy` is the user note-creation path. Point later seller
+commands at the pool it creates:
+
+```sh
+export DEXDO_PN_POOL="$PWD/pn_pool.json"
+```
 
 ## Phase 3. Note key, balance check, models.json, and the upstream key
 

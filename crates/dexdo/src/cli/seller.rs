@@ -13,10 +13,13 @@ use crate::cli::seller_policy::{
     is_err_not_open, AdvanceFailureDisposition, SellerTerminalPolicyOutcome,
 };
 use crate::cli::support::*;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::{DobParams, SellOfferOutcome};
+use serde_json::json;
 use std::io::Write as _;
+
+use crate::operator_shutdown_signal;
 
 fn seller_offer_outcome_line(outcome: &SellOfferOutcome) -> String {
     match outcome {
@@ -27,6 +30,25 @@ fn seller_offer_outcome_line(outcome: &SellOfferOutcome) -> String {
     }
 }
 
+fn seller_shutdown_event(token_contract: &str) -> serde_json::Value {
+    json!({
+        "event": "stopping",
+        "role": "seller",
+        "token_contract": token_contract,
+        "reason": "signal"
+    })
+}
+
+fn emit_seller_shutdown_event(token_contract: &str) {
+    println!("{}", seller_shutdown_event(token_contract));
+    let _ = std::io::stdout().flush();
+}
+
+async fn react_to_seller_shutdown_signal(token_contract: &str) {
+    operator_shutdown_signal().await;
+    emit_seller_shutdown_event(token_contract);
+}
+
 fn seller_watch_cursor_path(
     deals_dir: Option<&std::path::Path>,
     token_contract: &str,
@@ -35,7 +57,7 @@ fn seller_watch_cursor_path(
         .join("seller-watch")
         .join(format!(
             "{}.cursor.json",
-            deals::make_handle_id(token_contract)
+            deals::make_token_contract_id(token_contract)
         )))
 }
 
@@ -249,34 +271,33 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         gateway_advertise: gateway_advertise.clone(),
         mock_token_count: args.mock_token_count,
     };
-    // Resume path: a matched buyer can fund this per-deal TC while no seller process was live (the deal ends up
-    // `funded-but-never-opened`). Because a `(sellerPubkey, nonce)` TC is single-use, re-posting the offer would
-    // fail -- but the stream can still be opened. This pre-offer probe MUST be non-blocking: fresh normal
-    // sellers must post their ask immediately, while `read_match` remains the later wait-loop after the ask rests.
-    let already_matched = match chain.read_openable_match_now(&token_contract).await {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(e) => {
-            return Err(anyhow!(
-                "seller: existing-match resume preflight failed for {token_contract}: {e}"
-            ));
+    let offer_startup = dexdo::seller::prepare_seller_offer(
+        note.as_ref(),
+        chain.as_ref(),
+        &cfg,
+        args.identity.note_addr.as_deref(),
+    )
+    .await?;
+    match &offer_startup {
+        dexdo::seller::SellerOfferStartup::ResumedFunded => {
+            tracing::info!(
+                token_contract = %token_contract,
+                "seller: TC already funded by a matched buyer; resuming without offer post"
+            );
         }
-    };
-    if already_matched {
-        tracing::info!(
-            token_contract = %token_contract,
-            "seller: TC already funded by a matched buyer (funded-but-never-opened) -- resuming: skipping offer post, opening stream"
-        );
-    } else {
-        // a deterministic per-deal TC(sellerPubkey + nonce) is single-use. If a prior deal already used this
-        // nonce's TC(opened/funded/disputed/residual), the seller's pre-stream steps revert with a raw `TVM_ERROR`
-        // (ERR_ALREADY_OPEN 321). Fail closed BEFORE post_offer with an actionable "fresh --nonce / recover+destroy"
-        // message(the mock backend no-ops; a fresh active-but-unfunded TC passes).
-        chain.assert_token_contract_fresh(&token_contract).await?;
-        tracing::info!(token_contract = %token_contract, "seller posting offer, awaiting buy + match");
-        dexdo::seller::post_offer_with_note(note.as_ref(), chain.as_ref(), &cfg).await?;
-        if let Some(outcome) = chain.confirm_offer_outcome(&token_contract).await? {
-            println!("{}", seller_offer_outcome_line(&outcome));
+        dexdo::seller::SellerOfferStartup::ResumedResting { order_id } => {
+            tracing::info!(
+                token_contract = %token_contract,
+                order_id,
+                "seller: exact raw resting SELL found; resuming gateway and watcher without offer post"
+            );
+            println!("seller_offer_resume RESTING order_id={order_id}");
+        }
+        dexdo::seller::SellerOfferStartup::Posted { outcome } => {
+            tracing::info!(token_contract = %token_contract, "seller posted fresh offer");
+            if let Some(outcome) = outcome {
+                println!("{}", seller_offer_outcome_line(outcome));
+            }
         }
     }
     let seller =
@@ -286,10 +307,12 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         token_contract,
         gateway_advertise,
         args.gateway_listen,
-        if already_matched {
-            "resumed_funded_tc"
-        } else {
-            "exact_tc_offer_accepted"
+        match offer_startup {
+            dexdo::seller::SellerOfferStartup::ResumedFunded => "resumed_funded_tc",
+            dexdo::seller::SellerOfferStartup::ResumedResting { .. } => {
+                "resumed_resting_offer"
+            }
+            dexdo::seller::SellerOfferStartup::Posted { .. } => "exact_tc_offer_accepted",
         }
     );
     let _ = std::io::stdout().flush();
@@ -389,9 +412,13 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     let mut server_task = seller.server_task;
     match advance_task {
         // Supervise: whichever of {by-fact advance, gateway server} ends first decides the exit.
-        Some(advance_task) => {
+        Some(mut advance_task) => {
             tokio::select! {
-                advanced = advance_task => match advanced {
+                _ = react_to_seller_shutdown_signal(&token_contract) => {
+                    advance_task.abort();
+                    server_task.abort();
+                }
+                advanced = &mut advance_task => match advanced {
                     Ok(Ok(finalized)) => {
                         tracing::info!(
                             token_contract = %token_contract, finalized,
@@ -473,15 +500,108 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                 served = &mut server_task => served?,
             }
         }
-        None => server_task.await?,
+        None => {
+            tokio::select! {
+                _ = react_to_seller_shutdown_signal(&token_contract) => {
+                    server_task.abort();
+                }
+                served = &mut server_task => served?,
+            }
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::seller_offer_outcome_line;
+    use super::{react_to_seller_shutdown_signal, seller_offer_outcome_line};
     use dexdo_core::SellOfferOutcome;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess helper for seller_sigterm_emits_shutdown_jsonl"]
+    async fn seller_sigterm_child() {
+        if std::env::var_os("DEXDO_SELLER_SIGTERM_CHILD").is_none() {
+            return;
+        }
+        println!("seller-sigterm-ready");
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush readiness marker");
+        react_to_seller_shutdown_signal("0:deadbeef").await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seller_sigterm_emits_shutdown_jsonl() {
+        use std::io::{BufRead as _, Read as _};
+        use std::process::{Command, Stdio};
+
+        let run_seller = include_str!("seller.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("seller tests marker")
+            .0;
+        assert_eq!(
+            run_seller
+                .matches("_ = react_to_seller_shutdown_signal(&token_contract)")
+                .count(),
+            2,
+            "both supervised and mock/no-advance run_seller branches must react to SIGTERM"
+        );
+
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "cli::seller::tests::seller_sigterm_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("DEXDO_SELLER_SIGTERM_CHILD", "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn seller SIGTERM regression child");
+        let stdout = child.stdout.take().expect("capture child stdout");
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut output = String::new();
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                stdout.read_line(&mut line).expect("read child readiness"),
+                0,
+                "seller child exited before readiness; output={output}"
+            );
+            output.push_str(&line);
+            if line.contains("seller-sigterm-ready") {
+                break;
+            }
+        }
+
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("send SIGTERM to seller child");
+        assert!(signal.success(), "kill -TERM failed: {signal}");
+        stdout
+            .read_to_string(&mut output)
+            .expect("read seller child output");
+        let status = child.wait().expect("wait for seller child");
+        assert!(
+            status.success(),
+            "seller child failed: {status}; output={output}"
+        );
+
+        let shutdown = output
+            .lines()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .expect("seller emitted no shutdown JSONL event");
+        assert_eq!(
+            shutdown,
+            serde_json::json!({
+                "event": "stopping",
+                "role": "seller",
+                "token_contract": "0:deadbeef",
+                "reason": "signal"
+            })
+        );
+    }
 
     /// static guard -- the seller publishes its offer and confirms THIS TC either rested in the IOB or
     /// immediately matched/funded BEFORE binding the gateway, so "gateway listening" cannot false-green as market
@@ -489,24 +609,39 @@ mod tests {
     #[test]
     fn seller_gateway_listens_only_after_offer_acceptance_guard() {
         let source = include_str!("seller.rs");
+        let startup_source = include_str!("../seller/mod.rs");
         let terms = source
             .find(&["sell_", "offer_terms(&token_contract)"].concat())
             .expect("seller reads authoritative TC terms before posting");
-        let resume_probe = source
-            .find(&["read_", "openable_match_now(&token_contract)"].concat())
-            .expect("seller uses a non-blocking resume probe before posting");
-        let post = source
-            .find(&["post_offer", "_with_note(note.as_ref()"].concat())
-            .expect("seller posts the offer before opening the gateway");
+        let startup = source
+            .find("dexdo::seller::prepare_seller_offer(")
+            .expect("seller runs authoritative startup classification");
         let withdrawn = source
             .find(&["assert_note_can_", "post_sell_offer()"].concat())
             .expect("seller checks withdrawn note state before posting");
-        let accepted = source
-            .find(&["confirm_", "offer_outcome(&token_contract)"].concat())
-            .expect("seller confirms this TC's postSellOffer outcome");
         let gateway = source
             .find(&["start_gateway", "_with_note(args.gateway_listen"].concat())
             .expect("seller starts the gateway");
+        let startup_begin = startup_source
+            .find("pub async fn prepare_seller_offer(")
+            .expect("seller startup seam present");
+        let startup_end = startup_source[startup_begin..]
+            .find("/// Open the stream for a match")
+            .map(|offset| startup_begin + offset)
+            .expect("seller startup seam end");
+        let startup_flow = &startup_source[startup_begin..startup_end];
+        let resume_probe = startup_flow
+            .find("read_openable_match_now")
+            .expect("seller uses a non-blocking funded resume probe");
+        let raw_read = startup_flow
+            .find("raw_resting_sell_orders_for_tc")
+            .expect("seller reads raw exact-TC SELL rows");
+        let post = startup_flow
+            .find("post_offer_with_note")
+            .expect("fresh seller posts once");
+        let accepted = startup_flow
+            .find("confirm_offer_outcome")
+            .expect("fresh seller confirms post outcome");
         let real_backend = include_str!("../../../core/src/shellnet/backends.rs");
         let guard = real_backend
             .find("async fn confirm_offer_outcome(")
@@ -514,29 +649,29 @@ mod tests {
         let guard_body = &real_backend[guard..];
 
         assert!(
-            terms < post,
-            "seller offer terms must come from the deployed TC before posting"
+            terms < startup && startup < gateway,
+            "seller must read TC terms and finish startup classification before binding the gateway"
         );
         assert!(
-            terms < resume_probe && resume_probe < post,
-            "fresh seller startup must use the non-blocking resume probe before post_offer"
+            resume_probe < raw_read && raw_read < post && post < accepted,
+            "fresh startup must prove no funded/raw resting resume before post and confirm its outcome"
         );
         assert!(
-            !source[terms..post].contains("read_match(&token_contract)"),
+            !startup_flow.contains("read_match("),
             "fresh seller startup must not call the read_match wait-loop before post_offer"
         );
-        assert!(!source.contains(&["assert_", "no_active_sell_order"].concat()));
         assert!(
-            withdrawn < post,
+            !startup_flow.contains("discover_offers")
+                && !startup_flow.contains("executable_resting_asks"),
+            "seller startup must not use buyer discovery or quote coalescing"
+        );
+        assert!(
+            withdrawn < startup,
             "seller must reject withdrawn notes before postSellOffer"
         );
         assert!(
-            post < accepted,
-            "seller must publish the offer before checking IOB acceptance"
-        );
-        assert!(
-            accepted < gateway,
-            "seller gateway must not listen before this TC's offer rested or immediately matched"
+            startup < gateway,
+            "seller gateway must not listen before this TC resumes or its fresh offer is accepted"
         );
         assert!(
             guard_body.contains("read_openable_match_once(tc)"),
@@ -591,12 +726,12 @@ mod tests {
             .find("enforce_model_registry_policy(")
             .map(|offset| registry + offset)
             .expect("seller registry preflight present");
-        let post = body
-            .find(&["post_offer", "_with_note(note.as_ref()"].concat())
-            .expect("seller post_offer present");
+        let startup = body
+            .find("dexdo::seller::prepare_seller_offer(")
+            .expect("seller startup seam present");
 
         assert!(
-            registry < role && role < enforce && enforce < post,
+            registry < role && role < enforce && enforce < startup,
             "seller registry validation must run before postSellOffer"
         );
     }
@@ -683,11 +818,11 @@ mod tests {
         let doctor = body
             .find("shellnet_doctor_preflight")
             .expect("real shellnet preflight present");
-        let post_offer = body
-            .find("dexdo::seller::post_offer_with_note")
-            .expect("seller offer post present");
+        let startup = body
+            .find("dexdo::seller::prepare_seller_offer")
+            .expect("seller startup seam present");
         assert!(enforce < doctor);
-        assert!(enforce < post_offer);
+        assert!(enforce < startup);
         assert!(body.contains("apply_seller_dispute_policy"));
         assert!(body.contains("apply_seller_terminal_policy"));
 

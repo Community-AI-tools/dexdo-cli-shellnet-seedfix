@@ -1,3 +1,31 @@
+## v0.0.16
+
+- Fix live_cli ExitStatusExt feature gate
+- fix: gate release version and publish refs atomically
+- directive: close release-version and atomic-publication blocker
+- docs: publish full v4.0.28 inference order-book audit
+- fix(client): repair four frozen terminal blockers
+- docs: factual InferenceOrderBook order reference
+- fix: remove redundant trim before split_whitespace
+- fix: resume seller resting offer after restart
+- fix: role-scoped buyer and seller deal handles
+- PR548: fix public gosh-sh/dexdo-cli / private order-book event fold
+- fix: market-data --contracts compatibility and installer overwrite warning (gosh-sh/dexdo-cli)
+- docs: fix buy-model/install/note-creation/machine-contract docs (models.json, escrow example, note-creation reconcile, wallet onboarding, market discovery, stale version, --json)
+- fix: restore buyer test isolation so the money-safety shellnet tests pass
+- fix: RootPN deploy exit-52 is not wallet-busy; only wallet replay-52 retries
+- fix: actionable errors for doctor (missing contracts) and market (note not found)
+- fix: buyer pre-submit anti-stale guard compares order identity/terms, not the whole object
+- fix: scope seller transient-retry to the read-only match poll, not post-match signed writes
+- fix: note balance labels getDetails _balance as current free, not configured
+- fix(note): support managed UpdateCustodian wallet funding
+- fix: actionable note-deploy history-proof(403) failure message, no auto-retry
+- fix: close reports success only after the on-chain outcome is confirmed
+- fix: remove DEXDO-SUBMIT-DBG debug lines + raw submit-JSON from released source
+- fix: seller survives a transient network error instead of crashing
+- fix: note balance labels distinguish native-gas vs ECC[2] SHELL
+- fix: seller emits a shutdown JSONL event on SIGTERM
+
 ## v0.0.15
 
 - fix: model-only exact-row match uses authoritative on-chain row (unblocks live model-only buy)

@@ -14,6 +14,18 @@ use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
 use dexdo_core::ChainBackend;
 
+#[cfg(feature = "shellnet")]
+async fn submit_then_observe_cleanup<S, SF, O, OF>(submit: S, observe: O) -> Result<()>
+where
+    S: FnOnce() -> SF,
+    SF: std::future::Future<Output = Result<()>>,
+    O: FnOnce() -> OF,
+    OF: std::future::Future<Output = Result<()>>,
+{
+    submit().await?;
+    observe().await
+}
+
 #[allow(clippy::too_many_arguments)]
 fn close_response(
     network: &str,
@@ -177,15 +189,6 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             args.deal
         )
     })?;
-    if let (Some(handle), Some(arg_note)) = (&target.handle, args.note_addr.as_deref()) {
-        if deals::normalize_addr(&handle.note_addr) != deals::normalize_addr(arg_note) {
-            bail!(
-                "close: --note-addr {arg_note} does not match handle {} note {}",
-                handle.handle,
-                handle.note_addr
-            );
-        }
-    }
     let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
     shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
     let contracts = args
@@ -417,7 +420,14 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                         args.deal
                     )
                 })?;
-                chain.stream_cleanup(&note, &keys, &tc).await?;
+                submit_then_observe_cleanup(
+                    || async {
+                        chain.stream_cleanup(&note, &keys, &tc).await?;
+                        Ok(())
+                    },
+                    || async { chain.wait_cleanup_unopened(&tc).await.map_err(Into::into) },
+                )
+                .await?;
                 if args.json {
                     return machine::print_json(&close_response(
                         "shellnet",
@@ -426,14 +436,14 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                         target.token_contract.clone(),
                         "streamCleanup",
                         true,
-                        false,
+                        true,
                         None,
                         s.kind.as_str(),
-                        "stopped",
+                        "closed",
                     )?);
                 }
                 println!(
-                    "close submitted role=buyer action=streamCleanup token_contract={} note={}",
+                    "close confirmed role=buyer action=streamCleanup token_contract={} note={}",
                     target.token_contract, note
                 );
                 return Ok(());
@@ -474,6 +484,29 @@ fn buyer_opened_close_action(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn stream_cleanup_submits_exactly_once_while_confirmation_only_observes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let submits = AtomicUsize::new(0);
+        let observations = AtomicUsize::new(0);
+        super::submit_then_observe_cleanup(
+            || async {
+                submits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                observations.fetch_add(3, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(submits.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.load(Ordering::SeqCst), 3);
+    }
+
     #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_close_reclaims_opened_deal_after_stream_timeout() {

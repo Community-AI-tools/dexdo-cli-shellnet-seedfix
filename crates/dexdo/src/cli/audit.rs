@@ -574,7 +574,7 @@ mod tests {
     fn sample_handle() -> DealHandle {
         DealHandle {
             version: DEAL_HANDLE_VERSION,
-            handle: make_handle_id("0:33"),
+            handle: make_handle_id("0:33", DealHandleRole::Seller),
             role: DealHandleRole::Seller,
             network: "shellnet".into(),
             token_contract: "0:33".into(),

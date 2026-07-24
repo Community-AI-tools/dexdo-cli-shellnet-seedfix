@@ -583,7 +583,20 @@ impl BuyerSubscriptionState {
 #[allow(dead_code)]
 fn buyer_submit_state_dir() -> Result<std::path::PathBuf> {
     #[cfg(test)]
-    let path = std::env::temp_dir().join("dexdo-buyer-submits-tests");
+    let path = {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let started_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test process clock must be after the Unix epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "dexdo-buyer-submits-tests-{}-{started_at}",
+                std::process::id()
+            ))
+        })
+        .clone()
+    };
     #[cfg(not(test))]
     let path = directories::ProjectDirs::from("ai", "gosh", "dexdo")
         .ok_or_else(|| {
@@ -2747,7 +2760,7 @@ fn recovered_buyer_resume_selected_fields(
         "token_contract": token_contract,
         "role": "buyer",
         "source": "durable_journal",
-        "deal_handle": deals::make_handle_id(&token_contract),
+        "deal_handle": deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer),
         "frame_model": frame_model,
         "submit_reconciliation": submit_reconciliation
     }))
@@ -4419,7 +4432,10 @@ struct BuyerMachineErrorContext {
 impl BuyerMachineErrorContext {
     fn set_token_contract(&mut self, token_contract: &str) {
         self.token_contract = Some(token_contract.to_string());
-        self.deal_handle = Some(deals::make_handle_id(token_contract));
+        self.deal_handle = Some(deals::make_handle_id(
+            token_contract,
+            deals::DealHandleRole::Buyer,
+        ));
     }
 
     fn fields(&self) -> Value {
@@ -4739,7 +4755,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                             "token_contract": tc.clone(),
                             "role": "buyer",
                             "source": "token_contract",
-                            "deal_handle": deals::make_handle_id(&tc),
+                            "deal_handle": deals::make_handle_id(&tc, deals::DealHandleRole::Buyer),
                             "frame_model": frame_model.clone()
                         }),
                     )
@@ -4847,7 +4863,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                         "order_id": machine::amount(fill.order_id),
                         "role": "buyer",
                         "source": "note_fill_event",
-                        "deal_handle": deals::make_handle_id(&tc),
+                        "deal_handle": deals::make_handle_id(&tc, deals::DealHandleRole::Buyer),
                         "frame_model": frame_model.clone()
                     }),
                 )
@@ -5012,7 +5028,7 @@ async fn prepare_lazy_buyer_api_deal_once(
         }
     };
 
-    let deal_handle = deals::make_handle_id(&token_contract);
+    let deal_handle = deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer);
     emit_shared_buyer_event(
         &events,
         "handover_received",
@@ -5202,7 +5218,7 @@ async fn run_buyer_on_demand_local_api(
         .transpose()?;
     let endpoint_deal_handle = endpoint_token_contract
         .as_deref()
-        .map(deals::make_handle_id);
+        .map(|token_contract| deals::make_handle_id(token_contract, deals::DealHandleRole::Buyer));
     emit_shared_buyer_event(
         &events,
         "endpoint_binding",
@@ -5334,7 +5350,7 @@ async fn run_buyer_on_demand_local_api(
         .as_ref()
         .map(|deal| {
             let tc = deal.route.token_contract.clone();
-            let handle = deals::make_handle_id(&tc);
+            let handle = deals::make_handle_id(&tc, deals::DealHandleRole::Buyer);
             (tc, handle)
         })
         .or_else(|| endpoint_token_contract.zip(endpoint_deal_handle))
@@ -5666,7 +5682,7 @@ async fn run_buyer_inner(
                                 "token_contract": tc.clone(),
                                 "role": "buyer",
                                 "source": "token_contract",
-                                "deal_handle": deals::make_handle_id(&tc),
+                                "deal_handle": deals::make_handle_id(&tc, deals::DealHandleRole::Buyer),
                                 "frame_model": frame_model.clone()
                             }),
                         )?;
@@ -5807,7 +5823,7 @@ async fn run_buyer_inner(
                             "order_id": machine::amount(fill.order_id),
                             "role": "buyer",
                             "source": "note_fill_event",
-                            "deal_handle": deals::make_handle_id(&tc),
+                            "deal_handle": deals::make_handle_id(&tc, deals::DealHandleRole::Buyer),
                             "frame_model": frame_model.clone()
                         }),
                     )?;
@@ -6025,7 +6041,7 @@ async fn run_buyer_inner(
             }
         }
     };
-    let mut deal_handle = deals::make_handle_id(&token_contract);
+    let mut deal_handle = deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer);
     if let Some(events) = machine_events.as_mut() {
         events.event(
             "handover_received",
@@ -8497,6 +8513,7 @@ mod tests {
         multisig_seed_file: Option<std::path::PathBuf>,
     ) -> NoteDeployArgs {
         NoteDeployArgs {
+            json: false,
             multisig_address: format!("0:{}", "1".repeat(64)),
             multisig_key,
             multisig_seed_file,
@@ -10345,6 +10362,46 @@ mod tests {
         assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// a benign metadata difference on the fresh non-atomic book read preserves the quoted
+    /// order identity/terms and reaches escrow submission.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn buyer_valid_quote_with_benign_reread_diff_reaches_money_submit() {
+        use std::sync::atomic::Ordering;
+
+        let mut quoted = issue67_real_like_order();
+        quoted.order_id = 489;
+        quoted.token_contract =
+            Some("0:03d8b19ead1b4efce30066813b244de7d92e07ea87cc20f8e0ec9c4ebf552cfb".to_string());
+        quoted.price_per_tick = 1;
+        quoted.ticks = 2;
+        let mut fresh = quoted.clone();
+        fresh.timestamp += 1;
+
+        let old_guard_error = (quoted != fresh).then_some(
+            "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent",
+        );
+        assert_eq!(
+            old_guard_error,
+            Some(
+                "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
+            ),
+            "the old whole-object guard must reproduce the exact  pre-submit rejection"
+        );
+
+        let chain = issue67_pipeline_chain(&quoted, Some(fresh));
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-95-benign-reread");
+        let journal_path = dir.join("submit.json");
+
+        let selection = issue67_select_and_submit(&chain, &journal_path)
+            .await
+            .expect("the new identity-and-terms guard accepts the benign reread");
+        assert_eq!(selection.quoted_order.as_ref(), Some(&quoted));
+        assert!(journal_path.exists());
+        assert_eq!(chain.model_before_post_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 1);
+    }
+
     /// negative: every matcher-relevant quote-to-submit mutation fails before durable journal POST
     /// and before the money submit.
     #[cfg(feature = "shellnet")]
@@ -11327,7 +11384,10 @@ mod tests {
         let canonical_token_contract = dexdo_core::Address::parse(&fill.token_contract)
             .unwrap()
             .with_workchain();
-        let canonical_deal_handle = super::deals::make_handle_id(&canonical_token_contract);
+        let canonical_deal_handle = super::deals::make_handle_id(
+            &canonical_token_contract,
+            super::deals::DealHandleRole::Buyer,
+        );
         for event in captured.iter().filter(|event| {
             matches!(
                 event["event"].as_str(),

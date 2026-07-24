@@ -100,8 +100,11 @@ jobs:
         if: matrix.native_run && matrix.os != 'windows-latest'
         shell: bash
         run: |
-          "target/${{ matrix.target }}/release/dexdo" --version
-          "target/${{ matrix.target }}/release/dexdo" --help
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          BIN="target/${{ matrix.target }}/release/dexdo"
+          ci/check-dexdo-version.sh "$BIN" "$VER"
+          "$BIN" --help
 
       - name: Linux portability smoke (old distros + no GLIBC symbols)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -132,8 +135,11 @@ jobs:
         if: matrix.native_run && matrix.os == 'windows-latest'
         shell: bash
         run: |
-          "target/${{ matrix.target }}/release/dexdo.exe" --version
-          "target/${{ matrix.target }}/release/dexdo.exe" --help
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          BIN="target/${{ matrix.target }}/release/dexdo.exe"
+          ci/check-dexdo-version.sh "$BIN" "$VER"
+          "$BIN" --help
 
       # Package the binary together with the runtime configuration it reads
       # (model config + deployed contract pins) and the docs.

@@ -96,7 +96,7 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     }
     writeln!(
         &mut out,
-        "SHELL ECC[2]: {} SHELL (raw {})",
+        "SHELL currency ECC[2] (live spendable balance): {} SHELL (raw {})",
         decimal_units(account.ecc_value(SHELL_ECC_ID)),
         account.ecc_value(SHELL_ECC_ID)
     )
@@ -110,12 +110,12 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     .unwrap();
     render_ecc_map(
         &mut out,
-        "account ECC balances",
+        "live account ECC balances (authoritative funding)",
         &NoteBalanceMap::Known(account.ecc.clone()),
     );
     render_ecc_map(
         &mut out,
-        "PrivateNote.getDetails balance",
+        "PrivateNote.getDetails current free token balance (not funding proof)",
         &view.getters.balance,
     );
     render_ecc_map(
@@ -1611,7 +1611,9 @@ mod note_deploy_tests {
         let out = render_note_balance(&view);
         assert!(out.contains("PrivateNote 0:abc"), "{out}");
         assert!(
-            out.contains("SHELL ECC[2]: 1.234567890 SHELL (raw 1234567890)"),
+            out.contains(
+                "SHELL currency ECC[2] (live spendable balance): 1.234567890 SHELL (raw 1234567890)"
+            ),
             "{out}"
         );
         assert!(
@@ -1624,6 +1626,36 @@ mod note_deploy_tests {
         );
         assert!(out.contains("ECC[7]: raw 42"), "{out}");
         assert!(out.contains("unknown (getter unavailable)"), "{out}");
+    }
+
+    /// a configured nominal must not look like proof that the note is funded.
+    #[test]
+    fn note_balance_labels_live_shell_and_configured_nominal_unambiguously() {
+        let view = build_note_balance_view(
+            "0:abc",
+            Some(NoteAccountSnapshot {
+                address: "0:abc".into(),
+                status: "Active".into(),
+                native_raw: 7,
+                ecc: vec![(2, 0)],
+                code_hash: None,
+            }),
+            NoteGetterBalanceMaps {
+                balance: NoteBalanceMap::Known(vec![(2, 10_000_000_000_000)]),
+                locked_in_orders: NoteBalanceMap::Known(vec![]),
+            },
+        )
+        .unwrap();
+
+        let out = render_note_balance(&view);
+        assert!(
+            out.contains("live account ECC balances (authoritative funding):\n  ECC[2] SHELL: 0.000000000 SHELL (raw 0)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("PrivateNote.getDetails current free token balance (not funding proof):\n  ECC[2] SHELL: 10000.000000000 SHELL (raw 10000000000000)"),
+            "{out}"
+        );
     }
 
     /// negative: a null/unreadable account is not rendered as zero.

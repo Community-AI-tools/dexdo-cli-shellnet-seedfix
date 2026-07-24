@@ -368,6 +368,10 @@ pub(crate) async fn run_release_dispute(_args: ReleaseDisputeArgs) -> Result<()>
     bail!("release-dispute unavailable: build with `--features shellnet`")
 }
 
+#[cfg(any(feature = "shellnet", test))]
+const WITHDRAW_SHELL_GUIDANCE: &str =
+    "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active.";
+
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
     use dexdo_core::{
@@ -411,7 +415,7 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
 
     eprintln!(
         "withdraw-shell {tc}: seller-signed TokenContract.withdrawShell(amount={amount}, recipient={recipient}). \
-         This withdraws finalized seller proceeds only; use `destroy` later to close/selfdestruct the TC."
+         {WITHDRAW_SHELL_GUIDANCE}"
     );
     chain.withdraw_shell(&tc, amount, &recipient, &keys).await?;
     println!(
@@ -572,5 +576,13 @@ mod tests {
         assert!(recovered["token_contract_updated_at_unix"]
             .as_u64()
             .is_some());
+    }
+
+    #[test]
+    fn withdraw_shell_guidance_describes_conditional_selfdestruct() {
+        assert_eq!(
+            super::WITHDRAW_SHELL_GUIDANCE,
+            "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active."
+        );
     }
 }

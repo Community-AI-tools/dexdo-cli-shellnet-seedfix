@@ -12,8 +12,11 @@ is green. Secrets (wallet seed/key, note owner secret, the pool file) are never 
 If any command fails, run `dexdo doctor` first -- it reports the shellnet version, manifest
 freshness, and whether your `policy.json` is complete.
 
-**Prerequisite:** a deployed multisig wallet holding test tokens plus its seed phrase (or key file).
-Buying works only after the seller has stood up their side and given you a deal address.
+**Prerequisite:** a deployed and funded UpdateCustodian multisig wallet holding test tokens plus its
+seed phrase (or key file). The wallet must have exactly one custodian whose public key matches the
+supplied funding key. Other wallet contract types are not currently supported, and the CLI does not
+create or fund the multisig. Buying also requires a live market with a seller ask; Phase 4 shows how
+to discover one.
 
 ---
 
@@ -63,7 +66,12 @@ dexdo note deploy \
 
 Use `--multisig-key /path/to/wallet.key` (a file with the 32-byte hex secret) instead of
 `--multisig-seed-file` if you hold the raw key. `pn_pool.json` holds the note owner secret -- keep it
-private, never commit it.
+private, never commit it. `dexdo note deploy` is the user note-creation path; it creates or appends
+the pool file that money-moving buyer commands require. Point the CLI at that same pool after deploy:
+
+```sh
+export DEXDO_PN_POOL="$PWD/pn_pool.json"
+```
 
 ## Phase 3. Prepare the note key
 
@@ -82,13 +90,52 @@ Confirm the note holds SHELL for escrow + gas (read-only, no key):
 dexdo note balance --note-addr "$NOTE_ADDR" --contracts contracts/deployed.shellnet.json
 ```
 
-## Phase 4. Get the deal address from the seller
+## Phase 4. Discover a live market
 
-Ask the seller for one of two things: the `market.json` file OR the `token_contract` string
-(`0:...`). Without it there is nothing to buy (the deal contract exists only after the seller's
-offer). If the seller gives you the bare `token_contract`, also get the canonical frame model
-(`qwen--qwen3--32b`) -- you pass it as `--frame-model` alongside `--token-contract`. Both sides must
-use the same `contracts/deployed.shellnet.json`.
+Start with the read-only market index. These commands need no note, wallet, or market file:
+
+```sh
+dexdo market-data list --output table --limit 20
+dexdo market-data show 0:<INFERENCE-ORDER-BOOK> --output json
+dexdo market-data depth 0:<INFERENCE-ORDER-BOOK> --output json --limit 50
+```
+
+Use `list` to find a live model market, then `show` and `depth` to inspect its identity and current
+asks. Record the canonical frame model and the best ask in the CLI's integer price units. You can
+buy by model without contacting a seller directly; the CLI selects an executable ask from the
+model's order book.
+
+If a seller gives you a specific deal instead, ask for either the `market.json` file or the
+`token_contract` string (`0:...`). With a bare `token_contract`, also get the canonical frame model
+and pass both to the buyer.
+
+Create `models.json` in the working directory before any `market` or `buyer` command. The buyer
+defaults to this path and uses the entry for model identity verification:
+
+```json
+{
+  "models": {
+    "qwen": {
+      "frame_model": "qwen--qwen3--32b",
+      "base_url": "https://api.groq.com/openai/v1",
+      "served_model": "qwen/qwen3-32b",
+      "api_key_env": "GROQ_API_KEY",
+      "tokenizer_family": "qwen",
+      "price_per_tick": 1000,
+      "identity_aliases": ["Qwen/Qwen3-32B"],
+      "vocab_size": 152064,
+      "fingerprints": [
+        {
+          "probe_prompt": "What is 17*23? Think step by step.",
+          "expected_contains": "<think>",
+          "accepts_reasoning_side_channel": true
+        }
+      ],
+      "capabilities": { "logprobs": true, "top_logprobs": 5 }
+    }
+  }
+}
+```
 
 ## Phase 5. Check the price and cost before you buy
 
@@ -176,18 +223,36 @@ dexdo buyer \
   --market market.json \
   --note-addr "$NOTE_ADDR" \
   --note-key note.secret.hex \
+  --models models.json \
   --ticks 8 \
-  --max-price-per-tick 1000 \
+  --max-price-per-tick 10 \
   --local-listen 127.0.0.1:8080 \
   --contracts contracts/deployed.shellnet.json
 ```
 
-Without `market.json`, replace `--market market.json` with
-`--token-contract 0:<ADDRESS> --frame-model qwen--qwen3--32b`. `--ticks` is how many ticks you buy;
-`--max-price-per-tick` is your per-tick price ceiling in whole SHELL (1 SHELL = 1e9 raw) and must be
->= the ask. Escrow is computed automatically as about `ticks x max-price-per-tick x 1.025` (a 2.5%
-book fee) -- do not set `--escrow` without a reason (over-funding a resting buy can strand the
-surplus). Wait for the line `consumer API listening (loopback)` -- the endpoint is ready.
+The value `10` is only a micro-priced example. Replace it with the best ask you recorded in Phase 4
+or a nearby ceiling in the same integer units. The automatic escrow is calculated from your ceiling,
+not from the eventual fill price, so an unnecessarily high ceiling locks unnecessarily high escrow.
+
+To buy from the discovered model order book without `market.json`, use:
+
+```sh
+dexdo buyer \
+  --frame-model qwen--qwen3--32b \
+  --note-addr "$NOTE_ADDR" \
+  --note-key note.secret.hex \
+  --models models.json \
+  --ticks 8 \
+  --max-price-per-tick 10 \
+  --local-listen 127.0.0.1:8080 \
+  --contracts contracts/deployed.shellnet.json
+```
+
+For a specific bare deal, add `--token-contract 0:<ADDRESS>` to that model command. `--ticks` is how
+many ticks you buy. `--max-price-per-tick` must be at least the ask. Escrow is computed automatically
+as `ticks x max-price-per-tick` plus the book fee. Do not set `--escrow` without a reason:
+over-funding a resting buy can strand the surplus. Wait for the line
+`consumer API listening (loopback)` -- the endpoint is ready.
 
 Two flags worth knowing:
 

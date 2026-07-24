@@ -116,6 +116,9 @@ impl Command {
             Command::Quote(args) if args.json => Some(machine::OP_QUOTE),
             Command::Status(args) if args.json => Some(machine::OP_STATUS),
             Command::Close(args) if args.json => Some(machine::OP_CLOSE),
+            Command::Note(args) if matches!(&args.command, NoteCommand::Deploy(args) if args.json) => {
+                Some(machine::OP_NOTE_DEPLOY)
+            }
             Command::Buyer(args) if args.json => Some(machine::OP_BUYER_START),
             _ => None,
         }
@@ -130,6 +133,9 @@ fn raw_machine_operation(args: &[std::ffi::OsString]) -> Option<&'static str> {
             "buyer" => machine::OP_BUYER_START,
             "status" => machine::OP_STATUS,
             "close" => machine::OP_CLOSE,
+            "note" if args.get(idx + 1).and_then(|a| a.to_str()) == Some("deploy") => {
+                machine::OP_NOTE_DEPLOY
+            }
             _ => continue,
         };
         if args
@@ -360,6 +366,7 @@ mod note_cli_tests {
             "dexdo",
             "note",
             "deploy",
+            "--json",
             "--multisig-address",
             "0:wallet",
             "--multisig-key",
@@ -380,6 +387,7 @@ mod note_cli_tests {
         assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
         assert_eq!(d.recovery, None);
+        assert!(d.json);
         assert!(!d.simulate_interrupt_after_spend_before_pool);
         let c = Cli::try_parse_from([
             "dexdo",
@@ -410,6 +418,7 @@ mod note_cli_tests {
             d.recovery,
             Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
+        assert!(!d.json);
         // The wallet address, one key input, and pool are required -- omitting any fails parse.
         assert!(Cli::try_parse_from(["dexdo", "note", "deploy", "--pool", "p.json"]).is_err());
         assert!(Cli::try_parse_from([
@@ -769,6 +778,8 @@ mod market_orders_cli_tests {
             "http://dodex-dev.ackinacki.org:8080",
             "--output",
             "json",
+            "--contracts",
+            "contracts/custom.json",
             "--endpoint",
             "new-shellnet.example",
             "list",
@@ -790,6 +801,7 @@ mod market_orders_cli_tests {
             Some("http://dodex-dev.ackinacki.org:8080")
         );
         assert_eq!(args.output, MarketDataOutput::Json);
+        assert_eq!(args.contracts, Some(PathBuf::from("contracts/custom.json")));
         assert_eq!(args.endpoint.as_deref(), Some("new-shellnet.example"));
         assert_eq!(args.timeout_ms, 10_000);
         let MarketDataCommand::List {
@@ -823,10 +835,27 @@ mod market_orders_cli_tests {
         };
         assert_eq!(args.output, MarketDataOutput::Json);
         assert_eq!(args.timeout_ms, 10_000);
+        assert_eq!(args.contracts, None);
         assert!(matches!(
             args.command,
             MarketDataCommand::List { limit: Some(1), .. }
         ));
+
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "market-data",
+            "list",
+            "--contracts",
+            "contracts/after-subcommand.json",
+        ])
+        .expect("market-data list accepts compatibility --contracts after subcommand");
+        let Command::MarketData(args) = c.command else {
+            panic!("expected Command::MarketData");
+        };
+        assert_eq!(
+            args.contracts,
+            Some(PathBuf::from("contracts/after-subcommand.json"))
+        );
 
         let c = Cli::try_parse_from([
             "dexdo",

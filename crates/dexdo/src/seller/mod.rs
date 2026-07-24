@@ -12,10 +12,10 @@ pub use advance::{drive_advance, AdvanceWindows};
 pub use models::{Capabilities, ModelConfig, ModelsConfig};
 pub use upstream::{anthropic::AnthropicConfig, openai::OpenAiConfig, UpstreamConfig};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use dexdo_core::{
-    ChainBackend, DobParams, Handover, LocalNote, Match, MatchWatchCursor, Note, SellOffer,
-    TokenContract,
+    normalize_wallet_address, ChainBackend, DobParams, Handover, LocalNote, Match,
+    MatchWatchCursor, Note, OrderBookOrder, SellOffer, SellOfferOutcome, TokenContract,
 };
 use gateway::{GatewayService, GatewayState};
 use std::net::SocketAddr;
@@ -44,6 +44,13 @@ pub struct SellerConfig {
     /// Real upstreams are limited by the buyer request's `max_tokens` and the market cap
     /// (`max_ticks * TICK_SIZE`), not by this debug fixture.
     pub mock_token_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SellerOfferStartup {
+    ResumedFunded,
+    ResumedResting { order_id: u128 },
+    Posted { outcome: Option<SellOfferOutcome> },
 }
 
 /// A running seller gateway: state handle + handle to the server's background task.
@@ -230,6 +237,170 @@ pub async fn post_offer_with_note(
     Ok(())
 }
 
+fn resting_offer_error(token_contract: &str, reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!(
+        "seller cannot safely resume or post TokenContract {token_contract}: {reason}. \
+         Check the raw order book and cancel the existing order before retrying."
+    )
+}
+
+fn validate_resting_offer(
+    order: &OrderBookOrder,
+    expected_owner: Option<&str>,
+    cfg: &SellerConfig,
+) -> Result<()> {
+    if order.is_buy {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!("order {} is not a SELL", order.order_id),
+        ));
+    }
+    let order_tc = order.token_contract.as_deref().ok_or_else(|| {
+        resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} is missing the required token_contract fact",
+                order.order_id
+            ),
+        )
+    })?;
+    let wanted_tc = normalize_wallet_address(&cfg.token_contract).map_err(|error| {
+        resting_offer_error(
+            &cfg.token_contract,
+            format!("expected TokenContract address is invalid: {error}"),
+        )
+    })?;
+    let actual_tc = normalize_wallet_address(order_tc).map_err(|error| {
+        resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} has an invalid token_contract fact: {error}",
+                order.order_id
+            ),
+        )
+    })?;
+    if actual_tc != wanted_tc {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} belongs to TokenContract {order_tc}, not this TC",
+                order.order_id
+            ),
+        ));
+    }
+
+    let expected_owner = expected_owner.ok_or_else(|| {
+        resting_offer_error(
+            &cfg.token_contract,
+            "the seller note owner is unavailable for raw order verification",
+        )
+    })?;
+    let wanted_owner = normalize_wallet_address(expected_owner).map_err(|error| {
+        resting_offer_error(
+            &cfg.token_contract,
+            format!("expected seller note owner is invalid: {error}"),
+        )
+    })?;
+    let actual_owner = normalize_wallet_address(&order.owner_note).map_err(|error| {
+        resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} is missing or has an invalid owner fact: {error}",
+                order.order_id
+            ),
+        )
+    })?;
+    if actual_owner != wanted_owner {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} owner {} does not match seller note {}",
+                order.order_id, order.owner_note, expected_owner
+            ),
+        ));
+    }
+    if order.price_per_tick != u128::from(cfg.price_per_tick) {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} price_per_tick {} does not match {}",
+                order.order_id, order.price_per_tick, cfg.price_per_tick
+            ),
+        ));
+    }
+    if order.ticks != u128::from(cfg.max_ticks) {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} remaining ticks {} do not match max ticks {}",
+                order.order_id, order.ticks, cfg.max_ticks
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Classify authoritative startup state before binding the gateway. A funded match resumes the
+/// existing match path; one exact raw resting SELL resumes its watcher; only an empty exact-TC
+/// result permits one fresh post.
+pub async fn prepare_seller_offer(
+    note: &dyn Note,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+) -> Result<SellerOfferStartup> {
+    match chain.read_openable_match_now(&cfg.token_contract).await {
+        Ok(Some(_)) => return Ok(SellerOfferStartup::ResumedFunded),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(anyhow!(
+                "seller: existing-match resume preflight failed for {}: {error}",
+                cfg.token_contract
+            ));
+        }
+    }
+
+    let raw_orders = chain
+        .raw_resting_sell_orders_for_tc(&cfg.token_contract)
+        .await
+        .map_err(|error| {
+            resting_offer_error(
+                &cfg.token_contract,
+                format!("authoritative raw order-book read failed: {error}"),
+            )
+        })?;
+    match raw_orders.as_slice() {
+        [] => {
+            chain
+                .assert_token_contract_fresh(&cfg.token_contract)
+                .await?;
+            post_offer_with_note(note, chain, cfg).await?;
+            let outcome = chain.confirm_offer_outcome(&cfg.token_contract).await?;
+            Ok(SellerOfferStartup::Posted { outcome })
+        }
+        [order] => {
+            validate_resting_offer(order, expected_owner, cfg)?;
+            Ok(SellerOfferStartup::ResumedResting {
+                order_id: order.order_id,
+            })
+        }
+        orders => {
+            let ids = orders
+                .iter()
+                .map(|order| order.order_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            Err(resting_offer_error(
+                &cfg.token_contract,
+                format!(
+                    "ambiguous raw order book has {} active SELL rows for this TC (order ids {ids})",
+                    orders.len()
+                ),
+            ))
+        }
+    }
+}
+
 /// Open the stream for a match:
 /// 1. reads the match(the buyer's pubkey is recorded in the contract);
 /// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
@@ -328,6 +499,20 @@ pub async fn provision_match(
     Ok(())
 }
 
+/// Perform only the read-only match poll, leaving provisioning to the caller.
+async fn poll_match(
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    cursor_path: &Path,
+) -> Result<(SellerMatchWatchCursor, Option<Match>)> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
+    cursor.last_polled_unix = Some(now_unix()?);
+    let found = chain
+        .poll_openable_match(&cfg.token_contract, &mut cursor.source)
+        .await?;
+    Ok((cursor, found))
+}
+
 /// Poll once for a match and provision access if one exists. The cursor is saved on every successful poll so a
 /// restarted gateway continues from the same source position instead of rereading the note event window forever.
 pub async fn poll_match_and_maybe_open(
@@ -336,11 +521,7 @@ pub async fn poll_match_and_maybe_open(
     cfg: &SellerConfig,
     cursor_path: &Path,
 ) -> Result<Option<Match>> {
-    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
-    cursor.last_polled_unix = Some(now_unix()?);
-    let found = chain
-        .poll_openable_match(&cfg.token_contract, &mut cursor.source)
-        .await?;
+    let (mut cursor, found) = poll_match(chain, cfg, cursor_path).await?;
     if let Some(m) = found {
         provision_match(seller, chain, cfg, m.clone()).await?;
         cursor.opened_at_unix.get_or_insert(now_unix()?);
@@ -361,9 +542,31 @@ pub async fn watch_and_serve_match(
     watch: &SellerMatchWatchConfig,
 ) -> Result<Match> {
     loop {
-        if let Some(m) = poll_match_and_maybe_open(seller, chain, cfg, &watch.cursor_path).await? {
+        let (mut cursor, found) = match poll_match(chain, cfg, &watch.cursor_path).await {
+            Ok(polled) => polled,
+            Err(error)
+                if error
+                    .downcast_ref::<dexdo_core::ChainError>()
+                    .is_some_and(|error| matches!(error, dexdo_core::ChainError::Transport(_))) =>
+            {
+                tracing::warn!(
+                    event = "seller_match_watch_network_error",
+                    token_contract = %cfg.token_contract,
+                    error = %error,
+                    "transient seller match-watch network error; keeping gateway alive"
+                );
+                tokio::time::sleep(watch.poll_interval).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(m) = found {
+            provision_match(seller, chain, cfg, m.clone()).await?;
+            cursor.opened_at_unix.get_or_insert(now_unix()?);
+            cursor.save(&watch.cursor_path)?;
             return Ok(m);
         }
+        cursor.save(&watch.cursor_path)?;
         tokio::time::sleep(watch.poll_interval).await;
     }
 }
@@ -382,7 +585,10 @@ mod tests {
         matched: Option<Match>,
         handover: Mutex<Option<Vec<u8>>>,
         opens: AtomicU64,
+        open_failures_remaining: AtomicU64,
         opened: bool,
+        poll_failures_remaining: AtomicU64,
+        polls: AtomicU64,
         state_failures_remaining: AtomicU64,
         state_reads: AtomicU64,
         expect_last_seen: Option<i64>,
@@ -399,7 +605,10 @@ mod tests {
                 matched,
                 handover: Mutex::new(None),
                 opens: AtomicU64::new(0),
+                open_failures_remaining: AtomicU64::new(0),
                 opened: false,
+                poll_failures_remaining: AtomicU64::new(0),
+                polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
                 expect_last_seen,
@@ -412,7 +621,10 @@ mod tests {
                 matched: Some(matched),
                 handover: Mutex::new(handover_present.then(|| b"existing-handover".to_vec())),
                 opens: AtomicU64::new(0),
+                open_failures_remaining: AtomicU64::new(0),
                 opened,
+                poll_failures_remaining: AtomicU64::new(0),
+                polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
                 expect_last_seen: None,
@@ -422,6 +634,16 @@ mod tests {
 
         fn with_state_failures(mut self, failures: u64) -> Self {
             self.state_failures_remaining = AtomicU64::new(failures);
+            self
+        }
+
+        fn with_poll_failures(mut self, failures: u64) -> Self {
+            self.poll_failures_remaining = AtomicU64::new(failures);
+            self
+        }
+
+        fn with_open_failures(mut self, failures: u64) -> Self {
+            self.open_failures_remaining = AtomicU64::new(failures);
             self
         }
     }
@@ -445,6 +667,11 @@ mod tests {
             token_contract: &TokenContract,
             cursor: &mut MatchWatchCursor,
         ) -> Result<Option<Match>, ChainError> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.poll_failures_remaining.load(Ordering::Relaxed) > 0 {
+                self.poll_failures_remaining.fetch_sub(1, Ordering::Relaxed);
+                return Err(ChainError::Transport("connection reset".to_string()));
+            }
             assert_eq!(cursor.last_seen_created_at, self.expect_last_seen);
             cursor.record_seen_batch([(self.record_created_at, token_contract.clone())]);
             Ok(self.matched.clone())
@@ -463,6 +690,12 @@ mod tests {
             _: &dyn Note,
         ) -> Result<(), ChainError> {
             self.opens.fetch_add(1, Ordering::Relaxed);
+            if self.open_failures_remaining.load(Ordering::Relaxed) > 0 {
+                self.open_failures_remaining.fetch_sub(1, Ordering::Relaxed);
+                return Err(ChainError::Transport(
+                    "timeout after signed writes".to_string(),
+                ));
+            }
             self.handover.lock().unwrap().replace(enc_endpoint);
             Ok(())
         }
@@ -512,11 +745,183 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    enum RawStartupRead {
+        Orders(Vec<OrderBookOrder>),
+        ChainFailure,
+        TransportFailure,
+    }
+
+    struct StartupBackend {
+        raw: RawStartupRead,
+        startup_match: Option<Match>,
+        watcher_match: Option<Match>,
+        post_calls: AtomicU64,
+        raw_reads: AtomicU64,
+        freshness_checks: AtomicU64,
+        poll_calls: AtomicU64,
+        poll_failures_remaining: AtomicU64,
+        open_calls: AtomicU64,
+    }
+
+    impl StartupBackend {
+        fn new(raw: RawStartupRead, startup_match: Option<Match>, watcher_match: Match) -> Self {
+            Self {
+                raw,
+                startup_match,
+                watcher_match: Some(watcher_match),
+                post_calls: AtomicU64::new(0),
+                raw_reads: AtomicU64::new(0),
+                freshness_checks: AtomicU64::new(0),
+                poll_calls: AtomicU64::new(0),
+                poll_failures_remaining: AtomicU64::new(0),
+                open_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn without_match(raw: RawStartupRead) -> Self {
+            Self {
+                raw,
+                startup_match: None,
+                watcher_match: None,
+                post_calls: AtomicU64::new(0),
+                raw_reads: AtomicU64::new(0),
+                freshness_checks: AtomicU64::new(0),
+                poll_calls: AtomicU64::new(0),
+                poll_failures_remaining: AtomicU64::new(0),
+                open_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn with_poll_failures(mut self, failures: u64) -> Self {
+            self.poll_failures_remaining = AtomicU64::new(failures);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainBackend for StartupBackend {
+        async fn discover_offers(&self) -> Result<Vec<OfferListing>, ChainError> {
+            panic!("seller startup must not call discover_offers")
+        }
+
+        async fn raw_resting_sell_orders_for_tc(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Vec<OrderBookOrder>, ChainError> {
+            self.raw_reads.fetch_add(1, Ordering::Relaxed);
+            match &self.raw {
+                RawStartupRead::Orders(orders) => Ok(orders.clone()),
+                RawStartupRead::ChainFailure => {
+                    Err(ChainError::Chain("raw book getter failed".to_string()))
+                }
+                RawStartupRead::TransportFailure => {
+                    Err(ChainError::Transport("raw book timeout".to_string()))
+                }
+            }
+        }
+
+        async fn assert_token_contract_fresh(&self, _: &TokenContract) -> Result<(), ChainError> {
+            self.freshness_checks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn post_offer(&self, _: SellOffer, _: &dyn Note) -> Result<(), ChainError> {
+            self.post_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn confirm_offer_outcome(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<SellOfferOutcome>, ChainError> {
+            Ok(Some(SellOfferOutcome::Rested { order_id: 835 }))
+        }
+
+        async fn read_openable_match_now(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<Match>, ChainError> {
+            Ok(self.startup_match.clone())
+        }
+
+        async fn poll_openable_match(
+            &self,
+            _: &TokenContract,
+            _: &mut MatchWatchCursor,
+        ) -> Result<Option<Match>, ChainError> {
+            self.poll_calls.fetch_add(1, Ordering::Relaxed);
+            if self.poll_failures_remaining.load(Ordering::Relaxed) > 0 {
+                self.poll_failures_remaining.fetch_sub(1, Ordering::Relaxed);
+                return Err(ChainError::Transport("temporary watch timeout".to_string()));
+            }
+            Ok(self.watcher_match.clone())
+        }
+
+        async fn place_buy(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
+            unimplemented!()
+        }
+
+        async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError> {
+            self.watcher_match
+                .clone()
+                .ok_or_else(|| ChainError::NoMatch(token_contract.clone()))
+        }
+
+        async fn open_stream(
+            &self,
+            _: &TokenContract,
+            _: Vec<u8>,
+            _: &dyn Note,
+        ) -> Result<(), ChainError> {
+            self.open_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn read_handover(&self, _: &TokenContract) -> Result<Option<Vec<u8>>, ChainError> {
+            Ok(None)
+        }
+
+        async fn advance_tick(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
+            unimplemented!()
+        }
+
+        async fn accept_probe(&self, _: &TokenContract) -> Result<(), ChainError> {
+            unimplemented!()
+        }
+
+        async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
+            unimplemented!()
+        }
+
+        async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
+            unimplemented!()
+        }
+
+        async fn deal_state(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainState>, ChainError> {
+            Ok(Some(DealChainState {
+                funded: true,
+                opened: false,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: 0,
+            }))
+        }
+
+        async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
+            None
+        }
+    }
+
     fn test_seller() -> RunningSeller {
         RunningSeller {
             state: Arc::new(GatewayState::new()),
             note: Arc::new(LocalNote::generate()),
-            server_task: tokio::spawn(async {}),
+            server_task: tokio::spawn(std::future::pending()),
             tls_fingerprint: "test-fingerprint".to_string(),
         }
     }
@@ -547,6 +952,278 @@ mod tests {
             buyer_pubkey,
             price_per_tick: 1000,
         }
+    }
+
+    fn chain_address(hex_digit: char) -> String {
+        format!("0:{}", hex_digit.to_string().repeat(64))
+    }
+
+    fn raw_sell(
+        order_id: u128,
+        owner_note: &str,
+        token_contract: Option<&str>,
+        price_per_tick: u128,
+        ticks: u128,
+    ) -> OrderBookOrder {
+        OrderBookOrder {
+            order_id,
+            owner_note: owner_note.to_string(),
+            token_contract: token_contract.map(str::to_string),
+            is_buy: false,
+            price_per_tick,
+            ticks,
+            escrow: 0,
+            deadline: 0,
+            flags: 0,
+            timestamp: 1,
+        }
+    }
+
+    async fn prepare_start_gateway_and_watch(
+        backend: &StartupBackend,
+        cfg: &SellerConfig,
+        expected_owner: &str,
+        cursor_name: &str,
+    ) -> (SellerOfferStartup, RunningSeller, Match) {
+        let note: Arc<dyn Note> = Arc::new(LocalNote::generate());
+        let startup = prepare_seller_offer(note.as_ref(), backend, cfg, Some(expected_owner))
+            .await
+            .expect("seller startup classification");
+        let seller =
+            start_gateway_with_note("127.0.0.1:0".parse().unwrap(), UpstreamConfig::Mock, note)
+                .await
+                .expect("gateway starts");
+        assert!(!seller.server_task.is_finished(), "gateway remains running");
+        let watch = SellerMatchWatchConfig {
+            cursor_path: temp_cursor_path(cursor_name),
+            poll_interval: Duration::from_millis(1),
+        };
+        let matched = tokio::time::timeout(
+            Duration::from_secs(2),
+            watch_and_serve_match(&seller, backend, cfg, &watch),
+        )
+        .await
+        .expect("watcher stays live")
+        .expect("watcher opens the later match");
+        (startup, seller, matched)
+    }
+
+    async fn assert_startup_rejected(
+        backend: &StartupBackend,
+        cfg: &SellerConfig,
+        expected_owner: &str,
+        expected_error: &str,
+    ) {
+        let note = LocalNote::generate();
+        let error = prepare_seller_offer(&note, backend, cfg, Some(expected_owner))
+            .await
+            .expect_err("unsafe raw order state must fail closed");
+        assert!(
+            error.to_string().contains(expected_error),
+            "expected `{expected_error}` in `{error}`"
+        );
+        assert!(
+            error.to_string().contains(&cfg.token_contract),
+            "error must identify the TC: {error}"
+        );
+        assert!(
+            error.to_string().contains("cancel the existing order"),
+            "error must tell the operator how to recover: {error}"
+        );
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_raw_resting_sell_resumes_gateway_and_later_match_without_repost() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let buyer = LocalNote::generate();
+        let row = raw_sell(
+            70,
+            &owner.to_ascii_uppercase(),
+            Some(&tc.to_ascii_uppercase()),
+            1000,
+            8,
+        );
+        let backend = StartupBackend::new(
+            RawStartupRead::Orders(vec![row]),
+            None,
+            sample_match(&tc, buyer.pubkey()),
+        );
+
+        let (startup, seller, matched) =
+            prepare_start_gateway_and_watch(&backend, &cfg, &owner, "raw-resume").await;
+
+        assert_eq!(startup, SellerOfferStartup::ResumedResting { order_id: 70 });
+        assert_eq!(matched.token_contract, tc);
+        assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.freshness_checks.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
+        seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_raw_book_posts_once_then_starts_gateway_and_watcher() {
+        let tc = chain_address('c');
+        let owner = chain_address('d');
+        let cfg = test_cfg(&tc);
+        let buyer = LocalNote::generate();
+        let backend = StartupBackend::new(
+            RawStartupRead::Orders(Vec::new()),
+            None,
+            sample_match(&tc, buyer.pubkey()),
+        );
+
+        let (startup, seller, _) =
+            prepare_start_gateway_and_watch(&backend, &cfg, &owner, "fresh-post").await;
+
+        assert_eq!(
+            startup,
+            SellerOfferStartup::Posted {
+                outcome: Some(SellOfferOutcome::Rested { order_id: 835 })
+            }
+        );
+        assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.freshness_checks.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
+        seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn funded_openable_match_keeps_existing_resume_path() {
+        let tc = chain_address('e');
+        let owner = chain_address('f');
+        let cfg = test_cfg(&tc);
+        let buyer = LocalNote::generate();
+        let matched = sample_match(&tc, buyer.pubkey());
+        let backend =
+            StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched);
+
+        let (startup, seller, _) =
+            prepare_start_gateway_and_watch(&backend, &cfg, &owner, "funded-resume").await;
+
+        assert_eq!(startup, SellerOfferStartup::ResumedFunded);
+        assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.freshness_checks.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
+        seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn resting_sell_for_wrong_tc_fails_before_post_or_open() {
+        let tc = chain_address('1');
+        let owner = chain_address('2');
+        let cfg = test_cfg(&tc);
+        let row = raw_sell(1, &owner, Some(&chain_address('3')), 1000, 8);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
+        assert_startup_rejected(&backend, &cfg, &owner, "not this TC").await;
+    }
+
+    #[tokio::test]
+    async fn resting_sell_for_wrong_owner_fails_before_post_or_open() {
+        let tc = chain_address('4');
+        let owner = chain_address('5');
+        let cfg = test_cfg(&tc);
+        let row = raw_sell(2, &chain_address('6'), Some(&tc), 1000, 8);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
+        assert_startup_rejected(&backend, &cfg, &owner, "does not match seller note").await;
+    }
+
+    #[tokio::test]
+    async fn resting_sell_for_wrong_price_fails_before_post_or_open() {
+        let tc = chain_address('7');
+        let owner = chain_address('8');
+        let cfg = test_cfg(&tc);
+        let row = raw_sell(3, &owner, Some(&tc), 999, 8);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
+        assert_startup_rejected(&backend, &cfg, &owner, "price_per_tick 999").await;
+    }
+
+    #[tokio::test]
+    async fn resting_sell_for_wrong_ticks_fails_before_post_or_open() {
+        let tc = chain_address('9');
+        let owner = chain_address('a');
+        let cfg = test_cfg(&tc);
+        let row = raw_sell(4, &owner, Some(&tc), 1000, 7);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
+        assert_startup_rejected(&backend, &cfg, &owner, "remaining ticks 7").await;
+    }
+
+    #[tokio::test]
+    async fn resting_sell_missing_required_fact_fails_before_post_or_open() {
+        let tc = chain_address('b');
+        let owner = chain_address('c');
+        let cfg = test_cfg(&tc);
+        let row = raw_sell(5, &owner, None, 1000, 8);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
+        assert_startup_rejected(
+            &backend,
+            &cfg,
+            &owner,
+            "missing the required token_contract",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn two_equivalent_raw_sell_rows_are_ambiguous_before_post_or_open() {
+        let tc = chain_address('d');
+        let owner = chain_address('e');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![
+            raw_sell(6, &owner, Some(&tc), 1000, 8),
+            raw_sell(7, &owner, Some(&tc), 1000, 8),
+        ]));
+        assert_startup_rejected(&backend, &cfg, &owner, "2 active SELL rows").await;
+    }
+
+    #[tokio::test]
+    async fn raw_book_chain_error_never_falls_back_to_repost() {
+        let tc = chain_address('f');
+        let owner = chain_address('1');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::ChainFailure);
+        assert_startup_rejected(&backend, &cfg, &owner, "raw order-book read failed").await;
+    }
+
+    #[tokio::test]
+    async fn raw_book_timeout_never_falls_back_to_repost() {
+        let tc = chain_address('2');
+        let owner = chain_address('3');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::TransportFailure);
+        assert_startup_rejected(&backend, &cfg, &owner, "raw book timeout").await;
+    }
+
+    #[tokio::test]
+    async fn resting_resume_keeps_gateway_alive_across_match_watch_transport_retry() {
+        let tc = chain_address('4');
+        let owner = chain_address('5');
+        let cfg = test_cfg(&tc);
+        let buyer = LocalNote::generate();
+        let backend = StartupBackend::new(
+            RawStartupRead::Orders(vec![raw_sell(8, &owner, Some(&tc), 1000, 8)]),
+            None,
+            sample_match(&tc, buyer.pubkey()),
+        )
+        .with_poll_failures(1);
+
+        let (startup, seller, _) =
+            prepare_start_gateway_and_watch(&backend, &cfg, &owner, "resume-retry").await;
+
+        assert_eq!(startup, SellerOfferStartup::ResumedResting { order_id: 8 });
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
+        assert!(!seller.server_task.is_finished());
+        seller.server_task.abort();
     }
 
     #[tokio::test]
@@ -583,6 +1260,76 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
         assert_eq!(saved.source.last_seen_created_at, Some(first_seen + 1));
         assert!(saved.opened_at_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn transient_match_watch_network_error_keeps_seller_alive() {
+        let cursor_path = temp_cursor_path("transient-network");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-transient-network");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match("tc-transient-network", buyer.pubkey())),
+            None,
+            1,
+        )
+        .with_poll_failures(1);
+        let watch = SellerMatchWatchConfig {
+            cursor_path,
+            poll_interval: Duration::from_millis(1),
+        };
+
+        let matched = tokio::time::timeout(
+            Duration::from_secs(1),
+            watch_and_serve_match(&seller, &backend, &cfg, &watch),
+        )
+        .await
+        .expect("seller watcher stays alive after the transient error")
+        .expect("seller watcher recovers without exiting");
+
+        assert_eq!(matched.token_contract, "tc-transient-network");
+        assert_eq!(backend.polls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+        assert!(!seller.server_task.is_finished(), "gateway remains alive");
+    }
+
+    #[tokio::test]
+    async fn post_match_transport_error_surfaces_without_reprovisioning() {
+        let cursor_path = temp_cursor_path("post-match-transport");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-post-match-transport");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match("tc-post-match-transport", buyer.pubkey())),
+            None,
+            1,
+        )
+        .with_open_failures(1);
+        let watch = SellerMatchWatchConfig {
+            cursor_path,
+            poll_interval: Duration::from_millis(1),
+        };
+
+        let error = watch_and_serve_match(&seller, &backend, &cfg, &watch)
+            .await
+            .expect_err("post-match transport error must surface");
+
+        assert!(
+            error
+                .downcast_ref::<ChainError>()
+                .is_some_and(|error| matches!(error, ChainError::Transport(_))),
+            "post-match transport error must remain observable: {error}"
+        );
+        assert_eq!(
+            backend.polls.load(Ordering::Relaxed),
+            1,
+            "a post-match failure must not re-enter the read-only match poll"
+        );
+        assert_eq!(
+            backend.opens.load(Ordering::Relaxed),
+            1,
+            "a post-match failure must not retry signed provisioning writes"
+        );
     }
 
     #[tokio::test]

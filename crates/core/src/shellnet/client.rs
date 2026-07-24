@@ -1233,12 +1233,6 @@ async fn send_message_routed_checked(
     dapp_id: &str,
     thread_id: Option<&str>,
 ) -> Result<Value> {
-    eprintln!(
-        "DEXDO-SUBMIT-DBG account_id={} dapp_id={} thread_id={:?}",
-        bare_hex(account_id),
-        bare_hex(dapp_id),
-        thread_id
-    );
     let mut item = json!({
         "id": submit_message_id(),
         "body": boc_base64,
@@ -1611,8 +1605,8 @@ pub(super) async fn fetch_ext_out_page(
         .json(&json!({
             "query": query,
             "variables": {
-                "accountId": account_id,
-                "dappId": dapp_id,
+                "accountId": bare_hex(account_id),
+                "dappId": bare_hex(dapp_id),
                 "last": page_size,
                 "before": before,
             },
@@ -4399,13 +4393,9 @@ impl RealChainBackend {
             // Pre-fund the RootModel's(and the TC's -- same nonce) uninit deploy addresses, then deploy the RM.
             self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
                 .await;
-            let prefund = self
-                .note_fund_deploy_shell(note, seed_keys, nonce, gas, gas)
+            self.note_fund_deploy_shell(note, seed_keys, nonce, gas, gas)
                 .await
                 .context("note-funded provision: fundDeployShell ECC[2]/SHELL funding failed")?;
-            eprintln!(
-                "deploy-prefund submit: RootModel {gas} + TokenContract {gas} via fundDeployShell(nonce={nonce}) -> {prefund}"
-            );
             self.log_deploy_prefund_snapshot("after fundDeployShell", note, &rm, &tc)
                 .await;
             // Do not hard-gate on a visible balance at the uninit deploy address. On shellnet an uninit
@@ -4437,15 +4427,11 @@ impl RealChainBackend {
             if !rm_absent {
                 self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
                     .await;
-                let prefund = self
-                    .note_fund_deploy_shell(note, seed_keys, nonce, 0, gas)
+                self.note_fund_deploy_shell(note, seed_keys, nonce, 0, gas)
                     .await
                     .context(
                         "note-funded provision: fundDeployShell ECC[2]/SHELL funding failed",
                     )?;
-                eprintln!(
-                    "deploy-prefund submit: TokenContract {gas} via fundDeployShell(nonce={nonce}) -> {prefund}"
-                );
                 self.log_deploy_prefund_snapshot("after fundDeployShell", note, &rm, &tc)
                     .await;
             }
@@ -5052,6 +5038,82 @@ mod tests {
         Arc, Mutex,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn fetch_ext_out_page_sends_bare_graphql_ids() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GraphQL fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept GraphQL request");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.expect("read GraphQL request");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers_end = headers_end + 4;
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .expect("GraphQL request content length");
+                if request.len() < headers_end + content_length {
+                    continue;
+                }
+                let body: Value =
+                    serde_json::from_slice(&request[headers_end..headers_end + content_length])
+                        .expect("GraphQL request JSON");
+                assert_eq!(
+                    body["variables"]["accountId"],
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                );
+                assert_eq!(
+                    body["variables"]["dappId"],
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                );
+                let response_body = json!({
+                    "data": {"blockchain": {"account": {"messages": {
+                        "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                        "edges": []
+                    }}}}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write GraphQL response");
+                break;
+            }
+        });
+
+        let page = fetch_ext_out_page(
+            &reqwest::Client::new(),
+            &endpoint,
+            &format!("0:{}", "1".repeat(64)),
+            &format!("0:{}", "2".repeat(64)),
+            100,
+            None,
+        )
+        .await
+        .expect("fetch ext-out page");
+        assert!(page.messages.is_empty());
+        assert_eq!(page.previous_cursor, None);
+        task.await.expect("GraphQL fixture task");
+    }
 
     #[test]
     fn clock_skew_within_threshold_passes() {
@@ -6364,5 +6426,12 @@ mod tests {
                 "dapp_id": "0x0",
             })
         );
+    }
+
+    #[test]
+    fn submit_path_has_no_raw_debug_console_output() {
+        let source = include_str!("client.rs");
+        assert!(!source.contains(concat!("DEXDO-SUBMIT", "-DBG")));
+        assert!(!source.contains(concat!("deploy-prefund", " submit:")));
     }
 }

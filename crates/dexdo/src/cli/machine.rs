@@ -8,6 +8,8 @@ pub(crate) const QUOTE_SCHEMA: &str = "dexdo.quote.v1";
 pub(crate) const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v1";
 pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v1";
 pub(crate) const CLOSE_SCHEMA: &str = "dexdo.close.v1";
+#[cfg(feature = "shellnet")]
+pub(crate) const NOTE_DEPLOY_SCHEMA: &str = "dexdo.note_deploy.v1";
 pub(crate) const ERROR_SCHEMA: &str = "dexdo.error.v1";
 
 pub(crate) const OP_MARKETS: &str = "markets";
@@ -17,6 +19,7 @@ pub(crate) const OP_BUYER_RUNTIME: &str = "buyer_runtime";
 pub(crate) const OP_BUYER_SHUTDOWN: &str = "buyer_shutdown";
 pub(crate) const OP_STATUS: &str = "status";
 pub(crate) const OP_CLOSE: &str = "close";
+pub(crate) const OP_NOTE_DEPLOY: &str = "note_deploy";
 
 #[derive(Debug)]
 pub(crate) struct MachineErrorPrinted;

@@ -54,14 +54,18 @@ impl OrderBookOrder {
     }
 }
 
-/// Fail closed unless the fresh matcher head is the exact full row rendered to the buyer.
-/// This guard intentionally compares the complete order identity. A caller must not reconstruct a
-/// shellnet row from a lossy market listing before invoking it.
+/// Fail closed unless the fresh matcher head has the order identity and executable terms rendered
+/// to the buyer.
 pub fn ensure_pre_submit_quote_unchanged(
     quoted_order: Option<&OrderBookOrder>,
     selected: &OrderBookOrder,
 ) -> Result<(), ChainError> {
-    if quoted_order == Some(selected) {
+    if quoted_order.is_some_and(|quoted| {
+        quoted.order_id == selected.order_id
+            && quoted.token_contract == selected.token_contract
+            && quoted.price_per_tick == selected.price_per_tick
+            && quoted.ticks == selected.ticks
+    }) {
         return Ok(());
     }
     Err(ChainError::Chain(

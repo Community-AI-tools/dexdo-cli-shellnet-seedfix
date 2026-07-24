@@ -92,6 +92,15 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<(u64, u64)>, ChainError> {
         Ok(None)
     }
+    /// Raw active SELL rows for this exact TokenContract, before any buyer quote coalescing. Backends
+    /// without a persistent authoritative book return an empty list; the real seller overrides this
+    /// with a strict per-order `InferenceOrderBook` read.
+    async fn raw_resting_sell_orders_for_tc(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Vec<OrderBookOrder>, ChainError> {
+        Ok(Vec::new())
+    }
     /// The buyer sends a buy order; the order book records its pubkey into `token_contract`.
     async fn place_buy(
         &self,
@@ -555,6 +564,27 @@ mod tests {
             .expect_err("a missing durable quote must fail before escrow")
             .to_string()
             .contains("no escrow was sent"));
+    }
+
+    /// non-term metadata returned by a later non-atomic book read does not make the same
+    /// executable ask stale.
+    #[test]
+    fn pre_submit_quote_identity_accepts_benign_reread_metadata_changes() {
+        let quoted = ask(
+            489,
+            "0:03d8b19ead1b4efce30066813b244de7d92e07ea87cc20f8e0ec9c4ebf552cfb",
+            1,
+            2,
+        );
+        let mut reread = quoted.clone();
+        reread.timestamp = 456;
+
+        assert_ne!(
+            quoted, reread,
+            "the old whole-OrderBookOrder comparison must observe the  benign reread difference"
+        );
+        ensure_pre_submit_quote_unchanged(Some(&quoted), &reread)
+            .expect("the same order identity and executable terms remain submit-safe");
     }
 
     /// quote consumes the book in price/time order and includes the 2.5% book fee in totals.

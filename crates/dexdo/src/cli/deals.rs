@@ -106,13 +106,24 @@ pub(crate) fn classify_deal_state(state: &serde_json::Value) -> DealStateSummary
     let opened = state["opened"].as_bool().unwrap_or(false);
     let disputed = state["disputed"].as_bool().unwrap_or(false);
     let probe_accepted = state["probeAccepted"].as_bool().unwrap_or(false);
+    let deposit = u128_field(state, "deposit");
+    let prepaid = u128_field(state, "prepaid");
+    let frozen = u128_field(state, "frozen");
+    let finalized_owed = u128_field(state, "finalizedOwed");
+    let settled = funded
+        && !opened
+        && !disputed
+        && deposit == 0
+        && prepaid == 0
+        && frozen == 0
+        && finalized_owed == 0;
     let kind = if disputed {
         DealStateKind::Disputed
     } else if opened && probe_accepted {
         DealStateKind::Streaming
     } else if opened {
         DealStateKind::Probe
-    } else if funded && probe_accepted {
+    } else if settled || funded && probe_accepted {
         DealStateKind::Stopped
     } else if funded {
         DealStateKind::FundedButNeverOpened
@@ -125,10 +136,10 @@ pub(crate) fn classify_deal_state(state: &serde_json::Value) -> DealStateSummary
         opened,
         disputed,
         probe_accepted,
-        deposit: u128_field(state, "deposit"),
-        prepaid: u128_field(state, "prepaid"),
-        frozen: u128_field(state, "frozen"),
-        finalized_owed: u128_field(state, "finalizedOwed"),
+        deposit,
+        prepaid,
+        frozen,
+        finalized_owed,
         funded_time: u64_opt_field(state, "fundedTime"),
         last_advance: u64_opt_field(state, "lastAdvance").unwrap_or(0),
     }
@@ -149,7 +160,7 @@ pub(crate) fn resolve_deals_dir(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn make_handle_id(token_contract: &str) -> String {
+pub(crate) fn make_token_contract_id(token_contract: &str) -> String {
     let clean = token_contract
         .trim()
         .chars()
@@ -162,6 +173,15 @@ pub(crate) fn make_handle_id(token_contract: &str) -> String {
         })
         .collect::<String>();
     format!("deal-{clean}")
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn make_handle_id(token_contract: &str, role: DealHandleRole) -> String {
+    format!(
+        "{}-{}",
+        make_token_contract_id(token_contract),
+        role.as_str()
+    )
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -208,22 +228,125 @@ pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn resolve_deal_ref(input: &str, dir: &Path) -> Result<Option<(PathBuf, DealHandle)>> {
+pub(crate) fn resolve_deal_ref(
+    input: &str,
+    dir: &Path,
+    explicit_role: Option<DealHandleRole>,
+    explicit_note_addr: Option<&str>,
+) -> Result<Option<(PathBuf, DealHandle)>> {
     let direct = Path::new(input);
     if direct.exists() {
-        return Ok(Some((direct.to_path_buf(), load_deal_handle(direct)?)));
+        let handle = load_deal_handle(direct)?;
+        validate_explicit_handle_args(&handle, explicit_role, explicit_note_addr)?;
+        return Ok(Some((direct.to_path_buf(), handle)));
     }
     let by_handle = handle_path(dir, input);
     if by_handle.exists() {
-        return Ok(Some((by_handle.clone(), load_deal_handle(&by_handle)?)));
+        let handle = load_deal_handle(&by_handle)?;
+        validate_explicit_handle_args(&handle, explicit_role, explicit_note_addr)?;
+        return Ok(Some((by_handle, handle)));
     }
-    let wanted = normalize_addr(input);
-    for (path, handle) in list_deal_handles(dir)? {
-        if normalize_addr(&handle.token_contract) == wanted || handle.handle == input {
-            return Ok(Some((path, handle)));
+
+    let handles = list_deal_handles(dir)?;
+    let mut by_id = handles.iter().filter(|(_, handle)| handle.handle == input);
+    if let Some((path, handle)) = by_id.next() {
+        if by_id.next().is_some() {
+            bail!("deal handle id `{input}` is ambiguous; pass an exact handle path");
         }
+        validate_explicit_handle_args(handle, explicit_role, explicit_note_addr)?;
+        return Ok(Some((path.clone(), handle.clone())));
     }
-    Ok(None)
+
+    let wanted = normalize_addr(input);
+    let matches = handles
+        .into_iter()
+        .filter(|(_, handle)| normalize_addr(&handle.token_contract) == wanted)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(role) = explicit_role else {
+        if matches.len() > 1 {
+            bail!(
+                "deal reference `{input}` is ambiguous: multiple local handles match this TokenContract; pass --role buyer|seller"
+            );
+        }
+        let (path, handle) = matches.into_iter().next().expect("one handle");
+        validate_explicit_handle_args(&handle, None, explicit_note_addr)?;
+        return Ok(Some((path, handle)));
+    };
+
+    let role_matches = matches
+        .into_iter()
+        .filter(|(_, handle)| handle.role == role)
+        .collect::<Vec<_>>();
+    if role_matches.is_empty() {
+        return Ok(None);
+    }
+    let matching = match explicit_note_addr {
+        Some(note_addr) => role_matches
+            .iter()
+            .filter(|(_, handle)| normalize_addr(&handle.note_addr) == normalize_addr(note_addr))
+            .cloned()
+            .collect::<Vec<_>>(),
+        None => role_matches.clone(),
+    };
+    if matching.is_empty() {
+        let (_, handle) = &role_matches[0];
+        bail!(
+            "--note-addr {} does not match handle {} note {}",
+            explicit_note_addr.expect("note filter"),
+            handle.handle,
+            handle.note_addr
+        );
+    }
+    if matching.len() > 1 {
+        let (_, first) = &matching[0];
+        let same_logical_side = matching.iter().all(|(_, handle)| {
+            normalize_addr(&handle.token_contract) == normalize_addr(&first.token_contract)
+                && handle.role == first.role
+                && normalize_addr(&handle.note_addr) == normalize_addr(&first.note_addr)
+        });
+        if same_logical_side {
+            if let Some((path, handle)) = matching.iter().find(|(_, handle)| {
+                handle.handle == make_handle_id(&handle.token_contract, handle.role)
+            }) {
+                return Ok(Some((path.clone(), handle.clone())));
+            }
+        }
+        bail!(
+            "deal reference `{input}` is ambiguous for role {}; pass an exact handle path",
+            role.as_str()
+        );
+    }
+    Ok(matching.into_iter().next())
+}
+
+fn validate_explicit_handle_args(
+    handle: &DealHandle,
+    explicit_role: Option<DealHandleRole>,
+    explicit_note_addr: Option<&str>,
+) -> Result<()> {
+    if explicit_role.is_some_and(|role| role != handle.role) {
+        bail!(
+            "--role {} does not match handle {} role {}",
+            explicit_role.expect("mismatched role").as_str(),
+            handle.handle,
+            handle.role.as_str()
+        );
+    }
+    if explicit_note_addr
+        .is_some_and(|note_addr| normalize_addr(note_addr) != normalize_addr(&handle.note_addr))
+    {
+        bail!(
+            "--note-addr {} does not match handle {} note {}",
+            explicit_note_addr.expect("mismatched note"),
+            handle.handle,
+            handle.note_addr
+        );
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -396,7 +519,7 @@ mod tests {
     fn sample_handle() -> DealHandle {
         DealHandle {
             version: DEAL_HANDLE_VERSION,
-            handle: make_handle_id("0:33"),
+            handle: make_handle_id("0:33", DealHandleRole::Seller),
             role: DealHandleRole::Seller,
             network: "shellnet".into(),
             token_contract: "0:33".into(),
@@ -448,7 +571,9 @@ mod tests {
     fn deal_state_classification_distinguishes_lifecycle_states() {
         let st = serde_json::json!({"funded": false, "opened": false, "disputed": false});
         assert_eq!(classify_deal_state(&st).kind, DealStateKind::Placed);
-        let st = serde_json::json!({"funded": true, "opened": false, "probeAccepted": false});
+        let st = serde_json::json!({
+            "funded": true, "opened": false, "probeAccepted": false, "deposit": "10"
+        });
         assert_eq!(
             classify_deal_state(&st).kind,
             DealStateKind::FundedButNeverOpened
@@ -459,19 +584,192 @@ mod tests {
         assert_eq!(classify_deal_state(&st).kind, DealStateKind::Streaming);
         let st = serde_json::json!({"funded": true, "opened": false, "probeAccepted": true});
         assert_eq!(classify_deal_state(&st).kind, DealStateKind::Stopped);
+        let st = serde_json::json!({
+            "funded": true,
+            "opened": false,
+            "probeAccepted": false,
+            "deposit": "0",
+            "prepaid": "0",
+            "frozen": "0",
+            "finalizedOwed": "0"
+        });
+        assert_eq!(
+            classify_deal_state(&st).kind,
+            DealStateKind::Stopped,
+            "a post-STOP deal with returned escrow is terminal, not never-opened"
+        );
         let st = serde_json::json!({"disputed": true});
         assert_eq!(classify_deal_state(&st).kind, DealStateKind::Disputed);
     }
 
     #[test]
     fn deal_ref_resolves_by_handle_and_token_contract() {
-        let base = std::env::temp_dir().join(format!("dexdo-deals-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
         let h = sample_handle();
-        let p = save_deal_handle(&base, &h).unwrap();
-        assert_eq!(resolve_deal_ref(&h.handle, &base).unwrap().unwrap().1, h);
-        assert_eq!(resolve_deal_ref("0:33", &base).unwrap().unwrap().0, p);
-        let _ = std::fs::remove_dir_all(&base);
+        let p = save_deal_handle(base, &h).unwrap();
+        assert_eq!(
+            resolve_deal_ref(&h.handle, base, None, None)
+                .unwrap()
+                .unwrap()
+                .1,
+            h
+        );
+        assert_eq!(
+            resolve_deal_ref("0:33", base, None, None)
+                .unwrap()
+                .unwrap()
+                .0,
+            p
+        );
+    }
+
+    fn buyer_handle() -> DealHandle {
+        let mut h = sample_handle();
+        h.handle = make_handle_id(&h.token_contract, DealHandleRole::Buyer);
+        h.role = DealHandleRole::Buyer;
+        h.note_addr = "0:55".into();
+        h
+    }
+
+    #[test]
+    fn buyer_and_seller_handles_for_one_token_contract_coexist() {
+        let temp = tempfile::tempdir().unwrap();
+        let buyer = buyer_handle();
+        let seller = sample_handle();
+
+        let buyer_path = save_deal_handle(temp.path(), &buyer).unwrap();
+        let seller_path = save_deal_handle(temp.path(), &seller).unwrap();
+
+        assert_eq!(
+            buyer_path.file_name().and_then(|name| name.to_str()),
+            Some("deal-0-33-buyer.json")
+        );
+        assert_eq!(
+            seller_path.file_name().and_then(|name| name.to_str()),
+            Some("deal-0-33-seller.json")
+        );
+        assert_eq!(load_deal_handle(&buyer_path).unwrap(), buyer);
+        assert_eq!(load_deal_handle(&seller_path).unwrap(), seller);
+    }
+
+    #[test]
+    fn raw_token_contract_with_explicit_buyer_selects_buyer_after_seller_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let buyer = buyer_handle();
+        save_deal_handle(temp.path(), &buyer).unwrap();
+        save_deal_handle(temp.path(), &sample_handle()).unwrap();
+
+        let (_, selected) = resolve_deal_ref(
+            "0:33",
+            temp.path(),
+            Some(DealHandleRole::Buyer),
+            Some("0:55"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected, buyer);
+    }
+
+    #[test]
+    fn explicit_owner_prefers_scoped_duplicate_over_legacy_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let scoped = buyer_handle();
+        let mut legacy = scoped.clone();
+        legacy.token_contract = " 0:33 ".into();
+        legacy.note_addr = " 0:55 ".into();
+        legacy.handle = make_token_contract_id(&legacy.token_contract);
+        save_deal_handle(temp.path(), &legacy).unwrap();
+        let scoped_path = save_deal_handle(temp.path(), &scoped).unwrap();
+
+        let (selected_path, selected) = resolve_deal_ref(
+            "0:33",
+            temp.path(),
+            Some(DealHandleRole::Buyer),
+            Some("0:55"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected_path, scoped_path);
+        assert_eq!(selected, scoped);
+    }
+
+    #[test]
+    fn other_role_handle_does_not_block_explicit_raw_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        save_deal_handle(temp.path(), &sample_handle()).unwrap();
+
+        assert!(resolve_deal_ref(
+            "0:33",
+            temp.path(),
+            Some(DealHandleRole::Buyer),
+            Some("0:55"),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn raw_token_contract_with_two_roles_is_ambiguous_without_role() {
+        let temp = tempfile::tempdir().unwrap();
+        save_deal_handle(temp.path(), &buyer_handle()).unwrap();
+        save_deal_handle(temp.path(), &sample_handle()).unwrap();
+
+        let err = resolve_deal_ref("0:33", temp.path(), None, None).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err:#}");
+        assert!(err.to_string().contains("--role"), "{err:#}");
+    }
+
+    #[test]
+    fn exact_handle_rejects_conflicting_role_and_note() {
+        let temp = tempfile::tempdir().unwrap();
+        let seller = sample_handle();
+        let path = save_deal_handle(temp.path(), &seller).unwrap();
+
+        let err = resolve_deal_ref(
+            path.to_str().unwrap(),
+            temp.path(),
+            Some(DealHandleRole::Buyer),
+            Some(&seller.note_addr),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--role buyer"), "{err:#}");
+
+        let err = resolve_deal_ref(
+            &seller.handle,
+            temp.path(),
+            Some(DealHandleRole::Seller),
+            Some("0:66"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--note-addr 0:66"), "{err:#}");
+    }
+
+    #[test]
+    fn legacy_unscoped_handle_remains_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut legacy = sample_handle();
+        legacy.handle = make_token_contract_id(&legacy.token_contract);
+        let path = save_deal_handle(temp.path(), &legacy).unwrap();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("deal-0-33.json")
+        );
+        assert_eq!(
+            resolve_deal_ref(&legacy.handle, temp.path(), None, None)
+                .unwrap()
+                .unwrap()
+                .1,
+            legacy
+        );
+        assert_eq!(
+            resolve_deal_ref("0:33", temp.path(), None, None)
+                .unwrap()
+                .unwrap()
+                .0,
+            path
+        );
     }
 }

@@ -724,6 +724,9 @@ pub(crate) struct QuoteArgs {
 /// Read-only Dodex inference market-data indexer discovery.
 #[derive(Args)]
 pub(crate) struct MarketDataArgs {
+    /// Compatibility flag matching shellnet market commands. Indexer-only reads do not use this manifest.
+    #[arg(long, global = true)]
+    pub(crate) contracts: Option<PathBuf>,
     /// Block Manager host or URL for deployment-specific read follow-ups.
     #[arg(long, alias = "graphql", global = true)]
     pub(crate) endpoint: Option<String>,
@@ -964,11 +967,10 @@ pub(crate) struct CloseArgs {
     /// Directory containing local deal handle JSON files. Defaults to the platform app data directory.
     #[arg(long)]
     pub(crate) deals_dir: Option<PathBuf>,
-    /// Role for a raw TokenContract address. Ignored for local handles, which carry their own role.
+    /// Role for a raw TokenContract address, or a mismatch guard for a local handle.
     #[arg(long)]
     pub(crate) role: Option<DealRoleArg>,
-    /// Actor PrivateNote address for a raw TokenContract address. Ignored for local handles unless supplied as a
-    /// mismatch guard.
+    /// Actor PrivateNote address for a raw TokenContract address, or a mismatch guard for a local handle.
     #[arg(long)]
     pub(crate) note_addr: Option<String>,
     /// Actor PrivateNote owner key. Required only when `close` needs to submit a signed transaction.
@@ -1069,6 +1071,9 @@ pub(crate) struct NoteStreamLocksArgs {
 /// `gosh.ackinacki`, then adapts the result into the `DEXDO_PN_POOL` schema.
 #[derive(Args)]
 pub(crate) struct NoteDeployArgs {
+    /// Emit one machine-readable JSON result on stdout.
+    #[arg(long)]
+    pub(crate) json: bool,
     /// Deployed multisig WALLET address that funds the note(no giver).
     #[arg(long)]
     pub(crate) multisig_address: String,

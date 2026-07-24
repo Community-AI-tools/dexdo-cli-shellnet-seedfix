@@ -57,6 +57,7 @@ echo "dexdo: checksum verified"
 
 tar -C "$tmp" -xzf "${tmp}/${asset}"
 mkdir -p "$BINDIR"
+[ ! -e "${BINDIR}/dexdo" ] || echo "dexdo: warning: replacing existing ${BINDIR}/dexdo" >&2
 install -m 0755 "${tmp}/dexdo-${vern}-${archname}-${osname}/dexdo" "${BINDIR}/dexdo"
 echo "dexdo: installed ${ver} to ${BINDIR}/dexdo"
 

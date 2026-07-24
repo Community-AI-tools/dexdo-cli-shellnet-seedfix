@@ -43,7 +43,7 @@ The `shellnet` feature is required for any on-chain command; a build without it 
 ## Phase 2. Verify the binary
 
 ```sh
-dexdo --version   # prints the installed release, e.g. "dexdo 0.0.4"
+dexdo --version   # prints the installed release, e.g. "dexdo <version>"
 dexdo --help      # lists the commands: note, provision, market, seller, buyer, quote, status, ...
 ```
 
@@ -81,9 +81,11 @@ network access to `shellnet.ackinacki.org`.
 The binary is ready, but real trading needs these from the operator -- gather them now so the sell/buy
 flow does not stall:
 
-1. A deployed **multisig wallet** holding test tokens, plus its **seed phrase** (or a key file). This
-   funds note deploys and per-deal markets. Keep the seed/key private -- pass it by file path, never
-   inline.
+1. A deployed and funded **UpdateCustodian multisig wallet** holding test tokens, plus its **seed
+   phrase** (or a key file). The wallet must have exactly one custodian whose public key matches the
+   supplied funding key. Other wallet contract types are not currently supported, and the CLI does
+   not create or fund multisig wallets. This wallet funds note deploys and per-deal markets. Keep the
+   seed/key private -- pass it by file path, never inline.
 2. A **model access key** for the seller only (for example `GROQ_API_KEY`), exported in the
    environment (`export GROQ_API_KEY=...`), never written to logs or files that get committed.
 3. A completed **failure policy**. Scaffold and fill it now:
@@ -103,7 +105,13 @@ flow does not stall:
      --nominal N10000 --token-type nackl --endpoint shellnet.ackinacki.org --pool pn_pool.json
    ```
 
-   `pn_pool.json` holds the note owner secret -- keep it private, never commit it.
+   `dexdo note deploy` is the user note-creation path. It creates or appends `pn_pool.json`, which
+   holds the note owner secret. Keep it private, never commit it, and point later seller or buyer
+   commands at it:
+
+   ```sh
+   export DEXDO_PN_POOL="$PWD/pn_pool.json"
+   ```
 
 ## Phase 6. Run it -- work end to end
 

@@ -116,9 +116,9 @@ fn status_next_for(
         (Some("seller"), _, _, true, false) => "seller_advance_probe_after_timeout",
         (Some("seller"), _, _, true, true) => "seller_advance_or_wait_buyer_stop",
         (Some("seller"), _, true, false, false) => "buyer_cleanup_after_timeout",
+        (Some("buyer"), "stopped", _, _, _) => "none",
         (Some("buyer"), _, _, true, _) => "stream_stop_or_reclaim_after_timeout",
         (Some("buyer"), _, true, false, false) => "cleanup_unopened_after_timeout",
-        (Some("buyer"), "stopped", _, _, _) => "seller_destroy",
         (Some("buyer"), _, _, _, _) => "cancel_resting_bid_or_wait_match",
         _ => "unknown_role",
     };
@@ -446,5 +446,13 @@ mod tests {
 
         assert_eq!(next.action, "seller_advance_probe_after_timeout");
         assert_eq!(next.command, "seller");
+    }
+
+    #[test]
+    fn buyer_terminal_status_does_not_recommend_cleanup() {
+        let next = super::status_next_for(Some("buyer"), "stopped", true, false, false);
+
+        assert_eq!(next.action, "none");
+        assert_eq!(next.command, "none");
     }
 }
