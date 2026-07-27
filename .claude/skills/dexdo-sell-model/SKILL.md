@@ -1,22 +1,23 @@
 ---
 name: dexdo-sell-model
-description: Guides a SELLER end-to-end through selling model inference on the dexdo market (real shellnet) -- install the client, deploy a wallet-funded private note, configure the model access key and models.json, read the current price with `dexdo market`, provision a per-deal market (`dexdo provision` -> market.json), fill the required failure policy (`dexdo policy init --role seller`), run the `dexdo seller` gateway (posts the offer, forces the model, proxies the real upstream, streams tick by tick), hand the deal address to the buyer, and check by-fact accounting (`dexdo status`/`dexdo monitor`) -- how many ticks were delivered and how much SHELL was received. Load this when the user wants to SELL access to their model, stand up a seller gateway, serve buyers, or check revenue and delivered tokens. For the buyer side, use the `dexdo-buy-model` skill.
+description: Guides a SELLER end-to-end through selling model inference on the dexdo market (real shellnet) -- install the client, deploy a wallet-funded private note, configure the model access key and models.json, read the current price with `dexdo market`, fill and validate the required seller policy, provision a per-deal market (`dexdo provision` -> market.json), run the `dexdo seller` gateway (posts the offer, forces the model, proxies the real upstream, streams tick by tick), hand the deal address to the buyer, and check by-fact accounting (`dexdo status`/`dexdo monitor`) -- how many ticks were delivered and how much SHELL was received. Load this when the user wants to SELL access to their model, stand up a seller gateway, serve buyers, or check revenue and delivered tokens. For the buyer side, use the `dexdo-buy-model` skill.
 ---
 
 # dexdo -- selling model access (seller side)
 
-Walk the seller through the real shellnet flow: install -> note -> price -> market -> policy ->
-gateway -> status. After each command, show the output and do not advance until the step is green.
+Walk the seller through the real shellnet flow: install -> note -> price -> policy -> validate ->
+provision -> gateway -> status. After each command, show the output and do not advance until the step is green.
 Secrets (wallet seed/key, note owner secret, the pool file, `GROQ_API_KEY`) are never printed or
 committed.
 
 If any command fails, run `dexdo doctor` first -- it reports the shellnet version, manifest
 freshness, and whether your `policy.json` is complete.
 
-**Prerequisites:** a deployed and funded UpdateCustodian multisig wallet holding test tokens plus its
-seed phrase (or key file), and a model access key (for example `GROQ_API_KEY`). The wallet must have
-exactly one custodian whose public key matches the supplied funding key. Other wallet contract types
-are not currently supported, and the CLI does not create or fund the multisig.
+**Prerequisites:** a deployed and funded `UpdateCustodianMultisigWallet_v2` v2.2.0 wallet holding
+test tokens plus its seed phrase (or key file), and a model access key (for example
+`GROQ_API_KEY`). The wallet must have exactly one custodian whose public key matches the supplied
+funding key. Other wallet contract types are not supported, and the CLI does not create or fund the
+multisig.
 
 ---
 
@@ -91,7 +92,7 @@ dexdo note balance --note-addr "$NOTE_ADDR" --contracts contracts/deployed.shell
 ```
 
 **Sizing:** the note's on-chain SHELL (its ECC currency-2 balance) must cover `--deposit-shells` for
-the deal deploys (Phase 4, whole SHELL) plus runtime gas. If it is short, deploy a larger `--nominal`
+the deal deploys (Phase 5, whole SHELL) plus runtime gas. If it is short, deploy a larger `--nominal`
 (or another note). Provision fails closed if `--deposit-shells` exceeds this balance.
 
 `models.json` in the working directory maps a model key to its canonical id, upstream, and metadata.
@@ -107,7 +108,7 @@ the deal deploys (Phase 4, whole SHELL) plus runtime gas. If it is short, deploy
       "served_model": "qwen/qwen3-32b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
-      "price_per_tick": 1000,
+      "price_per_tick": 1000000000,
       "capabilities": { "logprobs": true, "top_logprobs": 5 }
     }
   }
@@ -115,7 +116,7 @@ the deal deploys (Phase 4, whole SHELL) plus runtime gas. If it is short, deploy
 ```
 
 The `price_per_tick` here is decorative metadata -- it does NOT set the live deal price. The price
-buyers pay is whatever you set at `dexdo provision --price-per-tick` (Phase 4); editing this field
+buyers pay is whatever you set at `dexdo provision --price-per-tick` (Phase 5); editing this field
 changes nothing on-chain.
 
 Export the upstream key (not written to logs): `export GROQ_API_KEY=<your-key>`
@@ -136,7 +137,7 @@ or OpenAI logprobs, so keep `logprobs` off and omit `top_logprobs`:
       "base_url": "https://api.anthropic.com",
       "api_key_env": "ANTHROPIC_API_KEY",
       "tokenizer_family": "claude",
-      "price_per_tick": 1000,
+      "price_per_tick": 1000000000,
       "capabilities": { "logprobs": false }
     }
   }
@@ -147,7 +148,7 @@ Set `ANTHROPIC_API_KEY`, then run the seller with `--model claude-sonnet --model
 streams text immediately and reconciles billing to Anthropic's cumulative `usage.output_tokens`, not SSE
 content-delta count.
 
-## Phase 4. Read the price, then provision the deal
+## Phase 4. Read the price, then fill the failure policy
 
 First look at the model's shared order book (read-only, writes nothing) so you can price your offer
 against the market:
@@ -161,36 +162,13 @@ It prints the resting asks (price per tick, max ticks) and their deal addresses.
 --models models.json --note-addr "$NOTE_ADDR" --contracts contracts/deployed.shellnet.json` lists
 every configured book. To be taken by a best-price buyer, price at or below the current best ask.
 
-Now provision the per-deal `TokenContract`. Once per deal. `--nonce` is required and must be unique
-per deal (it derives the deal address). `--price-per-tick`, `--max-ticks`, and `--deposit-shells`
-are all in whole SHELL / ticks -- **1 SHELL = 1e9 raw**.
+The real `dexdo provision` and `dexdo seller` commands use the same complete seller policy. Keep one
+explicit path for both commands:
 
 ```sh
-dexdo provision \
-  --note-addr "$NOTE_ADDR" \
-  --note-key note.secret.hex \
-  --frame-model qwen--qwen3--32b \
-  --nonce 1 \
-  --price-per-tick 1000 \
-  --max-ticks 1024 \
-  --deposit-shells 20 \
-  --output market.json \
-  --contracts contracts/deployed.shellnet.json
-```
-
-`--price-per-tick` is the live tick price (whole SHELL); `--max-ticks` bounds the deal.
-`--deposit-shells` (whole SHELL) funds the two deploys (RootModel + TokenContract, split ~half each),
-defaults to ~20, and must fit the note balance from Phase 3 -- do not set it to the whole note (the
-remainder burns at `destroy`, and the note still needs runtime SHELL). The result `market.json`
-carries the deal address (`token_contract`), the model, and the nonce.
-
-## Phase 5. Fill the failure policy (required before the gateway)
-
-The real `dexdo seller` refuses to start without a complete policy at `~/.config/dexdo/policy.json`
-(Windows `%APPDATA%\dexdo\policy.json`). Scaffold it, then set every field:
-
-```sh
-dexdo policy init --role seller
+POLICY="${XDG_CONFIG_HOME:-$HOME/.config}/dexdo/policy.json"
+dexdo policy init --role seller --path "$POLICY"
+dexdo policy edit --path "$POLICY"
 ```
 
 This writes each required field as `UNSET`. Edit the file (or `dexdo policy edit`) and replace every
@@ -201,7 +179,7 @@ This writes each required field as `UNSET`. Edit the file (or `dexdo policy edit
   "version": 1,
   "seller": {
     "on": {
-      "buyer_no_show": "cleanup_and_retire",
+      "buyer_no_show": "retire_gateway",
       "after_deal_done": "retire",
       "dispute_against_me": "release_if_clean"
     },
@@ -212,27 +190,55 @@ This writes each required field as `UNSET`. Edit the file (or `dexdo policy edit
 
 Allowed values (the scaffold also lists these under `_legend.allowed`):
 
-- `seller.on.buyer_no_show`: `cleanup_and_republish | cleanup_and_retire` -- use `cleanup_and_retire`
-  (the republish variant is not yet supported by the daemon and fails closed when it fires).
-- `seller.on.after_deal_done`: `republish | republish_with_backoff | retire` -- use `retire` (the
-  republish variants fail closed on completion).
+- `seller.on.buyer_no_show`: `retire_gateway`.
+- `seller.on.after_deal_done`: `retire`.
 - `seller.on.dispute_against_me`: `release_if_clean | hold`.
-- `seller.max_open_deals`: integer >= 1, but **must be exactly `1`** -- the gateway owns one deal per
+- `seller.max_open_deals`: **exactly `1`** -- the gateway owns one deal per
   process and refuses to start with any other value.
 
-Confirm with `dexdo policy show`.
+The republish and cleanup action families are not seller runtime capabilities. Validation rejects
+them locally; it never substitutes a supported action.
 
 `policy.json` is the shared recovery control point. Manage it with `dexdo policy init`,
-`dexdo policy show`, and `dexdo policy edit`. The seller section decides whether to clean up,
-retire, or republish after buyer no-show or deal completion, and whether to release or hold a
-dispute. The buyer section classifies no handover, malformed handover, dead gateway, empty or stalled
-stream, and scam: stop honors finalized delivery, dispute freezes both notes, reclaim waits for the
-timeout and returns eligible escrow, and `next_seller` performs bounded failover.
+`dexdo policy show`, `dexdo policy edit`, and `dexdo policy validate`. The seller section chooses
+the supported terminal action after buyer no-show or deal completion and whether to release or hold
+a dispute.
+
+## Phase 5. Validate the policy, then provision the deal
+
+Validate immediately before provisioning. `provision` repeats the same pure-local validation before
+it reads the note key, connects to shellnet, prompts for a deposit, writes a manifest, or submits a
+transaction:
+
+```sh
+dexdo policy validate --role seller --path "$POLICY"
+dexdo provision \
+  --policy "$POLICY" \
+  --note-addr "$NOTE_ADDR" \
+  --note-key note.secret.hex \
+  --frame-model qwen--qwen3--32b \
+  --nonce 1 \
+  --price-per-tick 1000000000 \
+  --max-ticks 1024 \
+  --deposit-shells 20 \
+  --output market.json \
+  --contracts contracts/deployed.shellnet.json
+```
+
+Provision the per-deal `TokenContract` once per deal. `--nonce` is required and must be unique per
+deal (it derives the deal address). `--price-per-tick` is the live raw ECC[2] tick price and must
+be a positive whole `PRICE_STEP` multiple (`1000000000` raw = 1 SHELL);
+`--max-ticks` is a tick count and bounds the deal.
+`--deposit-shells` (whole SHELL) funds the two deploys (RootModel + TokenContract, split ~half each),
+defaults to ~20, and must fit the note balance from Phase 3 -- do not set it to the whole note (the
+remainder burns at `destroy`, and the note still needs runtime SHELL). The result `market.json`
+carries the deal address (`token_contract`), the model, and the nonce.
 
 ## Phase 6. Run the seller gateway
 
 ```sh
 dexdo seller \
+  --policy "$POLICY" \
   --market market.json \
   --model qwen \
   --models models.json \
@@ -242,7 +248,7 @@ dexdo seller \
   --contracts contracts/deployed.shellnet.json
 ```
 
-The offer price and volume come from the provisioned deal in `market.json` (set in Phase 4). The
+The offer price and volume come from the provisioned deal in `market.json` (set in Phase 5). The
 seller's own `--price-per-tick` flag is **ignored on the `--market` path** -- to re-price, run a new
 `dexdo provision` with a fresh `--nonce` and serve that manifest. `--gateway-listen` must be
 reachable by the buyer; if the buyer is on another host, also pass `--gateway-advertise
@@ -276,16 +282,14 @@ It prints the lifecycle `state=` (`placed`/`funded-but-never-opened`/`probe`/`st
 dexdo monitor --market market.json --contracts contracts/deployed.shellnet.json
 ```
 
-Read-only: ticks delivered, SHELL received, what is locked or burned, whether the deal is closed.
+Read-only: ticks delivered, SHELL received, per-deal collateral held or burned, and whether the deal is closed.
 Repeat `--market` for several markets; run it in a separate terminal.
 
 ## Phase 9. Anti-abuse and recovery
 
-`dexdo note withdraw` can refuse with `ERR_STREAM_LOCKED (405)` while a stream or dispute is live.
-It can also return `ERR_NOTE_BUSY (121)` when another note operation or stake state makes withdrawal
-unsafe. These gates are intentional, not a bug: the note lock prevents either side from reusing the
-same capital during a live deal or dispute, which makes wash trading, freeriding, and note hopping
-unprofitable (spec sections 4.3 and 4.4).
+Each deal keeps its own exact `2P` seller bond and contested buyer amount in that TokenContract.
+A dispute freezes only those per-deal funds; it does not lock the seller's or buyer's whole
+PrivateNote, so other independent deals remain possible.
 
 Use the recovery action that matches the failure:
 
@@ -293,12 +297,10 @@ Use the recovery action that matches the failure:
 +----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
 | Situation                              | Command                             | What it gives you                                                 |
 +----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
-| Concede a dispute                      | dexdo release-dispute               | Unlocks both notes and returns the contested amount to the buyer. |
+| Concede a dispute                      | dexdo release-dispute               | Returns this TC's contested amount and seller bond.                |
 | Collect finalized closed-deal earnings | dexdo withdraw-shell                | Moves finalized SHELL owed by the deal to the recipient.          |
 | Cancel one stale resting offer         | dexdo orders cancel <ID>            | Removes that order from the model book.                           |
 | Cancel all stale resting offers        | dexdo orders cancel-all             | Removes all of this note's orders from the model book.            |
-| Withdrawal fails with 405              | dexdo note stream-locks             | Lists locks, deal addresses, and the force-clear deadline.        |
-| Stale locks past the max-lock window   | PrivateNote.forceClearStreamLocks() | Owner backstop clears stale locks after the deadline.             |
 +----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
 ```
 
@@ -311,19 +313,8 @@ dexdo orders --note-addr "$NOTE_ADDR" --note-key note.secret.hex --market market
 dexdo orders --note-addr "$NOTE_ADDR" --note-key note.secret.hex --market market.json cancel-all
 ```
 
-Inspect a blocked withdrawal without signing anything:
-
-```sh
-dexdo note stream-locks --note-addr "$NOTE_ADDR" \
-  --contracts contracts/deployed.shellnet.json
-```
-
-First bring every listed deal to a clean end: stop or settle it, release or otherwise resolve its
-dispute, or let the stream/dispute timeout expire. Once no stream or dispute lock remains,
-`dexdo note withdraw` passes the lock gate. After the reported max-lock deadline,
-`PrivateNote.forceClearStreamLocks()` is the owner-only backstop for stale locks. The current CLI
-reports that deadline but does not expose the force-clear call as a subcommand or flag; it must be
-submitted with an owner-signing contract tool.
+Resolve a disputed TC with `release-dispute` or arbitration. There is no whole-note stream lock or
+force-clear step in the 4.0.28 economics model.
 
 ## Wrap-up
 
@@ -335,8 +326,7 @@ dexdo destroy --market market.json --note-addr "$NOTE_ADDR" --note-key note.secr
   --contracts contracts/deployed.shellnet.json
 ```
 
-Move the note's remaining token balance back to a wallet (rejected while stream-locked -- close the
-deal first):
+Move the note's remaining token balance back to a wallet:
 
 ```sh
 dexdo note withdraw --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
@@ -349,7 +339,8 @@ dexdo note withdraw --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
 
 - `policy (...) is missing or unreadable ... Run dexdo policy init` (or `... is incomplete`) -- the seller
   policy is absent or still has `UNSET`/invalid fields. Run `dexdo policy init --role seller`, fill
-  every field (Phase 5), and remember `seller.max_open_deals` must be `1`.
+  every field (Phase 4), run `dexdo policy validate --role seller`, and remember
+  `seller.max_open_deals` must be `1`.
 - `--note-addr ... is required` / `--note-key ... is required` -- pass the note address and key (Phase 3).
 - `--nonce <n> is required and must be UNIQUE per deal` -- set a new unique `--nonce` each deal.
 - provision fails for lack of SHELL -- the note's ECC currency-2 balance is below `--deposit-shells`;

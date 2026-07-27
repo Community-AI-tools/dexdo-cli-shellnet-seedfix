@@ -56,7 +56,7 @@ enum Command {
     /// contract's `reclaimOnTimeout`/`STREAM_TIMEOUT`.)
     Recover(RecoverArgs),
     /// Dispute: the BUYER opens an on-chain dispute on an OPEN deal -- `streamDispute` -> `TC.dispute()`
-    /// LOCKS both notes until `releaseDispute`/arbitration. The anti-scam lever for an observed
+    /// freezes this TC's contested amount and seller bond until resolution. The anti-scam lever for an observed
     /// substitution/fraud -- strictly stronger than `recover`'s STOP (which still pays for delivered
     /// ticks). Buyer-signed; fails closed if the deal is not OPEN / already disputed / the note isn't the buyer.
     Dispute(DisputeArgs),
@@ -65,10 +65,14 @@ enum Command {
     /// `streamCleanup` -> `TC.cleanupUnopened()` after `MATCH_OPEN_TIMEOUT`. Buyer-signed; fails closed locally
     /// on ownership + the timer.
     Reclaim(ReclaimArgs),
-    /// ReleaseDispute: the SELLER concedes a disputed deal -- `TokenContract.releaseDispute()` unlocks
-    /// both notes and returns the contested tick/deposit to the buyer. Seller-signed; fails closed if the deal
+    /// ReleaseDispute: the SELLER concedes a disputed deal -- `TokenContract.releaseDispute()` returns
+    /// this TC's contested amount to the buyer and the seller bond. Seller-signed; fails closed if the deal
     /// is not disputed or the signing key is not the TC seller.
     ReleaseDispute(ReleaseDisputeArgs),
+    /// Resolve a disputed deal after the deployed dispute window. Permissionless; the contract computes and
+    /// applies settlement, while the CLI rejects known-early or already-terminal calls before submit.
+    #[command(name = "resolve-dispute-timeout")]
+    ResolveDisputeTimeout(ResolveDisputeTimeoutArgs),
     /// WithdrawShell: the SELLER withdraws finalized `_finalizedOwed` SHELL from a deal TC. This moves
     /// seller proceeds; `destroy` remains the close/selfdestruct path.
     WithdrawShell(WithdrawShellArgs),
@@ -214,6 +218,7 @@ async fn main() -> Result<()> {
         Command::Dispute(args) => run_dispute(args).await,
         Command::Reclaim(args) => run_reclaim(args).await,
         Command::ReleaseDispute(args) => run_release_dispute(args).await,
+        Command::ResolveDisputeTimeout(args) => run_resolve_dispute_timeout(args).await,
         Command::WithdrawShell(args) => run_withdraw_shell(args).await,
         Command::Markets(args) => run_markets(args).await,
         Command::Market(args) => run_market(args).await,
@@ -233,7 +238,6 @@ async fn main() -> Result<()> {
             NoteCommand::Deploy(d) => run_note_deploy(d).await,
             NoteCommand::Recover(r) => run_note_recover(r).await,
             NoteCommand::Withdraw(w) => run_note_withdraw(w).await,
-            NoteCommand::StreamLocks(s) => run_note_stream_locks(s).await,
         },
         Command::Oracle(args) => run_oracle(args).await,
         Command::Policy(args) => policy::run_policy(args),
@@ -342,6 +346,18 @@ mod recovery_cli_tests {
         ])
         .expect("withdraw-shell --token-contract parses");
         assert!(matches!(c.command, Command::WithdrawShell(_)));
+    }
+
+    #[test]
+    fn permissionless_dispute_timeout_subcommand_parses_without_identity() {
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "resolve-dispute-timeout",
+            "--token-contract",
+            "0:tc",
+        ])
+        .expect("permissionless timeout command parses");
+        assert!(matches!(c.command, Command::ResolveDisputeTimeout(_)));
     }
 }
 
@@ -1004,7 +1020,7 @@ mod market_orders_cli_tests {
             "m.json",
             "place",
             "--max-price-per-tick",
-            "1000",
+            "1000000000",
             "--ticks",
             "4",
             "--auto-renew",
@@ -1021,7 +1037,7 @@ mod market_orders_cli_tests {
             s.read_timeout.read_timeout_secs,
             DEFAULT_CHAIN_READ_TIMEOUT_SECS
         );
-        assert_eq!(p.max_price_per_tick, 1000);
+        assert_eq!(p.max_price_per_tick, dexdo_core::PRICE_STEP);
         assert_eq!(p.ticks, Some(4));
         assert_eq!(p.budget, None);
         assert!(p.auto_renew);
@@ -1037,7 +1053,7 @@ mod market_orders_cli_tests {
             "--note-key",
             "note.secret",
             "--max-price-per-tick",
-            "1000",
+            "1000000000",
             "--ticks",
             "4",
         ])
@@ -1096,6 +1112,16 @@ mod market_orders_cli_tests {
             })
         ));
 
+        let c = Cli::try_parse_from(["dexdo", "subscription", "--market", "m.json", "poke", "7"])
+            .expect("permissionless subscription poke parses");
+        assert!(matches!(
+            c.command,
+            Command::Subscription(crate::cli::args::SubscriptionArgs {
+                command: SubscriptionCommand::Poke { order_id: 7 },
+                ..
+            })
+        ));
+
         assert!(Cli::try_parse_from([
             "dexdo",
             "subscription",
@@ -1105,7 +1131,7 @@ mod market_orders_cli_tests {
             "m.json",
             "place",
             "--max-price-per-tick",
-            "1000",
+            "1000000000",
             "--ticks",
             "4",
             "--budget",
@@ -1502,6 +1528,25 @@ mod oracle_cli_tests {
                 command: OracleCommand::Resolve(_)
             })
         ));
+
+        for subcommand in ["cancel", "delete"] {
+            let c = Cli::try_parse_from([
+                "dexdo",
+                "oracle",
+                subcommand,
+                "--manifest",
+                "oracle.json",
+                "--oracle-key",
+                "oracle.key",
+            ])
+            .unwrap_or_else(|error| panic!("oracle {subcommand} parses: {error}"));
+            assert!(matches!(
+                c.command,
+                Command::Oracle(crate::cli::args::OracleArgs {
+                    command: OracleCommand::Cancel(_) | OracleCommand::Delete(_)
+                })
+            ));
+        }
     }
 }
 
@@ -1550,25 +1595,25 @@ mod deposit_tests {
         let need = DEFAULT_DEPOSIT_SHELLS * SHELL_UNIT;
         assert!(
             ensure_provision_deposit_covered(need, DEFAULT_DEPOSIT_SHELLS, 0).is_ok(),
-            "zero-price deals have no seller probe commission"
+            "zero-price deals have no seller bond"
         );
         assert!(ensure_provision_deposit_covered(need - 1, DEFAULT_DEPOSIT_SHELLS, 0).is_err());
         assert!(ensure_provision_deposit_covered(need + 1, DEFAULT_DEPOSIT_SHELLS, 0).is_ok());
     }
 
     #[test]
-    fn provision_deposit_guard_reserves_contract_probe_commission() {
+    fn provision_deposit_guard_reserves_contract_seller_bond() {
         let deploy_need = DEFAULT_DEPOSIT_SHELLS * SHELL_UNIT;
         let price_per_tick = 1000;
-        let probe_commission = 25;
+        let seller_bond = 2 * price_per_tick; // the mirror bond is 2P
         let err =
             ensure_provision_deposit_covered(deploy_need, DEFAULT_DEPOSIT_SHELLS, price_per_tick)
-                .expect_err("exact deploy allocation leaves no seller probe commission");
+                .expect_err("exact deploy allocation leaves no seller bond");
         let msg = err.to_string();
-        assert!(msg.contains("seller probe commission"), "{msg}");
+        assert!(msg.contains("seller bond"), "{msg}");
         assert!(msg.contains("price_per_tick=1000"), "{msg}");
         assert!(ensure_provision_deposit_covered(
-            deploy_need + probe_commission,
+            deploy_need + seller_bond,
             DEFAULT_DEPOSIT_SHELLS,
             price_per_tick,
         )
@@ -1648,6 +1693,114 @@ mod tests {
     }
 
     #[test]
+    fn active_limit_price_defaults_use_the_canonical_price_step() {
+        let seller = Cli::try_parse_from(["dexdo", "seller"]).expect("seller defaults parse");
+        let Command::Seller(seller) = seller.command else {
+            panic!("seller command")
+        };
+        assert_eq!(
+            seller.price_per_tick as u128,
+            dexdo_core::PRICE_STEP,
+            "seller default must be one exact PRICE_STEP"
+        );
+
+        let buyer = Cli::try_parse_from(["dexdo", "buyer"]).expect("buyer defaults parse");
+        let Command::Buyer(buyer) = buyer.command else {
+            panic!("buyer command")
+        };
+        assert_eq!(buyer.max_price_per_tick, dexdo_core::PRICE_STEP);
+
+        let provision =
+            Cli::try_parse_from(["dexdo", "provision", "--frame-model", "qwen--qwen3--32b"])
+                .expect("provision defaults parse");
+        let Command::Provision(provision) = provision.command else {
+            panic!("provision command")
+        };
+        assert_eq!(provision.price_per_tick, dexdo_core::PRICE_STEP);
+
+        let book = Cli::try_parse_from(["dexdo", "executable-book", "qwen--qwen3--32b"])
+            .expect("executable-book defaults parse");
+        let Command::ExecutableBook(book) = book.command else {
+            panic!("executable-book command")
+        };
+        assert_eq!(book.max_price_per_tick, dexdo_core::PRICE_STEP);
+    }
+
+    #[test]
+    fn seller_help_has_no_obsolete_probe_shell_surface() {
+        let help = subcommand_long_help("seller");
+        assert!(!help.contains("--probe-shell"), "{help}");
+        assert!(help.contains("[default: 1000000000]"), "{help}");
+        assert!(help.contains("positive multiple of PRICE_STEP"), "{help}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn money_command_paths_reject_bad_price_before_backend_or_file_work() {
+        let invalid = (dexdo_core::PRICE_STEP - 1).to_string();
+
+        let seller = Cli::try_parse_from(["dexdo", "seller", "--price-per-tick", invalid.as_str()])
+            .expect("seller parses");
+        let Command::Seller(seller) = seller.command else {
+            panic!("seller command")
+        };
+        let error = run_seller(seller)
+            .await
+            .expect_err("seller must reject before resolving a market")
+            .to_string();
+        assert!(error.contains("PRICE_STEP"), "{error}");
+        assert!(!error.contains("--token-contract"), "{error}");
+
+        let buyer =
+            Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", invalid.as_str()])
+                .expect("buyer parses");
+        let Command::Buyer(buyer) = buyer.command else {
+            panic!("buyer command")
+        };
+        let error = run_buyer(buyer)
+            .await
+            .expect_err("buyer must reject before model/book setup")
+            .to_string();
+        assert!(error.contains("PRICE_STEP"), "{error}");
+        assert!(!error.contains("--frame-model"), "{error}");
+
+        let zero_limit = Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", "0"])
+            .expect("zero limit parses before semantic validation");
+        let Command::Buyer(zero_limit) = zero_limit.command else {
+            panic!("buyer command")
+        };
+        let error = run_buyer(zero_limit)
+            .await
+            .expect_err("this flags=0 CLI path is a limit BUY and must reject zero")
+            .to_string();
+        assert!(error.contains("PRICE_STEP"), "{error}");
+
+        let subscription = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--contracts",
+            "must-not-be-read.json",
+            "--model",
+            "qwen",
+            "place",
+            "--max-price-per-tick",
+            invalid.as_str(),
+            "--ticks",
+            "2",
+        ])
+        .expect("subscription parses");
+        let Command::Subscription(subscription) = subscription.command else {
+            panic!("subscription command")
+        };
+        let error = run_subscription(subscription)
+            .await
+            .expect_err("subscription must reject before backend construction")
+            .to_string();
+        assert!(error.contains("PRICE_STEP"), "{error}");
+        assert!(!error.contains("must-not-be-read"), "{error}");
+    }
+
+    #[test]
     fn explicit_endpoints_file_used_and_parent_created() {
         // D6: an explicit path is used as is, and a missing parent directory is created
         // (otherwise the mock write of `endpoints`/`*.chainstate.json` would fail on a fresh machine).
@@ -1680,6 +1833,33 @@ mod tests {
         assert!(matches!(c.command, Command::Policy(_)));
         let c = Cli::try_parse_from(["dexdo", "policy", "edit"]).expect("policy edit parses");
         assert!(matches!(c.command, Command::Policy(_)));
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "policy",
+            "validate",
+            "--role",
+            "seller",
+            "--path",
+            "policy.json",
+        ])
+        .expect("seller policy validation parses");
+        assert!(matches!(c.command, Command::Policy(_)));
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "provision",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--policy",
+            "policy.json",
+        ])
+        .expect("provision --policy parses");
+        let Command::Provision(args) = c.command else {
+            panic!("provision command expected");
+        };
+        assert_eq!(
+            args.policy.as_deref(),
+            Some(std::path::Path::new("policy.json"))
+        );
     }
 
     #[test]

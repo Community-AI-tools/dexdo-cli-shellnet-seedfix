@@ -233,7 +233,9 @@ impl Gateway for GatewayService {
         let request = req.request;
         let mock_upstream = matches!(
             self.state.upstream,
-            UpstreamConfig::Mock | UpstreamConfig::MockScammer
+            UpstreamConfig::Mock
+                | UpstreamConfig::MockWithClaimedModel(_)
+                | UpstreamConfig::MockScammer
         );
         let count =
             self.state

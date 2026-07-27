@@ -151,8 +151,8 @@ impl DashboardBackend for ShellnetDashboardBackend {
             });
         let byfact = match state.as_ref() {
             Some(st) => {
-                let probe = chain.token_contract_probe(&tc).await?;
-                dashboard_byfact_from_shellnet_state(st, probe.as_ref())
+                let bond = chain.token_contract_seller_bond(&tc).await?;
+                dashboard_byfact_from_shellnet_state(st, bond.as_ref())
             }
             None => DashboardByFact {
                 closed: Some(true),
@@ -193,11 +193,11 @@ fn lifecycle_from_chain_state(state: dexdo_core::DealChainState) -> DashboardLif
 #[cfg(test)]
 fn byfact_from_chain_snapshot(snapshot: dexdo_core::StreamSnapshot) -> DashboardByFact {
     DashboardByFact {
-        seller_locked: Some(snapshot.seller_locked),
-        buyer_locked: Some(snapshot.buyer_locked),
-        seller_received: Some(snapshot.seller_received),
-        buyer_refunded: Some(snapshot.buyer_refunded),
-        burned: Some(snapshot.burned),
+        seller_locked: Some(u64::try_from(snapshot.seller_locked).unwrap_or(u64::MAX)),
+        buyer_locked: Some(u64::try_from(snapshot.buyer_locked).unwrap_or(u64::MAX)),
+        seller_received: Some(u64::try_from(snapshot.seller_received).unwrap_or(u64::MAX)),
+        buyer_refunded: Some(u64::try_from(snapshot.buyer_refunded).unwrap_or(u64::MAX)),
+        burned: Some(u64::try_from(snapshot.burned).unwrap_or(u64::MAX)),
         closed: Some(snapshot.closed),
     }
 }
@@ -254,7 +254,7 @@ fn dashboard_byfact_from_shellnet_state(
     let frozen = u64_json_field(st, "frozen");
     let deposit = u64_json_field(st, "deposit");
     DashboardByFact {
-        seller_locked: probe.and_then(|p| u64_json_field(p, "probeLocked")),
+        seller_locked: probe.and_then(|p| u64_json_field(p, "bondHeld")),
         buyer_locked: sum_u64_options([prepaid, frozen, deposit]),
         seller_received: u64_json_field(st, "finalizedOwed"),
         buyer_refunded: None,

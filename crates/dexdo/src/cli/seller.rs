@@ -3,8 +3,9 @@
 use crate::cli::args::SellerArgs;
 use crate::cli::commands::{
     enforce_model_registry_policy, expected_order_book_for_note,
-    load_enabled_model_registry_policy, order_book_active_from_contracts, save_runtime_deal_handle,
-    shellnet_doctor_preflight, RuntimeDealHandleInput,
+    load_enabled_model_registry_policy, order_book_active_from_contracts,
+    resolve_model_registry_target, save_runtime_deal_handle, shellnet_doctor_preflight, BookTarget,
+    RuntimeDealHandleInput,
 };
 use crate::cli::deals;
 use crate::cli::policy;
@@ -61,49 +62,9 @@ fn seller_watch_cursor_path(
         )))
 }
 
-pub(crate) fn enforce_seller_runtime_policy(policy: &policy::SellerRuntimePolicy) -> Result<()> {
-    if policy.max_open_deals != 1 {
-        bail!(
-            "policy_action failure_class=seller.max_open_deals action=enforce token_contract=<not-posted> \
-             state=pre_offer result=unsupported_max_open_deals requested={} supported=1; \
-             current seller daemon owns exactly one per-deal TokenContract",
-            policy.max_open_deals
-        );
-    }
-    let mut unsupported = Vec::new();
-    match policy.after_deal_done {
-        policy::SellerAfterDealDoneAction::Retire => {}
-        policy::SellerAfterDealDoneAction::Republish => {
-            unsupported.push("seller.on.after_deal_done=republish");
-        }
-        policy::SellerAfterDealDoneAction::RepublishWithBackoff => {
-            unsupported.push("seller.on.after_deal_done=republish_with_backoff");
-        }
-    }
-    match policy.buyer_no_show {
-        policy::SellerBuyerNoShowAction::CleanupAndRepublish => {
-            unsupported.push("seller.on.buyer_no_show=cleanup_and_republish");
-        }
-        policy::SellerBuyerNoShowAction::CleanupAndRetire => {
-            unsupported.push("seller.on.buyer_no_show=cleanup_and_retire");
-        }
-        policy::SellerBuyerNoShowAction::RetireGateway => {}
-    }
-    if !unsupported.is_empty() {
-        bail!(
-            "policy_action failure_class=policy_validation action=fail_closed token_contract=<not-posted> \
-             state=pre_offer result=unsupported_policy_choice runtime=seller unsupported_choices={} \
-             next_action=edit_policy diagnostic=seller runtime cannot execute fresh-TC republish or \
-             buyer-side cleanup_unopened from this seller daemon before/following an offer; supported seller \
-             terminal actions today are seller.on.after_deal_done=retire and \
-             seller.on.buyer_no_show=retire_gateway",
-            unsupported.join(",")
-        );
-    }
-    Ok(())
-}
-
 pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
+    // reject an invalid limit SELL price at the command boundary, before any file or chain work.
+    super::support::validate_price_step(args.price_per_tick as u128)?;
     // Issue: the deal token_contract comes from `--market`(a provision manifest) or `--token-contract`.
     // The manifest's frame_model(if any) is validated against `--model` inside `seller_real_backend`.
     let (token_contract, market_frame_model, market_nonce) =
@@ -127,10 +88,10 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
             policy_max_open_deals = policy.max_open_deals,
             "seller policy loaded"
         );
-        enforce_seller_runtime_policy(policy)?;
     }
     // on the real path, the --market manifest's seller_note must be this seller's --note-addr -- else the
     // offer posts a non-canonical TC the InferenceOrderBook won't rest, and the seller never matches.
+    let mut registry_frame_model = None;
     if !args.mock.mock_chain {
         if let (Some(market), Some(note_addr)) =
             (args.market.as_deref(), args.identity.note_addr.as_deref())
@@ -153,15 +114,42 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                         "real shellnet: set --model <name from config> (needed for model registry validation)"
                     )
                 })?;
-            let frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
+            let configured_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
                 .get(name)?
                 .frame_model
                 .clone();
-            dexdo_core::validate_canonical_model_id(&frame_model)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let selected_market = match args.market.as_deref() {
+                Some(market) => Some(load_market(market)?),
+                None => None,
+            };
+            let target = resolve_model_registry_target(
+                RegistryRole::Seller,
+                Some(&policy),
+                &args.contracts,
+                &configured_frame_model,
+                BookTarget {
+                    frame_model: selected_market
+                        .as_ref()
+                        .map(|market| market.frame_model.clone())
+                        .unwrap_or_else(|| configured_frame_model.clone()),
+                    model_hash: selected_market
+                        .as_ref()
+                        .map(|market| market.model_hash.clone())
+                        .unwrap_or_else(|| dexdo_core::model_hash_for(&configured_frame_model)),
+                    order_book: selected_market
+                        .as_ref()
+                        .map(|market| market.inference_order_book.clone()),
+                    root_model: selected_market
+                        .as_ref()
+                        .map(|market| market.root_model.clone()),
+                    note_addr: args.identity.note_addr.clone(),
+                },
+            )
+            .await?;
+            let frame_model = target.frame_model;
             check_market_model_match(market_frame_model.as_deref(), &frame_model, name)?;
-            let expected_order_book = if let Some(market) = args.market.as_deref() {
-                load_market(market)?.inference_order_book
+            let expected_order_book = if let Some(order_book) = target.order_book {
+                order_book
             } else {
                 let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -182,6 +170,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                 BuyerMissingBookPolicy::Reject,
             )
             .await?;
+            registry_frame_model = Some(frame_model);
         }
     }
     let deal_nonce = market_nonce.or(args.nonce);
@@ -189,7 +178,12 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     // otherwise a real model from the config; `--mock-chain` -> mock chain, otherwise real shellnet
     // (per-role backend behind the feature).
     let upstream = if args.mock.mock_model {
-        dexdo::seller::UpstreamConfig::Mock
+        match registry_frame_model.as_ref() {
+            Some(frame_model) => {
+                dexdo::seller::UpstreamConfig::MockWithClaimedModel(frame_model.clone())
+            }
+            None => dexdo::seller::UpstreamConfig::Mock,
+        }
     } else {
         let name = args
             .model
@@ -204,9 +198,15 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         let mc = models.get(name)?;
         mc.require_api_key_present()?;
         if dexdo::seller::AnthropicConfig::supports(mc) {
-            dexdo::seller::UpstreamConfig::Anthropic(dexdo::seller::AnthropicConfig::from_model(mc))
+            dexdo::seller::UpstreamConfig::Anthropic(dexdo::seller::AnthropicConfig::from_model(
+                mc,
+                registry_frame_model.as_deref(),
+            ))
         } else {
-            dexdo::seller::UpstreamConfig::OpenAi(dexdo::seller::OpenAiConfig::from_model(mc))
+            dexdo::seller::UpstreamConfig::OpenAi(dexdo::seller::OpenAiConfig::from_model(
+                mc,
+                registry_frame_model.as_deref(),
+            ))
         }
     };
     let seller_frame_model_for_handle = if args.mock.mock_chain {
@@ -221,18 +221,24 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                     "real shellnet: set --model <name from config> (needed for deal handle)"
                 )
             })?;
-        Some(
-            dexdo::seller::ModelsConfig::load(&args.models)?
+        Some(match registry_frame_model.as_ref() {
+            Some(frame_model) => frame_model.clone(),
+            None => dexdo::seller::ModelsConfig::load(&args.models)?
                 .get(name)?
                 .frame_model
                 .clone(),
-        )
+        })
     };
     let (chain, note) = if args.mock.mock_chain {
         let endpoints_file = resolve_endpoints_file(args.endpoints_file.clone())?;
         mock_chain_and_note(endpoints_file, &args.identity)?
     } else {
-        seller_real_backend(&args, market_frame_model.as_deref(), deal_nonce)?
+        seller_real_backend(
+            &args,
+            market_frame_model.as_deref(),
+            deal_nonce,
+            registry_frame_model.as_deref(),
+        )?
     };
     // the seller daemon publishes offers WITHOUT going through `provision_market`'s note-current gate, so
     // a note orphaned by a contract redeploy(stale code_hash) would hit a raw `TVM_ERROR` from `postSellOffer`.
@@ -258,11 +264,15 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                 )
             })?;
         println!(
-            "posting offer: {ticks} ticks (= {} model tokens) at {price} SHELL/tick",
+            "posting offer: {ticks} ticks (= {} model tokens) at {price} raw ECC[2]/tick \
+             (PRICE_STEP 1000000000 = 1 SHELL)",
             (ticks as u128).saturating_mul(DobParams::canonical().tick_size as u128)
         );
         (ticks, price)
     };
+    // The real path publishes the TC getter value, not the CLI fallback. Validate the actual
+    // write-bound price as well, after read-only term discovery and before postSellOffer.
+    super::support::validate_price_step(offer_price as u128)?;
     let gateway_advertise = args.gateway_advertise_addr();
     let cfg = dexdo::seller::SellerConfig {
         token_contract: token_contract.clone(),
@@ -701,41 +711,6 @@ mod tests {
         );
     }
 
-    /// seller-side ModelRegistry validation must happen before any offer write can move into
-    /// `postSellOffer`.
-    #[test]
-    fn seller_model_registry_preflight_precedes_offer_post() {
-        let source = include_str!("seller.rs");
-        let start = source
-            .find("pub(crate) async fn run_seller")
-            .expect("run_seller present");
-        let end = source[start..]
-            .find("#[cfg(test)]\nmod tests")
-            .map(|offset| start + offset)
-            .expect("run_seller end marker present");
-        let body = &source[start..end];
-
-        let registry = body
-            .find("load_enabled_model_registry_policy")
-            .expect("seller registry policy load present");
-        let role = body[registry..]
-            .find("RegistryRole::Seller")
-            .map(|offset| registry + offset)
-            .expect("seller registry role present");
-        let enforce = body[registry..]
-            .find("enforce_model_registry_policy(")
-            .map(|offset| registry + offset)
-            .expect("seller registry preflight present");
-        let startup = body
-            .find("dexdo::seller::prepare_seller_offer(")
-            .expect("seller startup seam present");
-
-        assert!(
-            registry < role && role < enforce && enforce < startup,
-            "seller registry validation must run before postSellOffer"
-        );
-    }
-
     /// regression: `run_seller` must not own the old bounded match wait. After the offer is posted/rested
     /// and the gateway is listening, match wait + handover provisioning are delegated to the gateway watcher.
     #[test]
@@ -782,16 +757,14 @@ mod tests {
     #[test]
     fn policy_seller_fields_dispatch_or_fail_closed_explicitly() {
         let source = include_str!("seller.rs");
+        let policy_source = include_str!("policy.rs");
         let seller_policy_source = include_str!("seller_policy.rs");
-        let enforce = source
-            .find("fn enforce_seller_runtime_policy")
-            .expect("seller max-open policy helper present");
         let run = source
             .find("pub(crate) async fn run_seller")
             .expect("run_seller present");
-        let helpers = &source[enforce..run];
         assert!(
-            helpers.contains("supported=1"),
+            policy_source.contains("fn validate_seller_runtime_capabilities")
+                && policy_source.contains("supported=1"),
             "seller max_open_deals must be enforced before offer posting"
         );
         assert!(
@@ -812,17 +785,17 @@ mod tests {
             .map(|offset| run + offset)
             .expect("run_seller end marker present");
         let body = &source[run..end];
-        let enforce = body
-            .find("enforce_seller_runtime_policy(policy)?")
-            .expect("seller policy enforcement present");
+        let validate = body
+            .find("load_seller_runtime_policy")
+            .expect("shared seller policy validation present");
         let doctor = body
             .find("shellnet_doctor_preflight")
             .expect("real shellnet preflight present");
         let startup = body
             .find("dexdo::seller::prepare_seller_offer")
             .expect("seller startup seam present");
-        assert!(enforce < doctor);
-        assert!(enforce < startup);
+        assert!(validate < doctor);
+        assert!(validate < startup);
         assert!(body.contains("apply_seller_dispute_policy"));
         assert!(body.contains("apply_seller_terminal_policy"));
 

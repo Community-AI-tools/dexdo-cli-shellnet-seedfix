@@ -113,7 +113,7 @@ fn status_next_for(
     let action = match (role, state, funded, opened, probe_accepted) {
         (_, "closed", _, _, _) => "none",
         (Some("seller"), "stopped", _, _, _) => "destroy",
-        (Some("seller"), _, _, true, false) => "seller_advance_probe_after_timeout",
+        (Some("seller"), _, _, true, false) => "seller_wait_delivery_then_advance_after_window",
         (Some("seller"), _, _, true, true) => "seller_advance_or_wait_buyer_stop",
         (Some("seller"), _, true, false, false) => "buyer_cleanup_after_timeout",
         (Some("buyer"), "stopped", _, _, _) => "none",
@@ -127,7 +127,9 @@ fn status_next_for(
         retryable_after_unix: None,
         command: if action == "none" {
             "none".to_string()
-        } else if action.starts_with("seller_advance") {
+        } else if action.starts_with("seller_advance")
+            || action == "seller_wait_delivery_then_advance_after_window"
+        {
             "seller".to_string()
         } else {
             "close".to_string()
@@ -221,8 +223,8 @@ fn mock_summary_from_snapshot(snapshot: &dexdo_core::StreamSnapshot) -> deals::D
         probe_accepted: snapshot.seller_received > 0,
         deposit: 0,
         prepaid: 0,
-        frozen: u128::from(snapshot.buyer_locked),
-        finalized_owed: u128::from(snapshot.seller_received),
+        frozen: snapshot.buyer_locked,
+        finalized_owed: snapshot.seller_received,
         funded_time: None,
         last_advance: 0,
     }
@@ -441,11 +443,37 @@ pub(crate) async fn run_export(_args: ExportArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn seller_open_probe_status_points_to_advance_not_buyer_stop() {
-        let next = super::status_next_for(Some("seller"), "probe", true, true, false);
+    fn seller_open_probe_status_waits_for_delivery_then_window() {
+        let summary = crate::cli::deals::DealStateSummary {
+            kind: crate::cli::deals::DealStateKind::Probe,
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            deposit: 0,
+            prepaid: 0,
+            frozen: 0,
+            finalized_owed: 0,
+            funded_time: Some(1),
+            last_advance: 1,
+        };
+        let status = super::status_response_from_summary(
+            "shellnet",
+            Some("deal-seller".to_string()),
+            Some("seller".to_string()),
+            "0:tc".to_string(),
+            Some("model".to_string()),
+            "probe",
+            true,
+            &summary,
+        )
+        .expect("format seller Probe status");
 
-        assert_eq!(next.action, "seller_advance_probe_after_timeout");
-        assert_eq!(next.command, "seller");
+        assert_eq!(
+            status.next.action,
+            "seller_wait_delivery_then_advance_after_window"
+        );
+        assert_eq!(status.next.command, "seller");
     }
 
     #[test]

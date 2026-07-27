@@ -281,10 +281,6 @@ pub enum ChainError {
     /// A non-idempotent money POST returned a decoded protocol/contract rejection.
     #[error("shellnet money submit was rejected: {0}")]
     MoneySubmitRejected(String),
-    /// Note locked by a dispute/stream -- cannot trade/withdraw (, anti-scam;
-    /// analog of the contract's `ERR_STREAM_LOCKED`).
-    #[error("note locked (dispute/stream): {0}")]
-    Locked(String),
     /// The agreed deal limit was exceeded(e.g. the offer's `max_ticks`). The real TC bounds it
     /// by deposit; the mock holds the same invariant with a guard.
     #[error("deal limit exceeded: {0}")]
@@ -294,20 +290,20 @@ pub enum ChainError {
 /// Snapshot of the stream's state in the mock(for e2e acceptance).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamSnapshot {
-    /// Locked at the seller(stake/probe commission).
-    pub seller_locked: Shell,
+    /// Seller bond held by this TokenContract.
+    pub seller_locked: u128,
     /// Locked at the buyer(deposited ticks) -- the TOTAL escrow still held(`prepaid + frozen + deposit`).
-    pub buyer_locked: Shell,
+    pub buyer_locked: u128,
     /// the buyer's at-risk **lead**(`prepaid + frozen`) -- the two-tick invariant bounds THIS
     /// (seller <= ~2 ticks ahead of finalized), NOT the total `buyer_locked` (which also carries the unspent
     /// `deposit` for the remaining ticks of a multi-tick deal). On the mock path the lock IS the lead.
-    pub buyer_lead: Shell,
+    pub buyer_lead: u128,
     /// Ticks sent to the seller(finalized).
-    pub seller_received: Shell,
+    pub seller_received: u128,
     /// Refunded to the buyer.
-    pub buyer_refunded: Shell,
+    pub buyer_refunded: u128,
     /// Total SHELL burned for the contract.
-    pub burned: Shell,
+    pub burned: u128,
     /// Stream terminal/STOPped according to the TokenContract lifecycle.
     /// This is not `!opened`: funded-but-never-opened and disputed TCs can hold escrow while still active.
     pub closed: bool,
@@ -429,7 +425,7 @@ pub struct NoteSnapshot {
     pub offers: Vec<OfferListing>,
     /// Deals where the note is the seller or the buyer.
     pub deals: Vec<DealView>,
-    /// At risk: the sum locked by the note in open(not closed) deals.
+    /// At risk: the role-side funds held in this note's open(not closed) deal TCs.
     pub exposure: Shell,
 }
 
@@ -446,7 +442,7 @@ pub struct TreeSnapshot {
     pub offers: Vec<OfferListing>,
     /// All the tree's deals(across all subnotes), role + anonymous counterparty + by-fact.
     pub deals: Vec<DealView>,
-    /// The tree's total exposure: the sum locked across all open deals of all subnotes.
+    /// The tree's total exposure: role-side funds held across all open deal TCs of all subnotes.
     pub exposure: Shell,
 }
 

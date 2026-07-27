@@ -1,11 +1,12 @@
 //! On-chain abstraction and the mock implementation for.
 //! brings up **only what e2e needs**: offer/match, `open_stream`
-//! (freezing the probe tick + locking `SELLER_PROBE_COMMISSION` + writing the enc-endpoint to
+//! (freezing the probe tick + holding the exact `2P` seller bond + writing the enc-endpoint to
 //! the endpoints file), `advance_tick`, `read_handover`, `stop`(incl. `BurnBoth` on the probe),
 //! `seller_timeout`/settle. No networked on-chain.
 
 use crate::machine::Settlement;
 use crate::note::{Note, NotePubkey};
+use crate::params::Shell;
 use async_trait::async_trait;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -39,6 +40,53 @@ impl HeartbeatGuard {
     }
 }
 
+/// Validate the exact on-chain state and deal price used by seller resume before any write.
+pub fn validate_seller_resume_state(
+    token_contract: &TokenContract,
+    state: &serde_json::Value,
+    price_per_tick: Shell,
+) -> Result<(), ChainError> {
+    let flag = |key: &str| state[key].as_bool().unwrap_or(false);
+    let amount = |key: &str| {
+        state[key]
+            .as_str()
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or(0)
+    };
+    let mut blockers = Vec::new();
+    if !flag("funded") {
+        blockers.push("funded=false".to_string());
+    }
+    if flag("disputed") {
+        blockers.push("disputed".to_string());
+    }
+    if flag("probeAccepted") && !flag("opened") {
+        blockers.push("probeAccepted without opened".to_string());
+    }
+    if !flag("opened") {
+        let deposit = amount("deposit");
+        if deposit < u128::from(price_per_tick) {
+            blockers.push(format!(
+                "deposit={deposit}, price_per_tick={price_per_tick}: TokenContract cannot be opened"
+            ));
+        }
+        for key in ["prepaid", "frozen", "finalizedOwed"] {
+            let value = amount(key);
+            if value > 0 {
+                blockers.push(format!("{key}={value}"));
+            }
+        }
+    }
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(ChainError::Chain(format!(
+        "TokenContract {token_contract} is matched but not openable for seller resume \
+         ({}) -- use a fresh --nonce for a new TokenContract, or close/destroy the old TokenContract",
+        blockers.join(", ")
+    )))
+}
+
 /// On-chain abstraction. In -- `MockChainBackend`; in -- the shellnet adapter.
 /// Brings up the minimum for e2e: discovery/book/oracle and subscriptions are the horizon.
 #[async_trait]
@@ -67,7 +115,7 @@ pub trait ChainBackend: Send + Sync {
     /// ensure the per-deal `TokenContract` being advertised is FRESH(deployed but unused) before resting
     /// an ask on it. A deterministic `(sellerPubkey, nonce)` TC is a single-use per-deal resource -- if a prior
     /// deal already `opened`/`funded`/`disputed` it(or left residual deposit/prepaid/frozen/finalized), the
-    /// seller's pre-stream steps(`fundProbeCommission`/`open`) revert with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN`
+    /// seller's pre-stream steps(`fundSellerBond`/`open`) revert with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN`
     /// 321 and kin). Default `Ok(())`(mock/buyer/deal backends are not gated); the real seller backend overrides
     /// with the on-chain `getState` check, failing closed with an actionable "use a fresh nonce / recover+destroy".
     async fn assert_token_contract_fresh(
@@ -289,8 +337,8 @@ pub trait ChainBackend: Send + Sync {
     }
     /// The seller waits for/reads the match on its own `token_contract`.
     async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError>;
-    /// The seller opens a stream: freezes the probe tick, locks
-    /// `SELLER_PROBE_COMMISSION`, writes `encrypt_to(buyer_pubkey, endpoint)` to the endpoints file.
+    /// The seller opens a stream: freezes the probe tick, holds the exact `2P`
+    /// seller bond, and writes `encrypt_to(buyer_pubkey, endpoint)` to the endpoints file.
     async fn open_stream(
         &self,
         token_contract: &TokenContract,
@@ -316,10 +364,10 @@ pub trait ChainBackend: Send + Sync {
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<Settlement, ChainError>;
-    /// The buyer opens a dispute on the stream: the seller's note
-    /// is locked (`streamDispute(tc)`->`TC.dispute()`) -- new offers/withdrawals are rejected with
-    /// `ERR_STREAM_LOCKED`, until arbitration resolves the dispute. Default implementation: STOP (lower
-    /// bound -- scam revenue=0); backends with disputes(mock/shellnet) override it to actually lock the scammer's note.
+    /// The buyer opens a dispute on the stream: this TC freezes
+    /// the contested buyer amount and seller bond until resolution; other deals and both whole notes
+    /// remain independent. Default implementation: STOP(lower bound -- scam revenue=0); backends with
+    /// disputes(mock/shellnet) override it with the per-TC freeze.
     async fn dispute(
         &self,
         token_contract: &TokenContract,
@@ -327,8 +375,8 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Settlement, ChainError> {
         self.stop(token_contract, note).await
     }
-    /// The seller **concedes the dispute**: `releaseDispute()` -> unlocks the notes and
-    /// **returns the frozen tick to the buyer**(on the probe -- without burn). Default: not supported (backends
+    /// The seller **concedes the dispute**: `releaseDispute()` returns the frozen
+    /// buyer amount and seller bond(on the probe -- without burn). Default: not supported (backends
     /// with disputes -- mock/shellnet -- override it). Symmetric to `dispute`.
     async fn release_dispute(
         &self,
@@ -416,8 +464,7 @@ pub trait ChainBackend: Send + Sync {
     }
 }
 
-/// Note identifier for the blacklist/lock: hex of the ed-pubkey. The same kind of id
-/// for the seller(`offer_sellers`) and the buyer(`Match.buyer_pubkey`), so both notes can be locked.
+/// Anonymous note identifier used for seller blacklisting and counterparty display: hex of the ed-pubkey.
 pub(crate) fn note_id_hex(pk: &NotePubkey) -> String {
     pk.ed.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -937,6 +984,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[tokio::test]
+    async fn mock_high_valid_price_preserves_exact_aggregate_stop_accounting() {
+        let base =
+            std::env::temp_dir().join(format!("dexdo-high-price-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let consts = ProtocolConsts::canonical();
+        let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
+        let seller = LocalNote::from_seed(&[13u8; 32]);
+        let buyer = LocalNote::from_seed(&[14u8; 32]);
+        let tc = "tc-high-price-stop".to_string();
+        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
+        let price = u64::MAX - (u64::MAX % step);
+        let p = u128::from(price);
+        let two_p = 2 * p;
+
+        chain
+            .post_offer(
+                SellOffer {
+                    price_per_tick: price,
+                    max_ticks: 3,
+                    token_contract: tc.clone(),
+                },
+                &seller,
+            )
+            .await
+            .unwrap();
+        chain.place_buy(&tc, &buyer).await.unwrap();
+        chain
+            .open_stream(&tc, vec![1, 2, 3], &seller)
+            .await
+            .unwrap();
+
+        let opened = chain.snapshot(&tc).await.unwrap();
+        assert_eq!(opened.seller_locked, two_p);
+        assert_eq!(opened.buyer_locked, p);
+
+        chain.accept_probe(&tc).await.unwrap();
+        let streaming = chain.snapshot(&tc).await.unwrap();
+        assert_eq!(streaming.seller_locked, two_p);
+        assert_eq!(streaming.buyer_locked, two_p);
+        assert_eq!(streaming.seller_received, p);
+        assert_eq!(streaming.buyer_locked + streaming.seller_received, 3 * p);
+
+        assert_eq!(
+            chain.stop(&tc, &buyer).await.unwrap(),
+            Settlement::AmicableSplit {
+                to_seller_ticks: 1,
+                to_buyer_refund: p,
+            }
+        );
+        let stopped = chain.snapshot(&tc).await.unwrap();
+        assert!(stopped.closed);
+        assert_eq!(stopped.seller_locked, 0);
+        assert_eq!(stopped.buyer_locked, 0);
+        assert_eq!(stopped.seller_received, two_p);
+        assert_eq!(stopped.buyer_refunded, p);
+        assert_eq!(
+            stopped.burned,
+            u128::from(crate::settle::net_burn(2, price, &consts))
+        );
+        assert_eq!(
+            stopped.seller_received + stopped.buyer_refunded,
+            3 * p,
+            "the buyer's probe plus two-tick window must be conserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// (R11): `note_snapshot` shows the note's offers, its deals and the **anonymous**
     /// counterparty(the note's pubkey, not an identity); another note sees nothing.
     #[tokio::test]
@@ -1007,12 +1124,12 @@ mod tests {
         burned: Shell,
     ) -> StreamSnapshot {
         StreamSnapshot {
-            seller_locked,
-            buyer_locked,
-            buyer_lead: buyer_locked, // test helper: treat the lock as the at-risk lead(the two-tick tests)
-            seller_received: received,
+            seller_locked: u128::from(seller_locked),
+            buyer_locked: u128::from(buyer_locked),
+            buyer_lead: u128::from(buyer_locked), // test helper: treat the lock as the at-risk lead(the two-tick tests)
+            seller_received: u128::from(received),
             buyer_refunded: 0,
-            burned,
+            burned: u128::from(burned),
             closed: false,
         }
     }
@@ -1293,8 +1410,8 @@ mod tests {
     fn two_tick_bounds_lead_not_total_lock() {
         let snap_lead = |buyer_locked: Shell, buyer_lead: Shell| StreamSnapshot {
             seller_locked: 0,
-            buyer_locked,
-            buyer_lead,
+            buyer_locked: u128::from(buyer_locked),
+            buyer_lead: u128::from(buyer_lead),
             seller_received: 0,
             buyer_refunded: 0,
             burned: 0,
@@ -1415,7 +1532,7 @@ mod recover_tests {
 mod dispute_reclaim_tests {
     use super::{
         check_disputable, check_reclaimable, check_release_disputable, check_seller_pubkey,
-        check_withdrawable_shell, MATCH_OPEN_TIMEOUT_SECS,
+        check_withdrawable_shell, ReclaimAction, MATCH_OPEN_TIMEOUT_SECS,
     };
 
     /// -- `check_disputable`: an OPEN, undisputed deal owned by THIS buyer is disputable; each
@@ -1456,21 +1573,24 @@ mod dispute_reclaim_tests {
         let me = [7u8; 32];
         let other = [9u8; 32];
         // opened + past STREAM_TIMEOUT(now 1000 >= lastAdvance 100 + streamTimeout 600), owned -> ok
-        assert!(check_reclaimable(
-            true,
-            true,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            1000,
-            100,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .is_ok());
+        assert_eq!(
+            check_reclaimable(
+                true,
+                true,
+                false,
+                Some("0:buyer"),
+                "0:buyer",
+                Some(&me),
+                &me,
+                1000,
+                100,
+                Some(600),
+                Some(50),
+                MATCH_OPEN_TIMEOUT_SECS
+            )
+            .unwrap(),
+            ReclaimAction::StreamReclaim
+        );
         // opened, before STREAM_TIMEOUT(now 500 < 700) -> reject
         assert!(check_reclaimable(
             true,
@@ -1483,7 +1603,7 @@ mod dispute_reclaim_tests {
             500,
             100,
             Some(600),
-            None,
+            Some(50),
             MATCH_OPEN_TIMEOUT_SECS
         )
         .unwrap_err()
@@ -1506,21 +1626,24 @@ mod dispute_reclaim_tests {
         .unwrap_err()
         .contains("MATCH_OPEN_TIMEOUT"));
         // funded but never opened after MATCH_OPEN_TIMEOUT -> ok(streamCleanup path).
-        assert!(check_reclaimable(
-            true,
-            false,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            1100,
-            0,
-            None,
-            Some(500),
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .is_ok());
+        assert_eq!(
+            check_reclaimable(
+                true,
+                false,
+                false,
+                Some("0:buyer"),
+                "0:buyer",
+                Some(&me),
+                &me,
+                1100,
+                0,
+                None,
+                Some(500),
+                MATCH_OPEN_TIMEOUT_SECS
+            )
+            .unwrap(),
+            ReclaimAction::StreamCleanup
+        );
         // not funded -> reject
         assert!(check_reclaimable(
             false,
@@ -1608,6 +1731,78 @@ mod dispute_reclaim_tests {
         .contains("no recorded buyer note"));
     }
 
+    fn owned_reclaim(
+        opened: bool,
+        now: u64,
+        last_advance: u64,
+        stream_timeout: Option<u64>,
+        funded_time: Option<u64>,
+    ) -> Result<ReclaimAction, String> {
+        let me = [7u8; 32];
+        check_reclaimable(
+            true,
+            opened,
+            false,
+            Some("0:buyer"),
+            "0:buyer",
+            Some(&me),
+            &me,
+            now,
+            last_advance,
+            stream_timeout,
+            funded_time,
+            MATCH_OPEN_TIMEOUT_SECS,
+        )
+    }
+
+    /// each valid branch permits one write, while a retained non-zero `lastAdvance`
+    /// after opened reclaim permits no repeat POST.
+    #[test]
+    fn reclaim_selection_rejects_repeat_after_opened_timeout() {
+        let first = owned_reclaim(true, 1000, 100, Some(600), Some(50));
+        assert_eq!(usize::from(first.is_ok()), 1, "opened POST count");
+        assert_eq!(first.unwrap(), ReclaimAction::StreamReclaim);
+
+        let repeat = owned_reclaim(false, 1001, 100, None, Some(50));
+        assert_eq!(usize::from(repeat.is_ok()), 0, "repeat POST count");
+        assert!(repeat.unwrap_err().contains("previously OPENED"));
+
+        let cleanup = owned_reclaim(false, 650, 0, None, Some(50));
+        assert_eq!(usize::from(cleanup.is_ok()), 1, "cleanup POST count");
+        assert_eq!(cleanup.unwrap(), ReclaimAction::StreamCleanup);
+    }
+
+    /// missing and internally contradictory getter timestamps remain fail-closed.
+    #[test]
+    fn reclaim_timestamps_fail_closed() {
+        let failures = [
+            (
+                "opened missing lastAdvance",
+                owned_reclaim(true, 1000, 0, Some(600), Some(50)),
+                "lastAdvance",
+            ),
+            (
+                "closed missing fundedTime",
+                owned_reclaim(false, 1000, 0, None, None),
+                "fundedTime",
+            ),
+            (
+                "opened timestamps reversed",
+                owned_reclaim(true, 1000, 40, Some(600), Some(50)),
+                "contradictory timestamps",
+            ),
+            (
+                "opened missing streamTimeout",
+                owned_reclaim(true, 1000, 100, None, Some(50)),
+                "streamTimeout",
+            ),
+        ];
+        for (name, result, expected) in failures {
+            assert_eq!(usize::from(result.is_ok()), 0, "{name} POST count");
+            assert!(result.unwrap_err().contains(expected), "{name}");
+        }
+    }
+
     /// seller-side dispute/payout commands fail closed before on-chain submission where state/key checks
     /// already prove the call would revert.
     #[test]
@@ -1624,6 +1819,9 @@ mod dispute_reclaim_tests {
         assert!(check_seller_pubkey("withdraw-shell", None, "abc")
             .unwrap_err()
             .contains("no seller pubkey"));
+        assert!(check_seller_pubkey("destroy", Some("0xabc"), "def")
+            .unwrap_err()
+            .starts_with("destroy: --note-key is not the deal's seller key"));
 
         assert_eq!(check_withdrawable_shell(500, None).unwrap(), 500);
         assert_eq!(check_withdrawable_shell(500, Some(100)).unwrap(), 100);

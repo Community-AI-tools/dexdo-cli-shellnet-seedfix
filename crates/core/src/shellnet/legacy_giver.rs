@@ -1,24 +1,24 @@
 use super::backends::note_owner_mismatch_reason;
 use super::contracts_provision::*;
 use super::*;
+use crate::canonical_multisig;
 use crate::manifest::model_hash_for;
-use crate::params::Shell;
+use crate::params::{Shell, PRICE_STEP};
 use anyhow::{anyhow, Result};
 use gosh_ackinacki::airegistry::calls::{encode_external_call, encode_internal_payload};
 use gosh_ackinacki::airegistry::deploy::local_context;
 use gosh_ackinacki::sdk::{Address, KeyPair};
-use gosh_ackinacki::wallet::contracts::MULTISIG_ABI_JSON;
 use serde_json::{json, Value};
 
-/// LIVE: the seller note posts the probe-commission to its already-deployed per-deal
-/// `TokenContract` from its OWN ECC[2](`postProbeCommission` -> `TC.fundProbeCommission`) -- **no operator
-/// wallet**. Asserts `getProbe().probeFunded == true`. Needs a note that already provisioned the deal TC
+/// LIVE: the seller note posts the exact `2P` seller bond to its already-deployed per-deal
+/// `TokenContract` from its OWN ECC[2](`postSellerBond` -> `TC.fundSellerBond`) -- **no operator
+/// wallet**. Asserts `getSellerBond().bondFunded == true`. Needs a note that already provisioned the deal TC
 /// (`dexdo provision`), passed via env. Run:
 /// `DEXDO_PROOF_NOTE_ADDR=0:.. DEXDO_PROOF_NOTE_KEY=/path/key DEXDO_PROOF_NONCE=7 \
-/// cargo test -p dexdo-core --features shellnet,test-giver live_post_probe_commission -- --ignored --nocapture`
+/// cargo test -p dexdo-core --features shellnet,test-giver live_post_seller_bond -- --ignored --nocapture`
 #[tokio::test]
-#[ignore = "live : postProbeCommission funds the probe on the deployed TC from the note (no wallet)"]
-async fn live_post_probe_commission_note_funded() {
+#[ignore = "live : postSellerBond funds the probe on the deployed TC from the note (no wallet)"]
+async fn live_post_seller_bond_note_funded() {
     let manifest = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../contracts/deployed.shellnet.json"
@@ -43,17 +43,27 @@ async fn live_post_probe_commission_note_funded() {
         .await
         .expect("TC addr (provision the market first)");
 
-    // Post the probe-commission from the note's OWN ECC[2] -- no operator wallet.
-    be.note_post_probe_commission(&note, &keys, nonce, 10_000_000)
+    let bond_required = be
+        .token_contract_seller_bond(&tc)
         .await
-        .expect("postProbeCommission");
+        .expect("getSellerBond")
+        .and_then(|bond| {
+            bond["bondRequired"]
+                .as_str()
+                .and_then(|raw| raw.parse().ok())
+        })
+        .expect("getSellerBond().bondRequired");
+    // Post the exact contract-derived seller bond from the note's OWN ECC[2] -- no operator wallet.
+    be.note_post_seller_bond(&note, &keys, nonce, bond_required)
+        .await
+        .expect("postSellerBond");
 
-    // The internal message settles in a few blocks -> poll getProbe() until probeFunded.
+    // The internal message settles in a few blocks -> poll getSellerBond() until bondFunded.
     let mut funded = false;
     for _ in 0..20 {
-        if let Ok(Some(p)) = be.token_contract_probe(&tc).await {
-            if p["probeFunded"].as_bool() == Some(true) {
-                println!("=== TC {tc} getProbe = {p} ===");
+        if let Ok(Some(p)) = be.token_contract_seller_bond(&tc).await {
+            if p["bondFunded"].as_bool() == Some(true) {
+                println!("=== TC {tc} getSellerBond = {p} ===");
                 funded = true;
                 break;
             }
@@ -62,7 +72,7 @@ async fn live_post_probe_commission_note_funded() {
     }
     assert!(
         funded,
-        "postProbeCommission set probeFunded==true on the deployed TC (note-funded, no wallet)"
+        "postSellerBond set bondFunded==true on the deployed TC (note-funded, no wallet)"
     );
 }
 
@@ -130,9 +140,8 @@ async fn live_shellnet_connect_and_read() {
 #[tokio::test]
 #[ignore = "live: mints testnet SHELL from the shellnet Giver (a real write submit)"]
 async fn live_giver_funds_fresh_wallet() {
-    use gosh_ackinacki::airegistry::deploy::local_context;
+    use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
     use gosh_ackinacki::config::AiRegistryConfig;
-    use gosh_ackinacki::wallet::deploy::{prepare_deploy, DeployParams};
     use gosh_ackinacki::wallet::giver::GiverClient;
 
     let cfg = AiRegistryConfig::shellnet();
@@ -145,7 +154,7 @@ async fn live_giver_funds_fresh_wallet() {
         .build()
         .expect("http client");
     let giver = GiverClient::new(
-        ctx,
+        ctx.clone(),
         cfg.giver_address.as_deref().expect("giver address"),
         cfg.giver_pubkey.as_deref().expect("giver pubkey"),
         cfg.giver_secret.as_deref().expect("giver secret"),
@@ -153,15 +162,25 @@ async fn live_giver_funds_fresh_wallet() {
         http.clone(),
     );
 
-    // A fresh key + the deterministic multisig deploy address(one key for all 3 owners -- for the probe).
+    // A fresh key + the deterministic canonical v2 multisig deploy address.
     let kp = KeyPair::generate();
-    let params = DeployParams {
-        agent_pubkey: kp.public_hex().to_string(),
-        controller_pubkey: kp.public_hex().to_string(),
-        owner_pubkey: kp.public_hex().to_string(),
-        initial_value: 0,
-    };
-    let prepared = prepare_deploy(&params, kp.secret_hex()).expect("prepare deploy");
+    let prepared = build_deploy(
+        &ctx,
+        canonical_multisig::MULTISIG_ABI_JSON,
+        canonical_multisig::MULTISIG_TVC,
+        json!({}),
+        json!({
+            "owners_pubkey": [format!("0x{}", kp.public_hex())],
+            "owners_address": [],
+            "reqConfirms": 1,
+            "reqConfirmsData": 1,
+            "value": "0",
+        }),
+        kp.public_hex(),
+        kp.secret_hex(),
+    )
+    .await
+    .expect("prepare canonical v2 deploy");
     println!("=== fresh wallet deploy address: {} ===", prepared.address);
 
     // Giver diagnostics: whether it exists, whether it is funded, and whether the keys in the SDK config are stale
@@ -192,7 +211,7 @@ async fn live_giver_funds_fresh_wallet() {
         .await
         .expect("giver fund_deploy_address");
     // Deploy the multisig(the deploy spends the funded gas).
-    gosh_ackinacki::wallet::query::send_message(&http, endpoint, &prepared.message_boc_base64)
+    gosh_ackinacki::wallet::query::send_message(&http, endpoint, &prepared.message_boc_b64)
         .await
         .expect("deploy submit");
 
@@ -443,8 +462,7 @@ async fn live_480_fund_deploy_shell_shortfall_is_receipt_backed() {
 #[tokio::test]
 #[ignore = "live (diag, read-only): RootPN.getDetails().privateNoteCodeHash"]
 async fn diag_rootpn_pinned_code_hash() {
-    const ROOTPN_ABI: &str =
-        include_str!("../../../../contracts/compiled_0.79.3/dex/RootPN.abi.json");
+    const ROOTPN_ABI: &str = include_str!("../../../../contracts/compiled/dex/RootPN.abi.json");
     let manifest = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../contracts/deployed.shellnet.json"
@@ -463,7 +481,7 @@ async fn diag_rootpn_pinned_code_hash() {
 }
 
 /// DIAGNOSTIC(live, writes): prove the wallet-funded voucher leg before running the full
-/// `dexdo note deploy` flow. This mirrors `fund_probe_commission`: internal payload + multisig
+/// `dexdo note deploy` flow. This mirrors `fund_seller_bond`: internal payload + multisig
 /// `sendTransaction` + attached ECC[2] SHELL, then waits for RootPN's `VoucherGenerated` ext-out
 /// carrying our unique `skUCommit`.
 #[tokio::test]
@@ -473,8 +491,7 @@ async fn live_multisig_send_transaction_generates_rootpn_voucher() {
     use base64::Engine as _;
     use rand::RngCore;
 
-    const ROOTPN_ABI: &str =
-        include_str!("../../../../contracts/compiled_0.79.3/dex/RootPN.abi.json");
+    const ROOTPN_ABI: &str = include_str!("../../../../contracts/compiled/dex/RootPN.abi.json");
     const ROOTPN: &str = "0:1010101010101010101010101010101010101010101010101010101010101010";
     const VOUCHER_EVENT_DST: &str =
         ":0000000000000000000000000000000000000000000000000000000000000087";
@@ -596,17 +613,17 @@ async fn live_multisig_send_transaction_generates_rootpn_voucher() {
     cc.insert("2".to_string(), json!(SHELL_N100_RAW.to_string()));
     let msg = encode_external_call(
         &ctx,
-        MULTISIG_ABI_JSON,
+        canonical_multisig::MULTISIG_ABI_JSON,
         &wallet.with_workchain(),
         "sendTransaction",
-        json!({
-            "dest": ROOTPN,
-            "value": "2000000000",
-            "cc": Value::Object(cc),
-            "bounce": true,
-            "flags": 1,
-            "payload": payload,
-        }),
+        canonical_multisig::send_transaction_params(
+            ROOTPN.to_string(),
+            2_000_000_000,
+            cc,
+            true,
+            1,
+            payload,
+        ),
         wallet_keys.public_hex(),
         wallet_keys.secret_hex(),
     )
@@ -767,11 +784,11 @@ async fn diag_128_guard_live_conforming_note() {
 }
 
 /// a note minted JUST NOW by live `mint_pn_pool` (deployed
-/// via RootPN `9ab11582`, 4.0.15) passes the re-pinned note-current guard. Point `DEXDO_PN_POOL` at
-/// the fresh pool. Proves by-fact that the 4.0.15 re-pin accepts current-chain notes (the exact
+/// via RootPN `3f091029`, 4.0.28) passes the re-pinned note-current guard. Point `DEXDO_PN_POOL` at
+/// the fresh pool. Proves by-fact that the 4.0.28 re-pin accepts current-chain notes (the exact
 /// `assert_seller_note_current` -> `note_code_hash_current` check that `dexdo provision` runs).
 #[tokio::test]
-#[ignore = "live (, read-only): a fresh 4.0.15 note passes the re-pinned note_code_hash_current"]
+#[ignore = "live (, read-only): a fresh 4.0.28 note passes the re-pinned note_code_hash_current"]
 async fn diag_412_repin_fresh_note_passes() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
         eprintln!("DEXDO_PN_POOL not set -- skipping");
@@ -798,15 +815,15 @@ async fn diag_412_repin_fresh_note_passes() {
         .expect("fresh note must be on-chain/active");
     let ch = acc.code_hash.as_deref().unwrap_or("<none>");
     println!(
-        "=== fresh 4.0.15 note {note}: active={}, on-chain code_hash={ch} ===",
+        "=== fresh 4.0.28 note {note}: active={}, on-chain code_hash={ch} ===",
         acc.is_active()
     );
     println!("=== re-pinned PRIVATENOTE_PINNED_CODE_HASH = {PRIVATENOTE_PINNED_CODE_HASH} ===");
     let res = note_code_hash_current(&note, acc.code_hash.as_deref());
-    println!("=== note_code_hash_current (4.0.15 re-pinned guard) => {res:?} ===");
+    println!("=== note_code_hash_current (4.0.28 re-pinned guard) => {res:?} ===");
     assert!(
         res.is_ok(),
-        "fresh 4.0.15 note must PASS the re-pinned note-current guard: {res:?}"
+        "fresh 4.0.28 note must PASS the re-pinned note-current guard: {res:?}"
     );
 }
 
@@ -938,7 +955,7 @@ async fn live_seller_posts_offer() {
     // requires `sha256(modelName) == modelHash`). On 4.0.6 the IOB DOES re-derive the canonical TC from
     // `(sellerPubkey, nonce)` and rejects a non-canonical `tokenContract`, so the offer only rests with
     // the RootModel-backed canonical TC.
-    let deal_price: u128 = 10;
+    let deal_price: u128 = PRICE_STEP;
     let deal_max_ticks: u128 = 10;
     let tc = be
         .deploy_token_contract(
@@ -1131,7 +1148,7 @@ async fn live_offer_cannot_submit_fake_tc_4_0_26() {
 
 /// **LEGACY.** Exercises the OLD operator-wallet/giver provisioning path, kept
 /// as `test-giver` regression coverage -- **NOT** the canonical proof. The canonical note-funded seller
-/// proof is [`provision_market`](Self::provision_market) + `live_post_probe_commission_note_funded` + the
+/// proof is [`provision_market`](Self::provision_market) + `live_post_seller_bond_note_funded` + the
 /// note-funded `live_cli` harness.
 /// A LIVE test of the issue operator path: provision a per-deal market -- OB(note-funded) +
 /// RootModel + `TokenContract`(**wallet-funded**, no giver) -- and assemble a `MarketManifest`.
@@ -1160,7 +1177,9 @@ async fn live_provision_wallet_funded_market() {
 
     // Operator wallet. In production the operator funds it
     // externally; here the giver stands in for that top-up(native gas, to pay the deploys).
-    let wallet = RealChainBackend::multisig_address(&owner).expect("wallet addr");
+    let wallet = RealChainBackend::multisig_address(&owner)
+        .await
+        .expect("wallet addr");
     be.giver_fund(&wallet.with_workchain(), 800_000_000_000)
         .await
         .expect("giver -> operator wallet (test stand-in for external top-up)");
@@ -1267,7 +1286,7 @@ async fn live_provision_wallet_funded_market() {
     // The per-deal TC is deployed by `provision_market()` ITSELF(ECC[2] wallet-funded, NO giver) --
     // see below. Here we only derive the expected RootModel-backed address to assert convergence.
     let nonce = std::process::id() as u64;
-    let (price, max_ticks): (u128, u128) = (1000, 1024);
+    let (price, max_ticks): (u128, u128) = (PRICE_STEP, 1024);
     let tc = be
         .resolve_token_contract(&rm, &seller_pubkey, nonce)
         .await
@@ -1349,7 +1368,7 @@ async fn live_buyer_matches_offer() {
     let frame_model = format!("dexdo-d-stream--{nonce:016x}");
     let model_hash = model_hash_for(&frame_model);
     let ob_tick_size: u128 = MODEL_TICK_SIZE;
-    let price: u128 = 10;
+    let price: u128 = PRICE_STEP;
     let max_ticks: u128 = 2;
 
     // A fresh book -- we deploy it and wait for Active.
@@ -1435,7 +1454,7 @@ async fn live_buyer_matches_offer() {
 
     // The buyer matches: maxPrice >= ask, ticks <= maxTicks, a generous escrow(ECC SHELL from note1's balance).
     let ticks: u128 = max_ticks;
-    let escrow: u128 = 1_000_000;
+    let escrow = crate::chain::required_escrow_for_buy(ticks, price);
     let resp = be
         .place_inference_buy(&buyer_addr, &buyer, &model_hash, price, ticks, escrow, 0, 0)
         .await
@@ -1493,7 +1512,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     let nonce = now_secs();
     let frame_model = format!("dexdo-d149-cleanup--{nonce:016x}");
     let model_hash = model_hash_for(&frame_model);
-    let price: u128 = 10;
+    let price: u128 = PRICE_STEP;
     let max_ticks: u128 = 5;
     let gas: u128 = 9_000_000_000;
     let market = be
@@ -1535,7 +1554,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     assert!(rested, " offer rests before buyer match");
 
     let ticks: u128 = 2;
-    let escrow: u128 = 1_000_000;
+    let escrow = crate::chain::required_escrow_for_buy(ticks, price);
     let resp = be
         .place_inference_buy(&buyer_addr, &buyer, &model_hash, price, ticks, escrow, 0, 0)
         .await
@@ -1710,11 +1729,11 @@ async fn setup_funded_deal(
 }
 
 /// **LEGACY.** Its deal SETUP routes through the OLD operator-wallet/giver path
-/// (`deploy_multisig` + `fund_probe_commission`), kept as `test-giver` regression coverage -- **NOT** the
-/// canonical proof. The canonical note-funded probe-commission proof is
-/// `live_post_probe_commission_note_funded`(and `RealDealBackend::open_stream` itself is note-funded now).
+/// (`deploy_multisig` + `fund_seller_bond`), kept as `test-giver` regression coverage -- **NOT** the
+/// canonical proof. The canonical note-funded seller-bond proof is
+/// `live_post_seller_bond_note_funded`(and `RealDealBackend::open_stream` itself is note-funded now).
 /// A LIVE deal test, step 4(open + stop on the probe): from a funded deal the seller
-/// posts the probe-commission(via the operational wallet) and opens the stream `open(endpointCipher)`;
+/// posts the exact `2P` seller bond(via the operational wallet) and opens the stream `open(endpointCipher)`;
 /// the handover **round-trips through the chain**(the buyer decrypts the endpoint); then the buyer
 /// **stops on the probe** `streamStop` -> `ProbeBurned`. Requires `DEXDO_PN_POOL`.
 #[tokio::test]
@@ -1741,8 +1760,8 @@ async fn live_stream_open_and_probe_burn() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // A deal with a NON-ZERO probe commission: price=10000 -> commission=250(= price*250bps).
-    let price: u128 = 10_000;
+    // A deal with the canonical exact `2P` seller bond.
+    let price: u128 = PRICE_STEP;
     let (_ob, tc) = setup_funded_deal(
         &be,
         &seller_addr,
@@ -1752,20 +1771,20 @@ async fn live_stream_open_and_probe_burn() {
         price,
         5,
         2,
-        100_000_000,
+        crate::chain::required_escrow_for_buy(2, price),
     )
     .await;
     println!("=== funded TC {tc} (price={price}) ===");
 
-    // The seller posts the probe-commission from the operational wallet(an internal call with SHELL ECC).
+    // The seller posts the exact `2P` bond from the operational wallet(an internal call with SHELL ECC).
     let wallet_keys = KeyPair::generate();
     let wallet = be
         .deploy_multisig(&wallet_keys)
         .await
         .expect("deploy wallet");
-    // The wallet needs ECC[2] SHELL to attach to `fundProbeCommission` -- we top it up from the
+    // The wallet needs ECC[2] SHELL to attach to `fundSellerBond` -- we top it up from the
     // giver(flag 1; deploy-funding only gives native gas).
-    be.giver_send_shell(&wallet.with_workchain(), 100_000_000)
+    be.giver_send_shell(&wallet.with_workchain(), 2 * price)
         .await
         .expect("send shell to wallet");
     let mut wshell = 0u128;
@@ -1788,26 +1807,29 @@ async fn live_stream_open_and_probe_burn() {
         "the wallet received ECC[2] SHELL from the giver"
     );
     let fresp = be
-        .fund_probe_commission(&wallet, &wallet_keys, &tc, 1_000_000)
+        .fund_seller_bond(&wallet, &wallet_keys, &tc, 2 * price)
         .await
-        .expect("fund probe");
-    println!("=== fund_probe_commission resp = {fresp} ===");
-    let mut probe_funded = false;
+        .expect("fund seller bond");
+    println!("=== fund_seller_bond resp = {fresp} ===");
+    let mut seller_bond_funded = false;
     for _ in 0..20 {
-        let p = be.token_contract_probe(&tc).await.expect("probe");
-        println!("probe={p:?}");
+        let p = be
+            .token_contract_seller_bond(&tc)
+            .await
+            .expect("seller bond");
+        println!("seller_bond={p:?}");
         if p.as_ref()
-            .and_then(|x| x["probeFunded"].as_bool())
+            .and_then(|x| x["bondFunded"].as_bool())
             .unwrap_or(false)
         {
-            probe_funded = true;
+            seller_bond_funded = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     assert!(
-        probe_funded,
-        "the probe-commission is posted (probeFunded==true)"
+        seller_bond_funded,
+        "the exact 2P seller bond is posted (bondFunded==true)"
     );
 
     // Handover: the seller encrypts the endpoint to the buyer's x25519 pubkey; open writes the cipher.
@@ -1855,8 +1877,11 @@ async fn live_stream_open_and_probe_burn() {
     let mut closed = false;
     for _ in 0..20 {
         let st = be.token_contract_state(&tc).await.expect("st");
-        let pr = be.token_contract_probe(&tc).await.expect("pr");
-        println!("after stop: state={st:?} probe={pr:?}");
+        let bond = be
+            .token_contract_seller_bond(&tc)
+            .await
+            .expect("seller bond");
+        println!("after stop: state={st:?} seller_bond={bond:?}");
         if st
             .as_ref()
             .and_then(|s| s["opened"].as_bool())
@@ -1874,136 +1899,9 @@ async fn live_stream_open_and_probe_burn() {
     );
 }
 
-/// A LIVE anti-scam test of: from an open stream the buyer opens a dispute
-/// `streamDispute` -> `TC.dispute()` -> **both notes are actually locked**. We check `disputed==true`
-/// on the TC and `disputeCount>0` on the seller's note -- direct on-chain proof of `ERR_STREAM_LOCKED`
-/// (a new offer/withdrawal from a locked note is rejected until the dispute is resolved). Requires `DEXDO_PN_POOL`.
-#[tokio::test]
-#[ignore = "live: buyer streamDispute -> TC.dispute() locks both notes (disputeCount>0) on shellnet"]
-async fn live_stream_dispute_locks_note() {
-    let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
-        return;
-    };
-    let pool: Value =
-        serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool")).expect("parse pool");
-    let notes = pool["notes"].as_array().expect("notes");
-    let s_sec = notes[0]["owner_secret_key_hex"].as_str().expect("s0");
-    let b_sec = notes[1]["owner_secret_key_hex"].as_str().expect("s1");
-    let seller_addr = Address::parse(notes[0]["address"].as_str().expect("a0")).expect("a0");
-    let seller = KeyPair::from_secret_hex(s_sec).expect("k0");
-    let buyer_addr = Address::parse(notes[1]["address"].as_str().expect("a1")).expect("a1");
-    let buyer = KeyPair::from_secret_hex(b_sec).expect("k1");
-
-    let manifest = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../contracts/deployed.shellnet.json"
-    );
-    let be = RealChainBackend::connect(manifest).expect("connect");
-
-    let price: u128 = 10_000;
-    let (_ob, tc) = setup_funded_deal(
-        &be,
-        &seller_addr,
-        &seller,
-        &buyer_addr,
-        &buyer,
-        price,
-        5,
-        2,
-        100_000_000,
-    )
-    .await;
-    println!("=== funded TC {tc} (price={price}) ===");
-
-    open_stream_with_probe(&be, &tc, &seller, s_sec, b_sec).await;
-    assert!(
-        be.token_contract_state(&tc)
-            .await
-            .expect("st")
-            .as_ref()
-            .and_then(|s| s["opened"].as_bool())
-            .unwrap_or(false),
-        "the stream is open before the dispute"
-    );
-
-    // The buyer opens a dispute: streamDispute -> TC.dispute() locks BOTH notes.
-    be.stream_dispute(&buyer_addr, &buyer, &tc)
-        .await
-        .expect("dispute");
-    let mut disputed = false;
-    for _ in 0..20 {
-        let st = be.token_contract_state(&tc).await.expect("st");
-        println!("after dispute: state={st:?}");
-        if st
-            .as_ref()
-            .and_then(|s| s["disputed"].as_bool())
-            .unwrap_or(false)
-        {
-            disputed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(disputed, "TC.dispute() went through: disputed==true");
-
-    // Direct proof that "the note is locked": the seller has disputeCount > 0(streamDisputeLock).
-    let dispute_count = |locks: &Option<Value>| -> u64 {
-        locks
-            .as_ref()
-            .map(|l| &l["disputeCount"])
-            .and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-            .unwrap_or(0)
-    };
-    let mut seller_locked = false;
-    for _ in 0..20 {
-        let locks = be.note_stream_locks(&seller_addr).await.expect("locks");
-        println!("seller note locks={locks:?}");
-        if dispute_count(&locks) > 0 {
-            seller_locked = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(
-        seller_locked,
-        "the seller's note is actually locked by the dispute (disputeCount>0 -> ERR_STREAM_LOCKED)"
-    );
-    println!("=== seller note dispute-locked on chain (ERR_STREAM_LOCKED) ===");
-
-    // the seller CONCEDES -- releaseDispute() unlocks both notes and returns the tick to the buyer.
-    be.release_dispute(&tc, &seller)
-        .await
-        .expect("releaseDispute");
-    let mut resolved = false;
-    for _ in 0..20 {
-        let st = be.token_contract_state(&tc).await.expect("st");
-        let locks = be.note_stream_locks(&seller_addr).await.expect("locks");
-        println!("after release: state={st:?} seller_locks={locks:?}");
-        let still_disputed = st
-            .as_ref()
-            .and_then(|s| s["disputed"].as_bool())
-            .unwrap_or(true);
-        let unlocked = dispute_count(&locks) == 0;
-        if !still_disputed && unlocked {
-            resolved = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(
-        resolved,
-        "releaseDispute resolved the dispute: disputed==false AND the seller's note is unlocked (disputeCount==0)"
-    );
-    println!("=== releaseDispute resolved: notes unlocked, tick returned to buyer ===");
-}
-
-/// Helper: the seller posts the probe-commission(a fresh operational wallet + ECC[2] from the giver) and
-/// opens the stream with the handover cipher of the endpoint to the buyer. On exit: TC `opened`, `probeFunded`.
-async fn open_stream_with_probe(
+/// Helper: the seller posts the exact `2P` bond(a fresh operational wallet + ECC[2] from the giver) and
+/// opens the stream with the handover cipher of the endpoint to the buyer. On exit: TC `opened`, `bondFunded`.
+async fn open_stream_with_seller_bond(
     be: &RealChainBackend,
     tc: &Address,
     seller: &KeyPair,
@@ -2016,9 +1914,19 @@ async fn open_stream_with_probe(
         .deploy_multisig(&wallet_keys)
         .await
         .expect("deploy wallet");
-    be.giver_send_shell(&wallet.with_workchain(), 100_000_000)
+    let bond_required = be
+        .token_contract_seller_bond(tc)
         .await
-        .expect("send shell");
+        .expect("getSellerBond")
+        .and_then(|bond| {
+            bond["bondRequired"]
+                .as_str()
+                .and_then(|raw| raw.parse().ok())
+        })
+        .expect("getSellerBond().bondRequired");
+    be.giver_send_shell(&wallet.with_workchain(), bond_required)
+        .await
+        .expect("send exact seller bond");
     for _ in 0..20 {
         if be
             .client()
@@ -2027,21 +1935,21 @@ async fn open_stream_with_probe(
             .expect("w")
             .map(|a| a.shell())
             .unwrap_or(0)
-            > 0
+            >= bond_required
         {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
-    be.fund_probe_commission(&wallet, &wallet_keys, tc, 1_000_000)
+    be.fund_seller_bond(&wallet, &wallet_keys, tc, bond_required)
         .await
-        .expect("fund probe");
+        .expect("fund seller bond");
     for _ in 0..20 {
         if be
-            .token_contract_probe(tc)
+            .token_contract_seller_bond(tc)
             .await
             .expect("p")
-            .and_then(|x| x["probeFunded"].as_bool())
+            .and_then(|x| x["bondFunded"].as_bool())
             .unwrap_or(false)
         {
             break;
@@ -2077,7 +1985,7 @@ fn u128_field(v: &Option<Value>, key: &str) -> u128 {
 
 /// A LIVE deal test, step 4b(accept path + two-tick invariant + clean stop): from an open
 /// stream the seller waits for `SETTLE_WINDOW` and `advance` -- the probe is accepted (probe-tick -> seller,
-/// the commission is returned), and the **two-tick invariant** is established(`prepaid==P && frozen==P`);
+/// while the `2P` bond remains held), and the **two-tick invariant** is established(`prepaid==P && frozen==P`);
 /// then the buyer `stop` -- a standard split, the stream is closed. Slow(~5 min due to 180s).
 #[tokio::test]
 #[ignore = "live: stream advance(accept) + two-tick invariant + stop on shellnet (~5min: 180s settle)"]
@@ -2102,8 +2010,8 @@ async fn live_stream_advance_and_stop() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // ticks=4(depo=4*P=40000) -- enough for the probe-tick at open(P) + the two-tick invariant(2P+fee).
-    let price: u128 = 10_000;
+    // ticks=4 gives enough escrow for the probe tick plus the two-tick invariant.
+    let price: u128 = PRICE_STEP;
     let (_ob, tc) = setup_funded_deal(
         &be,
         &seller_addr,
@@ -2113,7 +2021,7 @@ async fn live_stream_advance_and_stop() {
         price,
         5,
         4,
-        100_000_000,
+        crate::chain::required_escrow_for_buy(4, price),
     )
     .await;
     println!(
@@ -2121,7 +2029,7 @@ async fn live_stream_advance_and_stop() {
         u128_field(&be.token_contract_state(&tc).await.expect("st"), "deposit")
     );
 
-    open_stream_with_probe(&be, &tc, &seller, s_sec, b_sec).await;
+    open_stream_with_seller_bond(&be, &tc, &seller, s_sec, b_sec).await;
     let st = be.token_contract_state(&tc).await.expect("st");
     println!(
         "=== opened: opened={:?} frozen={} deposit={} ===",
@@ -2199,7 +2107,7 @@ async fn live_stream_advance_and_stop() {
 
 /// A LIVE test, the **seller no-show** scenario: the deal is open, but the seller does NOT advance
 /// the ticks; after `STREAM_TIMEOUT` the buyer reclaims. Expectation: the stream is closed, the probe is **not accepted**,
-/// the commission(250) -> the seller as `finalizedOwed`, probe+deposit -> the buyer, **no burn** (a no-show is not
+/// the full seller bond `2P` returns via `finalizedOwed`, probe+deposit -> the buyer, **no burn** (a no-show is not
 /// slashed). Slow(~12 min due to 600s). Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: seller no-show reclaim on shellnet (~12min: 600s STREAM_TIMEOUT)"]
@@ -2224,7 +2132,7 @@ async fn live_stream_seller_no_show() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    let price: u128 = 10_000;
+    let price: u128 = PRICE_STEP;
     let (_ob, tc) = setup_funded_deal(
         &be,
         &seller_addr,
@@ -2234,10 +2142,10 @@ async fn live_stream_seller_no_show() {
         price,
         5,
         4,
-        100_000_000,
+        crate::chain::required_escrow_for_buy(4, price),
     )
     .await;
-    open_stream_with_probe(&be, &tc, &seller, s_sec, b_sec).await;
+    open_stream_with_seller_bond(&be, &tc, &seller, s_sec, b_sec).await;
     println!(
         "=== opened (seller will STAY SILENT): probeAccepted={:?} frozen={} deposit={} ===",
         be.token_contract_state(&tc)
@@ -2290,20 +2198,21 @@ async fn live_stream_seller_no_show() {
         Some(false),
         "the probe is NOT accepted (the seller did not show up)"
     );
-    // to the seller -- only the returned commission(250 = price*250bps); probe+deposit to the buyer; no burn.
+    // the exact `2P` seller bond returns; probe+deposit goes to the buyer; no burn.
     assert_eq!(
-        finalized, 250,
-        "no-show: the seller's finalizedOwed == the returned commission (250), the tick did NOT go to the seller"
+        finalized,
+        2 * price,
+        "no-show: finalizedOwed carries only the returned 2P seller bond; the tick did NOT go to the seller"
     );
     println!(
-        "=== seller no-show: reclaimed, no burn, commission(250)->seller, probe+deposit->buyer ==="
+        "=== seller no-show: reclaimed, no burn, seller bond 2P->seller, probe+deposit->buyer ==="
     );
 }
 
 /// **LEGACY.** Its deal SETUP routes through the OLD operator-wallet/giver path
 /// (`deploy_multisig`), kept as `test-giver` regression coverage -- **NOT** the canonical proof (though
-/// `RealDealBackend::open_stream` itself posts the probe-commission note-funded). The canonical note-funded
-/// seller proof is [`provision_market`](Self::provision_market) + `live_post_probe_commission_note_funded`.
+/// `RealDealBackend::open_stream` itself posts the exact `2P` seller bond note-funded). The canonical note-funded
+/// seller proof is [`provision_market`](Self::provision_market) + `live_post_seller_bond_note_funded`.
 /// A LIVE trait-level smoke test: drives a deal **through the adapter methods** of `RealDealBackend`
 /// (`post_offer`->`place_buy`->`read_match`->`open_stream`->`read_handover`->`accept_probe`->`stop`)
 /// on shellnet -- checks the wiring of step 5 end-to-end. Slow(~6 min: 185s SETTLE_WINDOW). Requires `DEXDO_PN_POOL`.
@@ -2333,7 +2242,7 @@ async fn live_real_deal_backend_trait() {
     );
     let chain = RealChainBackend::connect(manifest).expect("connect");
 
-    let price: u128 = 10_000;
+    let price: u128 = PRICE_STEP;
     let max_ticks: u128 = 5;
     let ticks: u128 = 4;
     let nonce = now_secs();
@@ -2381,7 +2290,7 @@ async fn live_real_deal_backend_trait() {
         .await
         .expect("deploy wallet");
     chain
-        .giver_send_shell(&wallet.with_workchain(), 100_000_000)
+        .giver_send_shell(&wallet.with_workchain(), 2 * price)
         .await
         .expect("send shell");
     for _ in 0..20 {
@@ -2415,8 +2324,7 @@ async fn live_real_deal_backend_trait() {
         price_per_tick: price,
         max_ticks,
         ticks,
-        escrow: 100_000_000,
-        probe_shell: 1_000_000,
+        escrow: crate::chain::required_escrow_for_buy(ticks, price),
     };
     let backend = RealDealBackend::new(chain, ctx);
     let tc_s = tc.with_workchain();
@@ -2527,7 +2435,7 @@ async fn live_recover_stops_orphaned_open_deal() {
     );
     let chain = RealChainBackend::connect(manifest).expect("connect");
 
-    let price: u128 = 10_000;
+    let price: u128 = PRICE_STEP;
     let max_ticks: u128 = 5;
     let ticks: u128 = 4;
     let nonce = now_secs();
@@ -2574,7 +2482,7 @@ async fn live_recover_stops_orphaned_open_deal() {
         .await
         .expect("deploy wallet");
     chain
-        .giver_send_shell(&wallet.with_workchain(), 100_000_000)
+        .giver_send_shell(&wallet.with_workchain(), 2 * price)
         .await
         .expect("send shell");
     for _ in 0..20 {
@@ -2606,8 +2514,7 @@ async fn live_recover_stops_orphaned_open_deal() {
         price_per_tick: price,
         max_ticks,
         ticks,
-        escrow: 100_000_000,
-        probe_shell: 1_000_000,
+        escrow: crate::chain::required_escrow_for_buy(ticks, price),
     };
     let backend = RealDealBackend::new(chain, ctx);
     let tc_s = tc.with_workchain();

@@ -32,28 +32,38 @@ pub fn net_burn(n_clean_ticks: u64, p: Shell, c: &ProtocolConsts) -> Shell {
     mul_bps(rate, n_clean_ticks, p)
 }
 
-/// Burn on an early stop at the probe tick:
-/// the buyer's probe tick(`P`) + the seller's probe commission -- both burned, to no one.
+/// Resolution of an early stop at the probe tick:
+/// the buyer burns `P`, the seller burns `P`, the remaining seller-bond `P` is refunded, and any
+/// unspent buyer deposit is refunded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeBurn {
     /// The buyer's probe tick -- burned.
     pub buyer: Shell,
-    /// The seller's probe commission -- burned.
+    /// The buyer's remaining, unspent deposit -- refunded.
+    pub buyer_refund: u128,
+    /// The slashed half of the seller's `2P` bond -- burned.
     pub seller: Shell,
+    /// The unslashed half of the seller's `2P` bond -- refunded to the seller.
+    pub seller_refund: Shell,
 }
 
 impl ProbeBurn {
     /// Total SHELL burned.
-    pub fn total(&self) -> Shell {
-        self.buyer + self.seller
+    pub fn total(&self) -> u128 {
+        u128::from(self.buyer) + u128::from(self.seller)
     }
 }
 
-/// `probe_burn`: tick price `p` from the buyer + `seller_probe_commission` from the seller.
-pub fn probe_burn(p: Shell, seller_probe_commission: Shell) -> ProbeBurn {
+/// `probe_burn`: on a probe STOP the buyer's probe tick `p` burns AND a
+/// mirror `p` from the seller's `2P` bond burns(symmetric `P` vs `P`); the remaining bond
+/// (`p`) is returned to the seller separately. The pure stream machine has no extra buyer
+/// deposit; real adapters fill `buyer_refund` from the pre-STOP contract state.
+pub fn probe_burn(p: Shell) -> ProbeBurn {
     ProbeBurn {
         buyer: p,
-        seller: seller_probe_commission,
+        buyer_refund: 0,
+        seller: p,
+        seller_refund: p,
     }
 }
 
@@ -123,10 +133,14 @@ mod tests {
     }
 
     #[test]
-    fn probe_burn_goes_nowhere() {
-        let b = probe_burn(P, 25);
+    fn probe_stop_burns_p_per_side_and_refunds_remaining_seller_bond() {
+        // symmetric P vs P burn; the other P of the seller's 2P bond returns.
+        let b = probe_burn(P);
         assert_eq!(b.buyer, P);
-        assert_eq!(b.seller, 25);
-        assert_eq!(b.total(), P + 25);
+        assert_eq!(b.buyer_refund, 0);
+        assert_eq!(b.seller, P);
+        assert_eq!(b.seller_refund, P);
+        assert_eq!(b.total(), u128::from(P) * 2);
+        assert_eq!(b.seller + b.seller_refund, 2 * P);
     }
 }

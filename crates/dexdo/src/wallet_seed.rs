@@ -1,5 +1,7 @@
 //! TVM-compatible multisig seed phrase derivation for `dexdo note deploy`.
 
+use zeroize::Zeroizing;
+
 pub const TVM_DEFAULT_DERIVATION_PATH: &str = "m/44'/1331'/0'/0/0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +26,7 @@ impl std::error::Error for MultisigSeedError {}
 #[derive(Clone, PartialEq, Eq)]
 pub struct DerivedMultisigKey {
     public_hex: String,
-    secret_hex: String,
+    secret_hex: Zeroizing<String>,
 }
 
 impl DerivedMultisigKey {
@@ -77,7 +79,7 @@ pub fn derive_multisig_key_from_seed_phrase(
     .map_err(|_| MultisigSeedError::InvalidPhrase)?;
     Ok(DerivedMultisigKey {
         public_hex: keys.public.clone(),
-        secret_hex: keys.secret.clone(),
+        secret_hex: keys.secret.clone().into(),
     })
 }
 
@@ -200,6 +202,17 @@ mod tests {
         let dbg = format!("{key:?}");
         assert!(dbg.contains(key.public_hex()));
         assert!(!dbg.contains(key.secret_hex()));
+    }
+
+    #[test]
+    fn derived_multisig_secret_is_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let key = DerivedMultisigKey {
+            public_hex: "public".into(),
+            secret_hex: "secret".to_string().into(),
+        };
+        assert_zeroize_on_drop(&key.secret_hex);
     }
 
     #[cfg(not(feature = "shellnet"))]

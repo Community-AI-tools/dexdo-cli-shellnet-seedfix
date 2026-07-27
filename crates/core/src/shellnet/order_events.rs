@@ -115,7 +115,8 @@ mod tests {
             "maxPrice": "700",
             "ticks": "2",
             "cycleBudget": "350",
-            "autoRenew": true
+            "autoRenew": true,
+            "flags": 0
         }));
         let placement = decode_subscription_placement(&body)
             .expect("decode placement")

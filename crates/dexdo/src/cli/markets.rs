@@ -5,8 +5,8 @@ use crate::cli::commands::mock_chain_for_machine;
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     direct_chain_read_with_timeout, enforce_model_registry_policy,
-    load_enabled_model_registry_policy, read_executable_book_target, target_from_market,
-    BookTarget,
+    load_enabled_model_registry_policy, read_executable_book_target, resolve_model_registry_target,
+    target_from_market, BookTarget,
 };
 use crate::cli::machine;
 #[cfg(not(feature = "shellnet"))]
@@ -126,26 +126,28 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     };
     direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-        if args.json {
-            let mut markets = Vec::new();
-            for target in targets {
-                let source = if target.order_book.is_some() {
-                    "market_manifest"
-                } else {
-                    "models_config"
-                };
-                let root_model = target.root_model.clone();
-                let snapshot = read_executable_book_target(&chain, &target).await?;
-                markets.push(market_entry_from_snapshot(&snapshot, root_model, source));
-            }
-            return machine::print_json(&machine::MarketsResponse {
-                schema: machine::MARKETS_SCHEMA,
-                network: "shellnet".to_string(),
-                generated_at_unix: machine::now_unix()?,
-                markets,
-            });
-        }
+        let mut resolved_targets = Vec::with_capacity(targets.len());
         for target in targets {
+            let requested_model = target.frame_model.clone();
+            resolved_targets.push(
+                resolve_model_registry_target(
+                    RegistryRole::Buyer,
+                    registry_policy.as_ref(),
+                    &args.contracts,
+                    &requested_model,
+                    target,
+                )
+                .await?,
+            );
+        }
+        let mut available = Vec::with_capacity(resolved_targets.len());
+        for target in resolved_targets {
+            let source = if target.order_book.is_some() {
+                "market_manifest"
+            } else {
+                "models_config"
+            };
+            let root_model = target.root_model.clone();
             let snapshot = read_executable_book_target(&chain, &target).await?;
             if let Some(policy) = registry_policy.as_ref() {
                 let action = enforce_model_registry_policy(
@@ -162,6 +164,23 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
                     continue;
                 }
             }
+            available.push((snapshot, root_model, source));
+        }
+        if args.json {
+            let markets = available
+                .iter()
+                .map(|(snapshot, root_model, source)| {
+                    market_entry_from_snapshot(snapshot, root_model.clone(), source)
+                })
+                .collect();
+            return machine::print_json(&machine::MarketsResponse {
+                schema: machine::MARKETS_SCHEMA,
+                network: "shellnet".to_string(),
+                generated_at_unix: machine::now_unix()?,
+                markets,
+            });
+        }
+        for (snapshot, _, _) in available {
             let depth_ticks: u128 = snapshot.resting_asks().map(|o| o.ticks).sum();
             let best_ask = snapshot.resting_asks().map(|o| o.price_per_tick).min();
             let order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
@@ -219,13 +238,24 @@ mod tests {
             .find("continue;")
             .map(|offset| hidden_action + offset)
             .expect("markets skips hidden books");
+        let timeout = body
+            .find("direct_chain_read_with_timeout(")
+            .expect("markets read timeout present");
+        let resolution = body
+            .find("resolve_model_registry_target(")
+            .expect("markets registry resolution present");
+        let json = body.find("if args.json").expect("markets JSON branch");
         let print = body
             .find("println!(")
             .expect("markets prints visible books");
 
         assert!(
-            hide_policy < hidden_action && hidden_action < skip && skip < print,
-            "markets must skip inactive registry books before printing available books"
+            hide_policy < hidden_action && hidden_action < skip && skip < json && json < print,
+            "markets must apply one registry filter before JSON or human output"
+        );
+        assert!(
+            timeout < resolution,
+            "markets registry getter must run inside the existing read timeout"
         );
     }
 }

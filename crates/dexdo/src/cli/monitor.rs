@@ -31,7 +31,7 @@ pub(crate) async fn run_monitor(args: MonitorArgs) -> Result<()> {
 /// Real-shellnet monitor: read the operator's `--market` manifest(s) and print each market's
 /// by-fact deal state on-chain through the SAME `print_tree_snapshot` (per-model breakdown + anomaly
 /// surfacing) as the mock path. Read-only -- only getters, moves nothing. Each manifest's `TokenContract` is
-/// read via `real_market_deal_view`(`getState`/`getProbe` + the buyer pubkey); the model/price come from the
+/// read via `real_market_deal_view`(`getState`/`getSellerBond` + the buyer pubkey); the model/price come from the
 /// manifest. Live-verifiable once a deal `TokenContract` is deployed.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
@@ -67,9 +67,10 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
         if let Some(s) = &deal.snapshot {
             if !s.closed {
                 // The operator is the SELLER of their own market, so the note's at-risk SHELL is the
-                // SELLER-side lock(probe/stake) -- NOT the buyer's deposit. This matches the mock's role-side
-                // exposure and `TreeSnapshot.exposure`'s contract("the sum locked by the note").
-                exposure = exposure.saturating_add(s.seller_locked);
+                // seller bond held by this TC -- NOT the buyer's deposit. This matches the mock's role-side
+                // exposure and `TreeSnapshot.exposure`'s per-TC contract.
+                exposure =
+                    exposure.saturating_add(u64::try_from(s.seller_locked).unwrap_or(u64::MAX));
             }
         }
         deals.push(deal);

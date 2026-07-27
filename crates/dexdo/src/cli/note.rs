@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 #[allow(dead_code)]
 const UNIT_SCALE: u128 = 1_000_000_000;
@@ -317,7 +318,7 @@ pub(crate) fn ensure_onchain_owner_matches_pool_key(
 /// secret and is written before any wallet spend. Later deploy steps add the on-chain note identifiers so
 /// `dexdo note recover` can finalize the pool without repeating an already completed deploy.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct NoteDeployRecoveryState {
     pub version: u32,
     pub endpoint: String,
@@ -327,7 +328,7 @@ pub(crate) struct NoteDeployRecoveryState {
     pub ecc_shell_deposit: u64,
     pub funding_multisig_address: String,
     pub owner_public_key_hex: String,
-    pub owner_secret_key_hex: String,
+    pub owner_secret_key_hex: Zeroizing<String>,
     pub pn_address: Option<String>,
     pub deposit_identifier_hash: Option<String>,
     pub deployed_at_unix: Option<u64>,
@@ -337,6 +338,16 @@ pub(crate) struct NoteDeployRecoveryState {
     pub shell_voucher: Option<NoteDeployVoucherCheckpoint>,
     pub shell_funded: bool,
     pub sanity_checked: bool,
+}
+
+impl std::fmt::Debug for NoteDeployRecoveryState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoteDeployRecoveryState")
+            .field("owner_public_key_hex", &self.owner_public_key_hex)
+            .field("owner_secret_key_hex", &"<redacted>")
+            .field("pn_address", &self.pn_address)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -358,9 +369,9 @@ pub(crate) enum NoteDeployVoucherKind {
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct NoteDeployVoucherCheckpoint {
-    pub sk_u_hex: String,
+    pub sk_u_hex: Zeroizing<String>,
     pub sk_u_commit_hex: String,
     pub recipient_ephemeral_pubkey_hex: String,
     pub token_type: u32,
@@ -372,6 +383,15 @@ pub(crate) struct NoteDeployVoucherCheckpoint {
     pub event: Option<NoteDeployVoucherEvent>,
     #[serde(default)]
     pub proof: Option<NoteDeployVoucherProof>,
+}
+
+impl std::fmt::Debug for NoteDeployVoucherCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoteDeployVoucherCheckpoint")
+            .field("sk_u_hex", &"<redacted>")
+            .field("sk_u_commit_hex", &self.sk_u_commit_hex)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -386,7 +406,7 @@ pub(crate) struct NoteDeployVoucherEvent {
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct NoteDeployVoucherProof {
     pub proof: String,
     pub deposit_identifier_hash_hex: String,
@@ -397,8 +417,17 @@ pub(crate) struct NoteDeployVoucherProof {
     pub voucher_value: u64,
     pub voucher_token_type: u32,
     pub layer_number: u8,
-    pub sk_u_hex: String,
+    pub sk_u_hex: Zeroizing<String>,
     pub sk_u_commit_hex: String,
+}
+
+impl std::fmt::Debug for NoteDeployVoucherProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoteDeployVoucherProof")
+            .field("sk_u_hex", &"<redacted>")
+            .field("sk_u_commit_hex", &self.sk_u_commit_hex)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -429,7 +458,7 @@ impl NoteDeployVoucherCheckpoint {
         sk_u_commit_hex: String,
     ) -> Result<Self> {
         let checkpoint = Self {
-            sk_u_hex: normalize_secret_like_hex(&sk_u_hex, "sk_u_hex")?,
+            sk_u_hex: normalize_secret_like_hex(&sk_u_hex, "sk_u_hex")?.into(),
             sk_u_commit_hex: normalize_secret_like_hex(&sk_u_commit_hex, "sk_u_commit_hex")?,
             recipient_ephemeral_pubkey_hex: normalize_secret_like_hex(
                 recipient_ephemeral_pubkey_hex,
@@ -612,7 +641,7 @@ impl NoteDeployVoucherProof {
             voucher_value: proof.voucher_value,
             voucher_token_type: proof.voucher_token_type,
             layer_number: proof.layer_number,
-            sk_u_hex: proof.sk_u_hex.clone(),
+            sk_u_hex: proof.sk_u_hex.clone().into(),
             sk_u_commit_hex: proof.sk_u_commit_hex.clone(),
         }
     }
@@ -628,7 +657,7 @@ impl NoteDeployVoucherProof {
             voucher_value: self.voucher_value,
             voucher_token_type: self.voucher_token_type,
             layer_number: self.layer_number,
-            sk_u_hex: self.sk_u_hex.clone(),
+            sk_u_hex: self.sk_u_hex.to_string(),
             sk_u_commit_hex: self.sk_u_commit_hex.clone(),
         }
     }
@@ -656,7 +685,7 @@ impl NoteDeployRecoveryState {
             ecc_shell_deposit: request.ecc_shell_deposit,
             funding_multisig_address,
             owner_public_key_hex,
-            owner_secret_key_hex,
+            owner_secret_key_hex: owner_secret_key_hex.into(),
             pn_address: None,
             deposit_identifier_hash: None,
             deployed_at_unix: None,
@@ -1217,7 +1246,7 @@ fn validate_hex_u256(raw: &str, label: &str) -> Result<()> {
 /// `allow(dead_code)` off `shellnet`: the only non-test consumer(`run_note_deploy`) is shellnet-gated, and the
 /// `cfg(test)` suite does not save these from clippy's non-test `-D warnings` pass on the default bin.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct OnboardPnState {
     pub endpoint: String,
     pub nominal: String,
@@ -1227,10 +1256,21 @@ pub(crate) struct OnboardPnState {
     pub pn_address: Option<String>,
     pub deposit_identifier_hash: Option<String>,
     pub owner_public_key_hex: Option<String>,
-    pub owner_secret_key_hex: Option<String>,
+    pub owner_secret_key_hex: Option<Zeroizing<String>>,
     pub deployed_at_unix: Option<u64>,
     pub shell_funded: bool,
     pub sanity_checked: bool,
+}
+
+impl std::fmt::Debug for OnboardPnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnboardPnState")
+            .field("endpoint", &self.endpoint)
+            .field("pn_address", &self.pn_address)
+            .field("owner_public_key_hex", &self.owner_public_key_hex)
+            .field("owner_secret_key_hex", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -1245,7 +1285,7 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
             pn_address: Some(s.pn_address),
             deposit_identifier_hash: Some(s.deposit_identifier_hash),
             owner_public_key_hex: Some(s.owner_public_key_hex),
-            owner_secret_key_hex: Some(s.owner_secret_key_hex),
+            owner_secret_key_hex: Some(s.owner_secret_key_hex.into()),
             deployed_at_unix: Some(s.deployed_at_unix),
             shell_funded: s.shell_funded,
             sanity_checked: s.sanity_checked,
@@ -1497,11 +1537,70 @@ mod note_deploy_tests {
             pn_address: Some("0:abc".into()),
             deposit_identifier_hash: Some("123".into()),
             owner_public_key_hex: Some(public),
-            owner_secret_key_hex: Some(secret),
+            owner_secret_key_hex: Some(secret.into()),
             deployed_at_unix: Some(1000),
             shell_funded: true,
             sanity_checked: true,
         }
+    }
+
+    #[test]
+    fn secret_bearing_note_states_redact_debug_output() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let mut onboard = complete_state();
+        onboard.owner_secret_key_hex = Some("onboard-secret-sentinel".to_string().into());
+        assert_zeroize_on_drop(onboard.owner_secret_key_hex.as_ref().unwrap());
+        let onboard_debug = format!("{onboard:?}");
+        assert!(!onboard_debug.contains("onboard-secret-sentinel"));
+        assert!(onboard_debug.contains("owner_secret_key_hex: \"<redacted>\""));
+        assert!(onboard_debug.contains("shellnet.ackinacki.org"));
+
+        let proof = NoteDeployVoucherProof {
+            proof: "public-proof".into(),
+            deposit_identifier_hash_hex: "deposit-id".into(),
+            final_layer_historical_hash_root_hex: "history-root".into(),
+            voucher_nominal_fr_hex: "nominal".into(),
+            token_type_fr_hex: "token-type".into(),
+            ephemeral_pubkey_hex: "ephemeral-key".into(),
+            voucher_value: 1,
+            voucher_token_type: 2,
+            layer_number: 3,
+            sk_u_hex: "proof-secret-sentinel".to_string().into(),
+            sk_u_commit_hex: "proof-commit".into(),
+        };
+        assert_zeroize_on_drop(&proof.sk_u_hex);
+        let proof_debug = format!("{proof:?}");
+        assert!(!proof_debug.contains("proof-secret-sentinel"));
+        assert!(proof_debug.contains("sk_u_hex: \"<redacted>\""));
+        assert!(proof_debug.contains("proof-commit"));
+
+        let checkpoint = NoteDeployVoucherCheckpoint {
+            sk_u_hex: "checkpoint-secret-sentinel".to_string().into(),
+            sk_u_commit_hex: "checkpoint-commit".into(),
+            recipient_ephemeral_pubkey_hex: "recipient-key".into(),
+            token_type: 2,
+            raw_value: 1,
+            is_fee: false,
+            submit_maybe_sent: false,
+            event: None,
+            proof: Some(proof),
+        };
+        assert_zeroize_on_drop(&checkpoint.sk_u_hex);
+        let checkpoint_debug = format!("{checkpoint:?}");
+        assert!(!checkpoint_debug.contains("checkpoint-secret-sentinel"));
+        assert!(checkpoint_debug.contains("sk_u_hex: \"<redacted>\""));
+        assert!(checkpoint_debug.contains("checkpoint-commit"));
+
+        let mut recovery = complete_recovery_state();
+        recovery.owner_secret_key_hex = "recovery-secret-sentinel".to_string().into();
+        assert_zeroize_on_drop(&recovery.owner_secret_key_hex);
+        recovery.deposit_voucher = Some(checkpoint);
+
+        let recovery_debug = format!("{recovery:?}");
+        assert!(!recovery_debug.contains("recovery-secret-sentinel"));
+        assert!(recovery_debug.contains("owner_secret_key_hex: \"<redacted>\""));
+        assert!(recovery_debug.contains("0:abc"));
     }
 
     #[cfg(feature = "shellnet")]
@@ -1557,7 +1656,7 @@ mod note_deploy_tests {
         note_address: Option<&str>,
     ) -> NoteDeployRecoveryState {
         let mut state = complete_recovery_state();
-        state.owner_secret_key_hex = secret.to_string();
+        state.owner_secret_key_hex = secret.to_string().into();
         state.owner_public_key_hex = derive_owner_pubkey_from_secret_hex(secret).unwrap();
         state.pn_address = note_address.map(ToOwned::to_owned);
         state.deposit_identifier_hash =
@@ -1672,9 +1771,44 @@ mod note_deploy_tests {
         assert!(err.contains("refusing to report zero"), "{err}");
     }
 
+    #[test]
+    fn note_balance_zero_current_account_is_valid() {
+        let view = build_note_balance_view(
+            "0:zero",
+            Some(NoteAccountSnapshot {
+                address: "0:zero".into(),
+                status: "Active".into(),
+                native_raw: 0,
+                ecc: Vec::new(),
+                code_hash: Some("current".into()),
+            }),
+            note_getter_balance_maps(Some(&json!({
+                "balance": {},
+                "lockedInOrders": {}
+            }))),
+        )
+        .unwrap();
+        let out = render_note_balance(&view);
+        assert!(
+            out.contains(
+                "SHELL currency ECC[2] (live spendable balance): 0.000000000 SHELL (raw 0)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("VMSHELL native gas: 0.000000000 vmshell (raw 0)"),
+            "{out}"
+        );
+        assert_eq!(out.matches("none reported").count(), 3, "{out}");
+    }
+
     /// `getDetails` maps preserve unknown vs empty and parse known token maps.
     #[test]
     fn note_balance_getter_maps_preserve_unknown() {
+        let maps = note_getter_balance_maps(None);
+        assert!(matches!(maps.balance, NoteBalanceMap::Unknown(_)));
+        assert!(matches!(maps.locked_in_orders, NoteBalanceMap::Unknown(_)));
+
         let maps = note_getter_balance_maps(Some(&json!({
             "balance": {"2": "3000000000", "7": "9"},
             "lockedInOrders": null
@@ -1819,7 +1953,7 @@ mod note_deploy_tests {
             pool_note_recovery_records(&pool).unwrap(),
             vec![(
                 note_addr.to_string(),
-                s.owner_secret_key_hex.clone().unwrap(),
+                s.owner_secret_key_hex.clone().unwrap().to_string(),
                 tc,
                 "buyer".to_string(),
             )]
@@ -1946,7 +2080,7 @@ mod note_deploy_tests {
         let derived = dexdo::wallet_seed::derive_multisig_key_from_seed_phrase(&phrase).unwrap();
         let mut state = complete_state();
         state.owner_public_key_hex = Some(derived.public_hex().to_string());
-        state.owner_secret_key_hex = Some(derived.secret_hex().to_string());
+        state.owner_secret_key_hex = Some(derived.secret_hex().to_string().into());
         let wallet = format!("0:{}", "a".repeat(64));
         let pool = pool_with_note_added(
             None,
@@ -1980,7 +2114,7 @@ mod note_deploy_tests {
         write_note_deploy_recovery(&path, &state).unwrap();
         let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
 
-        assert_eq!(loaded.owner_secret_key_hex, fixture_secret_hex());
+        assert_eq!(loaded.owner_secret_key_hex.as_str(), fixture_secret_hex());
         assert_eq!(loaded.pn_address, None);
         #[cfg(unix)]
         {
@@ -2173,7 +2307,7 @@ mod note_deploy_tests {
         let json = serde_json::to_string_pretty(&state).unwrap();
 
         assert!(json.contains("owner_secret_key_hex"), "{json}");
-        assert!(json.contains(&state.owner_secret_key_hex), "{json}");
+        assert!(json.contains(state.owner_secret_key_hex.as_str()), "{json}");
         assert!(
             !json.contains(&wallet_secret),
             "wallet secret leaked into recovery JSON"
@@ -2199,7 +2333,7 @@ mod note_deploy_tests {
         assert_eq!(pool["notes"][0]["address"], state.pn_address.unwrap());
         assert_eq!(
             pool["notes"][0]["owner_secret_key_hex"],
-            state.owner_secret_key_hex
+            state.owner_secret_key_hex.as_str()
         );
     }
 
@@ -2218,7 +2352,7 @@ mod note_deploy_tests {
         assert!(err.contains("no deployed PrivateNote address"), "{err}");
         assert!(err.contains("note deploy --recovery"), "{err}");
         assert!(
-            !err.contains(&state.owner_secret_key_hex),
+            !err.contains(state.owner_secret_key_hex.as_str()),
             "secret leaked in error: {err}"
         );
     }
@@ -2253,7 +2387,7 @@ mod note_deploy_tests {
         assert!(json.contains("\"deposit_voucher\""), "{json}");
         assert!(json.contains("\"submit_maybe_sent\": true"), "{json}");
         assert!(
-            !err.contains(&state.deposit_voucher.unwrap().sk_u_hex),
+            !err.contains(state.deposit_voucher.as_ref().unwrap().sk_u_hex.as_str()),
             "voucher secret leaked in error: {err}"
         );
     }
@@ -2317,7 +2451,7 @@ mod note_deploy_tests {
         assert!(err.contains("does not match this deploy request"), "{err}");
         assert!(err.contains("fresh --pool/--recovery"), "{err}");
         assert!(
-            !err.contains(&state.owner_secret_key_hex),
+            !err.contains(state.owner_secret_key_hex.as_str()),
             "secret leaked in error: {err}"
         );
     }
@@ -2332,7 +2466,7 @@ mod note_deploy_tests {
         assert!(msg.contains("note recover"), "{msg}");
         assert!(msg.contains("pn_pool.json.recovery.json"), "{msg}");
         assert!(
-            !msg.contains(&state.owner_secret_key_hex),
+            !msg.contains(state.owner_secret_key_hex.as_str()),
             "secret leaked in message: {msg}"
         );
         assert!(

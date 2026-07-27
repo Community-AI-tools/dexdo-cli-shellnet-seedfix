@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Result};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
+use dexdo_core::PRICE_STEP;
 use http::uri::Authority;
 use std::fmt;
 use std::net::SocketAddr;
@@ -180,8 +181,8 @@ pub(crate) struct SellerArgs {
     /// the manifest, so do not pass both.
     #[arg(long)]
     pub(crate) nonce: Option<u64>,
-    /// Tick price P in SHELL.
-    #[arg(long, default_value_t = 1000)]
+    /// Tick price P in raw ECC[2] units; must be a positive multiple of PRICE_STEP(1 SHELL).
+    #[arg(long, default_value_t = PRICE_STEP as u64)]
     pub(crate) price_per_tick: u64,
     /// How many fake tokens to serve in `--mock-model` mode. Real upstreams follow the request's
     /// `max_tokens`, capped by the market's `max_ticks * TICK_SIZE`.
@@ -197,14 +198,9 @@ pub(crate) struct SellerArgs {
     pub(crate) models: PathBuf,
     /// **Real shellnet:** manifest of the deployed contracts(SuperRoot/DappConfig addresses). The release
     /// places it next to the binary; default -- `contracts/deployed.shellnet.json` in the working directory. The
-    /// probe-commission is posted by the note itself -- no operator wallet.
+    /// exact seller bond `2P` is posted by the note itself -- no operator wallet.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
-    /// **Real shellnet:** maximum raw ECC[2] units the seller may post for `fundProbeCommission`.
-    /// The client reads `getProbe().probeCommission` and posts exactly that raw amount; this limit fails
-    /// closed if the contract requires more. The default is 1_000_000 raw units, i.e. 0.001 SHELL.
-    #[arg(long, default_value_t = 1_000_000)]
-    pub(crate) probe_shell: u128,
     /// Persistent failure policy JSON. Defaults to XDG config (`~/.config/dexdo/policy.json`, Windows
     /// `%APPDATA%\dexdo\policy.json`). Real seller startup fails closed if missing or incomplete.
     #[arg(long)]
@@ -276,10 +272,9 @@ pub(crate) struct BuyerArgs {
     /// (loaded from the manifest). Horizon: derive it from the deal's per-model `InferenceOrderBook`.
     #[arg(long, visible_alias = "model")]
     pub(crate) frame_model: Option<String>,
-    /// accept a model whose family has **no content-identity check** (no B8 fingerprint and no B7
-    /// reference/key) on NAME-only evidence. Without it the buyer refuses to open the consumer API for such a
-    /// model -- a seller could serve a cheaper model under the correct name undetected. When a fingerprint OR a
-    /// reference key IS available the content gate runs regardless of this flag(it cannot be opted out of).
+    /// Accept a model without an executable exact-model buyer reference on NAME-only evidence. Existing B8/B7
+    /// checks still run when their data is available; this flag only opts out of the reference-availability
+    /// preflight.
     #[arg(long)]
     pub(crate) allow_unverified_model: bool,
     /// path to the models config(JSON) providing the **per-model verification data** (B5 vocab, B8
@@ -291,11 +286,12 @@ pub(crate) struct BuyerArgs {
     /// How many ticks the buyer purchases. Not used on the mock path.
     #[arg(long, default_value_t = 8)]
     pub(crate) ticks: u128,
-    /// **Real shellnet:** the per-tick price LIMIT(`maxPricePerTick`) -- crosses with ask <= limit.
+    /// **Real shellnet:** the per-tick price LIMIT(`maxPricePerTick`) in raw ECC[2]
+    /// (`PRICE_STEP = 1000000000` raw = 1 SHELL) -- crosses with ask <= limit.
     /// Must be >= ask. Book deposit check: `escrow >= ticks x maxPricePerTick x (1 + 2.5 %
     /// fee)` -- the fee is charged ON TOP of the limit, so `escrow = limit x ticks`(without headroom) does
     /// not pass; keep the limit noticeably below `escrow /(ticks x 1.025)`.
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = PRICE_STEP)]
     pub(crate) max_price_per_tick: u128,
     /// **Real shellnet:** escrow(the note's ECC SHELL) for `placeInferenceBuy`. Omit it to use EXACTLY
     /// the required `ticks x max_price_per_tick x(1 + 2.5 % book fee)`. An
@@ -394,6 +390,8 @@ pub(crate) enum PolicyCommand {
     Show(PolicyPathArgs),
     /// Open policy.json in $VISUAL or $EDITOR, scaffolding it first if missing.
     Edit(PolicyPathArgs),
+    /// Validate a seller policy using the same local capability check as seller/provision.
+    Validate(PolicyValidateArgs),
 }
 
 #[derive(Args)]
@@ -413,11 +411,26 @@ pub(crate) struct PolicyPathArgs {
     pub(crate) path: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub(crate) struct PolicyValidateArgs {
+    /// Runtime role whose policy must be validated.
+    #[arg(long, value_enum)]
+    pub(crate) role: PolicyValidateRoleArg,
+    /// Policy file path. Defaults to the platform config path.
+    #[arg(long)]
+    pub(crate) path: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PolicyRoleArg {
     Buyer,
     Seller,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PolicyValidateRoleArg {
+    Seller,
 }
 
 /// Provision arguments: bring up a per-deal market from the seller note alone.
@@ -438,8 +451,8 @@ pub(crate) struct ProvisionArgs {
     /// nonce collides(overwrites a prior deal's TC). No unsafe `0` default; pass a distinct value per deal.
     #[arg(long)]
     pub(crate) nonce: Option<u64>,
-    /// Tick price P(SHELL) for the deal `TokenContract`.
-    #[arg(long, default_value_t = 1000)]
+    /// Tick price P in raw ECC[2] units; must be a positive multiple of PRICE_STEP(1 SHELL).
+    #[arg(long, default_value_t = PRICE_STEP)]
     pub(crate) price_per_tick: u128,
     /// Max ticks the deal `TokenContract` bounds to.
     #[arg(long, default_value_t = 1024)]
@@ -454,6 +467,10 @@ pub(crate) struct ProvisionArgs {
     /// seller`/`buyer` load it via `--market`.
     #[arg(long, default_value = "market.json")]
     pub(crate) output: PathBuf,
+    /// Persistent seller failure policy JSON. Defaults to the same platform path as `dexdo seller`.
+    /// Provisioning fails locally before reading secrets or connecting to shellnet if it is unsupported.
+    #[arg(long)]
+    pub(crate) policy: Option<PathBuf>,
 }
 
 /// Args for `dexdo destroy`: the seller CLOSES a STOPped deal's `TokenContract` (DESTRUCTIVE -- the held
@@ -499,7 +516,7 @@ pub(crate) struct RecoverArgs {
 }
 
 /// Args for `dexdo dispute`: the BUYER opens an on-chain dispute on an OPEN deal -- `streamDispute` ->
-/// `TC.dispute()` LOCKS both notes until `releaseDispute`/arbitration. The anti-scam lever for an
+/// `TC.dispute()` freezes this TC's contested amount and seller bond until resolution. The anti-scam lever for an
 /// observed substitution/fraud -- strictly stronger than `recover`'s STOP(which still pays for ticks).
 #[derive(Args)]
 pub(crate) struct DisputeArgs {
@@ -541,7 +558,7 @@ pub(crate) struct ReclaimArgs {
 }
 
 /// Args for `dexdo release-dispute`: the SELLER concedes an on-chain dispute on its deal TC,
-/// unlocking both notes and returning the contested tick/deposit to the buyer.
+/// returning the contested amount to the buyer and the seller bond.
 #[derive(Args)]
 pub(crate) struct ReleaseDisputeArgs {
     #[command(flatten)]
@@ -550,6 +567,20 @@ pub(crate) struct ReleaseDisputeArgs {
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
     /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    #[arg(long)]
+    pub(crate) market: Option<PathBuf>,
+    /// Deployed-contracts manifest.
+    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    pub(crate) contracts: PathBuf,
+}
+
+/// Permissionless resolution of a disputed TokenContract after its deployed dispute window.
+#[derive(Args)]
+pub(crate) struct ResolveDisputeTimeoutArgs {
+    /// The disputed deal `TokenContract` to resolve(or pass `--market`).
+    #[arg(long)]
+    pub(crate) token_contract: Option<String>,
+    /// A `dexdo provision` market manifest carrying the `token_contract`.
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Deployed-contracts manifest.
@@ -674,8 +705,8 @@ pub(crate) struct ExecutableBookArgs {
     /// Desired buyer ticks for the executable row filter.
     #[arg(long, default_value_t = 8)]
     pub(crate) ticks: u128,
-    /// Buyer price ceiling used by `dexdo buyer --max-price-per-tick`.
-    #[arg(long, default_value_t = 1_000_000)]
+    /// Buyer price ceiling in raw ECC[2] used by `dexdo buyer --max-price-per-tick`.
+    #[arg(long, default_value_t = PRICE_STEP)]
     pub(crate) max_price_per_tick: u128,
     /// Deployed-contracts manifest.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
@@ -861,6 +892,11 @@ pub(crate) enum SubscriptionCommand {
         /// Resting subscription order id.
         order_id: u128,
     },
+    /// Apply an already-expired subscription cycle and print the resulting on-chain state.
+    Poke {
+        /// Resting subscription order id.
+        order_id: u128,
+    },
 }
 
 #[derive(Args)]
@@ -874,7 +910,8 @@ pub(crate) struct SubscriptionPlaceArgs {
     /// Actor PrivateNote owner key. May be passed before `place` or here after `place`.
     #[arg(long)]
     pub(crate) note_key: Option<PathBuf>,
-    /// Per-tick price ceiling. Required because this command moves SHELL.
+    /// Per-tick ceiling in raw ECC[2]; must be a positive multiple of PRICE_STEP(1 SHELL).
+    /// Required because this command moves SHELL.
     #[arg(long)]
     pub(crate) max_price_per_tick: u128,
     /// Desired subscription ticks. Mutually exclusive with --budget.
@@ -1022,10 +1059,8 @@ pub(crate) enum NoteCommand {
     Recover(NoteRecoverArgs),
     /// Withdraw: submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's
     /// available token balances. This is not a claim that every native/ECC balance is fully retired without
-    /// by-fact evidence on the current contract. Fails on-chain if the note is stream-locked.
+    /// by-fact evidence on the current contract.
     Withdraw(NoteWithdrawArgs),
-    /// Read active stream/dispute locks, their deal addresses, and the force-clear deadline.
-    StreamLocks(NoteStreamLocksArgs),
 }
 
 /// Args for `dexdo note balance`: read-only PrivateNote balance by address.
@@ -1052,17 +1087,6 @@ pub(crate) struct NoteWithdrawArgs {
     #[arg(long)]
     pub(crate) to: String,
     /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
-    pub(crate) contracts: PathBuf,
-}
-
-/// Args for `dexdo note stream-locks`: read-only PrivateNote lock diagnostics.
-#[derive(Args)]
-pub(crate) struct NoteStreamLocksArgs {
-    /// PrivateNote address to inspect, `0:<64 hex>`.
-    #[arg(long)]
-    pub(crate) note_addr: String,
-    /// Deployed-contracts manifest.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
 }
@@ -1156,6 +1180,10 @@ pub(crate) enum OracleCommand {
     State(OracleStateArgs),
     /// Resolve a range PMP: OracleEventList.resolveRange -> OB requestWeeklyMedian -> OEL onWeeklyMedian -> PMP submitResolve.
     Resolve(OracleResolveArgs),
+    /// Cast this oracle's normal cancellation vote for the manifest PMP.
+    Cancel(OracleResolveArgs),
+    /// Delete the manifest event after its real deadline and after all PMP confirmations are released.
+    Delete(OracleResolveArgs),
 }
 
 #[derive(Args)]

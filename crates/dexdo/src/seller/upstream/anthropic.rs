@@ -27,11 +27,13 @@ impl AnthropicConfig {
             .contains("api.anthropic.com")
     }
 
-    pub fn from_model(model: &ModelConfig) -> Self {
+    pub fn from_model(model: &ModelConfig, registry_frame_model: Option<&str>) -> Self {
         Self {
             base_url: model.base_url.clone(),
             model: model.served_model.clone(),
-            frame_model: model.frame_model.clone(),
+            frame_model: registry_frame_model
+                .unwrap_or(&model.frame_model)
+                .to_string(),
             api_key_env: model.api_key_env.clone(),
             tokenizer_family: model.tokenizer_family.clone(),
         }

@@ -19,6 +19,7 @@ sha2.workspace = true
 hkdf = "0.12"
 rand.workspace = true
 tokio = { workspace = true }
+zeroize.workspace = true
 # real shellnet backend on top of the gosh.ackinacki SDK. Optional behind the
 # `shellnet` feature -- mock mode(directives 1/3) builds by default without the heavy TVM dependency.
 # Cross-platform(D6): the previous Windows blocker (tvm-sdk carried a test file with ':' in its path,

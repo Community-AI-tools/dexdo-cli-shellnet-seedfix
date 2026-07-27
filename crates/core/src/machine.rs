@@ -18,7 +18,7 @@ pub struct Tick {
 /// Stream state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamState {
-    /// The seller posts the endpoint; the probe tick is frozen + `SELLER_PROBE_COMMISSION`.
+    /// The seller posts the endpoint; the probe tick is frozen and the seller's exact `2P` bond is held.
     Opening,
     /// Probe tick: frozen, NOT prepaid. Stop -> `BurnBoth`.
     Probe { tick: Tick },
@@ -30,7 +30,7 @@ pub enum StreamState {
     },
     /// The buyer issued STOP -> amicable split.
     Stopping,
-    /// Dispute: both notes are locked.
+    /// Dispute: this TC's contested buyer amount and seller bond are frozen.
     Disputed,
     /// Self-destruction of `token_contract`.
     Closed,
@@ -39,7 +39,7 @@ pub enum StreamState {
 /// Settlement on completion/stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
-    /// Stop on the probe: the buyer's probe tick + the seller's commission are burned.
+    /// Stop on the probe: buyer and seller each burn `P`; the seller's remaining bond `P` is refunded.
     BurnBoth(ProbeBurn),
     /// Amicable split after the probe is accepted: the delivered tick -> to the seller,
     /// the frozen buffer -> to the buyer.
@@ -47,15 +47,15 @@ pub enum Settlement {
         /// Ticks sent to the seller(prepaid/delivered).
         to_seller_ticks: u64,
         /// Tick refunded to the buyer(the thawed buffer).
-        to_buyer_refund: Shell,
+        to_buyer_refund: u128,
     },
     /// The seller is gone(no-show on the probe / timeout): the buyer takes the frozen tick,
-    /// nothing went to the seller, the seller's commission is returned to them -- NOT burned.
+    /// nothing went to the seller, and the seller's bond is returned -- NOT burned.
     SellerNoShow {
         /// Refund to the buyer(the frozen/probe tick).
-        to_buyer_refund: Shell,
-        /// Return of the seller's probe commission(not burned on a no-show).
-        seller_commission_returned: Shell,
+        to_buyer_refund: u128,
+        /// Return of the seller's bond(not burned on a no-show).
+        seller_bond_returned: u128,
     },
 }
 
@@ -69,19 +69,20 @@ pub struct InvariantError(pub &'static str);
 pub struct StreamMachine {
     state: StreamState,
     price: Shell,
-    probe_commission: Shell,
+    /// Seller mirror bond `2P`, locked from `open()` until a terminal state.
+    seller_bond: u128,
 }
 
 impl StreamMachine {
-    /// Open a stream: the seller froze the probe tick and posted `SELLER_PROBE_COMMISSION`.
+    /// Open a stream: the seller froze the probe tick and posted the `2P` mirror bond.
     /// Transition `Opening` -> `Probe`.
-    pub fn open(price: Shell, params: &DobParams) -> Self {
+    pub fn open(price: Shell, _params: &DobParams) -> Self {
         Self {
             state: StreamState::Probe {
                 tick: Tick { index: 0, price },
             },
             price,
-            probe_commission: params.seller_probe_commission,
+            seller_bond: u128::from(price) * 2,
         }
     }
 
@@ -96,7 +97,8 @@ impl StreamMachine {
     }
 
     /// The probe is accepted: the probe tick goes to
-    /// the seller, the commission is returned, the two-tick invariant kicks in. `Probe` -> `Streaming`.
+    /// the seller, the `2P` bond remains held by this TC, and the two-tick invariant kicks in.
+    /// `Probe` -> `Streaming`.
     pub fn on_probe_accepted(&mut self) -> Result<(), InvariantError> {
         match &self.state {
             StreamState::Probe { tick } => {
@@ -148,15 +150,15 @@ impl StreamMachine {
     pub fn buyer_stop(&mut self) -> Settlement {
         let settlement = match &self.state {
             StreamState::Probe { .. } => {
-                // the buyer's probe tick + the seller's commission are burned, to no one.
-                Settlement::BurnBoth(probe_burn(self.price, self.probe_commission))
+                // burn the buyer's probe tick P + a mirror P from the seller bond.
+                Settlement::BurnBoth(probe_burn(self.price))
             }
             StreamState::Streaming { prepaid, .. } => {
                 // the delivered/prepaid tick -> to the seller, the frozen buffer -> to the buyer.
                 let _ = prepaid;
                 Settlement::AmicableSplit {
                     to_seller_ticks: 1,
-                    to_buyer_refund: self.price,
+                    to_buyer_refund: u128::from(self.price),
                 }
             }
             // A stop from other states is treated as an amicable split with no delivered ticks.
@@ -170,27 +172,28 @@ impl StreamMachine {
     }
 
     /// The seller is gone: no-show on the probe or an inactivity timeout `STREAM_TIMEOUT`.
-    /// The buyer takes the frozen tick, pays zero; the seller's commission is returned. NOT burned.
+    /// The buyer takes the frozen tick, pays zero; the seller's full bond is returned. NOT burned.
     pub fn seller_timeout(&mut self) -> Settlement {
         let settlement = match &self.state {
+            // No-show is not slashed: the full 2P bond is returned to the seller.
             StreamState::Probe { tick } => Settlement::SellerNoShow {
-                to_buyer_refund: tick.price,
-                seller_commission_returned: self.probe_commission,
+                to_buyer_refund: u128::from(tick.price),
+                seller_bond_returned: self.seller_bond,
             },
             StreamState::Streaming { frozen, .. } => Settlement::SellerNoShow {
-                to_buyer_refund: frozen.price,
-                seller_commission_returned: 0,
+                to_buyer_refund: u128::from(frozen.price),
+                seller_bond_returned: self.seller_bond,
             },
             _ => Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             },
         };
         self.state = StreamState::Closed;
         settlement
     }
 
-    /// The buyer opened a dispute: both notes are locked.
+    /// The buyer opened a dispute: this TC freezes the contested amount and seller bond.
     pub fn buyer_dispute(&mut self) {
         self.state = StreamState::Disputed;
     }
@@ -202,16 +205,16 @@ impl StreamMachine {
 
     /// The buyer's maximum loss in the current state:
     /// `<= 2*P` in `Streaming`(prepaid + frozen), `<= 1*P` on the probe.
-    pub fn max_buyer_loss(&self) -> Shell {
+    pub fn max_buyer_loss(&self) -> u128 {
         match &self.state {
             StreamState::Opening => 0,
             // On the probe the risk is exactly 1 tick(the probe tick may burn on a stop).
-            StreamState::Probe { tick } => tick.price,
+            StreamState::Probe { tick } => u128::from(tick.price),
             // Two ticks: prepaid ahead + frozen.
             StreamState::Streaming {
                 prepaid, frozen, ..
-            } => prepaid.price + frozen.price,
-            StreamState::Stopping | StreamState::Disputed => self.price,
+            } => u128::from(prepaid.price) + u128::from(frozen.price),
+            StreamState::Stopping | StreamState::Disputed => u128::from(self.price),
             StreamState::Closed => 0,
         }
     }
@@ -221,7 +224,7 @@ impl StreamMachine {
         match &self.state {
             StreamState::Probe { .. } => {
                 // On the probe there is no prepayment ahead; risk <= 1*P.
-                if self.max_buyer_loss() > self.price {
+                if self.max_buyer_loss() > u128::from(self.price) {
                     return Err(InvariantError("probe risk exceeds 1*P"));
                 }
             }
@@ -237,7 +240,7 @@ impl StreamMachine {
                 if prepaid.index != *finalized_up_to + 1 {
                     return Err(InvariantError("prepaid must immediately follow finalized"));
                 }
-                if self.max_buyer_loss() > 2 * self.price {
+                if self.max_buyer_loss() > u128::from(self.price) * 2 {
                     return Err(InvariantError("buyer loss exceeds 2*P"));
                 }
             }
@@ -298,7 +301,10 @@ mod tests {
         match s {
             Settlement::BurnBoth(b) => {
                 assert_eq!(b.buyer, 1000);
-                assert_eq!(b.seller, params().seller_probe_commission);
+                assert_eq!(b.buyer_refund, 0);
+                assert_eq!(b.seller, 1000); // mirror P from the 2P bond
+                assert_eq!(b.seller_refund, 1000);
+                assert_eq!(b.seller + b.seller_refund, 2000);
             }
             _ => panic!("expected BurnBoth"),
         }
@@ -326,7 +332,27 @@ mod tests {
             s,
             Settlement::SellerNoShow {
                 to_buyer_refund: 1000,
-                seller_commission_returned: params().seller_probe_commission,
+                seller_bond_returned: 2000, // full 2P bond returned on a no-show
+            }
+        );
+    }
+
+    #[test]
+    fn high_valid_price_preserves_exact_two_p_bond_and_two_tick_loss() {
+        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
+        let price = u64::MAX - (u64::MAX % step);
+        assert!(price > u64::MAX / 2);
+
+        let mut streaming = StreamMachine::open(price, &params());
+        streaming.on_probe_accepted().unwrap();
+        assert_eq!(streaming.max_buyer_loss(), u128::from(price) * 2);
+
+        let mut timed_out = StreamMachine::open(price, &params());
+        assert_eq!(
+            timed_out.seller_timeout(),
+            Settlement::SellerNoShow {
+                to_buyer_refund: u128::from(price),
+                seller_bond_returned: u128::from(price) * 2,
             }
         );
     }

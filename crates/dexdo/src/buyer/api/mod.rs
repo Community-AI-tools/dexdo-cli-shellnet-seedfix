@@ -936,7 +936,7 @@ impl SessionSettle {
                     policy_action = action,
                     token_contract = %self.token_contract,
                     settlement = ?s,
-                    "consumer API: selected policy action opened DISPUTE; the buyer note is locked until resolution"
+                    "consumer API: selected policy action opened DISPUTE; this deal's contested funds are frozen until resolution"
                 );
                 true
             }
@@ -955,7 +955,7 @@ impl SessionSettle {
     }
 
     /// Apply the explicit `bad_output_scam` policy on a verification bail. `dispute` uses the
-    /// existing streamDispute lever and warns about the note lock. `stop_and_blacklist` is not silently
+    /// existing streamDispute lever and reports the per-deal freeze. `stop_and_blacklist` is not silently
     /// degraded in the consumer API surface because this surface has no seller-id blacklist store.
     pub async fn settle_verification_bail(&self, reason: &str) -> bool {
         let _guard = self.settle_lock.lock().await;
@@ -1007,7 +1007,7 @@ impl SessionSettle {
                         policy_action = action.as_str(),
                         token_contract = %self.token_contract,
                         settlement = ?s,
-                        "consumer API: verification bail opened DISPUTE; the buyer note is locked until resolution"
+                        "consumer API: verification bail opened DISPUTE; this deal's contested funds are frozen until resolution"
                     );
                     true
                 }
@@ -1740,7 +1740,7 @@ mod tests {
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 
@@ -1758,7 +1758,7 @@ mod tests {
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 
@@ -1778,7 +1778,7 @@ mod tests {
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 
@@ -1798,7 +1798,7 @@ mod tests {
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 

@@ -73,13 +73,13 @@ impl Default for OpenAiConfig {
 
 impl OpenAiConfig {
     /// Build from a model config entry -- the operational CLI path(`--model`).
-    pub fn from_model(m: &ModelConfig) -> Self {
+    pub fn from_model(m: &ModelConfig, registry_frame_model: Option<&str>) -> Self {
         Self {
             base_url: m.base_url.clone(),
             model: m.served_model.clone(),
             // The on-wire declared model is the CANONICAL frame(what the buyer paid for / verifies against),
             // not the upstream served slug -- else the buyer's check false-trips a substitution.
-            frame_model: m.frame_model.clone(),
+            frame_model: registry_frame_model.unwrap_or(&m.frame_model).to_string(),
             // Production path: honest declaration(`claimed_model == frame_model`). The override is test-only.
             claimed_model_override: None,
             api_key_env: m.api_key_env.clone(),
@@ -306,9 +306,7 @@ async fn stream_upstream(
         .map_err(|e| Status::unavailable(format!("upstream connect failed: {e}")))?;
 
     if !resp.status().is_success() {
-        let code = resp.status();
-        // The body may carry an upstream error detail, but not our key -- safe to surface the code.
-        return Err(Status::unavailable(format!("upstream HTTP {code}")));
+        return Err(upstream_http_error(resp, key, req).await);
     }
 
     // Incremental SSE parsing over the body's byte stream(R6): accumulate a buffer, split on
@@ -374,6 +372,204 @@ async fn stream_upstream(
         }
     }
     Ok(())
+}
+
+/// Provider errors are untrusted and may echo credentials or request fields. Read only a small
+/// prefix and surface either a known JSON error field or a compact text response.
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 4096;
+const MAX_UPSTREAM_ERROR_DETAIL_BYTES: usize = 1024;
+const TRUNCATED_DETAIL_SUFFIX: &str = "... [truncated]";
+
+async fn upstream_http_error(resp: reqwest::Response, key: &str, request: &CanonRequest) -> Status {
+    use futures::StreamExt;
+
+    let code = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !is_text_error_body(&content_type) {
+        return Status::unavailable(format!(
+            "upstream HTTP {code}: non-text response body omitted"
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(item) = stream.next().await {
+        let bytes = match item {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Status::unavailable(format!(
+                    "upstream HTTP {code}: provider error body unreadable"
+                ));
+            }
+        };
+        let remaining = MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if bytes.len() > remaining {
+            body.extend_from_slice(&bytes[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&bytes);
+    }
+
+    let Some(detail) = safe_error_detail(&body, &content_type, key, request, truncated) else {
+        return Status::unavailable(format!("upstream HTTP {code}"));
+    };
+    Status::unavailable(format!("upstream HTTP {code}: {detail}"))
+}
+
+fn is_text_error_body(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type.is_empty()
+        || media_type.starts_with("text/")
+        || media_type == "application/json"
+        || media_type.ends_with("+json")
+}
+
+fn safe_error_detail(
+    body: &[u8],
+    content_type: &str,
+    key: &str,
+    request: &CanonRequest,
+    body_truncated: bool,
+) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if body_truncated {
+        return Some(bound_error_detail(
+            "provider error body omitted".to_string(),
+            true,
+        ));
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Some("non-text response body omitted".to_string());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let detail = if media_type.ends_with("json")
+        || (media_type.is_empty() && (text.starts_with('{') || text.starts_with('[')))
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return Some("malformed provider error body omitted".to_string());
+        };
+        json_error_detail(&value).unwrap_or_else(|| "provider error body omitted".to_string())
+    } else {
+        text.to_string()
+    };
+
+    Some(bound_error_detail(
+        sanitize_error_detail(&detail, key, request),
+        body_truncated,
+    ))
+}
+
+fn json_error_detail(value: &serde_json::Value) -> Option<String> {
+    let error = value.get("error").unwrap_or(value);
+    if let Some(detail) = error.as_str() {
+        return Some(detail.to_string());
+    }
+    ["message", "detail", "code", "type"]
+        .into_iter()
+        .find_map(|field| error.get(field).and_then(|value| value.as_str()))
+        .map(ToString::to_string)
+}
+
+fn sanitize_error_detail(detail: &str, key: &str, request: &CanonRequest) -> String {
+    const PARTIAL_ECHO_PREFIX_CHARS: usize = 32;
+
+    fn compact_text(text: &str) -> String {
+        text.chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn echoes_request_value(detail: &str, value: &str) -> bool {
+        let value = compact_text(value);
+        let prefix = value
+            .chars()
+            .take(PARTIAL_ECHO_PREFIX_CHARS)
+            .collect::<String>();
+        !value.is_empty()
+            && (detail.contains(&value)
+                || value.contains(detail)
+                || (prefix != value && detail.contains(&prefix)))
+    }
+
+    let compact = compact_text(detail);
+    let lower = compact.to_ascii_lowercase();
+    const SENSITIVE_MARKERS: &[&str] = &[
+        "authorization",
+        "bearer ",
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "access-token",
+        "client_secret",
+        "private_key",
+        "password",
+        "secret",
+        "gsk_",
+        "sk-",
+    ];
+    let echoes_request_secret = request
+        .messages
+        .iter()
+        .any(|message| echoes_request_value(&compact, &message.content))
+        || request.params.as_ref().is_some_and(|params| {
+            params
+                .stop
+                .iter()
+                .any(|stop| echoes_request_value(&compact, stop))
+        });
+    if echoes_request_secret
+        || (!key.is_empty() && compact.contains(key))
+        || SENSITIVE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+    {
+        return "sensitive provider error detail redacted".to_string();
+    }
+
+    compact
+}
+
+fn bound_error_detail(mut detail: String, body_truncated: bool) -> String {
+    let truncated = body_truncated || detail.len() > MAX_UPSTREAM_ERROR_DETAIL_BYTES;
+    if !truncated {
+        return detail;
+    }
+    let limit = MAX_UPSTREAM_ERROR_DETAIL_BYTES - TRUNCATED_DETAIL_SUFFIX.len();
+    let mut end = detail.len().min(limit);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
+    detail.push_str(TRUNCATED_DETAIL_SUFFIX);
+    detail
 }
 
 /// Cap on an unfinished SSE frame(Y3): a hostile/broken upstream sending bytes without
@@ -491,6 +687,258 @@ fn collect_reasoning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn error_response(
+        status: reqwest::StatusCode,
+        content_type: Option<&str>,
+        body: impl Into<Vec<u8>>,
+    ) -> reqwest::Response {
+        let mut response = http::Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            response = response.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        response
+            .body(body.into())
+            .expect("build error response")
+            .into()
+    }
+
+    async fn error_message(
+        status: reqwest::StatusCode,
+        content_type: Option<&str>,
+        body: impl Into<Vec<u8>>,
+        key: &str,
+    ) -> String {
+        error_message_for_request(
+            status,
+            content_type,
+            body,
+            key,
+            &CanonRequest {
+                messages: vec![],
+                params: None,
+            },
+        )
+        .await
+    }
+
+    async fn error_message_for_request(
+        status: reqwest::StatusCode,
+        content_type: Option<&str>,
+        body: impl Into<Vec<u8>>,
+        key: &str,
+        request: &CanonRequest,
+    ) -> String {
+        upstream_http_error(error_response(status, content_type, body), key, request)
+            .await
+            .message()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn surfaces_http_400_json_error_detail() {
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("application/json"),
+            br#"{"error":{"message":"logprobs are not supported for this model","type":"invalid_request_error"}}"#,
+            "unused-key",
+        )
+        .await;
+        assert_eq!(
+            message,
+            "upstream HTTP 400 Bad Request: logprobs are not supported for this model"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_http_400_text_error_detail() {
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("text/plain; charset=utf-8"),
+            " invalid request\n  detail ",
+            "unused-key",
+        )
+        .await;
+        assert_eq!(
+            message,
+            "upstream HTTP 400 Bad Request: invalid request detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_http_404_status_and_detail() {
+        let message = error_message(
+            reqwest::StatusCode::NOT_FOUND,
+            Some("application/problem+json"),
+            br#"{"error":{"message":"model not found"}}"#,
+            "unused-key",
+        )
+        .await;
+        assert_eq!(message, "upstream HTTP 404 Not Found: model not found");
+    }
+
+    #[tokio::test]
+    async fn empty_error_body_keeps_status_only() {
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("text/plain"),
+            "",
+            "unused-key",
+        )
+        .await;
+        assert_eq!(message, "upstream HTTP 400 Bad Request");
+    }
+
+    #[tokio::test]
+    async fn malformed_error_body_is_not_echoed() {
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("application/json"),
+            br#"{"error":{"message":"unterminated""#,
+            "unused-key",
+        )
+        .await;
+        assert_eq!(
+            message,
+            "upstream HTTP 400 Bad Request: malformed provider error body omitted"
+        );
+        assert!(!message.contains("unterminated"));
+    }
+
+    #[tokio::test]
+    async fn oversized_error_body_is_truncated() {
+        let body = format!(
+            "{}must-not-appear",
+            "x".repeat(MAX_UPSTREAM_ERROR_BODY_BYTES + 256)
+        );
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("text/plain"),
+            body,
+            "unused-key",
+        )
+        .await;
+        assert!(message.ends_with(TRUNCATED_DETAIL_SUFFIX), "{message}");
+        assert!(!message.contains("must-not-appear"), "{message}");
+        assert!(
+            message.len()
+                <= "upstream HTTP 400 Bad Request: ".len() + MAX_UPSTREAM_ERROR_DETAIL_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn error_detail_redacts_keys_authorization_and_bearer_credentials() {
+        const KEY: &str = "gsk_live_GROQ_API_KEY_value";
+        for body in [
+            format!(r#"{{"error":{{"message":"provider echoed {KEY}"}}}}"#),
+            r#"{"error":{"message":"Authorization: basic-credential"}}"#.to_string(),
+            r#"{"error":{"message":"Bearer bearer-credential"}}"#.to_string(),
+            r#"{"error":{"message":"api_key=other-provider-key"}}"#.to_string(),
+        ] {
+            let message = error_message(
+                reqwest::StatusCode::BAD_REQUEST,
+                Some("application/json"),
+                body,
+                KEY,
+            )
+            .await;
+            assert!(
+                message.ends_with("sensitive provider error detail redacted"),
+                "{message}"
+            );
+            for secret in [
+                KEY,
+                "basic-credential",
+                "bearer-credential",
+                "other-provider-key",
+            ] {
+                assert!(!message.contains(secret), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_and_partial_request_message_echoes_are_redacted() {
+        let request_secret = "A".repeat(MAX_UPSTREAM_ERROR_BODY_BYTES + 512);
+        let request = CanonRequest {
+            messages: vec![dexdo_proto::ChatMessage {
+                role: "user".to_string(),
+                content: request_secret.clone(),
+            }],
+            params: None,
+        };
+        let truncated = error_message_for_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("text/plain"),
+            request_secret.clone(),
+            "unused-key",
+            &request,
+        )
+        .await;
+        assert_eq!(
+            truncated,
+            "upstream HTTP 400 Bad Request: provider error body omitted... [truncated]"
+        );
+        assert!(!truncated.contains("AAAAAAAA"), "{truncated}");
+
+        let partial = request_secret[..64].to_string();
+        let message = error_message_for_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("text/plain"),
+            format!("provider echoed {partial}"),
+            "unused-key",
+            &request,
+        )
+        .await;
+        assert!(
+            message.ends_with("sensitive provider error detail redacted"),
+            "{message}"
+        );
+        assert!(!message.contains(&partial), "{message}");
+    }
+
+    #[tokio::test]
+    async fn stop_sequence_echo_is_redacted() {
+        const STOP: &str = "STOP-PRIVATE-VALUE-4c9";
+        let request = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.0,
+                max_tokens: 0,
+                stop: vec![STOP.to_string()],
+                greedy: false,
+            }),
+        };
+        let message = error_message_for_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("application/json"),
+            format!(r#"{{"error":{{"message":"provider rejected stop {STOP}"}}}}"#),
+            "unused-key",
+            &request,
+        )
+        .await;
+        assert!(
+            message.ends_with("sensitive provider error detail redacted"),
+            "{message}"
+        );
+        assert!(!message.contains(STOP), "{message}");
+    }
+
+    #[tokio::test]
+    async fn non_text_error_body_is_omitted() {
+        let message = error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("application/octet-stream"),
+            b"\0\xffGROQ_API_KEY_VALUE".to_vec(),
+            "GROQ_API_KEY_VALUE",
+        )
+        .await;
+        assert_eq!(
+            message,
+            "upstream HTTP 400 Bad Request: non-text response body omitted"
+        );
+        assert!(!message.contains("GROQ_API_KEY_VALUE"));
+    }
 
     #[test]
     fn parses_delta_done_and_other() {

@@ -34,7 +34,7 @@ const SELLER_OPEN_STATE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 pub struct SellerConfig {
     /// Contract -- the deal's handover point.
     pub token_contract: TokenContract,
-    /// Tick price `P` in SHELL.
+    /// Tick price `P` in raw ECC[2] units.
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,
@@ -404,7 +404,7 @@ pub async fn prepare_seller_offer(
 /// Open the stream for a match:
 /// 1. reads the match(the buyer's pubkey is recorded in the contract);
 /// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
-/// `SELLER_PROBE_COMMISSION` + writing the enc-endpoint into the endpoints file);
+/// exact `2P` seller bond + writing the enc-endpoint into the endpoints file);
 /// 3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
 pub async fn serve_match(
     seller: &RunningSeller,
@@ -575,8 +575,8 @@ pub async fn watch_and_serve_match(
 mod tests {
     use super::*;
     use dexdo_core::{
-        ChainError, DealChainState, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement,
-        StreamSnapshot,
+        validate_seller_resume_state, ChainError, DealChainState, LocalNote, NotePubkey,
+        OfferListing, SellOffer, Settlement, StreamSnapshot,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -762,6 +762,8 @@ mod tests {
         poll_calls: AtomicU64,
         poll_failures_remaining: AtomicU64,
         open_calls: AtomicU64,
+        startup_failure: Option<String>,
+        resume_facts: Option<(serde_json::Value, u64)>,
     }
 
     impl StartupBackend {
@@ -776,6 +778,8 @@ mod tests {
                 poll_calls: AtomicU64::new(0),
                 poll_failures_remaining: AtomicU64::new(0),
                 open_calls: AtomicU64::new(0),
+                startup_failure: None,
+                resume_facts: None,
             }
         }
 
@@ -790,11 +794,23 @@ mod tests {
                 poll_calls: AtomicU64::new(0),
                 poll_failures_remaining: AtomicU64::new(0),
                 open_calls: AtomicU64::new(0),
+                startup_failure: None,
+                resume_facts: None,
             }
         }
 
         fn with_poll_failures(mut self, failures: u64) -> Self {
             self.poll_failures_remaining = AtomicU64::new(failures);
+            self
+        }
+
+        fn with_startup_failure(mut self, failure: impl Into<String>) -> Self {
+            self.startup_failure = Some(failure.into());
+            self
+        }
+
+        fn with_resume_facts(mut self, state: serde_json::Value, price_per_tick: u64) -> Self {
+            self.resume_facts = Some((state, price_per_tick));
             self
         }
     }
@@ -840,8 +856,14 @@ mod tests {
 
         async fn read_openable_match_now(
             &self,
-            _: &TokenContract,
+            token_contract: &TokenContract,
         ) -> Result<Option<Match>, ChainError> {
+            if let Some(failure) = &self.startup_failure {
+                return Err(ChainError::Chain(failure.clone()));
+            }
+            if let Some((state, price_per_tick)) = &self.resume_facts {
+                validate_seller_resume_state(token_contract, state, *price_per_tick)?;
+            }
             Ok(self.startup_match.clone())
         }
 
@@ -1103,7 +1125,20 @@ mod tests {
         let buyer = LocalNote::generate();
         let matched = sample_match(&tc, buyer.pubkey());
         let backend =
-            StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched);
+            StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
+                .with_resume_facts(
+                    serde_json::json!({
+                        "funded": true,
+                        "opened": false,
+                        "probeAccepted": false,
+                        "disputed": false,
+                        "deposit": "1000",
+                        "prepaid": "0",
+                        "frozen": "0",
+                        "finalizedOwed": "0"
+                    }),
+                    1000,
+                );
 
         let (startup, seller, _) =
             prepare_start_gateway_and_watch(&backend, &cfg, &owner, "funded-resume").await;
@@ -1114,6 +1149,115 @@ mod tests {
         assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
         assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
         seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_zero_deposit_match_fails_startup_before_post_or_open() {
+        for price_per_tick in [1, 2] {
+            let tc = chain_address(char::from_digit(price_per_tick, 10).unwrap());
+            let owner = chain_address('a');
+            let mut cfg = test_cfg(&tc);
+            cfg.price_per_tick = price_per_tick.into();
+            let buyer = LocalNote::generate();
+            let mut matched = sample_match(&tc, buyer.pubkey());
+            matched.price_per_tick = price_per_tick.into();
+            let backend =
+                StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
+                    .with_resume_facts(
+                        serde_json::json!({
+                            "funded": true,
+                            "opened": false,
+                            "probeAccepted": false,
+                            "disputed": false,
+                            "deposit": "0",
+                            "prepaid": "0",
+                            "frozen": "0",
+                            "finalizedOwed": "0"
+                        }),
+                        price_per_tick.into(),
+                    );
+            let note = LocalNote::generate();
+
+            let error = prepare_seller_offer(&note, &backend, &cfg, Some(&owner))
+                .await
+                .expect_err("terminal zero-deposit TC must fail startup");
+            let error = error.to_string();
+
+            assert!(error.contains(&tc), "{error}");
+            assert!(error.contains("deposit=0"), "{error}");
+            assert!(
+                error.contains(&format!("price_per_tick={price_per_tick}")),
+                "{error}"
+            );
+            assert!(error.contains("cannot be opened"), "{error}");
+            assert!(error.contains("fresh --nonce"), "{error}");
+            assert!(error.contains("close/destroy"), "{error}");
+            assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.open_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 0);
+        }
+
+        let tc = chain_address('3');
+        let owner = chain_address('b');
+        let mut cfg = test_cfg(&tc);
+        cfg.price_per_tick = 1;
+        let buyer = LocalNote::generate();
+        let mut matched = sample_match(&tc, buyer.pubkey());
+        matched.price_per_tick = 2;
+        let backend =
+            StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
+                .with_resume_facts(
+                    serde_json::json!({
+                        "funded": true,
+                        "opened": false,
+                        "probeAccepted": false,
+                        "disputed": false,
+                        "deposit": "1",
+                        "prepaid": "0",
+                        "frozen": "0",
+                        "finalizedOwed": "0"
+                    }),
+                    2,
+                );
+        let note = LocalNote::generate();
+
+        let error = prepare_seller_offer(&note, &backend, &cfg, Some(&owner))
+            .await
+            .expect_err("authoritative price must override the lower local config price")
+            .to_string();
+
+        assert!(error.contains("deposit=1"), "{error}");
+        assert!(error.contains("price_per_tick=2"), "{error}");
+        assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.open_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn seller_resume_state_and_terms_read_failures_make_no_writes() {
+        for failure in [
+            "TokenContract getState read failed",
+            "TokenContract getDeal unavailable after match",
+        ] {
+            let tc = chain_address('b');
+            let owner = chain_address('c');
+            let cfg = test_cfg(&tc);
+            let backend = StartupBackend::without_match(RawStartupRead::ChainFailure)
+                .with_startup_failure(failure);
+            let note = LocalNote::generate();
+
+            let error = prepare_seller_offer(&note, &backend, &cfg, Some(&owner))
+                .await
+                .expect_err("resume preflight read failure must fail closed");
+
+            assert!(error.to_string().contains(failure), "{error}");
+            assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.open_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]

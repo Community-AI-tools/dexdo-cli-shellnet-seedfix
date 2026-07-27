@@ -365,7 +365,8 @@ mod tests {
                 "ticks": ticks.to_string(),
                 "note": NOTE,
                 "tokenContract": token_contract,
-                "deadline": "1900000000"
+                "deadline": "1900000000",
+                "flags": 0
             }),
         )
     }
@@ -502,6 +503,7 @@ mod tests {
                 ("note".into(), "address".into()),
                 ("tokenContract".into(), "address".into()),
                 ("deadline".into(), "uint64".into()),
+                ("flags".into(), "uint8".into()),
             ]
         );
         assert_eq!(

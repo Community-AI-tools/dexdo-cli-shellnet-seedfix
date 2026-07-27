@@ -269,9 +269,14 @@ pub fn aggregate_tree(snaps: Vec<NoteSnapshot>) -> TreeSnapshot {
 /// stream never opened.
 fn finalized_ticks(snapshot: Option<&StreamSnapshot>, price_per_tick: Shell) -> u64 {
     match snapshot {
-        Some(s) if price_per_tick > 0 => s.seller_received / price_per_tick,
+        Some(s) if price_per_tick > 0 => summary_shell(s.seller_received) / price_per_tick,
         _ => 0,
     }
+}
+
+/// Keep the existing `u64` saturation boundary for cross-deal monitor summaries.
+fn summary_shell(amount: u128) -> Shell {
+    Shell::try_from(amount).unwrap_or(Shell::MAX)
 }
 
 /// By-fact accounting view for one role, broken down by served model and counterparty. The
@@ -290,7 +295,11 @@ pub fn per_model_breakdown(deals: &[DealView], role: DealRole) -> Vec<ModelBreak
                     DealRole::Seller => s.seller_locked,
                     DealRole::Buyer => s.buyer_locked,
                 };
-                (s.seller_received, locked, s.burned)
+                (
+                    summary_shell(s.seller_received),
+                    summary_shell(locked),
+                    summary_shell(s.burned),
+                )
             }
             None => (0, 0, 0),
         };
@@ -349,7 +358,7 @@ pub fn deal_anomalies(deal: &DealView) -> Vec<DealAnomaly> {
     let Some(snap) = deal.snapshot.as_ref() else {
         return out;
     };
-    let locked = snap.seller_locked.saturating_add(snap.buyer_locked);
+    let locked = summary_shell(snap.seller_locked.saturating_add(snap.buyer_locked));
     if locked > 0 && deal.counterparty.is_none() {
         out.push(DealAnomaly::LockedNoMatch { locked });
     }
@@ -363,12 +372,13 @@ pub fn deal_anomalies(deal: &DealView) -> Vec<DealAnomaly> {
         // lock arithmetic). Saturates to `Shell::MAX` on absurd prices(then `buyer_lead` can't exceed it).
         let ceiling = required_escrow_for_buy(2, deal.price_per_tick as u128)
             .min(Shell::MAX as u128) as Shell;
+        let buyer_lead = summary_shell(snap.buyer_lead);
         // bound the at-risk LEAD(`prepaid + frozen`), NOT the total `buyer_locked` -- the unspent deposit
         // for a multi-tick deal's remaining ticks is not part of the two-tick lead, so checking the total
         // false-flagged every legitimate `maxTicks > 2` deal(e.g. an 8-tick lock of 8200 vs a 2050 ceiling).
-        if snap.buyer_lead > ceiling {
+        if buyer_lead > ceiling {
             out.push(DealAnomaly::BuyerLockExceedsTwoTicks {
-                buyer_lead: snap.buyer_lead,
+                buyer_lead,
                 ceiling,
             });
         }
@@ -461,7 +471,7 @@ fn check_buyer_owns(
 }
 
 /// `dexdo dispute` pre-flight -- the **pure** precondition behind the buyer-side on-chain dispute
-/// (`streamDispute` -> `TC.dispute()`, which LOCKS both notes,). Gates: the deal is OPEN, not already
+/// (`streamDispute` -> `TC.dispute()`, which freezes this TC's contested funds,). Gates: the deal is OPEN, not already
 /// disputed, and owned by THIS buyer note/key. Strictly stronger than `recover`'s STOP (which still pays for
 /// delivered ticks) -- the anti-scam lever for an observed substitution. Offline-regression-tested.
 pub fn check_disputable(
@@ -496,14 +506,22 @@ pub fn check_disputable(
 /// (`contracts/airegistry/modifiers/modifiers.sol::MATCH_OPEN_TIMEOUT`).
 pub const MATCH_OPEN_TIMEOUT_SECS: u64 = 600;
 
+/// The single contract write selected by a successful `dexdo reclaim` pre-flight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimAction {
+    StreamReclaim,
+    StreamCleanup,
+}
+
 /// `dexdo reclaim` pre-flight -- the pure timer gate behind the buyer-side timeout reclaim:
 /// `streamReclaim` for opened-abandoned deals, `streamCleanup` for funded-but-never-opened deals. Fails LOUD
 /// before sending rather than letting the contract revert:
 /// - not disputed, matched, owned by THIS buyer(else reject);
 /// - funded(else nothing to reclaim);
-/// - OPENED + `now >= last_advance + stream_timeout` -> Ok(the `streamReclaim` path, `TC.sol:597`);
+/// - OPENED + `now >= last_advance + stream_timeout` -> `StreamReclaim`(`TC.sol:597`);
 /// - OPENED but before the timeout -> reject(too early);
-/// - funded but never opened + `now >= funded_time + match_open_timeout` -> Ok(`streamCleanup` path);
+/// - funded, closed, and non-zero `last_advance` -> reject(the deal was previously opened);
+/// - funded but never opened + `now >= funded_time + match_open_timeout` -> `StreamCleanup`;
 /// - funded but never opened before `MATCH_OPEN_TIMEOUT` -> reject(too early).
 /// Times are seconds(client `SystemTime` vs on-chain `lastAdvance`/`fundedTime` + contract timeouts).
 /// Offline-regression-tested.
@@ -521,7 +539,7 @@ pub fn check_reclaimable(
     stream_timeout: Option<u64>,
     funded_time: Option<u64>,
     match_open_timeout: u64,
-) -> Result<(), String> {
+) -> Result<ReclaimAction, String> {
     if disputed {
         return Err("reclaim: deal is DISPUTED -- resolve via the dispute path (releaseDispute/arbitration), not reclaim".into());
     }
@@ -535,11 +553,16 @@ pub fn check_reclaimable(
     if !funded {
         return Err("reclaim: deal is not funded (not matched) -- nothing to reclaim".into());
     }
+    let funded_time = funded_time
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "reclaim: getState exposes no valid fundedTime".to_string())?;
     if !opened {
-        let funded_time = funded_time.ok_or_else(|| {
-            "reclaim: getState exposes no fundedTime; cannot preflight the never-opened MATCH_OPEN_TIMEOUT"
-                .to_string()
-        })?;
+        if last_advance != 0 {
+            return Err(format!(
+                "reclaim: deal is CLOSED but lastAdvance {last_advance} proves it was previously OPENED; \
+                 refusing streamCleanup before submit"
+            ));
+        }
         let deadline = funded_time.saturating_add(match_open_timeout);
         if now < deadline {
             return Err(format!(
@@ -549,7 +572,18 @@ pub fn check_reclaimable(
                 deadline.saturating_sub(now)
             ));
         }
-        return Ok(());
+        return Ok(ReclaimAction::StreamCleanup);
+    }
+    if last_advance == 0 {
+        return Err(
+            "reclaim: OPEN deal has no valid open-time lastAdvance; refusing to submit".into(),
+        );
+    }
+    if last_advance < funded_time {
+        return Err(format!(
+            "reclaim: contradictory timestamps: OPEN deal lastAdvance {last_advance} precedes fundedTime \
+             {funded_time}; refusing to submit"
+        ));
     }
     let stream_timeout = stream_timeout.ok_or_else(|| {
         "reclaim: getConfig exposes no streamTimeout; cannot preflight the OPEN deal timeout"
@@ -564,7 +598,7 @@ pub fn check_reclaimable(
             deadline.saturating_sub(now)
         ));
     }
-    Ok(())
+    Ok(ReclaimAction::StreamReclaim)
 }
 
 /// `dexdo release-dispute` pre-flight -- the seller can concede only an actually disputed deal.

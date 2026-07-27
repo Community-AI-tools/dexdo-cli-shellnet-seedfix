@@ -5,9 +5,10 @@ use crate::cli::args::*;
 use crate::cli::commands::{
     direct_chain_read_with_timeout, enforce_model_registry_policy, fold_snapshot_from_orders,
     load_enabled_model_registry_policy, model_target_from_config, print_book_table,
-    read_book_target, read_executable_book_target, resolve_order_book_target,
-    retry_executable_read, snapshot_with_executable_orders, target_from_market,
-    target_from_market_for_model, BookRow, BookTarget,
+    read_book_target, read_executable_book_target, registry_requested_model,
+    resolve_model_registry_target, resolve_order_book_target, retry_executable_read,
+    snapshot_with_executable_orders, target_from_market, target_from_market_for_model, BookRow,
+    BookTarget,
 };
 use crate::cli::commands::{mock_chain_for_machine, mock_orders_from_offers};
 use crate::cli::indexer::{self, DepthQuery, IndexerClient, MarketsQuery};
@@ -292,17 +293,47 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     // The book is keyed by the canonical model: derive it from `--note-addr` (any active note supplies the
     // book code), or read it from a provision manifest. `market.json` is the seller's artifact -- a buyer
     // normally passes only the model name + its own `--note-addr`.
-    let target = if let Some(market) = args.market.as_deref() {
+    let (requested_model, target) = if let Some(market) = args.market.as_deref() {
         if args.note_addr.is_some() {
             bail!("--market is mutually exclusive with --note-addr");
         }
-        target_from_market_for_model(market, &args.models, &args.model)?
+        if registry_policy.is_some() {
+            (
+                registry_requested_model(&args.models, &args.model)?,
+                target_from_market(market)?,
+            )
+        } else {
+            let target = target_from_market_for_model(market, &args.models, &args.model)?;
+            (target.frame_model.clone(), target)
+        }
+    } else if registry_policy.is_some() {
+        let requested_model = registry_requested_model(&args.models, &args.model)?;
+        (
+            requested_model.clone(),
+            BookTarget {
+                model_hash: model_hash_for(&requested_model),
+                frame_model: requested_model,
+                order_book: None,
+                root_model: None,
+                note_addr: args.note_addr.clone(),
+            },
+        )
     } else {
-        model_target_from_config(&args.models, &args.model, args.note_addr.clone()).map_err(|e| {
-            anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
-        })?
+        let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
+            .map_err(|e| {
+                anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
+            })?;
+        (target.frame_model.clone(), target)
     };
     let view = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        let target = resolve_model_registry_target(
+            RegistryRole::Buyer,
+            registry_policy.as_ref(),
+            &args.contracts,
+            &requested_model,
+            target,
+        )
+        .await?;
         let order_book = resolve_order_book_target(&chain, &target).await?;
         let view = read_executable_market_view(&chain, &target, &order_book).await?;
         if let Some(policy) = registry_policy.as_ref() {
@@ -434,18 +465,48 @@ pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> 
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
     )?;
-    let target = if let Some(market) = args.market.as_deref() {
+    let (requested_model, target) = if let Some(market) = args.market.as_deref() {
         if args.note_addr.is_some() {
             bail!("--market is mutually exclusive with --note-addr");
         }
-        target_from_market_for_model(market, &args.models, &args.model)?
+        if registry_policy.is_some() {
+            (
+                registry_requested_model(&args.models, &args.model)?,
+                target_from_market(market)?,
+            )
+        } else {
+            let target = target_from_market_for_model(market, &args.models, &args.model)?;
+            (target.frame_model.clone(), target)
+        }
+    } else if registry_policy.is_some() {
+        let requested_model = registry_requested_model(&args.models, &args.model)?;
+        (
+            requested_model.clone(),
+            BookTarget {
+                model_hash: model_hash_for(&requested_model),
+                frame_model: requested_model,
+                order_book: None,
+                root_model: None,
+                note_addr: args.note_addr.clone(),
+            },
+        )
     } else {
-        model_target_from_config(&args.models, &args.model, args.note_addr.clone()).map_err(|e| {
-            anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
-        })?
+        let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
+            .map_err(|e| {
+                anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
+            })?;
+        (target.frame_model.clone(), target)
     };
     let (snapshot, orders, empty_reason) =
         direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            let target = resolve_model_registry_target(
+                RegistryRole::Buyer,
+                registry_policy.as_ref(),
+                &args.contracts,
+                &requested_model,
+                target,
+            )
+            .await?;
             let snapshot = read_book_target(&chain, &target).await?;
             if let Some(policy) = registry_policy.as_ref() {
                 enforce_model_registry_policy(
@@ -504,21 +565,47 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
     )?;
-    let target = if let Some(market) = args.market.as_deref() {
+    let (requested_model, target) = if let Some(market) = args.market.as_deref() {
         if args.model.is_some() || args.note_addr.is_some() {
             bail!("--market is mutually exclusive with --model/--note-addr for quote");
         }
-        target_from_market(market)?
+        let target = target_from_market(market)?;
+        (target.frame_model.clone(), target)
+    } else if registry_policy.is_some() {
+        let model = args
+            .model
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("quote without --market requires --model"))?;
+        let requested_model = registry_requested_model(&args.models, model)?;
+        (
+            requested_model.clone(),
+            BookTarget {
+                model_hash: model_hash_for(&requested_model),
+                frame_model: requested_model,
+                order_book: None,
+                root_model: None,
+                note_addr: args.note_addr.clone(),
+            },
+        )
     } else {
-        model_target_from_config(
+        let target = model_target_from_config(
             &args.models,
             args.model
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("quote without --market requires --model"))?,
             args.note_addr.clone(),
-        )?
+        )?;
+        (target.frame_model.clone(), target)
     };
     let (view, q) = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        let target = resolve_model_registry_target(
+            RegistryRole::Buyer,
+            registry_policy.as_ref(),
+            &args.contracts,
+            &requested_model,
+            target,
+        )
+        .await?;
         let order_book = resolve_order_book_target(&chain, &target).await?;
         let view = read_executable_market_view(&chain, &target, &order_book).await?;
         if let Some(policy) = registry_policy.as_ref() {
@@ -679,6 +766,35 @@ pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn registry_getters_use_existing_read_timeout_scope() {
+        let source = include_str!("market_views.rs");
+        for function in [
+            "pub(crate) async fn run_market(args: MarketArgs)",
+            "pub(crate) async fn run_executable_book(args: ExecutableBookArgs)",
+            "pub(crate) async fn run_quote(args: QuoteArgs)",
+        ] {
+            let start = source.find(function).expect("shellnet command present");
+            let rest = &source[start..];
+            let end = rest[1..]
+                .find("\n#[cfg(")
+                .map(|offset| offset + 1)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            let timeout = body
+                .find("direct_chain_read_with_timeout(")
+                .expect("existing read timeout present");
+            let resolution = body
+                .find("resolve_model_registry_target(")
+                .expect("registry resolution present");
+            assert!(
+                timeout < resolution,
+                "{function}: registry getter must run inside the existing read timeout"
+            );
+        }
+    }
+
     #[cfg(feature = "shellnet")]
     fn wire_read_target() -> super::BookTarget {
         super::BookTarget {

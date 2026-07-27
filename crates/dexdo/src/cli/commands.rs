@@ -11,14 +11,15 @@ pub(crate) use crate::cli::market_views::{
 pub(crate) use crate::cli::markets::run_markets;
 pub(crate) use crate::cli::monitor::run_monitor;
 pub(crate) use crate::cli::note_cmd::{
-    run_note_balance, run_note_deploy, run_note_recover, run_note_stream_locks, run_note_withdraw,
+    run_note_balance, run_note_deploy, run_note_recover, run_note_withdraw,
 };
 pub(crate) use crate::cli::oracle::run_oracle;
 pub(crate) use crate::cli::orders::run_orders;
 #[cfg(feature = "shellnet")]
 use crate::cli::policy;
 pub(crate) use crate::cli::recover::{
-    run_dispute, run_reclaim, run_recover, run_release_dispute, run_withdraw_shell,
+    run_dispute, run_reclaim, run_recover, run_release_dispute, run_resolve_dispute_timeout,
+    run_withdraw_shell,
 };
 pub(crate) use crate::cli::reports::{
     run_dashboard, run_deals, run_export, run_history, run_status,
@@ -31,6 +32,8 @@ use dexdo::registry::{
     enforce_model_registry_policy as enforce_model_registry_policy_with_reader,
     ShellnetModelRegistryReader,
 };
+#[cfg(feature = "shellnet")]
+use dexdo::registry::{resolve_registered_model_identity, ModelRegistryReader};
 use dexdo::registry::{
     BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistryValidationInput,
     RegistryValidationPolicy,
@@ -47,6 +50,8 @@ use serde_json::{json, Value};
 use std::future::Future;
 #[cfg(feature = "shellnet")]
 use std::io::Write as _;
+#[cfg(feature = "shellnet")]
+use zeroize::Zeroizing;
 
 /// Deadline for awaiting match/handover: fail-closed, so `seller`/`buyer` don't hang
 /// forever if the match didn't go through. Backstop, not SLA -- a real on-chain match completes in ~1-2 min.
@@ -108,7 +113,7 @@ pub(crate) struct RuntimeDealHandleInput<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct PoolRecoveryInputs {
     pub(crate) note_addr: String,
-    pub(crate) note_secret_hex: String,
+    pub(crate) note_secret_hex: Zeroizing<String>,
     pub(crate) token_contract: String,
     pub(crate) pool_record: Option<PoolRecoveryRecord>,
 }
@@ -118,7 +123,7 @@ pub(crate) struct PoolRecoveryInputs {
 pub(crate) struct PoolRecoveryRecord {
     pub(crate) pool_path: std::path::PathBuf,
     pub(crate) note_addr: String,
-    pub(crate) note_secret_hex: String,
+    pub(crate) note_secret_hex: Zeroizing<String>,
     pub(crate) token_contract: String,
     pub(crate) role: String,
 }
@@ -295,7 +300,7 @@ pub(crate) fn resolve_pool_recovery_inputs(
     ) {
         return Ok(PoolRecoveryInputs {
             note_addr: note_addr.clone(),
-            note_secret_hex: read_secret_hex(note_key, "--note-key")?,
+            note_secret_hex: read_secret_hex(note_key, "--note-key")?.into(),
             token_contract: tc.clone(),
             pool_record: None,
         });
@@ -336,8 +341,8 @@ pub(crate) fn resolve_pool_recovery_inputs(
     }
     let (pool_note_addr, pool_secret, pool_tc, pool_role) = records.remove(0);
     let note_secret_hex = match identity.note_key.as_deref() {
-        Some(path) => read_secret_hex(path, "--note-key")?,
-        None => pool_secret.clone(),
+        Some(path) => read_secret_hex(path, "--note-key")?.into(),
+        None => pool_secret.clone().into(),
     };
     let pool_record = (identity.note_addr.is_none()
         && identity.note_key.is_none()
@@ -346,7 +351,7 @@ pub(crate) fn resolve_pool_recovery_inputs(
     .then(|| PoolRecoveryRecord {
         pool_path,
         note_addr: pool_note_addr.clone(),
-        note_secret_hex: pool_secret,
+        note_secret_hex: pool_secret.into(),
         token_contract: pool_tc.clone(),
         role: pool_role,
     });
@@ -536,6 +541,217 @@ pub(crate) async fn enforce_model_registry_policy(
         buyer_missing_book_policy,
     );
     bail!("ModelRegistry validation requires a shellnet build")
+}
+
+#[cfg(feature = "shellnet")]
+async fn resolve_model_registry_target_with_reader(
+    reader: &dyn ModelRegistryReader,
+    role: RegistryRole,
+    policy: &RegistryValidationPolicy,
+    requested_model: &str,
+    mut target: BookTarget,
+) -> Result<BookTarget> {
+    let registry_address = policy.required_address(role)?;
+    let identity =
+        resolve_registered_model_identity(reader, role, registry_address, requested_model).await?;
+    if target.order_book.is_some()
+        && (target.frame_model != identity.registry_model
+            || !target.model_hash.eq_ignore_ascii_case(&identity.model_hash)
+            || !target
+                .order_book
+                .as_deref()
+                .is_some_and(|book| book.eq_ignore_ascii_case(&identity.order_book)))
+    {
+        bail!(
+            "{} model registry check failed: requested model {} resolved to exact ModelRegistry {} \
+             identity {} (modelHash {}, orderBook {}), but the selected market target is {} \
+             (modelHash {}, orderBook {})",
+            role.as_str(),
+            requested_model,
+            registry_address,
+            identity.registry_model,
+            identity.model_hash,
+            identity.order_book,
+            target.frame_model,
+            target.model_hash,
+            target.order_book.as_deref().unwrap_or("-")
+        );
+    }
+    target.frame_model = identity.registry_model;
+    target.model_hash = identity.model_hash;
+    Ok(target)
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn resolve_model_registry_target(
+    role: RegistryRole,
+    policy: Option<&RegistryValidationPolicy>,
+    contracts: &std::path::Path,
+    requested_model: &str,
+    target: BookTarget,
+) -> Result<BookTarget> {
+    let Some(policy) = policy else {
+        return Ok(target);
+    };
+    let registry_address = policy.required_address(role)?;
+    let reader = ShellnetModelRegistryReader::from_manifest(contracts, registry_address)?;
+    resolve_model_registry_target_with_reader(&reader, role, policy, requested_model, target).await
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn resolve_model_registry_target(
+    role: RegistryRole,
+    policy: Option<&RegistryValidationPolicy>,
+    contracts: &std::path::Path,
+    requested_model: &str,
+    target: BookTarget,
+) -> Result<BookTarget> {
+    if policy.is_none() {
+        return Ok(target);
+    }
+    let _ = (role, contracts, requested_model);
+    bail!("ModelRegistry validation requires a shellnet build")
+}
+
+#[cfg(all(test, feature = "shellnet"))]
+mod registry_target_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use dexdo::registry::ModelRegistryEntry;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const REGISTRY: &str = "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EXACT_BOOK: &str = "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const LEGACY_BOOK: &str = "0:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const NOTE: &str = "0:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const REQUESTED: &str = "qwen--qwen3--32b";
+    const EXACT: &str = "Qwen/Qwen3-32B";
+
+    #[derive(Default)]
+    struct FakeReader {
+        entries: BTreeMap<String, ModelRegistryEntry>,
+        queries: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ModelRegistryReader for FakeReader {
+        async fn model(&self, frame_model: &str) -> Result<Option<ModelRegistryEntry>> {
+            self.queries
+                .lock()
+                .expect("query lock")
+                .push(frame_model.to_string());
+            Ok(self.entries.get(frame_model).cloned())
+        }
+    }
+
+    fn policy() -> RegistryValidationPolicy {
+        RegistryValidationPolicy {
+            network: "shellnet".to_string(),
+            registry_address: Some(REGISTRY.to_string()),
+            seller_check_model_registry: true,
+            seller_deploy_missing_order_book: true,
+            buyer_check_model_registry: true,
+            source: None,
+            address_overridden: false,
+        }
+    }
+
+    fn reader() -> FakeReader {
+        FakeReader {
+            entries: BTreeMap::from([(
+                EXACT.to_string(),
+                ModelRegistryEntry {
+                    exists: true,
+                    model_hash: model_hash_for(EXACT),
+                    order_book: EXACT_BOOK.to_string(),
+                },
+            )]),
+            queries: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn target(frame_model: &str, order_book: Option<&str>) -> BookTarget {
+        BookTarget {
+            frame_model: frame_model.to_string(),
+            model_hash: model_hash_for(frame_model),
+            order_book: order_book.map(str::to_string),
+            root_model: None,
+            note_addr: Some(NOTE.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_target_rejects_legacy_manifest_before_dispatch() {
+        let error = match resolve_model_registry_target_with_reader(
+            &reader(),
+            RegistryRole::Seller,
+            &policy(),
+            REQUESTED,
+            target(REQUESTED, Some(LEGACY_BOOK)),
+        )
+        .await
+        {
+            Ok(_) => panic!("legacy manifest target must fail closed"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(REQUESTED), "{error}");
+        assert!(error.contains(EXACT), "{error}");
+        assert!(error.contains(EXACT_BOOK), "{error}");
+    }
+
+    #[tokio::test]
+    async fn disabled_registry_policy_preserves_legacy_target() {
+        let original = target(REQUESTED, Some(LEGACY_BOOK));
+        let resolved = resolve_model_registry_target(
+            RegistryRole::Buyer,
+            None,
+            std::path::Path::new("missing-contracts.json"),
+            REQUESTED,
+            target(REQUESTED, Some(LEGACY_BOOK)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.frame_model, original.frame_model);
+        assert_eq!(resolved.model_hash, original.model_hash);
+        assert_eq!(resolved.order_book, original.order_book);
+    }
+
+    #[test]
+    fn explicit_registry_identity_wins_over_colliding_config_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models.json");
+        std::fs::write(
+            &models,
+            r#"{
+              "models": {
+                "Qwen/Qwen3-32B": {
+                  "frame_model": "other--model--1",
+                  "base_url": "https://provider.example/v1",
+                  "served_model": "other/model",
+                  "api_key_env": "PROVIDER_API_KEY",
+                  "tokenizer_family": "other",
+                  "price_per_tick": 1
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(registry_requested_model(&models, EXACT).unwrap(), EXACT);
+    }
+
+    #[test]
+    fn explicit_registry_identity_does_not_require_models_config() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing.json");
+
+        assert_eq!(
+            registry_requested_model(&missing, REQUESTED).unwrap(),
+            REQUESTED
+        );
+        assert_eq!(registry_requested_model(&missing, EXACT).unwrap(), EXACT);
+    }
 }
 
 fn role_arg_to_handle(role: DealRoleArg) -> deals::DealHandleRole {
@@ -739,7 +955,7 @@ pub(crate) async fn run_doctor(_args: DoctorArgs) -> Result<()> {
     bail!("shellnet doctor unavailable: build with `--features shellnet`")
 }
 
-#[cfg(feature = "shellnet")]
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) struct BookTarget {
     pub(crate) frame_model: String,
     pub(crate) model_hash: String,
@@ -763,6 +979,15 @@ pub(crate) fn model_target_from_config(
         root_model: None,
         note_addr,
     })
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) fn registry_requested_model(models: &std::path::Path, model: &str) -> Result<String> {
+    if model.contains("--") || model.contains('/') {
+        return Ok(model.to_string());
+    }
+    let cfg = dexdo::seller::ModelsConfig::load(models)?;
+    Ok(cfg.get(model)?.frame_model.clone())
 }
 
 #[cfg(feature = "shellnet")]
@@ -1135,7 +1360,7 @@ pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> St
         }
         Some(deals::DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
             format!(
-                "next=seller_advance_probe_after_timeout command=`keep dexdo seller running for {deal}; it calls TokenContract.advance() after PROBE_WINDOW` reason=buyer_silent_probe"
+                "next=seller_wait_delivery_then_advance_after_window command=`keep dexdo seller running for {deal}; it waits for the first delivered canonical tick, then calls TokenContract.advance() only after PROBE_WINDOW` reason=awaiting_delivery_then_probe_window"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.opened => {
@@ -1200,7 +1425,9 @@ pub fn print_book_table(
     // so price/tick and the tick counts are interpretable in model tokens, not abstract units.
     let tick_size = DobParams::canonical().tick_size as u128;
     let title = format!("inference order book -- {frame_model}");
-    let subtitle = format!("1 tick = {tick_size} model tokens");
+    let subtitle = format!(
+        "1 tick = {tick_size} model tokens * prices are raw ECC[2] (PRICE_STEP 1000000000 = 1 SHELL)"
+    );
     if rows.is_empty() {
         println!("{}  ({subtitle})", paint(&title, "1;36"));
         println!(
@@ -1302,7 +1529,8 @@ pub fn print_book_table(
     println!("{}", paint(&border("-", "-", "-"), "2"));
     if let (Some(ticks), Some(cap)) = (your_order_ticks, max_price_per_tick) {
         println!(
-            "{} {ticks} ticks (= {} model tokens) at up to {} SHELL/tick -- fills the best ask within the limit",
+            "{} {ticks} ticks (= {} model tokens) at up to {} raw ECC[2]/tick \
+             (PRICE_STEP 1000000000 = 1 SHELL) -- fills the best ask within the limit",
             paint("your order:", "1"),
             ticks.saturating_mul(tick_size),
             paint(&cap.to_string(), "33"),

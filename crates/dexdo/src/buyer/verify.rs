@@ -275,6 +275,34 @@ pub fn reference_endpoint_for(model_id: &str, models: &ModelsConfig) -> Option<R
     Some(cfg.reference_endpoint())
 }
 
+/// Resolve an exact buyer-controlled reference binding. Registry identities are accepted only when
+/// explicitly listed in `identity_aliases`; fuzzy model-family matching is not used for money admission.
+pub fn executable_reference_model_for<'a>(
+    model_id: &str,
+    models: &'a ModelsConfig,
+) -> Option<&'a str> {
+    let id = model_id.trim();
+    let cfg = models
+        .get(id)
+        .ok()
+        .or_else(|| {
+            models
+                .models
+                .values()
+                .find(|model| model.served_model.trim() == id)
+        })
+        .or_else(|| {
+            models.models.values().find(|model| {
+                model
+                    .identity_aliases
+                    .iter()
+                    .any(|alias| alias.trim() == id)
+            })
+        })?;
+    cfg.require_executable_reference().ok()?;
+    Some(cfg.frame_model.as_str())
+}
+
 /// Default probe-prompt of an exact/reference model(B8) -- the first configured fingerprint. `None` -- no fingerprint
 /// (degradation R3: B8 does not apply, reliance on B5/B6/B7).
 pub fn default_probe(model_id: &str, models: &ModelsConfig) -> Option<String> {
@@ -877,6 +905,36 @@ mod tests {
             ),
             Verdict::Pass,
             "correct gpt-oss quirk -> Pass"
+        );
+    }
+
+    #[test]
+    fn executable_reference_requires_exact_bound_identity_and_key() {
+        let mut cfg = qwen_models();
+        cfg.models.get_mut("qwen").unwrap().api_key_env = "PATH".into();
+
+        for model_id in [
+            "qwen",
+            "qwen--qwen3--32b",
+            "qwen/qwen3-32b",
+            "Qwen/Qwen3-32B",
+        ] {
+            assert_eq!(
+                executable_reference_model_for(model_id, &cfg),
+                Some("qwen--qwen3--32b"),
+                "{model_id}"
+            );
+        }
+        assert_eq!(
+            executable_reference_model_for("Qwen/Qwen3-32B-unlisted", &cfg),
+            None
+        );
+
+        cfg.models.get_mut("qwen").unwrap().api_key_env =
+            "DEXDO_TEST_REFERENCE_KEY_MISSING_520".into();
+        assert_eq!(
+            executable_reference_model_for("qwen--qwen3--32b", &cfg),
+            None
         );
     }
 

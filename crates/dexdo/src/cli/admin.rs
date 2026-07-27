@@ -4,12 +4,14 @@ use crate::cli::args::{DestroyArgs, MarketDeployArgs, ProvisionArgs};
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     enforce_model_registry_policy, load_enabled_model_registry_policy, order_book_active,
-    shellnet_doctor_preflight,
+    resolve_model_registry_target, shellnet_doctor_preflight, BookTarget,
 };
+use crate::cli::policy;
 #[cfg(feature = "shellnet")]
 use crate::cli::support::{
     deposit_per_deploy, ensure_provision_deposit_covered, prompt_deposit_shells, read_secret_hex,
-    require_provision_nonce, resolve_market_fields, DEFAULT_DEPOSIT_SHELLS, SHELL_UNIT,
+    require_provision_nonce, resolve_market_fields, validate_price_step, DEFAULT_DEPOSIT_SHELLS,
+    SHELL_UNIT,
 };
 #[cfg(not(feature = "shellnet"))]
 use anyhow::bail;
@@ -25,6 +27,9 @@ use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
     use dexdo_core::{Address, KeyPair, RealChainBackend};
+    // A3: reject an invalid limit price at the command boundary, before any key/file/network read or write.
+    validate_price_step(args.price_per_tick)?;
+    policy::load_seller_runtime_policy(args.policy.as_deref())?;
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "real shellnet provisioning: --note-addr (provisioned note address) is required"
@@ -37,32 +42,46 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // The deployed book/deal model name/hash MUST be canonical `producer--model--version`(indexer-parseable).
-    dexdo_core::validate_canonical_model_id(&args.frame_model).map_err(|e| anyhow::anyhow!(e))?;
+    let registry_policy =
+        load_enabled_model_registry_policy(RegistryRole::Seller, &args.registry, &args.contracts)?;
+    let requested_model = args.frame_model.clone();
+    if registry_policy.is_none() {
+        dexdo_core::validate_canonical_model_id(&requested_model)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
     shellnet_doctor_preflight(&args.contracts, None).await?;
+    let target = resolve_model_registry_target(
+        RegistryRole::Seller,
+        registry_policy.as_ref(),
+        &args.contracts,
+        &requested_model,
+        BookTarget {
+            frame_model: requested_model.clone(),
+            model_hash: dexdo_core::model_hash_for(&requested_model),
+            order_book: None,
+            root_model: None,
+            note_addr: Some(note_addr.clone()),
+        },
+    )
+    .await?;
+    let frame_model = target.frame_model;
     let seed = read_secret_hex(note_key, "--note-key")?;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note =
         Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    if let Some(policy) =
-        load_enabled_model_registry_policy(RegistryRole::Seller, &args.registry, &args.contracts)?
-    {
+    if let Some(policy) = registry_policy.as_ref() {
         let expected_order_book = chain
-            .inference_orderbook_address(
-                &note,
-                &dexdo_core::model_hash_for(&args.frame_model),
-                dexdo_core::MODEL_TICK_SIZE,
-            )
+            .inference_orderbook_address(&note, &target.model_hash, dexdo_core::MODEL_TICK_SIZE)
             .await?
             .with_workchain();
         let order_book_active = order_book_active(&chain, &expected_order_book).await?;
         enforce_model_registry_policy(
             RegistryRole::Seller,
-            &policy,
+            policy,
             &args.contracts,
-            &args.frame_model,
+            &frame_model,
             &expected_order_book,
             order_book_active,
             BuyerMissingBookPolicy::Reject,
@@ -106,7 +125,7 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
         .provision_market(
             &keys,
             &note,
-            &args.frame_model,
+            &frame_model,
             nonce,
             args.price_per_tick,
             args.max_ticks,
@@ -121,8 +140,44 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, feature = "shellnet"))]
+mod tests {
+    use super::*;
+    use crate::cli::args::{IdentityArgs, ModelRegistryValidationArgs};
+
+    #[tokio::test]
+    async fn provision_rejects_bad_price_before_identity_or_network_side_effects() {
+        let args = ProvisionArgs {
+            identity: IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: None,
+            },
+            registry: ModelRegistryValidationArgs::default(),
+            frame_model: "not-even-a-canonical-model".to_string(),
+            contracts: "missing-contracts-manifest.json".into(),
+            nonce: None,
+            price_per_tick: dexdo_core::PRICE_STEP - 1,
+            max_ticks: 1,
+            deposit_shells: None,
+            output: "must-not-be-written.json".into(),
+            policy: None,
+        };
+
+        let error = run_provision(args)
+            .await
+            .expect_err("invalid price must fail at the command boundary");
+        let message = error.to_string();
+        assert!(message.contains("PRICE_STEP"), "{message}");
+        assert!(message.contains(&(dexdo_core::PRICE_STEP - 1).to_string()));
+        assert!(!message.contains("--note-addr"), "{message}");
+        assert!(!message.contains("missing-contracts-manifest"), "{message}");
+    }
+}
+
 #[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_provision(_args: ProvisionArgs) -> Result<()> {
+pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
+    policy::load_seller_runtime_policy(args.policy.as_deref())?;
     bail!("real shellnet provisioning unavailable: build with `--features shellnet`")
 }
 
@@ -144,22 +199,39 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // The book's on-chain model name/hash MUST be the canonical `producer--model--version` (what the indexer
-    // parses); reject an OpenAI slug here BEFORE deploying an un-indexable book.
-    dexdo_core::validate_canonical_model_id(&args.frame_model).map_err(|e| anyhow::anyhow!(e))?;
     // Fail-closed on a stale binary / live-network skew BEFORE the on-chain deploy -- same gate `provision`/
     // `seller` run. Without it, deploy-market would silently deploy an order book on outdated contract code
     // against a re-deployed network(a live run caught exactly this: live PrivateNote ahead of the binary pin).
-    shellnet_doctor_preflight(&args.contracts, None).await?;
     let registry_policy =
         load_enabled_model_registry_policy(RegistryRole::Seller, &args.registry, &args.contracts)?;
+    let requested_model = args.frame_model.clone();
+    if registry_policy.is_none() {
+        dexdo_core::validate_canonical_model_id(&requested_model)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    shellnet_doctor_preflight(&args.contracts, None).await?;
+    let target = resolve_model_registry_target(
+        RegistryRole::Seller,
+        registry_policy.as_ref(),
+        &args.contracts,
+        &requested_model,
+        BookTarget {
+            frame_model: requested_model.clone(),
+            model_hash: model_hash_for(&requested_model),
+            order_book: None,
+            root_model: None,
+            note_addr: Some(note_addr.clone()),
+        },
+    )
+    .await?;
+    let frame_model = target.frame_model;
+    let model_hash = target.model_hash;
     let seed = read_secret_hex(note_key, "--note-key")?;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note =
         Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    let model_hash = model_hash_for(&args.frame_model);
     let tick_size = MODEL_TICK_SIZE;
     let ob = chain
         .inference_orderbook_address(&note, &model_hash, tick_size)
@@ -171,7 +243,7 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
             RegistryRole::Seller,
             policy,
             &args.contracts,
-            &args.frame_model,
+            &frame_model,
             &expected_order_book,
             book_active,
             BuyerMissingBookPolicy::Reject,
@@ -181,17 +253,17 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
     if book_active {
         println!(
             "inference market already deployed for {} -- order book {}",
-            args.frame_model,
+            frame_model,
             ob.with_workchain()
         );
         return Ok(());
     }
     println!(
         "deploying inference market (order book) for {} ...",
-        args.frame_model
+        frame_model
     );
     chain
-        .deploy_inference_orderbook(&note, &keys, &model_hash, &args.frame_model, tick_size)
+        .deploy_inference_orderbook(&note, &keys, &model_hash, &frame_model, tick_size)
         .await?;
     // Wait for activation so a follow-up `post_offer` doesn't race the deploy(the book getter returns once active).
     for _ in 0..30 {
@@ -202,7 +274,7 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
     }
     println!(
         "deployed inference market for {} -- order book {}",
-        args.frame_model,
+        frame_model,
         ob.with_workchain()
     );
     Ok(())

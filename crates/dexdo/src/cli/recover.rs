@@ -2,14 +2,15 @@
 //! extracted from `commands.rs`(move-only / behavior-identical, anti-entropy refactor Track C2).
 
 use crate::cli::args::{
-    DisputeArgs, ReclaimArgs, RecoverArgs, ReleaseDisputeArgs, WithdrawShellArgs,
+    DisputeArgs, ReclaimArgs, RecoverArgs, ReleaseDisputeArgs, ResolveDisputeTimeoutArgs,
+    WithdrawShellArgs,
 };
 use anyhow::Result;
 
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{persist_pool_recovery_record, resolve_pool_recovery_inputs};
 #[cfg(feature = "shellnet")]
-use crate::cli::support::{read_secret_hex, resolve_market_fields};
+use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
 #[cfg(not(feature = "shellnet"))]
 use anyhow::bail;
 #[cfg(feature = "shellnet")]
@@ -181,14 +182,14 @@ pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
     .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "dispute {tc}: buyer-signed streamDispute -> TokenContract.dispute() () -- LOCKS BOTH notes (yours \
-         and the seller's) until releaseDispute/arbitration. Stronger than `recover` (which still pays the \
-         seller for delivered ticks); releaseDispute is seller-only."
+        "dispute {tc}: buyer-signed streamDispute -> TokenContract.dispute() () -- freezes this TC's \
+         contested amount and seller bond until resolution. Stronger than `recover` (which still pays the \
+         seller for delivered ticks); both whole notes remain usable for independent deals."
     );
     chain.stream_dispute(&note, &keys, &tc).await?;
     println!(
-        "dispute submitted -> streamDispute(TokenContract {tc}) from buyer note {note}; the deal is DISPUTED \
-         and both notes are locked until it resolves (seller releaseDispute, or arbitration)."
+        "dispute submitted -> streamDispute(TokenContract {tc}) from buyer note {note}; this deal is DISPUTED \
+         and its contested funds are frozen until seller releaseDispute or arbitration."
     );
     Ok(())
 }
@@ -199,9 +200,82 @@ pub(crate) async fn run_dispute(_args: DisputeArgs) -> Result<()> {
 }
 
 #[cfg(feature = "shellnet")]
+fn reclaim_state_bool(state: &Value, field: &str) -> Result<bool, String> {
+    state
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("reclaim: getState.{field} is missing or not a bool"))
+}
+
+#[cfg(feature = "shellnet")]
+fn reclaim_state_u64(state: &Value, field: &str) -> Result<u64, String> {
+    state
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("reclaim: getState.{field} is missing or not a uint64"))
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReclaimPostRead {
+    Confirmed,
+    Pending,
+}
+
+#[cfg(feature = "shellnet")]
+fn reclaim_post_read(
+    action: dexdo_core::ReclaimAction,
+    state: Option<&Value>,
+) -> Result<ReclaimPostRead, String> {
+    use dexdo_core::ReclaimAction;
+
+    match action {
+        ReclaimAction::StreamReclaim => {
+            let state = state.ok_or_else(|| {
+                "TokenContract disappeared after streamReclaim; expected the active seller-payout state"
+                    .to_string()
+            })?;
+            let funded = reclaim_state_bool(state, "funded")?;
+            let opened = reclaim_state_bool(state, "opened")?;
+            let disputed = reclaim_state_bool(state, "disputed")?;
+            let last_advance = reclaim_state_u64(state, "lastAdvance")?;
+            if !funded || disputed || last_advance == 0 {
+                return Err(format!(
+                    "streamReclaim post-state is contradictory: funded={funded} opened={opened} \
+                     disputed={disputed} lastAdvance={last_advance}"
+                ));
+            }
+            if opened {
+                Ok(ReclaimPostRead::Pending)
+            } else {
+                Ok(ReclaimPostRead::Confirmed)
+            }
+        }
+        ReclaimAction::StreamCleanup => match state {
+            None => Ok(ReclaimPostRead::Confirmed),
+            Some(state) => {
+                let funded = reclaim_state_bool(state, "funded")?;
+                let opened = reclaim_state_bool(state, "opened")?;
+                let disputed = reclaim_state_bool(state, "disputed")?;
+                let last_advance = reclaim_state_u64(state, "lastAdvance")?;
+                if funded && !opened && !disputed && last_advance == 0 {
+                    Ok(ReclaimPostRead::Pending)
+                } else {
+                    Err(format!(
+                        "streamCleanup post-state is contradictory: funded={funded} opened={opened} \
+                         disputed={disputed} lastAdvance={last_advance}"
+                    ))
+                }
+            }
+        },
+    }
+}
+
+#[cfg(feature = "shellnet")]
 pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
     use dexdo_core::{
-        check_reclaimable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend,
+        check_reclaimable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend, ReclaimAction,
         MATCH_OPEN_TIMEOUT_SECS,
     };
     let manifest = args
@@ -232,16 +306,11 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
     let state = chain.token_contract_state(&tc).await?.ok_or_else(|| {
         anyhow::anyhow!("reclaim: TokenContract {tc} is not active (undeployed/closed)")
     })?;
-    let funded = state["funded"].as_bool().unwrap_or(false);
-    let opened = state["opened"].as_bool().unwrap_or(false);
-    let disputed = state["disputed"].as_bool().unwrap_or(false);
-    let last_advance = state["lastAdvance"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let funded_time = state["fundedTime"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok());
+    let funded = reclaim_state_bool(&state, "funded").map_err(anyhow::Error::msg)?;
+    let opened = reclaim_state_bool(&state, "opened").map_err(anyhow::Error::msg)?;
+    let disputed = reclaim_state_bool(&state, "disputed").map_err(anyhow::Error::msg)?;
+    let last_advance = reclaim_state_u64(&state, "lastAdvance").map_err(anyhow::Error::msg)?;
+    let funded_time = reclaim_state_u64(&state, "fundedTime").map_err(anyhow::Error::msg)?;
     let buyer_note = chain.token_contract_buyer_note(&tc).await?;
     let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
     let note_s = note.with_workchain();
@@ -267,7 +336,7 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
         .as_secs();
-    check_reclaimable(
+    let action = check_reclaimable(
         funded,
         opened,
         disputed,
@@ -278,35 +347,64 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
         now,
         last_advance,
         stream_timeout,
-        funded_time,
+        Some(funded_time),
         MATCH_OPEN_TIMEOUT_SECS,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    if opened {
-        let stream_timeout = stream_timeout.expect("opened branch parsed streamTimeout");
-        eprintln!(
-            "reclaim {tc}: buyer-signed streamReclaim -> TokenContract.reclaimOnTimeout() (no burn: probe + \
-             deposit back to you, commission to the seller). STREAM_TIMEOUT met: lastAdvance {last_advance} + \
-             streamTimeout {stream_timeout} <= now {now}."
-        );
-        chain.reclaim_on_timeout(&note, &keys, &tc).await?;
-        println!(
-            "reclaim submitted -> streamReclaim(TokenContract {tc}) from buyer note {note}; the escrow returns \
-             to your note and the deal closes (opened=false)."
-        );
-    } else {
-        let funded_time = funded_time.expect("never-opened branch checked fundedTime");
-        eprintln!(
-            "reclaim {tc}: buyer-signed streamCleanup -> TokenContract.cleanupUnopened() (never-opened refund). \
-             MATCH_OPEN_TIMEOUT met: fundedTime {funded_time} + matchOpenTimeout {MATCH_OPEN_TIMEOUT_SECS} <= \
-             now {now}."
-        );
-        chain.stream_cleanup(&note, &keys, &tc).await?;
-        println!(
-            "reclaim submitted -> streamCleanup(TokenContract {tc}) from buyer note {note}; the never-opened \
-             escrow returns to your note and the deal closes."
-        );
+    match action {
+        ReclaimAction::StreamReclaim => {
+            let stream_timeout = stream_timeout.expect("opened branch parsed streamTimeout");
+            eprintln!(
+                "reclaim {tc}: buyer-signed streamReclaim -> TokenContract.reclaimOnTimeout() (no burn: probe + \
+                 deposit back to you, full seller bond returned). STREAM_TIMEOUT met: lastAdvance {last_advance} + \
+                 streamTimeout {stream_timeout} <= now {now}."
+            );
+            chain.reclaim_on_timeout(&note, &keys, &tc).await?;
+        }
+        ReclaimAction::StreamCleanup => {
+            eprintln!(
+                "reclaim {tc}: buyer-signed streamCleanup -> TokenContract.cleanupUnopened() (never-opened refund). \
+                 MATCH_OPEN_TIMEOUT met: fundedTime {funded_time} + matchOpenTimeout {MATCH_OPEN_TIMEOUT_SECS} <= \
+                 now {now}."
+            );
+            chain.stream_cleanup(&note, &keys, &tc).await?;
+        }
+    }
+
+    let action_name = match action {
+        ReclaimAction::StreamReclaim => "streamReclaim",
+        ReclaimAction::StreamCleanup => "streamCleanup",
+    };
+    let post_state = chain.token_contract_state(&tc).await.map_err(|error| {
+        anyhow::anyhow!(
+            "reclaim submitted -> {action_name}(TokenContract {tc}); single post-read failed: {error}; \
+             settlement is not confirmed"
+        )
+    })?;
+    let post_read = reclaim_post_read(action, post_state.as_ref()).map_err(|reason| {
+        anyhow::anyhow!(
+            "reclaim submitted -> {action_name}(TokenContract {tc}); single post-read is contradictory: \
+             {reason}; settlement is not confirmed"
+        )
+    })?;
+    match (action, post_read) {
+        (ReclaimAction::StreamReclaim, ReclaimPostRead::Confirmed) => println!(
+            "reclaim confirmed -> streamReclaim(TokenContract {tc}); single post-read observed \
+             funded=true opened=false disputed=false and non-zero lastAdvance."
+        ),
+        (ReclaimAction::StreamCleanup, ReclaimPostRead::Confirmed) => println!(
+            "reclaim confirmed -> streamCleanup(TokenContract {tc}); single post-read found the \
+             TokenContract no longer readable."
+        ),
+        (ReclaimAction::StreamReclaim, ReclaimPostRead::Pending) => println!(
+            "reclaim submitted -> streamReclaim(TokenContract {tc}); single post-read is pending/stale \
+             (opened=true), so settlement is not yet confirmed."
+        ),
+        (ReclaimAction::StreamCleanup, ReclaimPostRead::Pending) => println!(
+            "reclaim submitted -> streamCleanup(TokenContract {tc}); single post-read is pending/stale \
+             (funded=true opened=false lastAdvance=0), so settlement is not yet confirmed."
+        ),
     }
     Ok(())
 }
@@ -354,11 +452,11 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
 
     eprintln!(
         "release-dispute {tc}: seller-signed TokenContract.releaseDispute() from note {note}; concedes the \
-         dispute, unlocks both notes, and returns the contested tick/deposit to the buyer."
+         dispute and returns this TC's contested amount to the buyer plus the seller bond."
     );
     chain.release_dispute(&tc, &keys).await?;
     println!(
-        "release-dispute submitted -> TokenContract {tc}; both notes unlock after the dispute resolution lands"
+        "release-dispute submitted -> TokenContract {tc}; this deal's frozen funds resolve when the transaction lands"
     );
     Ok(())
 }
@@ -366,6 +464,145 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
 #[cfg(not(feature = "shellnet"))]
 pub(crate) async fn run_release_dispute(_args: ReleaseDisputeArgs) -> Result<()> {
     bail!("release-dispute unavailable: build with `--features shellnet`")
+}
+
+#[cfg(feature = "shellnet")]
+fn required_u64(value: &Value, field: &str, context: &str) -> Result<u64> {
+    value[field]
+        .as_u64()
+        .or_else(|| value[field].as_str().and_then(|raw| raw.parse().ok()))
+        .ok_or_else(|| anyhow::anyhow!("{context}: getter exposes no {field}"))
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_dispute_timeout(state: &Value, config: &Value, now: u64) -> Result<u64> {
+    if state["disputed"].as_bool() != Some(true) {
+        anyhow::bail!("resolve-dispute-timeout: deal is not DISPUTED -- nothing to resolve");
+    }
+    let dispute_time = required_u64(state, "disputeTime", "resolve-dispute-timeout")?;
+    let dispute_window =
+        required_u64(config, "disputeWindow", "resolve-dispute-timeout getConfig")?;
+    let deadline = dispute_time.saturating_add(dispute_window);
+    if now < deadline {
+        anyhow::bail!(
+            "resolve-dispute-timeout: too early -- disputeTime {dispute_time} + disputeWindow \
+             {dispute_window} = {deadline} > now {now} ({} s remaining)",
+            deadline - now
+        );
+    }
+    Ok(deadline)
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_dispute_timeout_postread(state: Option<&Value>) -> Result<bool> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    let disputed = state["disputed"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("resolve-dispute-timeout: post-read exposes no disputed"))?;
+    let opened = state["opened"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("resolve-dispute-timeout: post-read exposes no opened"))?;
+    match (disputed, opened) {
+        (false, false) => Ok(true),
+        (true, _) => Ok(false),
+        (false, true) => anyhow::bail!(
+            "resolve-dispute-timeout: contradictory post-read: disputed=false but opened=true"
+        ),
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn submit_dispute_timeout_after_validation(
+    preflight: Result<u64>,
+    submit: impl std::future::Future<Output = Result<Value>>,
+) -> Result<u64> {
+    let deadline = preflight?;
+    submit.await?;
+    Ok(deadline)
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs) -> Result<()> {
+    use dexdo_core::{Address, Deployed, RealChainBackend};
+
+    let contracts = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    let chain = RealChainBackend::connect(contracts)?;
+    let now = chain.observed_chain_timestamp().await?;
+    let (tc_str, _frame, _nonce) =
+        resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
+    let tc =
+        Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let deployed = Deployed::load(&args.contracts)?;
+    let expected_hash = deployed
+        .contract_hashes
+        .get("TokenContract")
+        .ok_or_else(|| anyhow::anyhow!("deployed manifest has no TokenContract code hash"))?;
+    let (active, code_hash) = chain.account_active_code_hash(&tc).await?;
+    let mut identity_ok =
+        active && code_hash.as_deref() == Some(expected_hash.trim_start_matches("0x"));
+    if let Some(path) = args.market.as_deref() {
+        let market = load_market(path)?;
+        let seller = chain
+            .token_contract_seller_pubkey(&tc)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("TokenContract {tc} getSeller unavailable"))?;
+        let seller = serde_json::json!(format!("0x{seller:0>64}"));
+        let root = Address::parse(&market.root_model)?;
+        identity_ok &= chain.token_contract_model_hash(&tc).await?.as_deref()
+            == Some(market.model_hash.as_str())
+            && chain
+                .root_model_address_for(&seller)
+                .await?
+                .with_workchain()
+                == root.with_workchain()
+            && chain
+                .resolve_token_contract(&root, &seller, market.nonce)
+                .await?
+                .with_workchain()
+                == tc.with_workchain();
+    }
+    let before = chain.token_contract_state(&tc).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "resolve-dispute-timeout: TokenContract {tc} is not active (undeployed/closed)"
+        )
+    })?;
+    let config = chain.token_contract_config(&tc).await?.ok_or_else(|| {
+        anyhow::anyhow!("resolve-dispute-timeout: TokenContract {tc} getConfig unavailable")
+    })?;
+    let preflight = if identity_ok {
+        validate_dispute_timeout(&before, &config, now)
+    } else {
+        Err(anyhow::anyhow!(
+            "resolve-dispute-timeout: wrong TokenContract identity"
+        ))
+    };
+    let deadline =
+        submit_dispute_timeout_after_validation(preflight, chain.resolve_dispute_timeout(&tc))
+            .await?;
+    let after = chain.token_contract_state(&tc).await?;
+    let confirmed = validate_dispute_timeout_postread(after.as_ref())?;
+    let status = if confirmed { "confirmed" } else { "pending" };
+    match after {
+        None => println!(
+            "resolve-dispute-timeout submitted token_contract={tc} deadline={deadline} post_read=unavailable status={status}"
+        ),
+        Some(after) => println!(
+            "resolve-dispute-timeout submitted token_contract={tc} deadline={deadline} post_read_disputed={} post_read_opened={} status={status}",
+            after["disputed"].as_bool().unwrap_or(false),
+            after["opened"].as_bool().unwrap_or(false)
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_resolve_dispute_timeout(_args: ResolveDisputeTimeoutArgs) -> Result<()> {
+    bail!("resolve-dispute-timeout unavailable: build with `--features shellnet`")
 }
 
 #[cfg(any(feature = "shellnet", test))]
@@ -434,6 +671,80 @@ mod tests {
     #[cfg(feature = "shellnet")]
     use crate::cli::args::{IdentityArgs, RecoverArgs};
 
+    /// the one factual post-read distinguishes landed state, unchanged indexed state, and
+    /// contradictions without polling or another submit.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn reclaim_post_read_classifies_confirmed_pending_and_contradictory() {
+        use dexdo_core::ReclaimAction;
+        use serde_json::json;
+
+        let opened_confirmed = json!({
+            "funded": true,
+            "opened": false,
+            "disputed": false,
+            "lastAdvance": "100"
+        });
+        assert_eq!(
+            super::reclaim_post_read(ReclaimAction::StreamReclaim, Some(&opened_confirmed))
+                .unwrap(),
+            super::ReclaimPostRead::Confirmed
+        );
+
+        let opened_pending = json!({
+            "funded": true,
+            "opened": true,
+            "disputed": false,
+            "lastAdvance": "100"
+        });
+        assert_eq!(
+            super::reclaim_post_read(ReclaimAction::StreamReclaim, Some(&opened_pending)).unwrap(),
+            super::ReclaimPostRead::Pending
+        );
+
+        assert_eq!(
+            super::reclaim_post_read(ReclaimAction::StreamCleanup, None).unwrap(),
+            super::ReclaimPostRead::Confirmed
+        );
+        let cleanup_pending = json!({
+            "funded": true,
+            "opened": false,
+            "disputed": false,
+            "lastAdvance": "0"
+        });
+        assert_eq!(
+            super::reclaim_post_read(ReclaimAction::StreamCleanup, Some(&cleanup_pending)).unwrap(),
+            super::ReclaimPostRead::Pending
+        );
+
+        let cleanup_contradictory = json!({
+            "funded": true,
+            "opened": false,
+            "disputed": false,
+            "lastAdvance": "100"
+        });
+        assert!(super::reclaim_post_read(
+            ReclaimAction::StreamCleanup,
+            Some(&cleanup_contradictory)
+        )
+        .unwrap_err()
+        .contains("contradictory"));
+        assert!(super::reclaim_post_read(ReclaimAction::StreamReclaim, None)
+            .unwrap_err()
+            .contains("disappeared"));
+
+        let missing_timestamp = json!({
+            "funded": true,
+            "opened": true,
+            "disputed": false
+        });
+        assert!(
+            super::reclaim_post_read(ReclaimAction::StreamReclaim, Some(&missing_timestamp))
+                .unwrap_err()
+                .contains("lastAdvance")
+        );
+    }
+
     #[cfg(feature = "shellnet")]
     struct TempDirCleanup(std::path::PathBuf);
 
@@ -489,6 +800,69 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn dispute_timeout_validation_matches_deployed_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let disputed = serde_json::json!({"disputed": true, "disputeTime": "100"});
+        let terminal = serde_json::json!({"disputed": false, "disputeTime": "100"});
+        let config = serde_json::json!({"disputeWindow": "600"});
+
+        assert_eq!(
+            super::validate_dispute_timeout(&disputed, &config, 700).unwrap(),
+            700
+        );
+        assert!(super::validate_dispute_timeout(&disputed, &config, 699)
+            .unwrap_err()
+            .to_string()
+            .contains("too early"));
+        assert!(super::validate_dispute_timeout(&terminal, &config, 700)
+            .unwrap_err()
+            .to_string()
+            .contains("not DISPUTED"));
+
+        assert!(!super::validate_dispute_timeout_postread(None).unwrap());
+        assert!(!super::validate_dispute_timeout_postread(Some(
+            &serde_json::json!({"disputed": true, "opened": true})
+        ))
+        .unwrap());
+        assert!(super::validate_dispute_timeout_postread(Some(
+            &serde_json::json!({"disputed": false, "opened": false})
+        ))
+        .unwrap());
+        assert!(super::validate_dispute_timeout_postread(Some(
+            &serde_json::json!({"disputed": false, "opened": true})
+        ))
+        .is_err());
+
+        let posts = AtomicUsize::new(0);
+        let post = || async {
+            posts.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        };
+        for preflight in [
+            Err(anyhow::anyhow!("wrong TokenContract identity")),
+            super::validate_dispute_timeout(&disputed, &config, 699),
+        ] {
+            assert!(
+                super::submit_dispute_timeout_after_validation(preflight, post())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+
+        let deadline = super::submit_dispute_timeout_after_validation(
+            super::validate_dispute_timeout(&disputed, &config, 700),
+            post(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(deadline, 700);
     }
 
     /// primary regression: the production recover flow must atomically write the selected pool-only buyer

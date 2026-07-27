@@ -16,6 +16,7 @@ pub async fn run(
     req: Option<&CanonRequest>,
     tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
     scammer: bool,
+    claimed_model: Option<&str>,
 ) {
     // claims a DIFFERENT(real) model than the market's frame model -> the buyer's verification(B7) rejects it.
     // `scammer` makes the substitution UNCONDITIONAL -- a seller instance that always
@@ -86,7 +87,12 @@ pub async fn run(
                         tokenizer_family: "mock".to_string(),
                         has_token_ids: true,
                         has_logprobs: bad_logprobs,
-                        claimed_model: "mock".to_string(),
+                        claimed_model: if bad_logprobs {
+                            "mock"
+                        } else {
+                            claimed_model.unwrap_or("mock")
+                        }
+                        .to_string(),
                     }
                 }
             }),
@@ -145,7 +151,7 @@ mod tests {
             params: None,
         };
         let (tx, mut rx) = mpsc::channel(16);
-        run(8, Some(&req), tx, false).await;
+        run(8, Some(&req), tx, false, None).await;
         let mut chunks = Vec::new();
         while let Some(item) = rx.recv().await {
             if let UpstreamEvent::Chunk { chunk, .. } = item.unwrap() {

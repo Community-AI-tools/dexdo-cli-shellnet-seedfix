@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use gosh_ackinacki::sdk::{Address, KeyPair};
+use gosh_ackinacki::sdk::{Account, Address, KeyPair};
 use tvm_block::{Deserializable, Serializable, StateInit};
 
 pub(super) const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -19,86 +19,139 @@ pub(super) fn gas_health_top_up_amount(balance: u128, min: u128, target: u128) -
     }
 }
 
-/// ABI of the deployed contracts(`contracts/compiled_0.79.3`), embedded for on-chain getters.
+/// ABI of the deployed contracts(`contracts/compiled`), embedded for on-chain getters.
 pub(super) const SUPERROOT_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/airegistry/SuperRoot.abi.json");
+    include_str!("../../../../contracts/compiled/airegistry/SuperRoot.abi.json");
 pub(super) const ROOTPN_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/RootPN.abi.json");
+    include_str!("../../../../contracts/compiled/dex/RootPN.abi.json");
 pub(super) const ROOTORACLE_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/RootOracle.abi.json");
+    include_str!("../../../../contracts/compiled/dex/RootOracle.abi.json");
 pub(super) const ORACLE_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/Oracle.abi.json");
+    include_str!("../../../../contracts/compiled/dex/Oracle.abi.json");
 pub(super) const ORACLEEVENTLIST_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/OracleEventList.abi.json");
-pub(super) const PMP_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/PMP.abi.json");
+    include_str!("../../../../contracts/compiled/dex/OracleEventList.abi.json");
+pub(super) const PMP_ABI: &str = include_str!("../../../../contracts/compiled/dex/PMP.abi.json");
 pub(super) const ROOTMODEL_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/airegistry/RootModel.abi.json");
+    include_str!("../../../../contracts/compiled/airegistry/RootModel.abi.json");
 pub(super) const TOKENCONTRACT_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/airegistry/TokenContract.abi.json");
+    include_str!("../../../../contracts/compiled/airegistry/TokenContract.abi.json");
 /// `PrivateNote`(zk-note) -- ABI of the deal's owner methods (`deployInferenceOrderBook`,
 /// `postSellOffer`, `placeInferenceBuy`, `streamStop`, getter `getInferenceOrderBookAddress`).
 /// Minted via RootPN(gosh-dexdo `mint_pn_pool`); the signatures of these 5 methods match the
 /// deployed code byte-for-byte -- the note accepts our calls(see the live test).
 pub(super) const PRIVATENOTE_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/dex/PrivateNote.abi.json");
+    include_str!("../../../../contracts/compiled/dex/PrivateNote.abi.json");
 /// `PrivateNote` StateInit(`.tvc`) -- for the diagnostic comparison of the embedded image's code-hash
 /// against the `Account.code_hash` value of the minted note(live cross-check of the inference variant; test-only).
 pub(super) const PRIVATENOTE_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/dex/PrivateNote.tvc");
+    include_bytes!("../../../../contracts/compiled/dex/PrivateNote.tvc");
 pub(super) const SUPERROOT_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/airegistry/SuperRoot.tvc");
+    include_bytes!("../../../../contracts/compiled/airegistry/SuperRoot.tvc");
 /// Keep the standard-sold v2 image available for offline diagnostics; it is not the live
 /// shellnet RootPN self-hash expectation.
 #[allow(dead_code)]
 pub(super) const ROOTPN_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/dex/RootPN.tvc");
-/// Shellnet RootPN is compiled with the old halo2-sold(v1 ext-out) so the voucher prover
-/// (tvm_block 2.24.20) can parse VoucherGenerated; its code hash is 44faea57(v1), NOT the
-/// standard-sold v2 23c8fc1b. RootPN LOGIC is identical 4.0.27.
+    include_bytes!("../../../../contracts/compiled/dex/RootPN.tvc");
+/// Shellnet RootPN is compiled with `sold_old`(v1 ext-out), which preserves the
+/// `VoucherGenerated` format consumed by the voucher prover. The deployed 4.0.29 image updates the
+/// TokenContract/RootModel derivation pins while retaining that event format.
 pub(super) const SHELLNET_ROOTPN_V1_CODE_HASH: &str =
-    "44faea57e048ec3eec9a570a91dc9592b25d2d9021a173ca8870ba82fca8b3f6";
+    "187520fb02fef427dc16f8d8d703c301ef7251942364c98cfe2eeb30b8c658ce";
 pub(super) const ROOTORACLE_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/dex/RootOracle.tvc");
+    include_bytes!("../../../../contracts/compiled/dex/RootOracle.tvc");
 /// `TokenContract` StateInit(`.tvc`) -- deployed via `build_deploy` (step 2: the seller provisions
 /// the per-deal TC). Its code-hash == the `RootModel.TOKEN_CONTRACT_CODE_HASH` pin(offline guard), so
 /// the derived address matches `RootModel.getTokenContractAddress` and registration is accepted.
 pub(super) const TOKENCONTRACT_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/airegistry/TokenContract.tvc");
+    include_bytes!("../../../../contracts/compiled/airegistry/TokenContract.tvc");
 /// `RootModel` StateInit(`.tvc`) -- the seller(model owner) deploys their own RootModel under
 /// SuperRoot themselves(self-register: the ctor calls `SuperRoot.registerRoot`). Its code-hash == the
 /// `SuperRoot.ROOT_MODEL_CODE_HASH` pin(offline guard), otherwise SuperRoot rejects the registration.
 pub(super) const ROOTMODEL_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/airegistry/RootModel.tvc");
+    include_bytes!("../../../../contracts/compiled/airegistry/RootModel.tvc");
 /// The `TOKEN_CONTRACT_CODE_HASH` pin from `contracts/airegistry/RootModel.sol` -- against it RootModel
 /// checks the TC code when registering a deal. The embedded `TokenContract.tvc` must yield this hash.
 pub(super) const ROOTMODEL_PINNED_TC_CODE_HASH: &str =
-    "029dbf013ebcb356be93f5c1f594833014c4191445a021f1c773ca364249c240";
+    "5e37dd4f51a705100dc39a9e8a1d83e270c793b9f132a3c31e8c7f04aa809ac9";
 /// The `ROOT_MODEL_CODE_HASH` pin from `contracts/airegistry/SuperRoot.sol` -- against it SuperRoot
 /// checks the RootModel code at `registerRoot`. The embedded `RootModel.tvc` must yield this hash.
 pub(super) const SUPERROOT_PINNED_RM_CODE_HASH: &str =
-    "b88723892c07ad3b12eee921b98c3b79d1b853b8af41749474f3536ec1060de8";
+    "87e622b45a013a929626cc8c8d19a835c5fae55a660bc521ab8e34797ed38a5d";
 /// The deployed `PrivateNote` code-hash(`deployed.shellnet.json` `_note`). The orphaned-note
 /// guard(`assert_seller_note_current`) requires the seller note's on-chain `code_hash` to equal this; the
 /// `private_note_code_hash_matches_deployed_pin` test cross-checks it against the embedded `PRIVATENOTE_TVC`
 /// (test-only). Update on every PrivateNote redeploy(same cadence as `deployed.shellnet.json`).
 pub(super) const PRIVATENOTE_PINNED_CODE_HASH: &str =
-    "2894e9c978a9554f22ddd6d502d8580d847f67acf1af3fc4bae2496deb117c24";
+    "46239c6adea6cf767ec8e7ebcccc804bcb18370c000d2418e985c27510d8175b";
 
-/// (pure, offline-testable): the seller note must carry the CURRENT pinned `PrivateNote` code. A note
-/// minted before a contract redeploy is orphaned(stale code_hash) and its owner-methods (`confirmDeal`,
-/// provision) throw a raw `TVM_ERROR`; reject fail-closed with an actionable re-mint message instead. The async
-/// [`RealChainBackend::assert_seller_note_current`] wraps this with the on-chain existence + Active checks.
+pub(super) fn normalize_code_hash(raw: &str) -> Option<String> {
+    let h = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
+    if h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("{h:0>64}").to_lowercase())
+}
+
+/// (pure, offline-testable): an account must carry the current pinned `PrivateNote`
+/// code. The async seller guard and read-only note balance command share this identity check.
+fn private_note_code_hash_is_current(code_hash: Option<&str>) -> bool {
+    code_hash
+        .and_then(normalize_code_hash)
+        .is_some_and(|hash| hash == PRIVATENOTE_PINNED_CODE_HASH)
+}
+
 pub(super) fn note_code_hash_current(note: &Address, code_hash: Option<&str>) -> Result<()> {
-    match code_hash {
-        Some(h) if h == PRIVATENOTE_PINNED_CODE_HASH => Ok(()),
-        other => Err(anyhow!(
+    if private_note_code_hash_is_current(code_hash) {
+        Ok(())
+    } else {
+        Err(anyhow!(
             "seller note {note} code_hash {} != the current PrivateNote code {PRIVATENOTE_PINNED_CODE_HASH} \
              -- the pn_pool predates a contract redeploy (orphaned). Re-mint against the current contracts \
              (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool.",
-            other.unwrap_or("<none>")
-        )),
+            code_hash.unwrap_or("<none>")
+        ))
     }
+}
+
+pub(super) fn seller_note_account_current(note: &Address, account: Option<&Account>) -> Result<()> {
+    let account = account.ok_or_else(|| {
+        anyhow!(
+            "seller note {note} is not on-chain -- the pn_pool is likely orphaned by a contract redeploy \
+             (SuperRoot/PrivateNote rotation). Re-mint against the current contracts (`mint_pn_pool`) and \
+             point DEXDO_PN_POOL at the fresh pool."
+        )
+    })?;
+    if !account.is_active() {
+        return Err(anyhow!(
+            "seller note {note} is {}, not Active -- re-mint the pn_pool against the current contracts \
+             (`mint_pn_pool`); a pool minted before a SuperRoot redeploy is orphaned.",
+            account.status
+        ));
+    }
+    note_code_hash_current(note, account.code_hash.as_deref())
+}
+
+pub(super) fn note_balance_private_note_account(
+    note: &Address,
+    account: Option<&Account>,
+) -> Result<()> {
+    let account = account.ok_or_else(|| {
+        anyhow!("PrivateNote account {note} is not Active/not found (account snapshot absent)")
+    })?;
+    if !account.is_active() {
+        return Err(anyhow!(
+            "PrivateNote account {note} is not Active/not found (status: {})",
+            account.status
+        ));
+    }
+    if !private_note_code_hash_is_current(account.code_hash.as_deref()) {
+        return Err(anyhow!(
+            "note {note} is not current PrivateNote: actual code_hash {}, expected code_hash \
+             {PRIVATENOTE_PINNED_CODE_HASH}",
+            account.code_hash.as_deref().unwrap_or("<none>")
+        ));
+    }
+    Ok(())
 }
 
 /// Fund-safety guard for `note withdraw`: pure code-hash generation check.
@@ -158,13 +211,119 @@ mod withdraw_generation_tests {
     }
 }
 
+#[cfg(test)]
+mod note_balance_identity_tests {
+    use super::*;
+
+    fn note() -> Address {
+        Address::parse(&format!("0:{}", "2".repeat(64))).unwrap()
+    }
+
+    fn account(
+        status: &str,
+        code_hash: Option<&str>,
+        balance: u128,
+        ecc: Vec<(u32, u128)>,
+    ) -> Account {
+        Account {
+            address: note(),
+            status: status.to_string(),
+            balance,
+            ecc,
+            code_hash: code_hash.map(str::to_string),
+            boc: None,
+        }
+    }
+
+    #[test]
+    fn missing_and_inactive_accounts_are_not_private_notes() {
+        let note = note();
+        let missing = note_balance_private_note_account(&note, None)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains(&note.with_workchain()), "{missing}");
+        assert!(missing.contains("not Active/not found"), "{missing}");
+
+        for status in ["NonExist", "Uninit"] {
+            let account = account(status, None, 0, Vec::new());
+            let error = note_balance_private_note_account(&note, Some(&account))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&note.with_workchain()), "{error}");
+            assert!(error.contains("not Active/not found"), "{error}");
+            assert!(error.contains(status), "{error}");
+        }
+    }
+
+    #[test]
+    fn active_wrong_code_hash_names_actual_and_expected_identity() {
+        let note = note();
+        let actual = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let account = account("Active", Some(actual), 0, Vec::new());
+        let error = note_balance_private_note_account(&note, Some(&account))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&note.with_workchain()), "{error}");
+        assert!(error.contains("not current PrivateNote"), "{error}");
+        assert!(error.contains(actual), "{error}");
+        assert!(error.contains(PRIVATENOTE_PINNED_CODE_HASH), "{error}");
+    }
+
+    #[test]
+    fn current_private_note_accepts_zero_and_funded_balances() {
+        let note = note();
+        for account in [
+            account("Active", Some(PRIVATENOTE_PINNED_CODE_HASH), 0, Vec::new()),
+            account(
+                "Active",
+                Some(&format!(
+                    "0x{}",
+                    PRIVATENOTE_PINNED_CODE_HASH.to_uppercase()
+                )),
+                5_000_000_123,
+                vec![(2, 1_234_567_890)],
+            ),
+        ] {
+            note_balance_private_note_account(&note, Some(&account)).unwrap();
+        }
+    }
+
+    #[test]
+    fn seller_missing_and_inactive_keep_orphan_remint_diagnostics() {
+        let note = note();
+        let missing = seller_note_account_current(&note, None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            missing,
+            format!(
+                "seller note {note} is not on-chain -- the pn_pool is likely orphaned by a contract redeploy \
+                 (SuperRoot/PrivateNote rotation). Re-mint against the current contracts (`mint_pn_pool`) and \
+                 point DEXDO_PN_POOL at the fresh pool."
+            )
+        );
+
+        let account = account("Uninit", None, 0, Vec::new());
+        let inactive = seller_note_account_current(&note, Some(&account))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            inactive,
+            format!(
+                "seller note {note} is Uninit, not Active -- re-mint the pn_pool against the current contracts \
+                 (`mint_pn_pool`); a pool minted before a SuperRoot redeploy is orphaned."
+            )
+        );
+    }
+}
+
 /// `InferenceOrderBook` -- ABI of the on-chain offer/order book.
 pub(super) const INFERENCE_ORDERBOOK_ABI: &str =
-    include_str!("../../../../contracts/compiled_0.79.3/airegistry/InferenceOrderBook.abi.json");
+    include_str!("../../../../contracts/compiled/airegistry/InferenceOrderBook.abi.json");
 /// `InferenceOrderBook` StateInit(`.tvc`) -- the **code-cell** is extracted from it, which the note
 /// passes to `deployInferenceOrderBook(code,...)`(the book address is deterministic from code+params).
 pub(super) const INFERENCE_ORDERBOOK_TVC: &[u8] =
-    include_bytes!("../../../../contracts/compiled_0.79.3/airegistry/InferenceOrderBook.tvc");
+    include_bytes!("../../../../contracts/compiled/airegistry/InferenceOrderBook.tvc");
 pub(super) const ROOTPN_ADDR: &str =
     "0:1010101010101010101010101010101010101010101010101010101010101010";
 pub(super) const ROOTORACLE_ADDR: &str =

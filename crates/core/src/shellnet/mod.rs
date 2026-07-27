@@ -18,7 +18,6 @@ mod contracts_provision;
 mod live_tests;
 mod note_events;
 mod order_events;
-mod stream_locks;
 
 pub use backends::{
     real_market_deal_view, DealContext, RealBuyerBackend, RealDealBackend, RealNote,
@@ -29,9 +28,8 @@ pub use book_events::{
 };
 pub use client::{
     endpoint_urls, normalize_endpoint, resolve_endpoint, shellnet_clock_skew_preflight, Deployed,
-    MoneySubmitError, NoteStreamLockStatus, RealChainBackend, ShellnetDoctorCheck,
-    ShellnetDoctorReport, ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT,
-    PRIVATE_NOTE_STREAM_LOCK_MAX_SECS,
+    MoneySubmitError, RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport,
+    ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT,
 };
 #[cfg(feature = "test-giver")]
 pub use client::{
@@ -39,4 +37,3 @@ pub use client::{
     TokenContractSettlementReceipts,
 };
 pub use contracts_provision::keypair_ed_pubkey;
-pub use stream_locks::{NoteStreamLockEntry, NoteStreamLockKind, NoteStreamLockSnapshot};

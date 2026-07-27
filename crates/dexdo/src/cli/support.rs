@@ -81,6 +81,7 @@ pub(crate) fn seller_real_backend(
     args: &SellerArgs,
     market_frame_model: Option<&str>,
     market_nonce: Option<u64>,
+    registry_frame_model: Option<&str>,
 ) -> Result<ChainAndNote> {
     let name = args
         .model
@@ -89,14 +90,16 @@ pub(crate) fn seller_real_backend(
         .ok_or_else(|| {
             anyhow::anyhow!("real shellnet: set --model <name from config> (needed for model_hash)")
         })?;
-    let frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
+    let configured_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
         .get(name)?
         .frame_model
         .clone();
-    // The offer's on-chain model name/hash MUST be canonical `producer--model--version`(indexer-parseable);
-    // an OpenAI slug belongs in `served_model`. Fail loud before posting an un-indexable offer.
-    dexdo_core::validate_canonical_model_id(&frame_model).map_err(|e| anyhow::anyhow!(e))?;
-    check_market_model_match(market_frame_model, &frame_model, name)?;
+    let frame_model = registry_frame_model.unwrap_or(&configured_frame_model);
+    if registry_frame_model.is_none() {
+        // Without registry authority, preserve the legacy canonical market shape.
+        dexdo_core::validate_canonical_model_id(frame_model).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    check_market_model_match(market_frame_model, frame_model, name)?;
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr (provisioned note address) is required")
     })?;
@@ -121,9 +124,8 @@ pub(crate) fn seller_real_backend(
         manifest,
         &note_addr,
         &read_secret_hex(note_key, "--note-key")?,
-        &frame_model,
+        frame_model,
         nonce,
-        args.probe_shell,
     )?;
     let chain: Arc<dyn ChainBackend> = Arc::new(backend);
     let note: Arc<dyn Note> = Arc::new(rn);
@@ -135,6 +137,7 @@ pub(crate) fn seller_real_backend(
     _args: &SellerArgs,
     _market_frame_model: Option<&str>,
     _market_nonce: Option<u64>,
+    _registry_frame_model: Option<&str>,
 ) -> Result<ChainAndNote> {
     bail!(
         "real shellnet backend unavailable: build with `--features shellnet` or pass --mock-chain"
@@ -391,8 +394,9 @@ pub(crate) const MIN_DEPLOY_SHELLS: u128 = 5 /* REGISTER_FORWARD_VALUE */ + 5 /*
 #[allow(dead_code)]
 pub(crate) const DEFAULT_DEPOSIT_SHELLS: u128 = 20;
 /// Contract constants mirrored from `contracts/airegistry/modifiers/modifiers.sol`.
+/// The seller mirror bond is `2P` (`TokenContract._bondAmount()`,) -- not a bps commission.
 #[allow(dead_code)]
-pub(crate) const SELLER_PROBE_COMMISSION_BPS: u128 = 250;
+pub(crate) const SELLER_BOND_TICKS: u128 = 2;
 #[allow(dead_code)]
 pub(crate) const BPS_DENOMINATOR: u128 = 10_000;
 
@@ -421,23 +425,61 @@ pub(crate) fn deposit_per_deploy(deposit_shells: u128) -> Result<u128> {
     Ok(per_deploy)
 }
 
-/// Seller probe commission from `TokenContract._probeCommission()`:
-/// `pricePerTick * SELLER_PROBE_COMMISSION_BPS / BPS_DENOMINATOR`.
+/// Seller mirror bond from `TokenContract._bondRequired()`: the seller
+/// posts `2P` -- two ticks, mirroring the buyer's maximum contested `D = 2P`.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn seller_probe_commission_for_price(price_per_tick: u128) -> Result<u128> {
-    let product = price_per_tick
-        .checked_mul(SELLER_PROBE_COMMISSION_BPS)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "price_per_tick {price_per_tick}: seller probe commission overflows u128"
-            )
-        })?;
-    Ok(product / BPS_DENOMINATOR)
+pub(crate) fn seller_bond_for_price(price_per_tick: u128) -> Result<u128> {
+    price_per_tick.checked_mul(2).ok_or_else(|| {
+        anyhow::anyhow!("price_per_tick {price_per_tick}: seller bond (2P) overflows u128")
+    })
+}
+
+/// Shared client preflight for every limit price(limit SELL, limit BUY, subscription): the price
+/// must be a positive whole multiple of `PRICE_STEP`(1 SHELL). Rejects BEFORE any write / escrow
+/// action; the error names the value and step in both raw and SHELL units. Market BUY (no limit
+/// price) is the single explicit exception and does not call this.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn validate_price_step(price_per_tick: u128) -> Result<()> {
+    let price_step = dexdo_core::PRICE_STEP;
+    if price_per_tick == 0 {
+        anyhow::bail!(
+            "price 0 raw (0 SHELL) is invalid: must be a positive multiple of PRICE_STEP = \
+             {price_step} raw (1 SHELL)"
+        );
+    }
+    if !price_per_tick.is_multiple_of(price_step) {
+        anyhow::bail!(
+            "price {price_per_tick} raw ({}.{:09} SHELL) is not a whole multiple of PRICE_STEP = \
+             {price_step} raw (1 SHELL); use a whole number of SHELL per tick",
+            price_per_tick / price_step,
+            price_per_tick % price_step,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod price_step_tests {
+    use super::validate_price_step;
+    use dexdo_core::PRICE_STEP;
+
+    #[test]
+    fn price_step_boundaries() {
+        // reject: zero, sub-step, and non-multiple non-zero values
+        assert!(validate_price_step(0).is_err());
+        assert!(validate_price_step(PRICE_STEP - 1).is_err());
+        assert!(validate_price_step(PRICE_STEP + 1).is_err());
+        assert!(validate_price_step(3 * PRICE_STEP / 2).is_err());
+        // accept: exactly 1 SHELL and whole multiples
+        assert!(validate_price_step(PRICE_STEP).is_ok());
+        assert!(validate_price_step(2 * PRICE_STEP).is_ok());
+        assert!(validate_price_step(1000 * PRICE_STEP).is_ok());
+    }
 }
 
 /// provision may fail early if the note cannot cover the exact deploy deposit plus the contract-derived
-/// seller probe commission. This is not guessed runtime headroom: `TokenContract.open()` hard-requires
-/// `fundProbeCommission()` first, and the amount is `SELLER_PROBE_COMMISSION_BPS` of `price_per_tick`.
+/// seller mirror bond. This is not guessed runtime headroom: `TokenContract.open()` hard-requires
+/// `fundSellerBond()` first, and the amount is `2P` (`_bondAmount()`) of `price_per_tick`.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn ensure_provision_deposit_covered(
     note_ecc_raw: u128,
@@ -447,17 +489,17 @@ pub(crate) fn ensure_provision_deposit_covered(
     let deploy_need = deposit_shells.checked_mul(SHELL_UNIT).ok_or_else(|| {
         anyhow::anyhow!("--deposit-shells {deposit_shells}: overflows the u128 ECC[2] raw range")
     })?;
-    let probe_need = seller_probe_commission_for_price(price_per_tick)?;
-    let need = deploy_need.checked_add(probe_need).ok_or_else(|| {
+    let bond_need = seller_bond_for_price(price_per_tick)?;
+    let need = deploy_need.checked_add(bond_need).ok_or_else(|| {
         anyhow::anyhow!(
-            "--deposit-shells {deposit_shells} plus seller probe commission {probe_need}: overflows the u128 ECC[2] raw range"
+            "--deposit-shells {deposit_shells} plus seller bond {bond_need}: overflows the u128 ECC[2] raw range"
         )
     })?;
     if note_ecc_raw < need {
         anyhow::bail!(
             "provision: note ECC[2] SHELL = {note_ecc_raw} raw (~{} SHELL), but --deposit-shells \
              {deposit_shells} needs {deploy_need} raw (~{deposit_shells} SHELL) for RootModel + TokenContract \
-             deploys plus {probe_need} raw seller probe commission at price_per_tick={price_per_tick}. \
+             deploys plus {bond_need} raw seller bond (2P) at price_per_tick={price_per_tick}. \
              Lower --deposit-shells (default {DEFAULT_DEPOSIT_SHELLS}) or top up the note's physical ECC[2] SHELL.",
             note_ecc_raw / SHELL_UNIT,
         );
@@ -509,12 +551,17 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
     for id in &s.note_ids {
         writeln!(&mut out, "  * {id}").unwrap();
     }
-    writeln!(&mut out, "tree exposure (at risk): {} SHELL", s.exposure).unwrap();
+    writeln!(
+        &mut out,
+        "tree exposure (at risk): {} raw ECC[2]",
+        s.exposure
+    )
+    .unwrap();
     writeln!(&mut out, "offers in book: {}", s.offers.len()).unwrap();
     for o in &s.offers {
         writeln!(
             &mut out,
-            "  * {} -- {} SHELL/tick x {} ticks",
+            "  * {} -- {} raw ECC[2]/tick x {} ticks",
             o.token_contract, o.price_per_tick, o.max_ticks
         )
         .unwrap();
@@ -528,7 +575,8 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
         let cp = d.counterparty.as_deref().unwrap_or("--(no match)");
         let by_fact = match &d.snapshot {
             Some(snap) => format!(
-                "by-fact: to seller {} / refund {} / locked(buyer {}, seller {}) / burn {}{}",
+                "by-fact raw ECC[2]: to seller {} / refund {} / held-in-TC(buyer {}, \
+                 seller-bond {}) / burn {}{}",
                 snap.seller_received,
                 snap.buyer_refunded,
                 snap.buyer_locked,
@@ -540,7 +588,7 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
         };
         writeln!(
             &mut out,
-            "  * {} [{}] counterparty {} * {} SHELL/tick * {}",
+            "  * {} [{}] counterparty {} * {} raw ECC[2]/tick * {}",
             d.token_contract, role, cp, d.price_per_tick, by_fact
         )
         .unwrap();
@@ -549,13 +597,21 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
         for a in deal_anomalies(d) {
             let msg = match a {
                 DealAnomaly::LockedNoMatch { locked } => {
-                    format!("orphaned lock -- {locked} SHELL locked with no matched counterparty ()")
+                    format!(
+                        "orphaned lock -- {locked} raw ECC[2] locked with no matched counterparty ()"
+                    )
                 }
                 DealAnomaly::LockedAfterClose { locked } => {
-                    format!("settlement mismatch -- {locked} SHELL still locked after the deal closed ()")
+                    format!(
+                        "settlement mismatch -- {locked} raw ECC[2] still locked after the deal closed ()"
+                    )
                 }
-                DealAnomaly::BuyerLockExceedsTwoTicks { buyer_lead, ceiling } => format!(
-                    "two-tick invariant -- buyer lead {buyer_lead} SHELL exceeds the {ceiling} ceiling ()"
+                DealAnomaly::BuyerLockExceedsTwoTicks {
+                    buyer_lead,
+                    ceiling,
+                } => format!(
+                    "two-tick invariant -- buyer lead {buyer_lead} raw ECC[2] exceeds the {ceiling} \
+                     raw ECC[2] ceiling ()"
                 ),
             };
             writeln!(&mut out, "      ! ANOMALY: {msg}").unwrap();
@@ -593,7 +649,7 @@ fn write_role_breakdown(
     for m in models {
         writeln!(
             out,
-            "  > model {} -- tokens {} * {} {} SHELL * locked {} * burned {}",
+            "  > model {} -- tokens {} * {} {} raw ECC[2] * locked {} raw ECC[2] * burned {} raw ECC[2]",
             m.model, m.tokens, money_label, m.money, m.locked, m.burned
         )
         .unwrap();
@@ -601,7 +657,7 @@ fn write_role_breakdown(
             let cp = c.counterparty.as_deref().unwrap_or("--(no match)");
             writeln!(
                 out,
-                "      -> {} -- tokens {} * {} {} SHELL * locked {} * burned {}",
+                "      -> {} -- tokens {} * {} {} raw ECC[2] * locked {} raw ECC[2] * burned {} raw ECC[2]",
                 cp, c.tokens, money_label, c.money, c.locked, c.burned
             )
             .unwrap();
@@ -632,10 +688,10 @@ mod monitor_render_tests {
         seller_locked: u64,
     ) -> StreamSnapshot {
         StreamSnapshot {
-            seller_locked,
-            buyer_locked,
+            seller_locked: u128::from(seller_locked),
+            buyer_locked: u128::from(buyer_locked),
             buyer_lead: 0,
-            seller_received,
+            seller_received: u128::from(seller_received),
             buyer_refunded: 0,
             burned: 0,
             closed: state.is_stopped(),
@@ -646,7 +702,7 @@ mod monitor_render_tests {
         let exposure = if snapshot.closed {
             0
         } else {
-            snapshot.seller_locked
+            u64::try_from(snapshot.seller_locked).unwrap_or(u64::MAX)
         };
         let tree = TreeSnapshot {
             note_ids: vec!["seller-note".to_string()],
@@ -673,13 +729,13 @@ mod monitor_render_tests {
         let expected = "\
 identity note tree (1 sub-notes polled):
   * seller-note
-tree exposure (at risk): 10 SHELL
+tree exposure (at risk): 10 raw ECC[2]
 offers in book: 0
 deals: 1
-  * tc-funded-never-opened [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 0 / refund 0 / locked(buyer 3075, seller 10) / burn 0
+  * tc-funded-never-opened [seller] counterparty buyer-pubkey * 400 raw ECC[2]/tick * by-fact raw ECC[2]: to seller 0 / refund 0 / held-in-TC(buyer 3075, seller-bond 10) / burn 0
 seller accounting (by model):
-  > model qwen--qwen3--32b -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
-      -> buyer-pubkey -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
+  > model qwen--qwen3--32b -- tokens 0 * recv 0 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
+      -> buyer-pubkey -- tokens 0 * recv 0 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
 ";
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("CLOSED"), "{rendered}");
@@ -695,13 +751,13 @@ seller accounting (by model):
         let expected = "\
 identity note tree (1 sub-notes polled):
   * seller-note
-tree exposure (at risk): 10 SHELL
+tree exposure (at risk): 10 raw ECC[2]
 offers in book: 0
 deals: 1
-  * tc-opened-probe [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 0 / refund 0 / locked(buyer 4100, seller 10) / burn 0
+  * tc-opened-probe [seller] counterparty buyer-pubkey * 400 raw ECC[2]/tick * by-fact raw ECC[2]: to seller 0 / refund 0 / held-in-TC(buyer 4100, seller-bond 10) / burn 0
 seller accounting (by model):
-  > model qwen--qwen3--32b -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
-      -> buyer-pubkey -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
+  > model qwen--qwen3--32b -- tokens 0 * recv 0 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
+      -> buyer-pubkey -- tokens 0 * recv 0 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
 ";
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("CLOSED"), "{rendered}");
@@ -717,14 +773,14 @@ seller accounting (by model):
         let expected = "\
 identity note tree (1 sub-notes polled):
   * seller-note
-tree exposure (at risk): 0 SHELL
+tree exposure (at risk): 0 raw ECC[2]
 offers in book: 0
 deals: 1
-  * tc-stopped-locked [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 810 / refund 0 / locked(buyer 4100, seller 10) / burn 0 * CLOSED
-      ! ANOMALY: settlement mismatch -- 4110 SHELL still locked after the deal closed ()
+  * tc-stopped-locked [seller] counterparty buyer-pubkey * 400 raw ECC[2]/tick * by-fact raw ECC[2]: to seller 810 / refund 0 / held-in-TC(buyer 4100, seller-bond 10) / burn 0 * CLOSED
+      ! ANOMALY: settlement mismatch -- 4110 raw ECC[2] still locked after the deal closed ()
 seller accounting (by model):
-  > model qwen--qwen3--32b -- tokens 2 * recv 810 SHELL * locked 10 * burned 0
-      -> buyer-pubkey -- tokens 2 * recv 810 SHELL * locked 10 * burned 0
+  > model qwen--qwen3--32b -- tokens 2 * recv 810 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
+      -> buyer-pubkey -- tokens 2 * recv 810 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
 ";
         assert_eq!(rendered, expected);
     }

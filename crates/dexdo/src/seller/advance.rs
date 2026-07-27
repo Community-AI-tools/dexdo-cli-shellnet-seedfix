@@ -78,8 +78,10 @@ pub async fn drive_advance(
     // count is visible(no stale under-read).
     assert!(tick_size > 0, "tick_size must be non-zero");
     tokio::time::sleep(windows.probe).await;
+    let mut waiting_event_emitted = false;
     loop {
-        if billed_ticks(delivered.load(Ordering::Acquire), tick_size) >= 1 {
+        let delivered_tokens = delivered.load(Ordering::Acquire);
+        if billed_ticks(delivered_tokens, tick_size) >= 1 {
             break; // at least one token delivered -- accept the probe below
         }
         if delivery_done.load(Ordering::Acquire) || deal_closed(chain, token_contract).await {
@@ -90,6 +92,16 @@ pub async fn drive_advance(
                 break;
             }
             return Ok(0); // truly zero delivery: no probe, nothing finalized
+        }
+        if !waiting_event_emitted {
+            tracing::info!(
+                event = "seller_waiting_for_first_delivered_tick",
+                token_contract = %token_contract,
+                delivered_tokens,
+                finalized_ticks = 0u128,
+                "seller waiting for first delivered canonical tick"
+            );
+            waiting_event_emitted = true;
         }
         tokio::time::sleep(windows.settle).await; // poll for the first delivered token
     }
@@ -281,11 +293,13 @@ mod tests {
     /// A backend whose `advance_tick` always succeeds and counts the calls -- used to prove `drive_advance`
     /// never finalizes more ticks than were delivered.
     struct CountingBackend {
+        accepts: AtomicU64,
         advances: AtomicU64,
     }
     impl CountingBackend {
         fn new() -> Self {
             Self {
+                accepts: AtomicU64::new(0),
                 advances: AtomicU64::new(0),
             }
         }
@@ -320,6 +334,7 @@ mod tests {
             Ok(())
         }
         async fn accept_probe(&self, _: &TokenContract) -> Result<(), ChainError> {
+            self.accepts.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
@@ -354,8 +369,9 @@ mod tests {
         };
 
         // Zero delivered(no-request / errored before the first token) -> finalize NOTHING(no probe tick).
+        let b = CountingBackend::new();
         let n = drive_advance(
-            &CountingBackend::new(),
+            &b,
             &tc,
             &note,
             w,
@@ -369,6 +385,16 @@ mod tests {
         assert_eq!(
             n, 0,
             "zero delivered -> zero finalized (probe not accepted)"
+        );
+        assert_eq!(
+            b.accepts.load(Ordering::Relaxed),
+            0,
+            "zero-delivery terminal must not accept the probe"
+        );
+        assert_eq!(
+            b.advances.load(Ordering::Relaxed),
+            0,
+            "zero-delivery terminal must not advance a tick"
         );
 
         // Delivered 5 tokens at tick_size=4: finalized is capped at 2 billed ticks, not 5 per-token ticks.
@@ -396,8 +422,9 @@ mod tests {
         );
 
         // Budget below delivered: finalized capped at the budget(still <= delivered).
+        let backend = CountingBackend::new();
         let n = drive_advance(
-            &CountingBackend::new(),
+            &backend,
             &tc,
             &note,
             w,
@@ -416,6 +443,8 @@ mod tests {
     /// terminal(`delivery_done`/closed before the first token) returns 0.
     #[tokio::test]
     async fn drive_advance_waits_for_first_token_then_finalizes_probe() {
+        use tracing::instrument::WithSubscriber as _;
+
         let note = LocalNote::generate();
         let tc = "tc".to_string();
         let w = AdvanceWindows {
@@ -433,48 +462,112 @@ mod tests {
             d2.store(1, Ordering::Release);
             done2.store(true, Ordering::Release);
         });
-        let n = drive_advance(
-            &CountingBackend::new(),
-            &tc,
-            &note,
-            w,
-            10,
-            4,
-            delivered,
-            done,
-        )
-        .await
-        .unwrap();
+        let backend = CountingBackend::new();
+        let n = drive_advance(&backend, &tc, &note, w, 10, 4, delivered, done)
+            .with_subscriber(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             n, 1,
             "waited for the first delivered token, then finalized the probe (not a premature 0)"
+        );
+        assert_eq!(
+            backend.accepts.load(Ordering::Relaxed),
+            1,
+            "the first delivered token accepts the probe exactly once"
+        );
+        assert_eq!(
+            backend.advances.load(Ordering::Relaxed),
+            0,
+            "one delivered tick needs no stream-phase advance"
         );
     }
 
     /// regression: after `open_stream`, a matched buyer may not have connected yet. Empty delivery is not a
     /// seller failure and must not drive by-fact advancement or end the seller while the session is still open.
-    #[tokio::test]
-    async fn drive_advance_keeps_waiting_when_buyer_not_connected_yet() {
+    #[test]
+    fn drive_advance_keeps_waiting_when_buyer_not_connected_yet() {
+        use tracing::instrument::WithSubscriber as _;
+
+        struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture tracing output").extend(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let note = LocalNote::generate();
-        let tc = "tc".to_string();
-        let backend = CountingBackend::new();
-        let res = tokio::time::timeout(
-            Duration::from_millis(25),
-            drive_advance(
-                &backend,
-                &tc,
-                &note,
-                AdvanceWindows {
-                    probe: Duration::from_millis(1),
-                    settle: Duration::from_millis(5),
-                },
-                10,
-                4,
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(AtomicBool::new(false)),
-            ),
-        )
-        .await;
+        let tc = "tc-zero-wait".to_string();
+        let backend = Arc::new(CountingBackend::new());
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || SharedWriter(captured.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build test runtime");
+        let driver_backend = backend.clone();
+        let wait_logs = logs.clone();
+        let res = runtime.block_on(async {
+            let task = tokio::spawn(
+                async move {
+                    drive_advance(
+                        driver_backend.as_ref(),
+                        &tc,
+                        &note,
+                        AdvanceWindows {
+                            probe: Duration::from_millis(1),
+                            settle: Duration::from_millis(5),
+                        },
+                        10,
+                        4,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                }
+                .with_subscriber(dispatch),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if String::from_utf8_lossy(
+                    &wait_logs.lock().expect("read in-flight tracing output"),
+                )
+                .contains("seller_waiting_for_first_delivered_tick")
+                {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "zero-delivery driver returned before its waiting event"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "zero-delivery driver did not emit its waiting event"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            task.abort();
+            task.await
+        });
 
         assert!(
             res.is_err(),
@@ -485,6 +578,26 @@ mod tests {
             0,
             "advance_tick must not fire before any delivered token"
         );
+        assert_eq!(
+            backend.accepts.load(Ordering::Relaxed),
+            0,
+            "accept_probe must not fire before any delivered token"
+        );
+        let logs = String::from_utf8(logs.lock().expect("read tracing output").clone())
+            .expect("tracing output is UTF-8");
+        assert_eq!(
+            logs.lines()
+                .filter(|line| {
+                    line.contains("seller_waiting_for_first_delivered_tick")
+                        && line.contains("token_contract=tc-zero-wait")
+                })
+                .count(),
+            1,
+            "waiting event must be emitted once across multiple polls: {logs}"
+        );
+        assert!(logs.contains("token_contract=tc-zero-wait"), "{logs}");
+        assert!(logs.contains("delivered_tokens=0"), "{logs}");
+        assert!(logs.contains("finalized_ticks=0"), "{logs}");
     }
 
     /// tokens delivered just before `done` must be finalized -- the driver re-reads

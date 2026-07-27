@@ -19,17 +19,22 @@ pub mod oracle_manifest;
 pub mod wallet;
 // real shellnet backend on top of the gosh.ackinacki SDK(behind the `shellnet` feature).
 #[cfg(feature = "shellnet")]
+pub mod canonical_multisig;
+#[cfg(feature = "shellnet")]
 pub mod shellnet;
 
 /// SDK shellnet types -- re-exported behind `shellnet` for the live harness and the production CLI note-deploy
-/// path. Custody stays external: dexdo reads the wallet/note secrets from explicit operator files and never
-/// owns key generation.
+/// path. Wallet custody stays external. `note deploy` generates the PrivateNote owner key and persists it in
+/// operator-owned recovery/pool files; subsequent commands read wallet/note secrets from explicit files.
 #[cfg(feature = "shellnet")]
 pub use gosh_ackinacki::{
     airegistry, private_note,
     sdk::{Address, ChainClient, KeyPair},
-    wallet as ackinacki_wallet,
 };
+#[cfg(feature = "shellnet")]
+pub mod ackinacki_wallet {
+    pub use gosh_ackinacki::wallet::query;
+}
 #[cfg(feature = "shellnet")]
 pub use shellnet::{
     endpoint_urls, keypair_ed_pubkey, normalize_endpoint, real_market_deal_view, resolve_endpoint,
@@ -48,12 +53,12 @@ pub use chain::{
     check_matched_token_contract_state, check_reclaimable, check_recoverable,
     check_release_disputable, check_seller_pubkey, check_withdrawable_shell, deal_anomalies,
     executable_quote, per_model_breakdown, required_escrow_for_buy, submit_safe_single_ask_quote,
-    ChainBackend, ChainError, CounterpartyTally, DealAnomaly, DealChainState, DealRole, DealView,
-    ExecutableQuote, InferenceSubscriptionPlacement, Match, MatchWatchCursor, MatchedFill,
-    MatchedTokenContractStatus, MockChainBackend, ModelBreakdown, NoteSnapshot, OfferListing,
-    OrderBookOrder, OrderBookSnapshot, OrderBookStats, OrderBookSubscription, QuoteFill, SellOffer,
-    SellOfferOutcome, StreamSnapshot, TokenContract, TreeSnapshot, MATCH_OPEN_TIMEOUT_SECS,
-    UNKNOWN_MODEL,
+    validate_seller_resume_state, ChainBackend, ChainError, CounterpartyTally, DealAnomaly,
+    DealChainState, DealRole, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
+    MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend, ModelBreakdown,
+    NoteSnapshot, OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats,
+    OrderBookSubscription, QuoteFill, ReclaimAction, SellOffer, SellOfferOutcome, StreamSnapshot,
+    TokenContract, TreeSnapshot, MATCH_OPEN_TIMEOUT_SECS, UNKNOWN_MODEL,
 };
 pub use handover::Handover;
 pub use machine::{InvariantError, Settlement, StreamMachine, StreamState, Tick};
@@ -66,6 +71,6 @@ pub use onchain_diagnostics::{
     OnchainSubmitError,
 };
 pub use oracle_manifest::OracleMarketManifest;
-pub use params::{DobParams, ProtocolConsts, Shell};
+pub use params::{DobParams, ProtocolConsts, Shell, PRICE_STEP};
 pub use settle::{fee, net_burn, probe_burn, rebate, rebate_rate_bps, ProbeBurn};
 pub use wallet::normalize_wallet_address;

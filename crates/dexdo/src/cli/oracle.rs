@@ -64,6 +64,8 @@ pub(crate) async fn run_oracle(args: OracleArgs) -> Result<()> {
         OracleCommand::Provision(p) => run_oracle_provision(*p).await,
         OracleCommand::State(s) => run_oracle_state(s).await,
         OracleCommand::Resolve(r) => run_oracle_resolve(r).await,
+        OracleCommand::Cancel(c) => run_oracle_cancel(c).await,
+        OracleCommand::Delete(d) => run_oracle_delete(d).await,
     }
 }
 
@@ -260,6 +262,204 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
     )
 }
 
+#[cfg(feature = "shellnet")]
+fn oracle_u128(value: &serde_json::Value, field: &str) -> Option<u128> {
+    value[field].as_u64().map(u128::from).or_else(|| {
+        value[field]
+            .as_str()
+            .and_then(|raw| raw.parse::<u128>().ok())
+    })
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_oracle_cancel_preflight(
+    before_pmp: &serde_json::Value,
+    before_event: &serde_json::Value,
+) -> Result<u128> {
+    if before_pmp["approved"].as_bool() != Some(true) {
+        bail!("oracle cancel: PMP is not approved");
+    }
+    if before_pmp["isCancelled"].as_bool() == Some(true) {
+        bail!("oracle cancel: PMP is already cancelled");
+    }
+    if pmp_resolved_outcome(before_pmp).is_some() {
+        bail!("oracle cancel: PMP is already resolved");
+    }
+    let before_count = oracle_u128(before_event, "count")
+        .ok_or_else(|| anyhow::anyhow!("oracle cancel: event getter exposes no count"))?;
+    if before_count == 0 {
+        bail!("oracle cancel: event confirmation count is already zero");
+    }
+    Ok(before_count)
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_oracle_cancel_postread(
+    before_count: u128,
+    after_pmp: Option<&serde_json::Value>,
+    after_event: Option<&serde_json::Value>,
+    exact_confirmation_active: bool,
+) -> Result<(bool, Option<u128>)> {
+    let (Some(after_pmp), Some(after_event)) = (after_pmp, after_event) else {
+        return Ok((false, None));
+    };
+    let cancelled = after_pmp["isCancelled"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("oracle cancel: post-read exposes no isCancelled"))?;
+    if !cancelled && pmp_resolved_outcome(after_pmp).is_some() {
+        bail!("oracle cancel: contradictory post-read reports a resolved PMP");
+    }
+    let after_count = oracle_u128(after_event, "count")
+        .ok_or_else(|| anyhow::anyhow!("oracle cancel: post-read exposes no event count"))?;
+    let expected = before_count
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("oracle cancel: pre-read count was already zero"))?;
+    if !(expected..=before_count).contains(&after_count) {
+        bail!(
+            "oracle cancel: contradictory post-read confirmation count {after_count}; expected {expected}..={before_count}"
+        );
+    }
+    Ok((
+        cancelled && after_count == expected && !exact_confirmation_active,
+        Some(after_count),
+    ))
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_oracle_delete_preflight(event: &serde_json::Value, now: u64) -> Result<()> {
+    let count = oracle_u128(event, "count")
+        .ok_or_else(|| anyhow::anyhow!("oracle delete: event getter exposes no count"))?;
+    if count != 0 {
+        bail!("oracle delete: event still has {count} active PMP confirmation(s)");
+    }
+    let deadline = oracle_u128(event, "deadline")
+        .ok_or_else(|| anyhow::anyhow!("oracle delete: event getter exposes no deadline"))?;
+    if deadline >= u128::from(now) {
+        bail!("oracle delete: deadline not passed (deadline={deadline}, now={now})");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_oracle_delete_postread(
+    before_event: &serde_json::Value,
+    after_event: Option<&serde_json::Value>,
+) -> Result<bool> {
+    let Some(after_event) = after_event else {
+        return Ok(true);
+    };
+    if oracle_u128(after_event, "count") != Some(0)
+        || oracle_u128(after_event, "deadline") != oracle_u128(before_event, "deadline")
+    {
+        bail!("oracle delete: contradictory post-read event state");
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "shellnet")]
+async fn submit_oracle_cancel_after_validation(
+    preflight: Result<u128>,
+    submit: impl std::future::Future<Output = Result<serde_json::Value>>,
+) -> Result<u128> {
+    let before_count = preflight?;
+    submit.await?;
+    Ok(before_count)
+}
+
+#[cfg(feature = "shellnet")]
+async fn submit_oracle_delete_after_validation(
+    preflight: Result<()>,
+    submit: impl std::future::Future<Output = Result<serde_json::Value>>,
+) -> Result<()> {
+    preflight?;
+    submit.await?;
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn load_oracle_signer(path: &std::path::Path) -> Result<dexdo_core::KeyPair> {
+    let secret = read_secret_hex(path, "--oracle-key")?;
+    dexdo_core::KeyPair::from_secret_hex(secret.trim())
+        .map_err(|e| anyhow::anyhow!("--oracle-key (SDK secret hex): {e:?}"))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_cancel(args: OracleResolveArgs) -> Result<()> {
+    let manifest = load_oracle_market_manifest(&args.manifest)?;
+    shellnet_doctor_preflight(&args.contracts, None).await?;
+    let chain = dexdo_core::RealChainBackend::connect(
+        args.contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )?;
+    let signer = load_oracle_signer(&args.oracle_key)?;
+    let (oel, pmp, before_pmp, before_event) = chain
+        .assert_oracle_market_identity(&manifest, &signer)
+        .await?;
+    let before_count = submit_oracle_cancel_after_validation(
+        validate_oracle_cancel_preflight(&before_pmp, &before_event),
+        chain.submit_pmp_cancel_event(&pmp, &signer),
+    )
+    .await?;
+    let after_pmp = chain.pmp_details(&pmp).await?;
+    let after_event = chain.oracle_event_info(&oel, &manifest.event_id).await?;
+    let exact_confirmation_active = chain
+        .oracle_event_list_has_pmp_confirmation(&oel, &pmp, &manifest.event_id)
+        .await?;
+    let (confirmed, after_count) = validate_oracle_cancel_postread(
+        before_count,
+        after_pmp.as_ref(),
+        after_event.as_ref(),
+        exact_confirmation_active,
+    )?;
+    let cancelled = after_pmp
+        .as_ref()
+        .and_then(|details| details["isCancelled"].as_bool())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let after_count = after_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    println!(
+        "oracle cancel submitted event={} pmp={} post_read_is_cancelled={} confirmations={before_count}->{after_count} exact_confirmation_active={exact_confirmation_active} status={}",
+        manifest.event_id,
+        manifest.pmp,
+        cancelled,
+        if confirmed { "confirmed" } else { "pending" }
+    );
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_delete(args: OracleResolveArgs) -> Result<()> {
+    let manifest = load_oracle_market_manifest(&args.manifest)?;
+    shellnet_doctor_preflight(&args.contracts, None).await?;
+    let chain = dexdo_core::RealChainBackend::connect(
+        args.contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )?;
+    let signer = load_oracle_signer(&args.oracle_key)?;
+    let (oel, event) = chain
+        .assert_oracle_event_identity(&manifest, &signer)
+        .await?;
+    submit_oracle_delete_after_validation(
+        validate_oracle_delete_preflight(&event, chain.observed_chain_timestamp().await?),
+        chain.delete_oracle_event(&oel, &signer, &manifest.event_id),
+    )
+    .await?;
+    let after_event = chain.oracle_event_info(&oel, &manifest.event_id).await?;
+    let confirmed = validate_oracle_delete_postread(&event, after_event.as_ref())?;
+    println!(
+        "oracle delete submitted event={} oracle_event_list={} post_read_exists={} status={}",
+        manifest.event_id,
+        manifest.oracle_event_list,
+        after_event.is_some(),
+        if confirmed { "confirmed" } else { "pending" }
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
@@ -268,5 +468,121 @@ mod tests {
         let now = 1_900_000_000;
         assert!(super::validate_oracle_deadline(now + 119, now).is_err());
         assert!(super::validate_oracle_deadline(now + 120, now).is_ok());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn oracle_cancel_validation_checks_direct_pre_and_post_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let before_pmp =
+            serde_json::json!({"approved": true, "isCancelled": false, "resolvedOutcome": null});
+        let after_pmp =
+            serde_json::json!({"approved": true, "isCancelled": true, "resolvedOutcome": null});
+        let before_event = serde_json::json!({"count": "2"});
+        let after_event = serde_json::json!({"count": "1"});
+
+        let before = super::validate_oracle_cancel_preflight(&before_pmp, &before_event).unwrap();
+        let postread = |pmp, event, exact_active| {
+            super::validate_oracle_cancel_postread(before, Some(pmp), Some(event), exact_active)
+                .unwrap()
+        };
+        assert_eq!(before, 2);
+        assert_eq!(postread(&after_pmp, &after_event, false), (true, Some(1)));
+        assert_eq!(postread(&before_pmp, &before_event, true), (false, Some(2)));
+        assert_eq!(
+            postread(&after_pmp, &after_event, true),
+            (false, Some(1)),
+            "an unrelated decrement must not confirm this PMP while its exact OEL entry remains"
+        );
+
+        assert!(super::validate_oracle_cancel_preflight(
+            &serde_json::json!({"approved": true, "isCancelled": true, "resolvedOutcome": null}),
+            &before_event
+        )
+        .is_err());
+        assert!(super::validate_oracle_cancel_preflight(
+            &before_pmp,
+            &serde_json::json!({"count": "0"})
+        )
+        .is_err());
+        assert!(super::validate_oracle_cancel_postread(
+            before,
+            Some(&serde_json::json!({
+                "approved": true,
+                "isCancelled": false,
+                "resolvedOutcome": "1"
+            })),
+            Some(&before_event),
+            true
+        )
+        .is_err());
+        let cancel_posts = AtomicUsize::new(0);
+        let cancel_post = || async {
+            cancel_posts.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        };
+        assert!(super::submit_oracle_cancel_after_validation(
+            super::validate_oracle_cancel_preflight(
+                &before_pmp,
+                &serde_json::json!({"count": "0"}),
+            ),
+            cancel_post(),
+        )
+        .await
+        .is_err());
+        assert_eq!(cancel_posts.load(Ordering::SeqCst), 0);
+
+        let count = super::submit_oracle_cancel_after_validation(
+            super::validate_oracle_cancel_preflight(&before_pmp, &before_event),
+            cancel_post(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancel_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(count, 2);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn oracle_delete_validation_requires_zero_count_deadline_and_absence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let deletable = serde_json::json!({"count": "0", "deadline": "1000"});
+        assert!(super::validate_oracle_delete_preflight(&deletable, 1_001).is_ok());
+        assert!(super::validate_oracle_delete_preflight(&deletable, 1_000).is_err());
+        assert!(super::validate_oracle_delete_preflight(
+            &serde_json::json!({"count": "1", "deadline": "1000"}),
+            1_001
+        )
+        .is_err());
+        assert!(super::validate_oracle_delete_postread(&deletable, None).unwrap());
+        assert!(!super::validate_oracle_delete_postread(&deletable, Some(&deletable)).unwrap());
+        assert!(super::validate_oracle_delete_postread(
+            &deletable,
+            Some(&serde_json::json!({"count": "1", "deadline": "1000"}))
+        )
+        .is_err());
+
+        let delete_posts = AtomicUsize::new(0);
+        let delete_post = || async {
+            delete_posts.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        };
+        assert!(super::submit_oracle_delete_after_validation(
+            super::validate_oracle_delete_preflight(&deletable, 1_000),
+            delete_post(),
+        )
+        .await
+        .is_err());
+        assert_eq!(delete_posts.load(Ordering::SeqCst), 0);
+
+        super::submit_oracle_delete_after_validation(
+            super::validate_oracle_delete_preflight(&deletable, 1_001),
+            delete_post(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delete_posts.load(Ordering::SeqCst), 1);
     }
 }

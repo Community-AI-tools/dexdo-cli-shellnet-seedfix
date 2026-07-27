@@ -1,36 +1,29 @@
 use super::backends::{note_owner_mismatch_reason, MODEL_TICK_SIZE};
 use super::book_events::{read_book_event_fold, BookEventFold};
 use super::contracts_provision::*;
-use super::stream_locks::{
-    decode_note_stream_lock_call, NoteStreamLockEntry, NoteStreamLockFold, NoteStreamLockKind,
-    NoteStreamLockSnapshot,
-};
 use crate::chain::{
-    InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill, OrderBookSubscription,
+    check_seller_pubkey, InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill,
+    OrderBookSubscription,
 };
 use crate::manifest::{model_hash_for, MarketManifest};
 use crate::onchain_diagnostics::{validate_onchain_submit_response, OnchainSubmitError};
 use crate::oracle_manifest::OracleMarketManifest;
 use anyhow::{anyhow, Context, Result};
-#[cfg(feature = "test-giver")]
 use base64::Engine as _;
 use gosh_ackinacki::airegistry::calls::encode_external_call;
 use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
 use gosh_ackinacki::config::AiRegistryConfig;
-use gosh_ackinacki::sdk::{Address, ChainClient, ChainLiveness, KeyPair};
+use gosh_ackinacki::sdk::{Account, Address, ChainClient, ChainLiveness, KeyPair};
 use gosh_ackinacki::wallet::query::{dest_account_id_hex, fetch_dapp_id};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-#[cfg(feature = "test-giver")]
 use tvm_block::Deserializable;
 
 const FIXED_SUPERROOT_ACCOUNT_ID: &str =
     "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
 const MIN_PMP_INITIAL_STAKE: u128 = 10_000_000;
-/// `PrivateNote.sol::STREAM_LOCK_MAX`; the owner escape hatch is accepted strictly after this delay.
-pub const PRIVATE_NOTE_STREAM_LOCK_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// Pinned `tvm_client` default signed-message lifetime(`message_expiration_timeout`).
 const SDK_MESSAGE_EXPIRY_SECS: u64 = 40;
 /// Strict contract window: `block.timestamp < expireAt < block.timestamp + 300`.
@@ -226,60 +219,6 @@ pub struct ShellnetDoctorReport {
     pub checks: Vec<ShellnetDoctorCheck>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteStreamLockStatus {
-    pub stream_count: u32,
-    pub dispute_count: u32,
-    pub last_change_unix: u64,
-    pub entries: Vec<NoteStreamLockEntry>,
-    pub history_complete: bool,
-}
-
-impl NoteStreamLockStatus {
-    /// Reconstruct a status from successful inbound calls ordered from oldest to newest.
-    /// `internal_source` is the authoritative TokenContract deal address for 4.0.27
-    /// `stream*Lock(sellerPubkey, nonce)` calls; `None` identifies an external owner clear call.
-    pub fn from_successful_inbound_calls<'a>(
-        stream_count: u32,
-        dispute_count: u32,
-        last_change_unix: u64,
-        calls: impl IntoIterator<Item = (u64, &'a str, bool, Option<&'a str>)>,
-    ) -> Result<Self> {
-        let entries = reconstruct_note_stream_lock_entries(calls)?;
-        Ok(Self::from_entries(
-            stream_count,
-            dispute_count,
-            last_change_unix,
-            entries,
-        ))
-    }
-
-    fn from_entries(
-        stream_count: u32,
-        dispute_count: u32,
-        last_change_unix: u64,
-        entries: Vec<NoteStreamLockEntry>,
-    ) -> Self {
-        let folded_stream = entries
-            .iter()
-            .filter(|entry| entry.kind == NoteStreamLockKind::Stream)
-            .count();
-        let folded_dispute = entries
-            .iter()
-            .filter(|entry| entry.kind == NoteStreamLockKind::Dispute)
-            .count();
-        let history_complete =
-            folded_stream == stream_count as usize && folded_dispute == dispute_count as usize;
-        Self {
-            stream_count,
-            dispute_count,
-            last_change_unix,
-            entries,
-            history_complete,
-        }
-    }
-}
-
 impl ShellnetDoctorReport {
     pub fn is_ok(&self) -> bool {
         self.checks
@@ -297,14 +236,6 @@ impl ShellnetDoctorReport {
     }
 }
 
-fn normalize_code_hash(raw: &str) -> Option<String> {
-    let h = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
-    if h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(format!("{h:0>64}").to_lowercase())
-}
-
 fn getter_u128(v: &Value, key: &str) -> Option<u128> {
     let raw = &v[key];
     if let Some(n) = raw.as_u64() {
@@ -316,6 +247,50 @@ fn getter_u128(v: &Value, key: &str) -> Option<u128> {
     } else {
         s.parse::<u128>().ok()
     }
+}
+
+fn subscription_order_is_active_for_owner(
+    order_id: u128,
+    order: &Value,
+    owner_note: &str,
+) -> Result<bool> {
+    let amount = getter_u128(order, "amount")
+        .ok_or_else(|| anyhow!("getOrder({order_id}) has no amount: {order}"))?;
+    let canonical_empty = amount == 0
+        && order
+            .get("note")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().is_empty())
+        && order
+            .get("tokenContract")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().is_empty())
+        && ["price", "escrow", "deadline", "flags", "ts"]
+            .iter()
+            .all(|field| getter_u128(order, field) == Some(0))
+        && getter_bool(order, "isBuy") == Some(false);
+    if canonical_empty {
+        return Ok(false);
+    }
+    if amount == 0 {
+        return Err(anyhow!(
+            "getOrder({order_id}) has non-canonical zero-amount row: {order}"
+        ));
+    }
+    let Some(note) = order.get("note").and_then(Value::as_str) else {
+        return Err(anyhow!("getOrder({order_id}) has no owner note: {order}"));
+    };
+    let note = Address::parse(note)
+        .map_err(|error| anyhow!("getOrder({order_id}) owner note {note}: {error}"))?
+        .with_workchain();
+    let owner_note = Address::parse(owner_note)
+        .map_err(|error| anyhow!("expected owner note {owner_note}: {error}"))?
+        .with_workchain();
+    let is_buy = order
+        .get("isBuy")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("getOrder({order_id}) has no isBuy: {order}"))?;
+    Ok(is_buy && note.eq_ignore_ascii_case(&owner_note))
 }
 
 fn getter_bool(v: &Value, key: &str) -> Option<bool> {
@@ -331,6 +306,7 @@ fn getter_bool(v: &Value, key: &str) -> Option<bool> {
     }
 }
 
+#[cfg(feature = "test-giver")]
 fn successful_inbound_call(node: &Value) -> bool {
     let transaction = &node["dst_transaction"];
     if transaction.is_null() || transaction["aborted"].as_bool() != Some(false) {
@@ -348,44 +324,6 @@ fn successful_inbound_call(node: &Value) -> bool {
     };
     stage_succeeded(&transaction["compute"], "exit_code")
         && stage_succeeded(&transaction["action"], "result_code")
-}
-
-type SuccessfulInboundLockCall<'a> = (u64, &'a str, bool, Option<&'a str>);
-
-fn successful_inbound_lock_call(node: &Value) -> Result<Option<SuccessfulInboundLockCall<'_>>> {
-    if !successful_inbound_call(node) {
-        return Ok(None);
-    }
-    let Some(body) = node["body"].as_str() else {
-        return Ok(None);
-    };
-    let created_at = node["created_at"]
-        .as_u64()
-        .or_else(|| {
-            node["created_at"]
-                .as_str()
-                .and_then(|value| value.parse().ok())
-        })
-        .ok_or_else(|| anyhow!("successful PrivateNote inbound call has no created_at"))?;
-    let internal_source = node["src"].as_str().filter(|source| !source.is_empty());
-    Ok(Some((
-        created_at,
-        body,
-        internal_source.is_some(),
-        internal_source,
-    )))
-}
-
-fn reconstruct_note_stream_lock_entries<'a>(
-    calls: impl IntoIterator<Item = (u64, &'a str, bool, Option<&'a str>)>,
-) -> Result<Vec<NoteStreamLockEntry>> {
-    let mut fold = NoteStreamLockFold::default();
-    for (created_at, body, internal, internal_source) in calls {
-        if let Some(call) = decode_note_stream_lock_call(body, internal, internal_source)? {
-            fold.apply(call, created_at);
-        }
-    }
-    Ok(fold.into_entries())
 }
 
 fn details_has_withdrawn(details: &Value) -> Option<bool> {
@@ -836,6 +774,183 @@ fn find_event_id_in_getter_output(
     None
 }
 
+fn event_from_getter_output<'a>(output: &'a Value, event_id: &str) -> Option<&'a Value> {
+    let wanted = normalize_uint256_hex(event_id).ok()?;
+    let events = output.get("_events").unwrap_or(output);
+    if let Some(obj) = events.as_object() {
+        return obj.iter().find_map(|(key, event)| {
+            (normalize_uint256_hex(key).ok().as_deref() == Some(wanted.as_str())).then_some(event)
+        });
+    }
+    events.as_array()?.iter().find_map(|item| {
+        if let Some(obj) = item.as_object() {
+            let key = obj.get("key").or_else(|| obj.get("0"))?;
+            let event = obj.get("value").or_else(|| obj.get("1"))?;
+            return (value_to_uint256_hex(key).as_deref() == Some(wanted.as_str()))
+                .then_some(event);
+        }
+        let pair = item.as_array()?;
+        (pair.len() == 2 && value_to_uint256_hex(&pair[0]).as_deref() == Some(wanted.as_str()))
+            .then(|| &pair[1])
+    })
+}
+
+fn oracle_event_list_storage_fields(account_boc: &str) -> Result<Value> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(account_boc)
+        .map_err(|error| anyhow!("decode account BOC base64: {error}"))?;
+    let cell = tvm_types::read_single_root_boc(&bytes)
+        .map_err(|error| anyhow!("read account BOC: {error}"))?;
+    let account = tvm_block::Account::construct_from_cell(cell)
+        .map_err(|error| anyhow!("decode account: {error}"))?;
+    let data = account
+        .get_data()
+        .ok_or_else(|| anyhow!("active account exposes no data cell"))?;
+    let contract = tvm_abi::Contract::load(ORACLEEVENTLIST_ABI.as_bytes())
+        .map_err(|error| anyhow!("load OracleEventList ABI: {error}"))?;
+    let tokens = contract
+        .decode_storage_fields(
+            tvm_types::SliceData::load_cell(data)
+                .map_err(|error| anyhow!("load account data slice: {error}"))?,
+            true,
+        )
+        .map_err(|error| anyhow!("decode account storage: {error}"))?;
+    tvm_abi::token::Detokenizer::detokenize_to_json_value(&tokens)
+        .map_err(|error| anyhow!("detokenize account storage: {error}"))
+}
+
+fn oracle_pmp_confirmation_is_active(
+    fields: &Value,
+    pmp: &Address,
+    event_id: &str,
+) -> Result<bool> {
+    let Some(confirmed_event) = fields["_pmpConfirmed"]
+        .as_object()
+        .ok_or_else(|| anyhow!("OracleEventList storage exposes no _pmpConfirmed map"))?
+        .get(&format!("0x{}", pmp.bare()))
+    else {
+        return Ok(false);
+    };
+    if value_to_uint256_hex(confirmed_event).as_deref()
+        != Some(normalize_uint256_hex(event_id)?.as_str())
+    {
+        return Err(anyhow!(
+            "OracleEventList _pmpConfirmed entry for PMP {pmp} belongs to another event"
+        ));
+    }
+    Ok(true)
+}
+
+fn validate_oracle_event_list_identity(
+    fields: &Value,
+    manifest: &OracleMarketManifest,
+    signer: &KeyPair,
+) -> Result<u128> {
+    let live_oracle = fields["_oracle"]
+        .as_str()
+        .ok_or_else(|| anyhow!("OracleEventList storage exposes no _oracle"))?;
+    if normalize_addr(live_oracle)? != normalize_addr(&manifest.oracle)? {
+        return Err(anyhow!(
+            "OracleEventList belongs to {live_oracle}, not manifest oracle {}",
+            manifest.oracle
+        ));
+    }
+    let index = getter_u128(fields, "_index")
+        .ok_or_else(|| anyhow!("OracleEventList storage exposes no _index"))?;
+    let live_key = value_to_uint256_hex(&fields["_oraclePubkey"])
+        .ok_or_else(|| anyhow!("OracleEventList storage exposes no _oraclePubkey"))?;
+    if live_key != normalize_uint256_hex(signer.public_hex())? {
+        return Err(anyhow!(
+            "oracle signer {} does not own OracleEventList",
+            signer.public_hex()
+        ));
+    }
+    Ok(index)
+}
+
+fn validate_pmp_manifest(details: &Value, manifest: &OracleMarketManifest) -> Result<()> {
+    let event_id = value_to_uint256_hex(&details["eventId"])
+        .ok_or_else(|| anyhow!("PMP getDetails exposes no eventId"))?;
+    if event_id != normalize_uint256_hex(&manifest.event_id)? {
+        return Err(anyhow!("PMP eventId does not match the manifest"));
+    }
+    let list_hash = value_to_uint256_hex(&details["oracleListHash"])
+        .ok_or_else(|| anyhow!("PMP getDetails exposes no oracleListHash"))?;
+    if list_hash != normalize_uint256_hex(&manifest.oracle_list_hash)? {
+        return Err(anyhow!("PMP oracleListHash does not match the manifest"));
+    }
+    if getter_u128(details, "tokenType") != Some(u128::from(manifest.token_type)) {
+        return Err(anyhow!("PMP tokenType does not match the manifest"));
+    }
+    Ok(())
+}
+
+fn pmp_deployer(details: &Value) -> Result<Address> {
+    let raw = details["deployer"]
+        .as_str()
+        .ok_or_else(|| anyhow!("PMP getDetails exposes no deployer"))?;
+    Address::parse(raw).context("PMP getDetails deployer")
+}
+
+fn validate_salted_pmp_identity(
+    pmp: &Address,
+    actual_pmp_code_hash: Option<&str>,
+    deployer: &Address,
+    deployer_account: Option<&Account>,
+    pmp_code: Option<&Value>,
+) -> Result<()> {
+    let deployer_account = deployer_account.ok_or_else(|| {
+        anyhow!("PrivateNote account {deployer} is not Active/not found (account snapshot absent)")
+    })?;
+    if deployer_account.address != *deployer {
+        return Err(anyhow!(
+            "PMP deployer account snapshot belongs to {} instead of {deployer}",
+            deployer_account.address
+        ));
+    }
+    note_balance_private_note_account(deployer, Some(deployer_account))?;
+    let pmp_code =
+        pmp_code.ok_or_else(|| anyhow!("PrivateNote {deployer} getPMPCode unavailable"))?;
+    let expected = value_to_uint256_hex(&pmp_code["pmpCodeHash"])
+        .and_then(|hash| normalize_code_hash(&hash))
+        .ok_or_else(|| anyhow!("PrivateNote {deployer} getPMPCode exposes no pmpCodeHash"))?;
+    let actual = actual_pmp_code_hash
+        .and_then(normalize_code_hash)
+        .ok_or_else(|| anyhow!("PMP {pmp} exposes no code hash"))?;
+    if actual != expected {
+        return Err(anyhow!(
+            "PMP {pmp} code hash does not match PrivateNote {deployer} getPMPCode"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_oracle_event_manifest(
+    event: &Value,
+    range: &Value,
+    manifest: &OracleMarketManifest,
+) -> Result<()> {
+    if event["eventName"].as_str() != Some(manifest.event_name.as_str())
+        || getter_u128(event, "deadline") != Some(u128::from(manifest.deadline))
+        || !outcome_names_match(&event["outcomeNames"], &manifest.outcome_names)
+    {
+        return Err(anyhow!(
+            "OracleEventList event identity does not match the manifest"
+        ));
+    }
+    if getter_bool(range, "exists") != Some(true)
+        || range["ob"].as_str().map(normalize_addr).transpose()?
+            != Some(normalize_addr(&manifest.inference_order_book)?)
+        || range_bounds_to_uint256_hex(&range["bounds"])
+            != Some(requested_bounds_to_uint256_hex(&manifest.bounds)?)
+    {
+        return Err(anyhow!(
+            "OracleEventList range identity does not match the manifest"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod oracle_getter_tests {
     use super::*;
@@ -961,6 +1076,152 @@ mod oracle_getter_tests {
         )
         .is_none());
     }
+
+    #[test]
+    fn finds_exact_event_by_normalized_id() {
+        let output = json!({
+            "_events": [{
+                "key": "15",
+                "value": {"eventName": "weekly", "count": "2"}
+            }]
+        });
+        let event = event_from_getter_output(&output, "0x0f").expect("event by id");
+        assert_eq!(event["eventName"], "weekly");
+        assert_eq!(getter_u128(event, "count"), Some(2));
+        assert!(event_from_getter_output(&output, "0x10").is_none());
+    }
+
+    #[test]
+    fn finds_only_the_exact_pmp_confirmation_in_oel_storage() {
+        let pmp = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+        let other_pmp = Address::parse(&format!("0:{}", "2".repeat(64))).unwrap();
+        let mut confirmations = serde_json::Map::new();
+        confirmations.insert(format!("0x{}", pmp.bare()), json!("0x16"));
+        let fields = json!({"_pmpConfirmed": confirmations});
+
+        assert!(oracle_pmp_confirmation_is_active(&fields, &pmp, "0x16").unwrap());
+        assert!(!oracle_pmp_confirmation_is_active(&fields, &other_pmp, "0x16").unwrap());
+        assert!(oracle_pmp_confirmation_is_active(&fields, &pmp, "0x17").is_err());
+    }
+
+    #[test]
+    fn oracle_identity_validators_reject_wrong_signer_and_manifest() {
+        let addr = |digit: char| format!("0:{}", digit.to_string().repeat(64));
+        let manifest = OracleMarketManifest {
+            network: "shellnet".into(),
+            root_oracle: addr('1'),
+            oracle: addr('2'),
+            oracle_event_list: addr('3'),
+            oracle_list_hash: "0x15".into(),
+            event_id: "0x16".into(),
+            event_name: "event".into(),
+            pmp: addr('4'),
+            token_type: 1,
+            inference_order_book: addr('5'),
+            frame_model: "model".into(),
+            deadline: 1_000,
+            bounds: vec!["10".into()],
+            outcome_names: vec!["below".into(), "above".into()],
+        };
+        let signer = KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let fields = json!({
+            "_oracle": manifest.oracle,
+            "_index": "7",
+            "_oraclePubkey": signer.public_hex(),
+        });
+        assert_eq!(
+            validate_oracle_event_list_identity(&fields, &manifest, &signer).unwrap(),
+            7
+        );
+        assert!(validate_oracle_event_list_identity(
+            &fields,
+            &manifest,
+            &KeyPair::from_secret_hex(&"33".repeat(32)).unwrap()
+        )
+        .is_err());
+
+        let details = json!({
+            "eventId": manifest.event_id,
+            "oracleListHash": manifest.oracle_list_hash,
+            "tokenType": "1",
+        });
+        assert!(validate_pmp_manifest(&details, &manifest).is_ok());
+        assert!(validate_pmp_manifest(
+            &json!({"eventId": "0x17", "oracleListHash": "0x15", "tokenType": "1"}),
+            &manifest
+        )
+        .is_err());
+
+        let event = json!({
+            "eventName": manifest.event_name,
+            "deadline": "1000",
+            "outcomeNames": {"0": "below", "1": "above"},
+        });
+        let range = json!({"exists": true, "ob": manifest.inference_order_book, "bounds": ["10"]});
+        assert!(validate_oracle_event_manifest(&event, &range, &manifest).is_ok());
+        assert!(validate_oracle_event_manifest(
+            &event,
+            &json!({"exists": true, "ob": addr('6'), "bounds": ["10"]}),
+            &manifest
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn salted_pmp_identity_validator_is_fail_closed() {
+        const SALTED: &str = "893599247dee107d493507399985a0bb5a4396580b8693f03f62aa36a25737f3";
+        const BASE: &str = "fbc1fb4fa83a623bed6f224ba9d9d0f0904012f5f98a94937ea79ff27ce679fb";
+
+        let pmp = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+        let deployer = Address::parse(&format!("0:{}", "2".repeat(64))).unwrap();
+        let other = Address::parse(&format!("0:{}", "3".repeat(64))).unwrap();
+        let cases = [
+            ("canonical salted", 0),
+            ("unsalted base", 1),
+            ("wrong salt", 2),
+            ("wrong deployer", 3),
+            ("inactive deployer", 4),
+            ("non-PrivateNote", 5),
+            ("missing getter", 6),
+        ];
+
+        for (name, case) in cases {
+            let mut actual = SALTED;
+            let mut account_address = &deployer;
+            let mut status = "Active";
+            let mut code_hash = PRIVATENOTE_PINNED_CODE_HASH;
+            let mut getter = Some(SALTED);
+            match case {
+                1 => actual = BASE,
+                2 => getter = Some(BASE),
+                3 => account_address = &other,
+                4 => {
+                    status = "Uninit";
+                    getter = None;
+                }
+                5 => code_hash = BASE,
+                6 => getter = None,
+                _ => {}
+            }
+            let account = Account {
+                address: account_address.clone(),
+                status: status.into(),
+                balance: 0,
+                ecc: Vec::new(),
+                code_hash: Some(code_hash.into()),
+                boc: None,
+            };
+            let getter = getter.map(|hash| json!({"pmpCodeHash": format!("0x{hash}")}));
+            let result = validate_salted_pmp_identity(
+                &pmp,
+                Some(actual),
+                &deployer,
+                Some(&account),
+                getter.as_ref(),
+            );
+            assert_eq!(result.is_ok(), case == 0, "{name}");
+        }
+    }
 }
 
 /// Manifest of the deployed shellnet contracts(`contracts/deployed.shellnet.json`).
@@ -976,11 +1237,12 @@ pub struct Deployed {
     pub dapp_config: String,
     /// `dapp_id`(= account_id of `SuperRoot`).
     pub dapp_id: String,
-    /// The seller's probe-tick commission in bps.
-    pub seller_probe_commission_bps: u16,
     /// Optional Block Manager endpoint. `graphql` is accepted for deployed-manifest compatibility.
     #[serde(default, alias = "graphql")]
     pub endpoint: Option<String>,
+    /// Exact live code hashes used by destructive lifecycle preflights.
+    #[serde(default)]
+    pub contract_hashes: BTreeMap<String, String>,
 }
 
 impl Deployed {
@@ -1553,12 +1815,12 @@ pub enum TokenContractSettlementEvent {
     ProbeAccepted {
         buyer: String,
         to_seller: u128,
-        commission_returned: u128,
+        bond_returned: u128,
     },
     ProbeBurned {
         buyer: String,
         burned_probe: u128,
-        burned_commission: u128,
+        burned_bond: u128,
         refund_to_buyer: u128,
     },
     TickFinalized {
@@ -1734,12 +1996,12 @@ fn decode_token_contract_settlement_receipts(
             "ProbeAccepted" => TokenContractSettlementEvent::ProbeAccepted {
                 buyer: required_address("buyer")?,
                 to_seller: required_u128("toSeller")?,
-                commission_returned: required_u128("commissionReturned")?,
+                bond_returned: required_u128("bondReturned")?,
             },
             "ProbeBurned" => TokenContractSettlementEvent::ProbeBurned {
                 buyer: required_address("buyer")?,
                 burned_probe: required_u128("burnedProbe")?,
-                burned_commission: required_u128("burnedCommission")?,
+                burned_bond: required_u128("burnedBond")?,
                 refund_to_buyer: required_u128("refundToBuyer")?,
             },
             "TickFinalized" => TokenContractSettlementEvent::TickFinalized {
@@ -1888,7 +2150,11 @@ impl RealChainBackend {
         Ok(())
     }
 
-    async fn account_active_code_hash(&self, addr: &Address) -> Result<(bool, Option<String>)> {
+    pub async fn observed_chain_timestamp(&self) -> Result<u64> {
+        fetch_chain_time_secs(&self.http, self.client.endpoint()).await
+    }
+
+    pub async fn account_active_code_hash(&self, addr: &Address) -> Result<(bool, Option<String>)> {
         let Some(acc) = self.client.get_account(addr).await? else {
             return Ok((false, None));
         };
@@ -3033,22 +3299,7 @@ impl RealChainBackend {
         let Some(order) = self.inference_orderbook_order(ob, order_id).await? else {
             return Ok(false);
         };
-        let Some(note) = order.get("note").and_then(Value::as_str) else {
-            return Err(anyhow!("getOrder({order_id}) has no owner note: {order}"));
-        };
-        let note = Address::parse(note)
-            .map_err(|error| anyhow!("getOrder({order_id}) owner note {note}: {error}"))?
-            .with_workchain();
-        let owner_note = Address::parse(owner_note)
-            .map_err(|error| anyhow!("expected owner note {owner_note}: {error}"))?
-            .with_workchain();
-        let is_buy = order
-            .get("isBuy")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| anyhow!("getOrder({order_id}) has no isBuy: {order}"))?;
-        let amount = getter_u128(&order, "amount")
-            .ok_or_else(|| anyhow!("getOrder({order_id}) has no amount: {order}"))?;
-        Ok(is_buy && amount > 0 && note.eq_ignore_ascii_case(&owner_note))
+        subscription_order_is_active_for_owner(order_id, &order, owner_note)
     }
 
     /// The book's `getSubscription(orderId)` getter. `exists=false` means the order is not a live
@@ -3085,31 +3336,17 @@ impl RealChainBackend {
         }))
     }
 
-    /// The book's `getForfeit(orderId, cycle)` getter. This is read-only evidence for the
-    /// subscription full-fill path: the current-cycle unspent budget is recorded for that cycle's
-    /// sellers, while future-cycle residual must not remain stranded in the order.
-    pub async fn inference_orderbook_forfeit(
-        &self,
-        ob: &Address,
-        order_id: u128,
-        cycle: u8,
-    ) -> Result<Option<(u128, u128)>> {
-        let Some(v) = self
-            .client
-            .run_getter(
-                ob,
-                INFERENCE_ORDERBOOK_ABI,
-                "getForfeit",
-                json!({ "orderId": order_id.to_string(), "cycle": cycle }),
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((
-            getter_u128(&v, "pool").unwrap_or(0),
-            getter_u128(&v, "fundedTicks").unwrap_or(0),
-        )))
+    /// Apply an already-expired subscription cycle. The deployed order book owns all time and
+    /// settlement semantics; this permissionless caller supplies only the exact order id.
+    pub async fn poke_inference_subscription(&self, ob: &Address, order_id: u128) -> Result<Value> {
+        self.submit(
+            ob,
+            INFERENCE_ORDERBOOK_ABI,
+            "pokeSubscription",
+            json!({ "orderId": order_id.to_string() }),
+            &KeyPair::generate(),
+        )
+        .await
     }
 
     /// The seller submits exactly one owner-signed external call to the note:
@@ -3280,6 +3517,7 @@ impl RealChainBackend {
                     "modelHash": model_hash,
                     "maxPricePerTick": max_price_per_tick.to_string(),
                     "ticks": ticks.to_string(),
+                    "flags": 0,
                     "escrow": escrow.to_string(),
                     "autoRenew": auto_renew,
                 }),
@@ -3374,10 +3612,10 @@ impl RealChainBackend {
             .await
     }
 
-    /// The `getProbe` getter of the deal(`probeFunded`, `probeLocked`, `probeCommission`).
-    pub async fn token_contract_probe(&self, tc: &Address) -> Result<Option<Value>> {
+    /// The `getSellerBond` getter of the deal(`bondFunded`, `bondHeld`, `bondRequired`).
+    pub async fn token_contract_seller_bond(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getProbe", json!({}))
+            .run_getter(tc, TOKENCONTRACT_ABI, "getSellerBond", json!({}))
             .await
     }
 
@@ -3390,173 +3628,6 @@ impl RealChainBackend {
         self.client
             .run_getter(tc, TOKENCONTRACT_ABI, "getConfig", json!({}))
             .await
-    }
-
-    /// The `getStreamLocks` getter of the `PrivateNote` note(`streamCount`, `disputeCount`, `lastChange`):
-    /// direct proof that "the note is locked". After `TC.dispute()` both notes have
-    /// `disputeCount > 0` -- until the dispute is resolved, a new offer/withdrawal from the note is rejected
-    /// (`ERR_STREAM_LOCKED`). `None` if the note is not active.
-    pub async fn note_stream_locks(&self, note: &Address) -> Result<Option<Value>> {
-        self.client
-            .run_getter(note, PRIVATENOTE_ABI, "getStreamLocks", json!({}))
-            .await
-    }
-
-    /// Read only the authoritative `getStreamLocks` counters and `lastChange`, without the
-    /// transaction-history reconstruction performed by [`Self::note_stream_lock_status`].
-    pub async fn note_stream_lock_snapshot(
-        &self,
-        note: &Address,
-    ) -> Result<Option<NoteStreamLockSnapshot>> {
-        let Some(raw) = self.note_stream_locks(note).await? else {
-            return Ok(None);
-        };
-        let stream_count: u32 = getter_u128(&raw, "streamCount")
-            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no streamCount"))?
-            .try_into()
-            .map_err(|_| anyhow!("PrivateNote {note} streamCount exceeds u32"))?;
-        let dispute_count: u32 = getter_u128(&raw, "disputeCount")
-            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no disputeCount"))?
-            .try_into()
-            .map_err(|_| anyhow!("PrivateNote {note} disputeCount exceeds u32"))?;
-        let last_change_unix: u64 = getter_u128(&raw, "lastChange")
-            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no lastChange"))?
-            .try_into()
-            .map_err(|_| anyhow!("PrivateNote {note} lastChange exceeds u64"))?;
-        Ok(Some(NoteStreamLockSnapshot {
-            stream_count,
-            dispute_count,
-            last_change_unix,
-        }))
-    }
-
-    /// Read the authoritative lock counters and reconstruct the active deal addresses from successful
-    /// inbound `stream*Lock`/`stream*Unlock` calls. `forceClearStreamLocks` is folded as a reset.
-    pub async fn note_stream_lock_status(
-        &self,
-        note: &Address,
-    ) -> Result<Option<NoteStreamLockStatus>> {
-        let Some(snapshot) = self.note_stream_lock_snapshot(note).await? else {
-            return Ok(None);
-        };
-        let entries = if snapshot.stream_count == 0 && snapshot.dispute_count == 0 {
-            Vec::new()
-        } else {
-            self.note_stream_lock_entries(note).await?
-        };
-        Ok(Some(NoteStreamLockStatus::from_entries(
-            snapshot.stream_count,
-            snapshot.dispute_count,
-            snapshot.last_change_unix,
-            entries,
-        )))
-    }
-
-    async fn note_stream_lock_entries(&self, note: &Address) -> Result<Vec<NoteStreamLockEntry>> {
-        const PAGE_SIZE: u32 = 1_000;
-        let account_id = note.bare().to_string();
-        let endpoint = self.client.endpoint().trim_end_matches('/');
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
-        let gql = format!("{endpoint}/graphql");
-        let query = r#"
-            query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
-              blockchain {
-                account(account_id: $accountId, dapp_id: $dappId) {
-                  messages(msg_type: [ExtIn, IntIn], last: $last, before: $before) {
-                    pageInfo { startCursor hasPreviousPage }
-                    edges {
-                      cursor
-                      node {
-                        id body src created_at
-                        dst_transaction {
-                          aborted
-                          compute { exit_code success }
-                          action { result_code success }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-        "#;
-        let mut before: Option<String> = None;
-        let mut seen = BTreeSet::new();
-        let mut decoded = Vec::new();
-        loop {
-            let response: Value = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": {
-                        "accountId": account_id.as_str(),
-                        "dappId": dapp_id.as_str(),
-                        "last": PAGE_SIZE,
-                        "before": before.as_deref(),
-                    },
-                }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            if let Some(errors) = response.get("errors") {
-                return Err(anyhow!(
-                    "PrivateNote {note} inbound-message GraphQL errors: {errors}"
-                ));
-            }
-            let messages = response
-                .pointer("/data/blockchain/account/messages")
-                .ok_or_else(|| {
-                    anyhow!("PrivateNote {note} inbound-message GraphQL shape changed: {response}")
-                })?;
-            let edges = messages["edges"].as_array().ok_or_else(|| {
-                anyhow!("PrivateNote {note} inbound-message GraphQL edges missing: {response}")
-            })?;
-            for edge in edges {
-                let cursor = edge["cursor"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("PrivateNote {note} inbound message has no cursor"))?;
-                let node = &edge["node"];
-                let id = node["id"].as_str().unwrap_or(cursor);
-                if !seen.insert(id.to_string()) {
-                    continue;
-                }
-                let Some((created_at, body, internal, internal_source)) =
-                    successful_inbound_lock_call(node)?
-                else {
-                    continue;
-                };
-                decoded.push((
-                    created_at,
-                    cursor.to_string(),
-                    body.to_string(),
-                    internal,
-                    internal_source.map(str::to_string),
-                ));
-            }
-            let Some(next) = previous_page_cursor(
-                &format!("PrivateNote {note} inbound-message"),
-                messages,
-                before.as_deref(),
-            )?
-            else {
-                break;
-            };
-            before = Some(next);
-        }
-        decoded.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-        reconstruct_note_stream_lock_entries(decoded.iter().map(
-            |(created_at, _, body, internal, internal_source)| {
-                (
-                    *created_at,
-                    body.as_str(),
-                    *internal,
-                    internal_source.as_deref(),
-                )
-            },
-        ))
     }
 
     /// Read-only `PrivateNote.getDetails()`: public balance/lock maps and metadata, no key and no signed call.
@@ -3945,10 +4016,10 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive -- the note posts the probe-commission to the nonce-derived `TokenContract` from its own
-    /// ECC[2], via the `PrivateNote` owner-method `postProbeCommission(nonce, amount)`(4.0.7) -- replaces the
-    /// operator multisig's [`fund_probe_commission`](Self::fund_probe_commission). External owner-signed message.
-    pub async fn note_post_probe_commission(
+    /// Directive -- the note posts the exact `2P` seller bond to the nonce-derived `TokenContract` from its own
+    /// ECC[2], via the `PrivateNote` owner-method `postSellerBond(nonce, amount)`(4.0.7) -- replaces the
+    /// operator multisig's [`fund_seller_bond`](Self::fund_seller_bond). External owner-signed message.
+    pub async fn note_post_seller_bond(
         &self,
         note: &Address,
         owner_keys: &KeyPair,
@@ -3958,7 +4029,7 @@ impl RealChainBackend {
         self.submit(
             note,
             PRIVATENOTE_ABI,
-            "postProbeCommission",
+            "postSellerBond",
             json!({
                 "nonce": nonce.to_string(),
                 "amount": amount.to_string(),
@@ -3988,7 +4059,7 @@ impl RealChainBackend {
     }
 
     /// The seller advances the stream: `advance()`(external signature `_sellerPubkey`). The first call after
-    /// `SETTLE_WINDOW`(180s) accepts the probe (probe-tick -> seller, commission is returned, sets the
+    /// `SETTLE_WINDOW`(180s) accepts the probe (probe-tick -> seller; the `2P` bond remains held for the deal; sets the
     /// two-tick invariant); afterwards it finalizes the delivered tick.
     pub async fn advance_stream(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(tc, TOKENCONTRACT_ABI, "advance", json!({}), seller_keys)
@@ -4011,6 +4082,13 @@ impl RealChainBackend {
         payout: &Address,
         seller_keys: &KeyPair,
     ) -> Result<Value> {
+        let seller_pubkey = self.token_contract_seller_pubkey(tc).await?;
+        check_seller_pubkey(
+            "destroy",
+            seller_pubkey.as_deref(),
+            seller_keys.public_hex(),
+        )
+        .map_err(anyhow::Error::msg)?;
         self.submit(
             tc,
             TOKENCONTRACT_ABI,
@@ -4021,10 +4099,9 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) ->
-    /// unlocks BOTH notes and **returns the tick to the buyer** (on the probe: probe+deposit to the buyer,
-    /// commission to the seller, NO burn -- a concession is not a stop,/). Symmetric to `stream_dispute`,
-    /// closing the anti-scam cycle of(lock -> resolution -> tick return).
+    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) returns
+    /// this TC's contested amount to the buyer and the seller bond, with NO burn. Symmetric to
+    /// `stream_dispute`; neither whole note is locked.
     pub async fn release_dispute(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(
             tc,
@@ -4032,6 +4109,19 @@ impl RealChainBackend {
             "releaseDispute",
             json!({}),
             seller_keys,
+        )
+        .await
+    }
+
+    /// Permissionless expiry resolution for an already-disputed deal. The caller does not choose
+    /// payouts; `TokenContract.resolveDisputeTimeout()` applies the deployed settlement rules.
+    pub async fn resolve_dispute_timeout(&self, tc: &Address) -> Result<Value> {
+        self.submit(
+            tc,
+            TOKENCONTRACT_ABI,
+            "resolveDisputeTimeout",
+            json!({}),
+            &KeyPair::generate(),
         )
         .await
     }
@@ -4060,8 +4150,8 @@ impl RealChainBackend {
 
     /// Submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's available token
     /// balances. `dapp_id` is event metadata only(surfaced in `TokensWithdrawn`, drives no logic) -- taken from
-    /// the deployed manifest. Fails on-chain if the note is stream-locked. Returns
-    /// the submit result. Do not treat this helper as proof that every native/ECC balance is fully retired
+    /// the deployed manifest. Returns the submit result. Do not treat this helper as proof that every
+    /// native/ECC balance is fully retired
     /// without by-fact evidence on the current deployed contract.
     pub async fn withdraw_note_tokens(
         &self,
@@ -4097,8 +4187,8 @@ impl RealChainBackend {
     }
 
     /// The buyer stops the stream via their note: `streamStop(tokenContract)` -> `TC.stop()`
-    /// (the TC checks `msg.sender == _buyer`). On the probe(before accept) -- burns the probe-tick and commission
-    /// + returns the remaining deposit; in Streaming -- a standard split.
+    /// (the TC checks `msg.sender == _buyer`). On the probe(before accept), buyer and seller each burn `P`,
+    /// the remaining seller-bond `P` and buyer deposit return; in Streaming -- a standard split.
     pub async fn stream_stop(
         &self,
         buyer_note: &Address,
@@ -4116,10 +4206,9 @@ impl RealChainBackend {
     }
 
     /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` -> `TC.dispute()`
-    /// (the TC checks `msg.sender == _buyer`). `TC.dispute()` locks **both** notes (`streamDisputeLock` on
-    /// `_buyer` and `_sellerNote`,): until the dispute is resolved, new offers/withdrawals from a locked note
-    /// are rejected(`ERR_STREAM_LOCKED`); `releaseDispute()` then returns the tick. The anti-scam `Dispute`
-    /// of -- a real on-chain lock of the scammer's note(strictly stronger than `streamStop`).
+    /// (the TC checks `msg.sender == _buyer`). This TC freezes the contested buyer amount and seller bond
+    /// until resolution; neither whole note is locked and independent TCs remain usable. `releaseDispute()`
+    /// returns the contested amount and seller bond without a probe burn.
     pub async fn stream_dispute(
         &self,
         buyer_note: &Address,
@@ -4139,7 +4228,7 @@ impl RealChainBackend {
     /// The buyer reclaims the deal on a **seller-inactivity timeout**: the note sends
     /// `streamReclaim(tokenContract)` -> `TC.reclaimOnTimeout()`. Requires `block.timestamp >=
     /// _lastAdvance + STREAM_TIMEOUT`(600s) and `_opened`. On the probe(seller no-show) -- **no burn**:
-    /// the probe and deposit are returned to the buyer, the commission to the seller.
+    /// the probe and deposit are returned to the buyer, and the full seller bond returns.
     pub async fn reclaim_on_timeout(
         &self,
         buyer_note: &Address,
@@ -4556,6 +4645,14 @@ impl RealChainBackend {
             .await
     }
 
+    pub async fn oracle_event_info(&self, oel: &Address, event_id: &str) -> Result<Option<Value>> {
+        let events = self
+            .oracle_event_list_events(oel)
+            .await?
+            .ok_or_else(|| anyhow!("OracleEventList {oel} _events getter unavailable"))?;
+        Ok(event_from_getter_output(&events, event_id).cloned())
+    }
+
     pub async fn oracle_range_data(&self, oel: &Address, event_id: &str) -> Result<Option<Value>> {
         self.client
             .run_getter(
@@ -4659,6 +4756,157 @@ impl RealChainBackend {
         self.client
             .run_getter(pmp, PMP_ABI, "getDetails", json!({}))
             .await
+    }
+
+    /// Fail-closed OEL/signer/event identity preflight. It intentionally does not require a live
+    /// PMP, because a deletable event outlives the PMP that released its confirmation.
+    pub async fn assert_oracle_event_identity(
+        &self,
+        manifest: &OracleMarketManifest,
+        signer: &KeyPair,
+    ) -> Result<(Address, Value)> {
+        manifest.validate().map_err(anyhow::Error::msg)?;
+        let oel = Address::parse(&manifest.oracle_event_list)
+            .context("oracle manifest oracle_event_list")?;
+        let oracle = Address::parse(&manifest.oracle).context("oracle manifest oracle")?;
+
+        let oel_account = self
+            .client
+            .get_account(&oel)
+            .await?
+            .filter(Account::is_active)
+            .ok_or_else(|| anyhow!("OracleEventList {oel} is not Active"))?;
+        let expected_oel_hash = self
+            .deployed
+            .contract_hashes
+            .get("OracleEventList")
+            .and_then(|hash| normalize_code_hash(hash))
+            .ok_or_else(|| anyhow!("deployed manifest exposes no OracleEventList code hash"))?;
+        let actual_oel_hash = oel_account
+            .code_hash
+            .as_deref()
+            .and_then(normalize_code_hash)
+            .ok_or_else(|| anyhow!("OracleEventList {oel} exposes no code hash"))?;
+        if actual_oel_hash != expected_oel_hash {
+            return Err(anyhow!(
+                "OracleEventList {oel} code hash does not match the deployed manifest"
+            ));
+        }
+        let oel_fields = oracle_event_list_storage_fields(
+            oel_account
+                .boc
+                .as_deref()
+                .ok_or_else(|| anyhow!("OracleEventList {oel} account BOC is unavailable"))?,
+        )?;
+        let index = validate_oracle_event_list_identity(&oel_fields, manifest, signer)?;
+        let canonical_oel = self.oracle_event_list_address(&oracle, index).await?;
+        if canonical_oel.with_workchain() != oel.with_workchain() {
+            return Err(anyhow!(
+                "OracleEventList {oel} is not canonical oracle {} index {index}",
+                manifest.oracle
+            ));
+        }
+        let event = self
+            .oracle_event_info(&oel, &manifest.event_id)
+            .await?
+            .ok_or_else(|| anyhow!("event {} is absent from {oel}", manifest.event_id))?;
+        let range = self
+            .oracle_range_data(&oel, &manifest.event_id)
+            .await?
+            .ok_or_else(|| anyhow!("event {} has no range data", manifest.event_id))?;
+        validate_oracle_event_manifest(&event, &range, manifest)?;
+        Ok((oel, event))
+    }
+
+    /// Full fail-closed identity preflight for PMP cancellation.
+    pub async fn assert_oracle_market_identity(
+        &self,
+        manifest: &OracleMarketManifest,
+        signer: &KeyPair,
+    ) -> Result<(Address, Address, Value, Value)> {
+        let (oel, event) = self.assert_oracle_event_identity(manifest, signer).await?;
+        let pmp = Address::parse(&manifest.pmp).context("oracle manifest pmp")?;
+        let pmp_account = self
+            .client
+            .get_account(&pmp)
+            .await?
+            .filter(Account::is_active)
+            .ok_or_else(|| anyhow!("PMP {pmp} is not Active"))?;
+        let details = self
+            .pmp_details(&pmp)
+            .await?
+            .ok_or_else(|| anyhow!("PMP {pmp} getDetails unavailable"))?;
+        validate_pmp_manifest(&details, manifest)?;
+        let deployer = pmp_deployer(&details)?;
+        let deployer_account = self.client.get_account(&deployer).await?;
+        note_balance_private_note_account(&deployer, deployer_account.as_ref())?;
+        let pmp_code = self
+            .client
+            .run_getter(&deployer, PRIVATENOTE_ABI, "getPMPCode", json!({}))
+            .await?;
+        validate_salted_pmp_identity(
+            &pmp,
+            pmp_account.code_hash.as_deref(),
+            &deployer,
+            deployer_account.as_ref(),
+            pmp_code.as_ref(),
+        )?;
+        if !self
+            .oracle_event_list_has_pmp_confirmation(&oel, &pmp, &manifest.event_id)
+            .await?
+        {
+            return Err(anyhow!(
+                "PMP {pmp} has no active confirmation for event {}",
+                manifest.event_id
+            ));
+        }
+        Ok((oel, pmp, details, event))
+    }
+
+    pub async fn oracle_event_list_has_pmp_confirmation(
+        &self,
+        oel: &Address,
+        pmp: &Address,
+        event_id: &str,
+    ) -> Result<bool> {
+        let account = self
+            .client
+            .get_account(oel)
+            .await?
+            .filter(Account::is_active)
+            .ok_or_else(|| anyhow!("OracleEventList {oel} is not Active"))?;
+        let fields = oracle_event_list_storage_fields(
+            account
+                .boc
+                .as_deref()
+                .ok_or_else(|| anyhow!("OracleEventList {oel} account BOC is unavailable"))?,
+        )?;
+        oracle_pmp_confirmation_is_active(&fields, pmp, event_id)
+    }
+
+    pub async fn submit_pmp_cancel_event(
+        &self,
+        pmp: &Address,
+        oracle_keys: &KeyPair,
+    ) -> Result<Value> {
+        self.submit(pmp, PMP_ABI, "submitCancelEvent", json!({}), oracle_keys)
+            .await
+    }
+
+    pub async fn delete_oracle_event(
+        &self,
+        oel: &Address,
+        oracle_keys: &KeyPair,
+        event_id: &str,
+    ) -> Result<Value> {
+        self.submit(
+            oel,
+            ORACLEEVENTLIST_ABI,
+            "deleteEvent",
+            json!({ "eventId": normalize_uint256_hex(event_id)? }),
+            oracle_keys,
+        )
+        .await
     }
 
     pub async fn pmp_order_book_address(&self, pmp: &Address) -> Result<Option<Address>> {
@@ -4932,21 +5180,17 @@ impl RealChainBackend {
     /// `TVM_ERROR` in the compute phase. Catch both here with an actionable "re-mint your pool" message
     /// instead of letting provision fail opaquely downstream.
     pub async fn assert_seller_note_current(&self, note: &Address) -> Result<()> {
-        let acc = self.client.get_account(note).await?.ok_or_else(|| {
-            anyhow!(
-                "seller note {note} is not on-chain -- the pn_pool is likely orphaned by a contract redeploy \
-                 (SuperRoot/PrivateNote rotation). Re-mint against the current contracts (`mint_pn_pool`) and \
-                 point DEXDO_PN_POOL at the fresh pool."
-            )
-        })?;
-        if !acc.is_active() {
-            return Err(anyhow!(
-                "seller note {note} is {}, not Active -- re-mint the pn_pool against the current contracts \
-                 (`mint_pn_pool`); a pool minted before a SuperRoot redeploy is orphaned.",
-                acc.status
-            ));
-        }
-        note_code_hash_current(note, acc.code_hash.as_deref())
+        let account = self.client.get_account(note).await?;
+        seller_note_account_current(note, account.as_ref())
+    }
+
+    /// Validate the account snapshot read by `dexdo note balance`.
+    pub fn assert_note_balance_private_note_account(
+        &self,
+        note: &Address,
+        account: Option<&Account>,
+    ) -> Result<()> {
+        note_balance_private_note_account(note, account)
     }
 
     /// Fund-safety guard for `note withdraw`. A PrivateNote deployed by a
@@ -5038,6 +5282,64 @@ mod tests {
         Arc, Mutex,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn subscription_history_treats_cancelled_empty_order_as_absent() {
+        let owner = format!("0:{}", "1".repeat(64));
+        let tombstone = json!({
+            "note": "",
+            "tokenContract": "",
+            "price": "0",
+            "amount": "0",
+            "escrow": "0",
+            "deadline": "0",
+            "flags": "0",
+            "ts": "0",
+            "isBuy": false
+        });
+
+        assert!(
+            !subscription_order_is_active_for_owner(1, &tombstone, &owner)
+                .expect("canonical cancelled tombstone is absent")
+        );
+    }
+
+    #[test]
+    fn subscription_history_rejects_non_empty_order_without_owner() {
+        let owner = format!("0:{}", "1".repeat(64));
+        let malformed = json!({
+            "note": "",
+            "amount": "1",
+            "isBuy": true
+        });
+
+        let error = subscription_order_is_active_for_owner(2, &malformed, &owner)
+            .expect_err("non-empty ownerless order must fail closed");
+        assert!(error.to_string().contains("owner note"), "{error:#}");
+    }
+
+    #[test]
+    fn subscription_history_rejects_nonempty_zero_amount_row() {
+        let owner = format!("0:{}", "1".repeat(64));
+        let malformed = json!({
+            "note": owner.clone(),
+            "tokenContract": "",
+            "price": "0",
+            "amount": "0",
+            "escrow": "0",
+            "deadline": "0",
+            "flags": "0",
+            "ts": "0",
+            "isBuy": true
+        });
+
+        let error = subscription_order_is_active_for_owner(3, &malformed, &owner)
+            .expect_err("zero amount alone must not classify a non-empty row as absent");
+        assert!(
+            error.to_string().contains("non-canonical zero-amount"),
+            "{error:#}"
+        );
+    }
 
     #[tokio::test]
     async fn fetch_ext_out_page_sends_bare_graphql_ids() {
@@ -5194,20 +5496,27 @@ mod tests {
     ) -> (
         RealChainBackend,
         Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let posts = Arc::new(AtomicUsize::new(0));
         let server_posts = Arc::clone(&posts);
+        let posted_bocs = Arc::new(Mutex::new(Vec::new()));
+        let server_bocs = Arc::clone(&posted_bocs);
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 8192];
-                let read = socket.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
+                let request = read_fixture_http_request(&mut socket).await;
                 if request.starts_with("POST /v2/messages ") {
                     server_posts.fetch_add(1, Ordering::SeqCst);
+                    let body = request.split_once("\r\n\r\n").unwrap().1;
+                    let payload: Value = serde_json::from_str(body).unwrap();
+                    server_bocs
+                        .lock()
+                        .unwrap()
+                        .push(payload[0]["body"].as_str().unwrap().to_string());
                 }
                 let local = local_unix_secs().unwrap() as i64;
                 let chain = (local + chain_offset) as u64;
@@ -5227,13 +5536,13 @@ mod tests {
             superroot: Address::parse(&deployed.superroot).unwrap(),
             deployed,
         };
-        (backend, posts, task)
+        (backend, posts, posted_bocs, task)
     }
 
     #[tokio::test]
     async fn unsafe_clock_produces_zero_posts_in_regular_and_money_paths() {
         for chain_offset in [60, -300] {
-            let (backend, posts, task) = skew_fixture_backend(chain_offset).await;
+            let (backend, posts, _, task) = skew_fixture_backend(chain_offset).await;
             let regular = backend.retry_submit("not-posted", false).await.unwrap_err();
             assert!(format!("{regular:#}").contains("CLOCK_SKEW"));
 
@@ -5696,8 +6005,7 @@ mod tests {
                 "network": "shellnet",
                 "superroot": "0:{zeros}",
                 "dapp_config": "0:{zeros}",
-                "dapp_id": "{zeros}",
-                "seller_probe_commission_bps": 250
+                "dapp_id": "{zeros}"
                 {endpoint_field}
             }}"#,
             zeros = "0".repeat(64),
@@ -5750,6 +6058,75 @@ mod tests {
         assert_eq!(decoded_u128(&decoded.tokens, "escrow"), Some(14));
     }
 
+    async fn read_fixture_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            socket.read_buf(&mut request).await.unwrap();
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    #[cfg(feature = "test-giver")]
+    #[tokio::test]
+    async fn live_acceptance_submit_payloads_match_vendored_abis_exactly() {
+        let address =
+            Address::parse("0:1111111111111111111111111111111111111111111111111111111111111111")
+                .expect("address");
+        let keys = KeyPair::from_secret_hex(&"22".repeat(32)).expect("signer");
+        let (backend, posts, posted_bocs, server) = skew_fixture_backend(0).await;
+
+        backend.resolve_dispute_timeout(&address).await.unwrap();
+        backend
+            .poke_inference_subscription(&address, 7)
+            .await
+            .unwrap();
+        backend
+            .submit_pmp_cancel_event(&address, &keys)
+            .await
+            .unwrap();
+        backend
+            .delete_oracle_event(&address, &keys, "22")
+            .await
+            .unwrap();
+
+        assert_eq!(posts.load(Ordering::SeqCst), 4);
+        let posted_bocs = posted_bocs.lock().unwrap().clone();
+        assert_eq!(posted_bocs.len(), 4, "one POST per production method");
+        for (boc, (abi, method, expected_field)) in posted_bocs.iter().zip([
+            (TOKENCONTRACT_ABI, "resolveDisputeTimeout", None),
+            (
+                INFERENCE_ORDERBOOK_ABI,
+                "pokeSubscription",
+                Some(("orderId", 7)),
+            ),
+            (PMP_ABI, "submitCancelEvent", None),
+            (ORACLEEVENTLIST_ABI, "deleteEvent", Some(("eventId", 22))),
+        ]) {
+            let decoded = decode_external_abi_message_boc(&boc, abi, true)
+                .unwrap_or_else(|| panic!("decode {method}"));
+            assert_eq!(decoded.function_name, method);
+            if let Some((field, value)) = expected_field {
+                assert_eq!(decoded_u128(&decoded.tokens, field), Some(value));
+            } else {
+                assert!(decoded.tokens.is_empty(), "{method} must have no inputs");
+            }
+        }
+        assert!(backend.oracle_event_info(&address, "22").await.is_err());
+        server.abort();
+    }
+
     #[cfg(feature = "test-giver")]
     #[test]
     fn settlement_receipts_decode_exact_payloads_in_chain_order() {
@@ -5784,7 +6161,7 @@ mod tests {
                 json!({
                     "buyer": buyer,
                     "toSeller": "1",
-                    "commissionReturned": "0",
+                    "bondReturned": "0",
                 }),
             ),
             message(
@@ -5805,7 +6182,7 @@ mod tests {
                     event: TokenContractSettlementEvent::ProbeAccepted {
                         buyer: buyer.clone(),
                         to_seller: 1,
-                        commission_returned: 0,
+                        bond_returned: 0,
                     },
                 },
                 TokenContractSettlementReceipt {
@@ -5945,7 +6322,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept money POST");
             let mut request = [0_u8; 4096];
-            socket.read(&mut request).await.expect("read money POST");
+            let _ = socket.read(&mut request).await.expect("read money POST");
             socket
                 .write_all(response.as_bytes())
                 .await
@@ -5998,7 +6375,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept money POST");
             let mut request = [0_u8; 4096];
-            socket.read(&mut request).await.expect("read money POST");
+            let _ = socket.read(&mut request).await.expect("read money POST");
             drop(socket);
         });
         let error =
@@ -6125,7 +6502,7 @@ mod tests {
         let redirect_task = tokio::spawn(async move {
             let (mut socket, _) = redirect_listener.accept().await.expect("redirect request");
             let mut request = [0u8; 4096];
-            socket.read(&mut request).await.expect("read money POST");
+            let _ = socket.read(&mut request).await.expect("read money POST");
             socket
                 .write_all(
                     format!(
@@ -6142,7 +6519,7 @@ mod tests {
             .await
             {
                 Ok(Ok((mut replay, _))) => {
-                    replay.read(&mut request).await.expect("read replayed POST");
+                    let _ = replay.read(&mut request).await.expect("read replayed POST");
                     replay
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
@@ -6181,7 +6558,7 @@ mod tests {
         let redirect_task = tokio::spawn(async move {
             let (mut socket, _) = redirect_listener.accept().await.expect("redirect request");
             let mut request = [0u8; 4096];
-            socket.read(&mut request).await.expect("read money POST");
+            let _ = socket.read(&mut request).await.expect("read money POST");
             socket
                 .write_all(
                     format!(
@@ -6300,90 +6677,6 @@ mod tests {
             .expect("a contract generation without hasWithdrawn must remain usable");
         buyer_note_withdrawn_guard(&note, None)
             .expect("an empty getter result must not be reported as withdrawn");
-    }
-
-    async fn encoded_internal_note_call(method: &str) -> String {
-        gosh_ackinacki::airegistry::calls::encode_internal_payload(
-            &local_context().expect("local TVM context"),
-            PRIVATENOTE_ABI,
-            method,
-            json!({
-                "sellerPubkey": format!("0x{}", "1".repeat(64)),
-                "nonce": "7",
-            }),
-        )
-        .await
-        .expect("encode PrivateNote internal call")
-    }
-
-    #[tokio::test]
-    async fn stream_lock_fold_ignores_failed_encoded_inbound_calls() {
-        const SUCCESSFUL_DEAL: &str =
-            "0:1111111111111111111111111111111111111111111111111111111111111111";
-        const FAILED_DEAL: &str =
-            "0:2222222222222222222222222222222222222222222222222222222222222222";
-        let successful_body = encoded_internal_note_call("streamLock").await;
-        let failed_body = encoded_internal_note_call("streamLock").await;
-        let successful = json!({
-            "body": successful_body,
-            "src": SUCCESSFUL_DEAL,
-            "created_at": 10,
-            "dst_transaction": {
-                "aborted": false,
-                "compute": {"exit_code": 0, "success": true},
-                "action": {"result_code": 0, "success": true}
-            }
-        });
-        let failed = json!({
-            "body": failed_body,
-            "src": FAILED_DEAL,
-            "created_at": 11,
-            "dst_transaction": {
-                "aborted": true,
-                "compute": {"exit_code": 151, "success": false},
-                "action": {"result_code": 0, "success": true}
-            }
-        });
-
-        let mut calls = Vec::new();
-        for node in [&successful, &failed] {
-            if let Some((created_at, body, internal, internal_source)) =
-                successful_inbound_lock_call(node).expect("inspect inbound call")
-            {
-                calls.push((
-                    created_at,
-                    body.to_string(),
-                    internal,
-                    internal_source.map(str::to_string),
-                ));
-            }
-        }
-        let status = NoteStreamLockStatus::from_successful_inbound_calls(
-            1,
-            0,
-            10,
-            calls
-                .iter()
-                .map(|(created_at, body, internal, internal_source)| {
-                    (
-                        *created_at,
-                        body.as_str(),
-                        *internal,
-                        internal_source.as_deref(),
-                    )
-                }),
-        )
-        .expect("decode and fold successful inbound calls");
-
-        assert_eq!(
-            calls.len(),
-            1,
-            "failed inbound call must not reach the fold"
-        );
-        assert_eq!(status.entries.len(), 1);
-        assert_eq!(status.entries[0].deal, SUCCESSFUL_DEAL);
-        assert_ne!(status.entries[0].deal, FAILED_DEAL);
-        assert!(status.history_complete);
     }
 
     #[test]

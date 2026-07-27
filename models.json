@@ -6,7 +6,7 @@
       "served_model": "qwen/qwen3-32b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
-      "price_per_tick": 1000,
+      "price_per_tick": 1000000000,
       "identity_aliases": [
         "Qwen/Qwen3-32B"
       ],
@@ -29,7 +29,7 @@
       "served_model": "claude-sonnet-4-5-20250929",
       "api_key_env": "ANTHROPIC_API_KEY",
       "tokenizer_family": "claude",
-      "price_per_tick": 1000,
+      "price_per_tick": 1000000000,
       "capabilities": {
         "logprobs": false
       }

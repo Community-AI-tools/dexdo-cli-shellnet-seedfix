@@ -11,6 +11,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 /// Note public key(anonymous). Carries the x25519 pubkey(for endpoint encryption)
 /// and the ed25519 pubkey(for verifying the challenge signature). In reality this is one note
@@ -85,7 +86,7 @@ pub struct LocalNote {
     x_secret: StaticSecret,
     ed_signing: SigningKey,
     /// Root seed(only on a deterministically built root note) -- for deriving children.
-    seed: Option<[u8; 32]>,
+    seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl LocalNote {
@@ -124,7 +125,7 @@ impl LocalNote {
         Self {
             x_secret,
             ed_signing,
-            seed: Some(*seed),
+            seed: Some((*seed).into()),
         }
     }
 
@@ -138,7 +139,7 @@ impl LocalNote {
     /// `None` for a note without a seed (ephemeral `generate()` or a child note itself -- the tree is
     /// flat, depth 1: the single D7 axis is the index under the root; nested paths are out of scope).
     pub fn derive(&self, index: u32) -> Option<Self> {
-        let seed = self.seed.as_ref()?;
+        let seed = self.seed.as_deref()?;
         let hk = Hkdf::<Sha256>::new(None, seed);
         let mut info = Vec::with_capacity(DERIVE_INFO.len() + 4);
         info.extend_from_slice(DERIVE_INFO);
@@ -156,7 +157,7 @@ impl LocalNote {
     /// The note's root seed, if it was built deterministically from a key; `None` for the ephemeral
     /// `generate()` and for child notes. dexdo holds the seed only in memory and never writes it to disk.
     pub fn seed(&self) -> Option<&[u8; 32]> {
-        self.seed.as_ref()
+        self.seed.as_deref()
     }
 
     /// Load a note from a hex secret(32 bytes, optional `0x` prefix) -- the `--note-key` key format
@@ -168,7 +169,7 @@ impl LocalNote {
         if s.len() != 64 {
             return Err(NoteError::BadKey);
         }
-        let mut seed = [0u8; 32];
+        let mut seed = Zeroizing::new([0u8; 32]);
         for i in 0..32 {
             seed[i] =
                 u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| NoteError::BadKey)?;
@@ -359,6 +360,14 @@ mod tests {
             LocalNote::generate().pubkey(),
             "ephemeral generate() is almost certainly different"
         );
+    }
+
+    #[test]
+    fn deterministic_note_seed_is_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let note = LocalNote::from_seed(&[7u8; 32]);
+        assert_zeroize_on_drop(note.seed.as_ref().unwrap());
     }
 
     /// regression: the two `LocalNote` x25519 derivations are NON-INTEROPERABLE. `from_seed`

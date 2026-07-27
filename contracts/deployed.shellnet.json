@@ -1,9 +1,28 @@
 {
   "network": "shellnet",
-  "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+  "version": "4.0.29",
   "dapp_config": "",
   "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
-  "seller_probe_commission_bps": 250,
+  "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
   "model_registry": "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
-  "model_registry_after_restart": "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+  "model_registry_after_restart": "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+  "rootpn": "0:1010101010101010101010101010101010101010101010101010101010101010",
+  "rootoracle": "0:1515151515151515151515151515151515151515151515151515151515151515",
+  "seller_bond": "2P mirror seller bond held in TokenContract (spec 4.2).",
+  "contract_hashes": {
+    "_note": "Canonical 4.0.29 child hashes plus read-only live fixed-root hashes.",
+    "SuperRoot": "61b2df9424afc3d776231a2d722b33be7eb260659b1e0f91e16b23cbc4b101a4",
+    "ModelRegistry": "a352e600db8450baadd39f23bc07b1024a37a3de642400dc5854ad786b31590f",
+    "RootPN": "187520fb02fef427dc16f8d8d703c301ef7251942364c98cfe2eeb30b8c658ce",
+    "RootOracle": "4d415fddc899b9d1605289cc0ed515cdd800f49eef4919ac4dad79ebe02fd454",
+    "RootModel": "87e622b45a013a929626cc8c8d19a835c5fae55a660bc521ab8e34797ed38a5d",
+    "TokenContract": "5e37dd4f51a705100dc39a9e8a1d83e270c793b9f132a3c31e8c7f04aa809ac9",
+    "InferenceOrderBook": "4d2387031620c01bdc0349c1dbf06c600e3cf4f137045f250d2d3d1b5d7031e6",
+    "PrivateNote": "46239c6adea6cf767ec8e7ebcccc804bcb18370c000d2418e985c27510d8175b",
+    "Oracle": "568b04d1a0511f2690bf07bf60a28a2ee30ad923548a3e2d3df9ed01b953201e",
+    "OracleEventList": "eed7948aecdfe897bcb7149336c30cbe557dc667036af1d3483f2f7bb055377e",
+    "PMP": "0a0ea6a2673db3042e222621fcec2c76c6412897552012e457bace77bcd63a6c",
+    "OrderBook": "77bc794cf8c8e29f825f7f9c63e7c03d13b885f29cb349cf7c18496ac0fb9540",
+    "Nullifier": "f3cf2a2c452fda4fb8c5a583bf1da12f78e8432ad21c5deaaf723df4616ef2ab"
+  }
 }

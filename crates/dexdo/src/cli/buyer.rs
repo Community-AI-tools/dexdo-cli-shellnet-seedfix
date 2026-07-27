@@ -6,8 +6,8 @@ use crate::cli::commands::direct_chain_read_with_timeout;
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     acquire_pool_write_lock, load_pool_json, model_target_from_config, note_pool_path,
-    read_book_target, target_from_market, try_acquire_pool_write_lock, with_pool_write_lock,
-    write_pool_private, BookTarget, PoolWriteLock,
+    read_book_target, registry_requested_model, target_from_market, try_acquire_pool_write_lock,
+    with_pool_write_lock, write_pool_private, PoolWriteLock,
 };
 #[cfg(all(test, feature = "shellnet"))]
 use crate::cli::commands::{
@@ -21,16 +21,14 @@ use crate::cli::commands::{
 use crate::cli::commands::{
     enforce_model_registry_policy, expected_order_book_for_note,
     load_enabled_model_registry_policy, mock_orders_from_offers, note_pubkey_id,
-    order_book_active_from_contracts, print_book_table, save_mock_runtime_deal_handle,
-    save_runtime_deal_handle, shellnet_doctor_preflight, unix_now_secs, BookRow,
-    RuntimeDealHandleInput, DEAL_WAIT_SECS, RESUME_LOOKBACK_SECS, TRANSIENT_QUOTE_ATTEMPTS,
-    TRANSIENT_QUOTE_INITIAL_BACKOFF,
+    order_book_active_from_contracts, print_book_table, resolve_model_registry_target,
+    save_mock_runtime_deal_handle, save_runtime_deal_handle, shellnet_doctor_preflight,
+    unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput, DEAL_WAIT_SECS,
+    RESUME_LOOKBACK_SECS, TRANSIENT_QUOTE_ATTEMPTS, TRANSIENT_QUOTE_INITIAL_BACKOFF,
 };
 use crate::cli::deals;
 use crate::cli::machine;
 use crate::cli::policy;
-#[cfg(test)]
-use crate::cli::seller::enforce_seller_runtime_policy;
 #[cfg(test)]
 use crate::cli::seller_policy::{
     apply_seller_dispute_policy, apply_seller_terminal_policy, classify_by_fact_advance_failure,
@@ -142,7 +140,6 @@ const BUYER_SUBMIT_JOURNAL_SCHEMA_V1: &str = "dexdo.buyer.submit.v1";
 const BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v1";
 #[cfg(feature = "shellnet")]
 const BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v1";
-#[cfg(feature = "shellnet")]
 const INFERENCE_SUBSCRIPTION_CYCLES: u128 = 4;
 
 /// Journal-only representation of an owner-facing fill. The chain event decoder
@@ -2458,20 +2455,22 @@ async fn build_buyer_content_policy(
     let content_identity_model_ref = content_identity_model.as_deref();
     let content_check_model = content_identity_model_ref.unwrap_or(frame_model);
     let models_cfg = Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
-    let has_ref_key =
-        dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
-            .map(|e| {
-                std::env::var(&e.api_key_env)
-                    .map(|k| !k.is_empty())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+    let executable_reference_model =
+        dexdo::buyer::verify::executable_reference_model_for(content_check_model, &models_cfg);
+    if !args.mock.mock_model && !args.allow_unverified_model && executable_reference_model.is_none()
+    {
+        bail!(
+            "model `{frame_model}` has no available exact buyer reference; refusing before \
+             backend/quote/buy. Pass --allow-unverified-model to proceed without this preflight"
+        );
+    }
+    let policy_model = executable_reference_model.or(content_identity_model_ref);
     let content_check = dexdo::buyer::api::content_check_policy(
         frame_model,
-        content_identity_model_ref,
+        policy_model,
         args.mock.mock_model,
         args.allow_unverified_model,
-        has_ref_key,
+        executable_reference_model.is_some(),
         &models_cfg,
     )
     .map_err(|e| {
@@ -2825,10 +2824,8 @@ struct SubscriptionPlacePlan {
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 fn subscription_place_plan(args: &SubscriptionPlaceArgs) -> Result<SubscriptionPlacePlan> {
-    if args.max_price_per_tick == 0 {
-        bail!("subscription place requires --max-price-per-tick > 0");
-    }
-    match (args.ticks, args.budget) {
+    super::support::validate_price_step(args.max_price_per_tick)?;
+    let plan = match (args.ticks, args.budget) {
         (Some(_), Some(_)) | (None, None) => {
             bail!("subscription place requires exactly one of --ticks or --budget")
         }
@@ -2839,11 +2836,11 @@ fn subscription_place_plan(args: &SubscriptionPlaceArgs) -> Result<SubscriptionP
             let escrow = required_escrow_for_buy(ticks, args.max_price_per_tick);
             check_buy_deposit_headroom(escrow, ticks, args.max_price_per_tick)
                 .map_err(|e| anyhow::anyhow!("subscription escrow: {e}"))?;
-            Ok(SubscriptionPlacePlan {
+            SubscriptionPlacePlan {
                 ticks,
                 escrow,
                 unused_budget: 0,
-            })
+            }
         }
         (None, Some(budget)) => {
             if budget == 0 {
@@ -2863,13 +2860,42 @@ fn subscription_place_plan(args: &SubscriptionPlaceArgs) -> Result<SubscriptionP
             let escrow = required_escrow_for_buy(ticks, args.max_price_per_tick);
             check_buy_deposit_headroom(escrow, ticks, args.max_price_per_tick)
                 .map_err(|e| anyhow::anyhow!("subscription escrow: {e}"))?;
-            Ok(SubscriptionPlacePlan {
+            SubscriptionPlacePlan {
                 ticks,
                 escrow,
                 unused_budget: budget.saturating_sub(escrow),
-            })
+            }
         }
+    };
+
+    let minimum_ticks = 2 * INFERENCE_SUBSCRIPTION_CYCLES;
+    let required_minimum = required_escrow_for_buy(minimum_ticks, args.max_price_per_tick);
+    check_buy_deposit_headroom(required_minimum, minimum_ticks, args.max_price_per_tick)
+        .map_err(|e| anyhow::anyhow!("subscription cycle budget: {e}"))?;
+    let required_cycle_budget = required_escrow_for_buy(2, args.max_price_per_tick);
+    let cycle_budget = plan.escrow / INFERENCE_SUBSCRIPTION_CYCLES;
+    if cycle_budget < required_cycle_budget {
+        let selector = match (args.ticks, args.budget) {
+            (Some(ticks), None) => format!("--ticks {ticks}"),
+            (None, Some(budget)) => format!("--budget {budget} raw SHELL"),
+            _ => unreachable!("subscription selector was validated above"),
+        };
+        bail!(
+            "subscription place {selector} derives ticks {} and escrow {} raw SHELL, giving \
+             cycleBudget {} raw SHELL below required per-cycle minimum {} raw SHELL: escrow / \
+             SUB_CYCLES={} must fund 2 fee-inclusive ticks per cycle at maxPricePerTick {}; minimum \
+             total escrow {} raw SHELL and minimum ticks {}",
+            plan.ticks,
+            plan.escrow,
+            cycle_budget,
+            required_cycle_budget,
+            INFERENCE_SUBSCRIPTION_CYCLES,
+            args.max_price_per_tick,
+            required_minimum,
+            minimum_ticks,
+        );
     }
+    Ok(plan)
 }
 
 #[cfg(feature = "shellnet")]
@@ -3000,6 +3026,66 @@ fn render_subscription_line(
 }
 
 #[cfg(feature = "shellnet")]
+fn validate_subscription_poke<'a>(
+    order_book: &str,
+    order_is_resting: bool,
+    order_id: u128,
+    subscription: Option<&'a OrderBookSubscription>,
+) -> Result<&'a OrderBookSubscription> {
+    if !order_is_resting {
+        bail!(
+            "subscription poke: order {order_id} is not resting in selected order book {order_book}"
+        );
+    }
+    let subscription = subscription.ok_or_else(|| {
+        anyhow::anyhow!(
+            "subscription poke: getSubscription({order_id}) unavailable in {order_book}"
+        )
+    })?;
+    if !subscription.exists {
+        bail!("subscription poke: order {order_id} is not a live subscription in {order_book}");
+    }
+    Ok(subscription)
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_poke_postread(
+    before_cycle: u8,
+    order_book_active: bool,
+    order_is_resting: bool,
+    subscription: Option<&OrderBookSubscription>,
+) -> Result<bool> {
+    if !order_book_active {
+        bail!("subscription poke: post-read order book is not Active");
+    }
+    match subscription {
+        Some(subscription) if subscription.exists => {
+            if subscription.cur_cycle < before_cycle {
+                bail!(
+                    "subscription poke: contradictory post-read cycle {} < {}",
+                    subscription.cur_cycle,
+                    before_cycle
+                );
+            }
+            Ok(order_is_resting && subscription.cur_cycle > before_cycle)
+        }
+        Some(_) => Ok(!order_is_resting),
+        None => bail!("subscription poke: post-read getSubscription unavailable"),
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn submit_subscription_poke_after_validation(
+    preflight: Result<&OrderBookSubscription>,
+    submit: impl Future<Output = Result<Value>>,
+) -> Result<(u8, u128)> {
+    let before = preflight?;
+    let result = (before.cur_cycle, before.cycle_remaining());
+    submit.await?;
+    Ok(result)
+}
+
+#[cfg(feature = "shellnet")]
 async fn raise_subscription_place_journal_before_fresh_reads(
     chain: &dexdo_core::RealChainBackend,
     args: &SubscriptionArgs,
@@ -3054,6 +3140,12 @@ async fn raise_subscription_place_journal_before_fresh_reads(
 
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
+    // A subscription is a resting limit BUY. Compute and validate its exact escrow before backend
+    // construction, journal reconciliation, chain reads, money locks, signing, or submits.
+    let place_plan = match &args.command {
+        SubscriptionCommand::Place(place) => Some(subscription_place_plan(place)?),
+        _ => None,
+    };
     let chain = dexdo_core::RealChainBackend::connect(
         args.contracts
             .to_str()
@@ -3062,26 +3154,57 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     raise_subscription_place_journal_before_fresh_reads(&chain, &args).await?;
     let registry_policy =
         load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
-    let target = subscription_target(&args)?;
-    let snapshot = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-        let snapshot = read_book_target(&chain, &target).await?;
-        if matches!(&args.command, SubscriptionCommand::Place(_)) {
-            if let Some(policy) = registry_policy.as_ref() {
-                enforce_model_registry_policy(
-                    RegistryRole::Buyer,
-                    policy,
-                    &args.contracts,
-                    &target.frame_model,
-                    &snapshot.order_book,
-                    snapshot.active(),
-                    BuyerMissingBookPolicy::Reject,
-                )
-                .await?;
-            }
+    let target = if registry_policy.is_some() && args.market.is_none() {
+        let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription without --market requires --note-addr to derive the order-book address"
+            )
+        })?;
+        let requested_model = registry_requested_model(
+            &args.models,
+            args.model
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
+        )?;
+        BookTarget {
+            model_hash: model_hash_for(&requested_model),
+            frame_model: requested_model,
+            order_book: None,
+            root_model: None,
+            note_addr: Some(note_addr),
         }
-        Ok(snapshot)
-    })
-    .await?;
+    } else {
+        subscription_target(&args)?
+    };
+    let requested_model = target.frame_model.clone();
+    let (target, snapshot) =
+        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            let target = resolve_model_registry_target(
+                RegistryRole::Buyer,
+                registry_policy.as_ref(),
+                &args.contracts,
+                &requested_model,
+                target,
+            )
+            .await?;
+            let snapshot = read_book_target(&chain, &target).await?;
+            if matches!(&args.command, SubscriptionCommand::Place(_)) {
+                if let Some(policy) = registry_policy.as_ref() {
+                    enforce_model_registry_policy(
+                        RegistryRole::Buyer,
+                        policy,
+                        &args.contracts,
+                        &target.frame_model,
+                        &snapshot.order_book,
+                        snapshot.active(),
+                        BuyerMissingBookPolicy::Reject,
+                    )
+                    .await?;
+                }
+            }
+            Ok((target, snapshot))
+        })
+        .await?;
     if !snapshot.active() {
         bail!(
             "subscription: InferenceOrderBook {} for model {} is not active; run `dexdo deploy-market` or `dexdo provision` first",
@@ -3147,7 +3270,7 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                 chain.assert_note_owner_matches("subscription place", &note, &keys),
             )
             .await?;
-            let plan = subscription_place_plan(place)?;
+            let plan = place_plan.expect("subscription place plan was preflighted");
             let mut state = load_buyer_subscription_state(&subscriptions_path, &journal_note)?;
             let book_index = ensure_subscription_book(
                 &mut state,
@@ -3341,6 +3464,89 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                 sub.cycle_remaining()
             );
         }
+        SubscriptionCommand::Poke { order_id } => {
+            let order_id = *order_id;
+            let deployed = dexdo_core::Deployed::load(&args.contracts)?;
+            let expected_hash = deployed
+                .contract_hashes
+                .get("InferenceOrderBook")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("deployed manifest has no InferenceOrderBook code hash")
+                })?;
+            let (active, code_hash) = chain.account_active_code_hash(&ob).await?;
+            let canonical = dexdo_core::RealChainBackend::canonical_inference_orderbook_address(
+                &target.model_hash,
+            )?;
+            let params = chain
+                .inference_orderbook_params(&ob)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("InferenceOrderBook {ob} getParams unavailable"))?;
+            let target_identity_ok = active
+                && code_hash.as_deref() == Some(expected_hash.trim_start_matches("0x"))
+                && canonical.with_workchain() == ob.with_workchain()
+                && params["modelHash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.eq_ignore_ascii_case(&target.model_hash));
+            let before_subscription = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.inference_orderbook_subscription(&ob, order_id),
+            )
+            .await?;
+            let preflight = if target_identity_ok {
+                validate_subscription_poke(
+                    &snapshot.order_book,
+                    snapshot
+                        .orders
+                        .iter()
+                        .any(|order| order.order_id == order_id),
+                    order_id,
+                    before_subscription.as_ref(),
+                )
+            } else {
+                bail!("subscription poke: wrong InferenceOrderBook identity");
+            };
+            let (before_cycle, before_remaining) = submit_subscription_poke_after_validation(
+                preflight,
+                chain.poke_inference_subscription(&ob, order_id),
+            )
+            .await?;
+            let after_snapshot = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                read_book_target(&chain, &target),
+            )
+            .await?;
+            let after_order = after_snapshot
+                .orders
+                .iter()
+                .find(|order| order.order_id == order_id);
+            let after_subscription = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.inference_orderbook_subscription(&ob, order_id),
+            )
+            .await?;
+            let confirmed = validate_subscription_poke_postread(
+                before_cycle,
+                after_snapshot.active(),
+                after_order.is_some(),
+                after_subscription.as_ref(),
+            )?;
+            let status = if confirmed { "confirmed" } else { "pending" };
+            println!(
+                "subscription poke submitted model={} order_book={} order_id={} before_cycle={} before_remaining={} status={} after={}",
+                snapshot.frame_model,
+                snapshot.order_book,
+                order_id,
+                before_cycle,
+                before_remaining,
+                status,
+                render_subscription_line(
+                    &after_snapshot,
+                    order_id,
+                    after_order,
+                    after_subscription.as_ref()
+                )
+            );
+        }
     }
     Ok(())
 }
@@ -3524,7 +3730,7 @@ async fn apply_malformed_handover_policy(
                 "buyer: malformed handover for {token_contract}: {error}\n\
                  policy_action failure_class=malformed_handover action=dispute token_contract={token_contract} \
                  state=funded/opened/disputed result=dispute_opened settlement={settlement:?}; \
-                 warning=dispute_locks_buyer_note_until_resolution"
+                 warning=dispute_freezes_this_token_contract_buyer_D_and_seller_bond_until_resolution"
             );
         }
         policy::MalformedHandoverAction::FailClosed => {
@@ -5419,6 +5625,10 @@ async fn run_buyer_inner(
         shellnet_preflight,
         shutdown,
     } = runtime;
+    // this CLI path submits flags=0(limit BUY), so its max price must be a positive
+    // whole multiple of PRICE_STEP(1 SHELL), rejected before any submit/escrow. The contract's
+    // separate FLAG_MARKET path is the sole price-less exception; this command does not claim it.
+    super::support::validate_price_step(args.max_price_per_tick)?;
     // Issue: token_contract + frame_model come from `--market`(a provision manifest) or the flags.
     // The buyer ignores the deal nonce: it places a buy, it does not post the offer.
     // Model-only buy: with neither
@@ -5427,7 +5637,7 @@ async fn run_buyer_inner(
     // `InferenceFilledConfirmed` event -- no seller hand-off. With `--token-contract`/`--market` the explicit
     // deal address is used as before(back-compat).
     let model_only = args.market.is_none() && args.token_contract.is_none();
-    let (explicit_tc, frame_model) = if model_only {
+    let (explicit_tc, requested_frame_model) = if model_only {
         let fm = args.frame_model.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "provide --frame-model (model-only buy: the orderbook is derived from the model name), \
@@ -5445,11 +5655,77 @@ async fn run_buyer_inner(
             fm.ok_or_else(|| anyhow::anyhow!("provide --frame-model or --market <manifest>"))?;
         (Some(tc), fm)
     };
+    let registry_policy = if !args.mock.mock_chain && shellnet_preflight.should_run() {
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?
+    } else {
+        None
+    };
+    let frame_model = if let Some(policy) = registry_policy.as_ref() {
+        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+        reject_buyer_raw_token_contract_without_registry_book_proof(
+            args.market.as_deref(),
+            args.token_contract.as_deref(),
+            &requested_frame_model,
+        )?;
+        let selected_market = match args.market.as_deref() {
+            Some(market) => Some(load_market(market)?),
+            None => None,
+        };
+        let target = resolve_model_registry_target(
+            RegistryRole::Buyer,
+            Some(policy),
+            &args.contracts,
+            &requested_frame_model,
+            BookTarget {
+                frame_model: selected_market
+                    .as_ref()
+                    .map(|market| market.frame_model.clone())
+                    .unwrap_or_else(|| requested_frame_model.clone()),
+                model_hash: selected_market
+                    .as_ref()
+                    .map(|market| market.model_hash.clone())
+                    .unwrap_or_else(|| model_hash_for(&requested_frame_model)),
+                order_book: selected_market
+                    .as_ref()
+                    .map(|market| market.inference_order_book.clone()),
+                root_model: selected_market
+                    .as_ref()
+                    .map(|market| market.root_model.clone()),
+                note_addr: args.identity.note_addr.clone(),
+            },
+        )
+        .await?;
+        let expected_order_book = if let Some(order_book) = target.order_book {
+            order_book
+        } else {
+            let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "real shellnet: --note-addr is required to derive the buyer order book"
+                )
+            })?;
+            expected_order_book_for_note(&args.contracts, note_addr, &target.frame_model).await?
+        };
+        let order_book_active =
+            order_book_active_from_contracts(&args.contracts, &expected_order_book).await?;
+        enforce_model_registry_policy(
+            RegistryRole::Buyer,
+            policy,
+            &args.contracts,
+            &target.frame_model,
+            &expected_order_book,
+            order_book_active,
+            BuyerMissingBookPolicy::Reject,
+        )
+        .await?;
+        target.frame_model
+    } else {
+        requested_frame_model
+    };
     // Model-only discovery derives the order-book address from `sha256(frame_model)`, so the id MUST be the
     // canonical `producer--model--version`(else it looks at the wrong book). Only enforce here: on the explicit
     // `--token-contract`/`--market` path the deal address is given directly (frame_model is only B2/B7 there,
     // where `family_of` matches by substring regardless of form), and the mock demo uses `dexdo-mock`.
-    if model_only && !args.mock.mock_chain {
+    if model_only && !args.mock.mock_chain && registry_policy.is_none() {
         dexdo_core::validate_canonical_model_id(&frame_model).map_err(|e| anyhow::anyhow!(e))?;
     }
     machine_context.network = Some(
@@ -5498,6 +5774,19 @@ async fn run_buyer_inner(
     if let Some(err) = buyer_machine_error_fixture_from_env() {
         return Err(err);
     }
+    let buyer_content_policy = if args.local_listen.is_some() {
+        match build_buyer_content_policy(&args, &frame_model).await {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                machine_context.failure_class = Some("content_identity_preflight".to_string());
+                machine_context.missing_or_unset =
+                    Some("allow_unverified_model_or_models_data".to_string());
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
     let buyer_policy = if !args.mock.mock_chain {
         Some(policy::load_buyer_runtime_policy(args.policy.as_deref())?)
     } else {
@@ -5556,19 +5845,6 @@ async fn run_buyer_inner(
         )
         .await?
     };
-    let buyer_content_policy = if args.local_listen.is_some() {
-        match build_buyer_content_policy(&args, &frame_model).await {
-            Ok(policy) => Some(policy),
-            Err(err) => {
-                machine_context.failure_class = Some("content_identity_preflight".to_string());
-                machine_context.missing_or_unset =
-                    Some("allow_unverified_model_or_models_data".to_string());
-                return Err(err);
-            }
-        }
-    } else {
-        None
-    };
     if args.local_listen.is_some() && args.continuity_mode == ContinuityModeArg::OnDemand {
         let events = machine_events
             .take()
@@ -5592,41 +5868,8 @@ async fn run_buyer_inner(
         )
         .await;
     }
-    if !args.mock.mock_chain {
+    if !args.mock.mock_chain && registry_policy.is_none() {
         shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
-        if let Some(policy) = load_enabled_model_registry_policy(
-            RegistryRole::Buyer,
-            &args.registry,
-            &args.contracts,
-        )? {
-            reject_buyer_raw_token_contract_without_registry_book_proof(
-                args.market.as_deref(),
-                args.token_contract.as_deref(),
-                &frame_model,
-            )?;
-            let expected_order_book = if let Some(market) = args.market.as_deref() {
-                load_market(market)?.inference_order_book
-            } else {
-                let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "real shellnet: --note-addr is required to derive the buyer order book"
-                    )
-                })?;
-                expected_order_book_for_note(&args.contracts, note_addr, &frame_model).await?
-            };
-            let order_book_active =
-                order_book_active_from_contracts(&args.contracts, &expected_order_book).await?;
-            enforce_model_registry_policy(
-                RegistryRole::Buyer,
-                &policy,
-                &args.contracts,
-                &frame_model,
-                &expected_order_book,
-                order_book_active,
-                BuyerMissingBookPolicy::Reject,
-            )
-            .await?;
-        }
     }
     // Resolve the deal `TokenContract`: explicit(flag/manifest) or model-only (book -> choose -> buy -> fill
     // event). `buy_ticks` is the chosen volume(the consumer-API token budget tracks it).
@@ -5846,13 +6089,14 @@ async fn run_buyer_inner(
                     (
                         prompt_u128("How many ticks to buy", args.ticks),
                         prompt_u128(
-                            "Maximum price per tick (SHELL/tick)",
+                            "Maximum price per tick (raw ECC[2], 1000000000 = 1 SHELL)",
                             args.max_price_per_tick,
                         ),
                     )
                 } else {
                     (args.ticks, args.max_price_per_tick)
                 };
+                super::support::validate_price_step(max_price)?;
                 // Escrow: an explicit `--escrow` wins(checked == required downstream); otherwise the exact
                 // required for the CHOSEN order.
                 let escrow = args
@@ -6340,6 +6584,20 @@ mod tests {
         }
     }
 
+    fn subscription_place_args(
+        max_price_per_tick: u128,
+        ticks: Option<u128>,
+        budget: Option<u128>,
+    ) -> SubscriptionPlaceArgs {
+        SubscriptionPlaceArgs {
+            note_key: None,
+            max_price_per_tick,
+            ticks,
+            budget,
+            auto_renew: false,
+        }
+    }
+
     #[tokio::test]
     async fn direct_chain_read_timeout_returns_terminal_retryable_error() {
         let started = std::time::Instant::now();
@@ -6391,7 +6649,7 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
-    fn seller_open_probe_close_hint_points_to_advance_not_buyer_cleanup() {
+    fn seller_open_probe_close_hint_waits_for_delivery_then_window() {
         let target = super::DealTarget {
             handle: None,
             token_contract: "0:tc".to_string(),
@@ -6416,10 +6674,16 @@ mod tests {
         let hint = super::close_hint(&target, &summary);
 
         assert!(
-            hint.contains("next=seller_advance_probe_after_timeout"),
+            hint.contains("next=seller_wait_delivery_then_advance_after_window"),
             "{hint}"
         );
+        assert!(hint.contains("first delivered canonical tick"), "{hint}");
+        assert!(hint.contains("only after PROBE_WINDOW"), "{hint}");
         assert!(hint.contains("TokenContract.advance()"), "{hint}");
+        assert!(
+            !hint.contains("seller_advance_probe_after_timeout"),
+            "{hint}"
+        );
         assert!(!hint.contains("wait_for_buyer_stop"), "{hint}");
     }
 
@@ -6436,36 +6700,37 @@ mod tests {
 
     #[test]
     fn subscription_place_plan_uses_exact_fee_inclusive_escrow() {
-        let plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
+        let ticks_plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
             note_key: None,
-            max_price_per_tick: 1000,
-            ticks: Some(4),
+            max_price_per_tick: dexdo_core::PRICE_STEP,
+            ticks: Some(8),
             budget: None,
             auto_renew: false,
         })
         .unwrap();
-        assert_eq!(plan.ticks, 4);
-        assert_eq!(plan.escrow, 4100);
-        assert_eq!(plan.unused_budget, 0);
+        assert_eq!(ticks_plan.ticks, 8);
+        assert_eq!(ticks_plan.escrow, 8_200_000_000);
+        assert_eq!(ticks_plan.unused_budget, 0);
 
-        let plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
+        let budget_plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
             note_key: None,
-            max_price_per_tick: 1000,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
             ticks: None,
-            budget: Some(4200),
+            budget: Some(8_200_000_100),
             auto_renew: false,
         })
         .unwrap();
-        assert_eq!(plan.ticks, 4);
-        assert_eq!(plan.escrow, 4100);
-        assert_eq!(plan.unused_budget, 100);
+        assert_eq!(budget_plan.ticks, 8);
+        assert_eq!(budget_plan.escrow, 8_200_000_000);
+        assert_eq!(budget_plan.unused_budget, 100);
+        assert_eq!(ticks_plan.escrow, budget_plan.escrow);
     }
 
     #[test]
     fn subscription_place_plan_rejects_zero_sized_money_moves() {
         assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
             note_key: None,
-            max_price_per_tick: 1000,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
             ticks: Some(0),
             budget: None,
             auto_renew: false,
@@ -6473,7 +6738,7 @@ mod tests {
         .is_err());
         assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
             note_key: None,
-            max_price_per_tick: 1000,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
             ticks: None,
             budget: Some(1),
             auto_renew: false,
@@ -6487,6 +6752,67 @@ mod tests {
             auto_renew: false,
         })
         .is_err());
+    }
+
+    #[test]
+    fn subscription_cycle_budget_preflight_matrix() {
+        let price = dexdo_core::PRICE_STEP;
+        let unit = dexdo_core::required_escrow_for_buy(1, price);
+        let minimum = dexdo_core::required_escrow_for_buy(8, price);
+
+        assert!(
+            super::subscription_place_plan(&subscription_place_args(price, Some(7), None)).is_err()
+        );
+        let below_budget = super::subscription_place_plan(&subscription_place_args(
+            price,
+            None,
+            Some(minimum - 1),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            below_budget.contains(&format!("--budget {} raw SHELL", minimum - 1)),
+            "{below_budget}"
+        );
+        assert!(
+            below_budget.contains(&format!("derives ticks 7 and escrow {}", 7 * unit)),
+            "{below_budget}"
+        );
+        assert!(below_budget.contains("SUB_CYCLES=4"), "{below_budget}");
+        assert!(
+            below_budget.contains(&minimum.to_string()),
+            "{below_budget}"
+        );
+
+        let reproduced =
+            super::subscription_place_plan(&subscription_place_args(4 * price, Some(2), None))
+                .unwrap_err()
+                .to_string();
+
+        assert_eq!(
+            reproduced,
+            "subscription place --ticks 2 derives ticks 2 and escrow 8200000000 raw SHELL, \
+             giving cycleBudget 2050000000 raw SHELL below required per-cycle minimum \
+             8200000000 raw SHELL: escrow / SUB_CYCLES=4 must fund 2 fee-inclusive ticks per \
+             cycle at maxPricePerTick 4000000000; minimum total escrow 32800000000 raw SHELL \
+             and minimum ticks 8"
+        );
+
+        let largest_step_multiple = u128::MAX - (u128::MAX % price);
+        let cases = [
+            subscription_place_args(price - 1, Some(8), None),
+            subscription_place_args(largest_step_multiple, Some(8), None),
+            subscription_place_args(price, Some(u128::MAX), None),
+            subscription_place_args(price, Some(1), None),
+            subscription_place_args(price, None, Some(unit)),
+        ];
+
+        for args in cases {
+            assert!(
+                super::subscription_place_plan(&args).is_err(),
+                "invalid subscription must fail closed"
+            );
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -7191,6 +7517,79 @@ mod tests {
         assert!(line.contains("stale_subscription=true"));
     }
 
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_poke_validation_rejects_wrong_order_and_non_subscription() {
+        use super::validate_subscription_poke_postread as postread;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let live_sub = dexdo_core::OrderBookSubscription {
+            order_id: 9,
+            exists: true,
+            period_start: 10,
+            cur_cycle: 0,
+            cycle_budget: 100,
+            cycle_spent: 0,
+            auto_renew: false,
+        };
+        assert_eq!(
+            super::validate_subscription_poke("0:book", true, 9, Some(&live_sub))
+                .unwrap()
+                .order_id,
+            9
+        );
+        let error = super::validate_subscription_poke("0:book", false, 10, Some(&live_sub))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not resting"), "{error}");
+
+        let not_subscription = dexdo_core::OrderBookSubscription {
+            exists: false,
+            ..live_sub.clone()
+        };
+        let error = super::validate_subscription_poke("0:book", true, 9, Some(&not_subscription))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a live subscription"), "{error}");
+
+        let advanced = dexdo_core::OrderBookSubscription {
+            cur_cycle: 1,
+            ..live_sub.clone()
+        };
+        assert!(postread(0, true, true, Some(&advanced)).unwrap());
+        assert!(!postread(0, true, true, Some(&live_sub)).unwrap());
+        assert!(postread(0, false, false, None).is_err());
+        assert!(postread(0, true, false, Some(&not_subscription)).unwrap());
+        assert!(postread(0, true, false, None).is_err());
+        let regressed = dexdo_core::OrderBookSubscription {
+            cur_cycle: 0,
+            ..advanced
+        };
+        assert!(postread(1, true, true, Some(&regressed)).is_err());
+
+        let posts = AtomicUsize::new(0);
+        let post = || async {
+            posts.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        };
+        let rejected = super::submit_subscription_poke_after_validation(
+            Err(anyhow::anyhow!("wrong InferenceOrderBook identity")),
+            post(),
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+
+        let (cycle, remaining) = super::submit_subscription_poke_after_validation(
+            super::validate_subscription_poke("0:book", true, 9, Some(&live_sub)),
+            post(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!((cycle, remaining), (0, 100));
+    }
+
     /// Demo(run with `--nocapture`): render the model-only order book through the REAL `render_inference_book`
     /// against a `MockChainBackend` seeded with a few asks -- shows exactly what the buyer sees before choosing.
     #[tokio::test]
@@ -7315,45 +7714,115 @@ mod tests {
         assert!(!backend.contains("duplicate active sell order preflight incomplete"));
     }
 
-    /// buyer-side ModelRegistry validation must happen before either direct-deal buy or
-    /// model-wide `placeInferenceBuy`.
     #[test]
-    fn buyer_model_registry_preflight_precedes_buy_writes() {
+    fn buyer_registry_gate_precedes_backend_and_money_raise() {
         let source = include_str!("buyer.rs");
         let start = source
-            .find("pub(crate) async fn run_buyer")
-            .expect("run_buyer present");
+            .find("async fn run_buyer_inner")
+            .expect("run_buyer_inner present");
         let end = source[start..]
             .find("#[cfg(test)]\nmod tests")
             .map(|offset| start + offset)
-            .expect("run_buyer end marker present");
+            .expect("run_buyer_inner end marker present");
         let body = &source[start..end];
 
-        let registry = body
-            .find("load_enabled_model_registry_policy")
-            .expect("buyer registry policy load present");
-        let role = body[registry..]
-            .find("RegistryRole::Buyer")
-            .map(|offset| registry + offset)
-            .expect("buyer registry role present");
-        let enforce = body[registry..]
+        let policy = body
+            .find("let registry_policy =")
+            .expect("registry policy load present");
+        let doctor = body[policy..]
+            .find("shellnet_doctor_preflight(")
+            .map(|offset| policy + offset)
+            .expect("registry-enabled doctor present");
+        let resolve = body[doctor..]
+            .find("resolve_model_registry_target(")
+            .map(|offset| doctor + offset)
+            .expect("exact registry resolution present");
+        let enforce = body[resolve..]
             .find("enforce_model_registry_policy(")
-            .map(|offset| registry + offset)
-            .expect("buyer registry preflight present");
-        let raw_tc_guard = body[registry..]
-            .find("reject_buyer_raw_token_contract_without_registry_book_proof")
-            .map(|offset| registry + offset)
-            .expect("raw --token-contract guard present");
-        let durable_buy = body
-            .find("execute_buyer_quote_submit(")
-            .expect("durable buyer submit present");
+            .map(|offset| resolve + offset)
+            .expect("registry hash/book enforcement present");
+        let shape = body
+            .find("validate_canonical_model_id(")
+            .expect("legacy shape check present");
+        let backend = body
+            .find("buyer_real_backend(")
+            .expect("real backend construction present");
+        let money = body
+            .find("raise_pending_buyer_money_before_fresh_reads(")
+            .expect("pending money raise present");
 
         assert!(
-            registry < role
-                && role < raw_tc_guard
-                && raw_tc_guard < enforce
-                && enforce < durable_buy,
-            "registry check must precede every durable buy"
+            policy < doctor
+                && doctor < resolve
+                && resolve < enforce
+                && enforce < shape
+                && shape < backend
+                && backend < money,
+            "registry membership/hash/book gate must finish before legacy shape, backend construction, or money raise"
+        );
+    }
+
+    #[test]
+    fn subscription_registry_getter_uses_existing_read_timeout_scope() {
+        let source = include_str!("buyer.rs");
+        let start = source
+            .find("pub(crate) async fn run_subscription(args: SubscriptionArgs)")
+            .expect("shellnet subscription present");
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n#[cfg(")
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let timeout = body
+            .find("direct_chain_read_with_timeout(")
+            .expect("subscription read timeout present");
+        let resolution = body
+            .find("resolve_model_registry_target(")
+            .expect("subscription registry resolution present");
+
+        assert!(
+            timeout < resolution,
+            "subscription registry getter must run inside the existing read timeout"
+        );
+    }
+
+    #[test]
+    fn final_interactive_buyer_price_is_validated_before_escrow_and_quote() {
+        let step = dexdo_core::PRICE_STEP;
+        for invalid in [0, step - 1, step + 1] {
+            assert!(
+                crate::cli::support::validate_price_step(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        for valid in [step, 2 * step] {
+            assert!(
+                crate::cli::support::validate_price_step(valid).is_ok(),
+                "{valid} must be accepted"
+            );
+        }
+
+        let source = include_str!("buyer.rs");
+        let start = source
+            .find("// Show the book, THEN let the buyer choose")
+            .expect("interactive buyer selection branch");
+        let branch = &source[start..];
+        let chosen = branch
+            .find("let (ticks, max_price) =")
+            .expect("final interactive choice");
+        let validation = branch
+            .find("validate_price_step(max_price)?;")
+            .expect("final chosen-price validation");
+        let escrow = branch
+            .find("let escrow = args")
+            .expect("chosen-order escrow calculation");
+        let quote = branch
+            .find("buyer_quote_selection_for_submit(")
+            .expect("chosen-order quote");
+        assert!(
+            chosen < validation && validation < escrow && escrow < quote,
+            "the final chosen buyer price must be validated before escrow, quote, or submit"
         );
     }
 
@@ -7471,7 +7940,7 @@ mod tests {
     }
 
     /// released-style binaries must not need
-    /// `contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json` in the current working directory just to
+    /// `contracts/compiled/airegistry/ModelRegistry.abi.json` in the current working directory just to
     /// resolve the buyer's content identity. The ABI source is embedded in `registry.rs`; this guard keeps the
     /// CLI from reintroducing the old `abi_path.exists()` bail.
     #[test]
@@ -7528,7 +7997,7 @@ mod tests {
     }
 
     #[test]
-    fn buyer_local_api_content_identity_preflights_before_any_buy() {
+    fn buyer_local_api_content_identity_preflights_before_backend_quote_or_buy() {
         let source = include_str!("buyer.rs");
         let start = source
             .find("let buyer_content_policy = if args.local_listen.is_some()")
@@ -7537,6 +8006,12 @@ mod tests {
         let preflight = body
             .find("build_buyer_content_policy")
             .expect("content policy helper called");
+        let backend = body
+            .find("buyer_real_backend")
+            .expect("real buyer backend construction present");
+        let pending_money = body
+            .find("raise_pending_buyer_money_before_fresh_reads")
+            .expect("pending money reconciliation present");
         let on_demand = body
             .find("run_buyer_on_demand_local_api")
             .expect("on-demand branch present");
@@ -7547,6 +8022,10 @@ mod tests {
             .find(".place_buy_by_model(")
             .expect("model-only buy path present");
 
+        assert!(
+            preflight < backend && preflight < pending_money,
+            "content identity must reject before backend construction or pending-money recovery"
+        );
         assert!(
             preflight < on_demand,
             "on-demand buyer must reject missing content-identity inputs before lazy buy/handover"
@@ -7620,7 +8099,7 @@ mod tests {
         };
         std::env::set_current_dir(&tmp).expect("enter release-style cwd");
 
-        let cwd_abi = tmp.join("contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
+        let cwd_abi = tmp.join("contracts/compiled/airegistry/ModelRegistry.abi.json");
         assert!(
             !cwd_abi.exists(),
             "test cwd must not carry the ModelRegistry ABI file"
@@ -7894,7 +8373,7 @@ mod tests {
                 pn_address: Some(format!("0:{}", address_byte.to_string().repeat(64))),
                 deposit_identifier_hash: Some(address_byte.to_string().repeat(64)),
                 owner_public_key_hex: Some(public),
-                owner_secret_key_hex: Some(secret),
+                owner_secret_key_hex: Some(secret.into()),
                 deployed_at_unix: Some(1_000),
                 shell_funded: true,
                 sanity_checked: true,
@@ -8194,6 +8673,8 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_can_use_pool_only() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
         let dir = std::env::temp_dir().join(format!(
             "dexdo-recovery-pool-test-{}-{}",
             std::process::id(),
@@ -8237,8 +8718,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.note_addr, format!("0:{}", "1".repeat(64)));
-        assert_eq!(resolved.note_secret_hex, "2a".repeat(32));
+        assert_eq!(resolved.note_secret_hex.as_str(), "2a".repeat(32));
         assert_eq!(resolved.token_contract, format!("0:{}", "2".repeat(64)));
+        assert_zeroize_on_drop(&resolved.note_secret_hex);
+        assert_zeroize_on_drop(
+            &resolved
+                .pool_record
+                .as_ref()
+                .expect("pool-only recovery record")
+                .note_secret_hex,
+        );
     }
 
     /// regression: pool-only recovery must retain the path resolved before STOP even if its symlink alias
@@ -8338,7 +8827,7 @@ mod tests {
         let err = super::persist_pool_recovery_record(&super::PoolRecoveryRecord {
             pool_path: pool_path.clone(),
             note_addr,
-            note_secret_hex: "2a".repeat(32),
+            note_secret_hex: "2a".repeat(32).into(),
             token_contract,
             role: "buyer".to_string(),
         })
@@ -8694,6 +9183,8 @@ mod tests {
         subscription_placement_calls: std::sync::atomic::AtomicUsize,
         subscription_placement_error: bool,
         subscription_order_active: bool,
+        subscription_inactive_order_id: Option<u128>,
+        subscription_order_read_error_id: Option<u128>,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<dexdo::buyer::api::ApiDeal>>,
     }
 
@@ -8818,7 +9309,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 
@@ -8842,7 +9333,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             }))
         }
 
@@ -8854,7 +9345,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
-                seller_commission_returned: 0,
+                seller_bond_returned: 0,
             })
         }
 
@@ -8930,9 +9421,17 @@ mod tests {
         async fn buyer_order_is_active_for_owner(
             &self,
             _order_book: &str,
-            _order_id: u128,
+            order_id: u128,
             _buyer_note: &str,
         ) -> Result<bool, dexdo_core::ChainError> {
+            if self.subscription_order_read_error_id == Some(order_id) {
+                return Err(dexdo_core::ChainError::Chain(
+                    "malformed non-empty active getOrder row".to_string(),
+                ));
+            }
+            if self.subscription_inactive_order_id == Some(order_id) {
+                return Ok(false);
+            }
             Ok(self.subscription_order_active)
         }
 
@@ -9110,12 +9609,12 @@ mod tests {
         burned: u64,
     ) -> dexdo_core::StreamSnapshot {
         dexdo_core::StreamSnapshot {
-            seller_locked,
-            buyer_locked,
-            buyer_lead,
-            seller_received,
+            seller_locked: u128::from(seller_locked),
+            buyer_locked: u128::from(buyer_locked),
+            buyer_lead: u128::from(buyer_lead),
+            seller_received: u128::from(seller_received),
             buyer_refunded: 0,
-            burned,
+            burned: u128::from(burned),
             closed: false,
         }
     }
@@ -9255,7 +9754,7 @@ mod tests {
         policy: crate::cli::policy::SellerRuntimePolicy,
         expected_choice: &str,
     ) {
-        let err = super::enforce_seller_runtime_policy(&policy)
+        let err = crate::cli::policy::validate_seller_runtime_capabilities(&policy)
             .unwrap_err()
             .to_string();
 
@@ -9329,7 +9828,8 @@ mod tests {
             crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
         );
 
-        super::enforce_seller_runtime_policy(&policy).expect("supported seller policy starts");
+        crate::cli::policy::validate_seller_runtime_capabilities(&policy)
+            .expect("supported seller policy starts");
     }
 
     #[tokio::test]
@@ -9730,7 +10230,13 @@ mod tests {
         assert!(err.contains("failure_class=malformed_handover"), "{err}");
         assert!(err.contains("action=dispute"), "{err}");
         assert!(err.contains("result=dispute_opened"), "{err}");
-        assert!(err.contains("dispute_locks_buyer_note"), "{err}");
+        assert!(
+            err.contains(
+                "dispute_freezes_this_token_contract_buyer_D_and_seller_bond_until_resolution"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("dispute_locks_buyer_note"), "{err}");
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
     }
@@ -11125,6 +11631,10 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-61-resume");
         let pool_path = dir.join("pool.json");
         let mut fixture = buyer_submit_test_journal();
+        (fixture.max_price_per_tick, fixture.escrow) = (
+            dexdo_core::PRICE_STEP,
+            dexdo_core::required_escrow_for_buy(fixture.ticks, dexdo_core::PRICE_STEP),
+        );
         fixture.intent = super::BuyerSubmitIntent::on_demand();
         fixture.expected_token_contract = None;
         std::fs::write(
@@ -12435,6 +12945,106 @@ mod tests {
         assert_eq!(
             state.books[book_index].subscriptions[0].matches[0].token_contract,
             token_contract
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_reconcile_accepts_second_order_after_cancelled_tombstone() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-cancelled-tombstone");
+        let journal_path = dir.join("journal.json");
+        let state_path = dir.join("subscriptions.json");
+        let mut journal = subscription_submit_test_journal();
+        journal.order_id_floor = 42;
+
+        let mut state = super::BuyerSubscriptionState::empty(&journal.note_addr).unwrap();
+        let book_index = super::ensure_subscription_book(
+            &mut state,
+            &journal.order_book,
+            &journal.frame_model,
+            &journal.model_hash,
+            &journal.fill_cursor,
+        )
+        .unwrap();
+        super::record_subscription_placements(
+            &mut state,
+            book_index,
+            &journal,
+            &[dexdo_core::InferenceSubscriptionPlacement {
+                order_id: 41,
+                buyer_note: journal.note_addr.clone(),
+                max_price_per_tick: journal.max_price_per_tick,
+                ticks: journal.ticks,
+                cycle_budget: journal.cycle_budget,
+                auto_renew: journal.auto_renew,
+                created_at: 1_001,
+            }],
+        )
+        .unwrap();
+        super::write_buyer_subscription_state(&state_path, &state).unwrap();
+        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
+
+        let second_placement = dexdo_core::InferenceSubscriptionPlacement {
+            order_id: 42,
+            buyer_note: journal.note_addr.clone(),
+            max_price_per_tick: journal.max_price_per_tick,
+            ticks: journal.ticks,
+            cycle_budget: journal.cycle_budget,
+            auto_renew: journal.auto_renew,
+            created_at: 1_002,
+        };
+        let malformed_history = RecordingRecoveryChain {
+            subscription_placements: vec![second_placement.clone()],
+            subscription_order_active: true,
+            subscription_order_read_error_id: Some(41),
+            ..Default::default()
+        };
+        let error = super::reconcile_subscription_submit_with_backend(
+            &malformed_history,
+            &journal_path,
+            &state_path,
+            &journal,
+            None,
+        )
+        .await
+        .expect_err("malformed non-empty history row must fail closed");
+        assert!(super::is_ambiguous_submit_error(&error), "{error:#}");
+        assert!(journal_path.exists());
+
+        let cancelled_history = RecordingRecoveryChain {
+            subscription_placements: vec![second_placement],
+            subscription_order_active: true,
+            subscription_inactive_order_id: Some(41),
+            ..Default::default()
+        };
+        let placements = super::reconcile_subscription_submit_with_backend(
+            &cancelled_history,
+            &journal_path,
+            &state_path,
+            &journal,
+            None,
+        )
+        .await
+        .expect("cancelled tombstone must not block the landed second order");
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].order_id, 42);
+        assert!(!journal_path.exists());
+
+        let state = super::load_buyer_subscription_state(&state_path, &journal.note_addr).unwrap();
+        let subscriptions = &state.books[0].subscriptions;
+        assert!(
+            !subscriptions
+                .iter()
+                .find(|subscription| subscription.order_id == 41)
+                .unwrap()
+                .active
+        );
+        assert!(
+            subscriptions
+                .iter()
+                .find(|subscription| subscription.order_id == 42)
+                .unwrap()
+                .active
         );
     }
 

@@ -23,8 +23,8 @@ pub enum ScammerReaction {
     /// `stop()` -> `BurnBoth` on the probe(scam revenue = 0), blacklist, instant failover. The buyer's
     /// own probe tick is burned.
     Stop,
-    /// `dispute()` -> locks the scammer's note(cannot sell or withdraw) until `releaseDispute()`
-    /// returns the tick to the buyer; the buyer's note is also locked for the duration of the dispute. The stake is not slashed.
+    /// `dispute()` freezes this TC's contested buyer amount and seller bond until resolution.
+    /// Neither actor's whole note is locked; the current routing attempt waits.
     Dispute,
 }
 
@@ -250,7 +250,7 @@ impl RouteOutcome {
 /// -> deal+verification(`runner`):
 /// - `Delivered` -> delivered, return(we do not close an honest seller's stream);
 /// - `Scam` -> anti-scam per the **explicit** frame policy (`Stop` -> `stop()`/BurnBoth, scam revenue=0;
-/// `Dispute` -> `dispute()`, note lock) + `blacklist.mark` + next;
+/// `Dispute` -> `dispute()`, per-TC funds freeze) + `blacklist.mark`;
 /// - `NoShow` -> `seller_timeout()` + `blacklist.mark` + next.
 /// Exposure is bounded by the frame and the machine invariant(<= 2 ticks per stream): failover tries sellers
 /// sequentially, not multiplying risk. The reaction and `seller_timeout` are best-effort: their error does not break
@@ -325,9 +325,8 @@ pub async fn route_capped_buy(
                     outcome: DealOutcome::Scam(reason),
                     reaction: Some(reaction),
                 });
-                // (lead's decision): `dispute` locks BOTH notes -> the buyer's note is locked,
-                // failover of this request is impossible -- it WAITS for `release_dispute`/timeout. Only `stop`
-                // (no buyer lock) fails over to the next one. So on `Dispute` -- exit.
+                // Policy: a dispute freezes this TC's contested funds and stops the current routing
+                // attempt while it awaits resolution. It does not lock either whole note.
                 if reaction == ScammerReaction::Dispute {
                     break;
                 }

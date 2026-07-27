@@ -1,4 +1,4 @@
-use crate::cli::args::{PolicyArgs, PolicyCommand, PolicyRoleArg};
+use crate::cli::args::{PolicyArgs, PolicyCommand, PolicyRoleArg, PolicyValidateRoleArg};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ const SELLER_BUYER_NO_SHOW: &[&str] = &[
     "retire_gateway",
 ];
 const SELLER_DISPUTE: &[&str] = &["release_if_clean", "hold"];
+const SELLER_RUNTIME_AFTER_DONE: &[&str] = &["retire"];
+const SELLER_RUNTIME_BUYER_NO_SHOW: &[&str] = &["retire_gateway"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeRole {
@@ -258,6 +260,10 @@ impl SellerAfterDealDoneAction {
             Self::Retire => "retire",
         }
     }
+
+    fn runtime_supported_values() -> &'static [&'static str] {
+        SELLER_RUNTIME_AFTER_DONE
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +280,10 @@ impl SellerBuyerNoShowAction {
             Self::CleanupAndRetire => "cleanup_and_retire",
             Self::RetireGateway => "retire_gateway",
         }
+    }
+
+    fn runtime_supported_values() -> &'static [&'static str] {
+        SELLER_RUNTIME_BUYER_NO_SHOW
     }
 }
 
@@ -321,6 +331,45 @@ pub(crate) struct SellerRuntimePolicy {
     pub(crate) buyer_no_show: SellerBuyerNoShowAction,
     pub(crate) dispute_against_me: SellerDisputeAgainstMeAction,
     pub(crate) max_open_deals: u64,
+}
+
+pub(crate) fn validate_seller_runtime_capabilities(policy: &SellerRuntimePolicy) -> Result<()> {
+    if policy.max_open_deals != 1 {
+        bail!(
+            "policy_action failure_class=seller.max_open_deals action=enforce token_contract=<not-posted> \
+             state=pre_offer result=unsupported_max_open_deals requested={} supported=1; \
+             current seller daemon owns exactly one per-deal TokenContract",
+            policy.max_open_deals
+        );
+    }
+    let unsupported = [
+        (
+            "seller.on.after_deal_done",
+            policy.after_deal_done.as_str(),
+            SellerAfterDealDoneAction::runtime_supported_values(),
+        ),
+        (
+            "seller.on.buyer_no_show",
+            policy.buyer_no_show.as_str(),
+            SellerBuyerNoShowAction::runtime_supported_values(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, selected, supported)| !supported.contains(selected))
+    .map(|(field, selected, _)| format!("{field}={selected}"))
+    .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        bail!(
+            "policy_action failure_class=policy_validation action=fail_closed token_contract=<not-posted> \
+             state=pre_offer result=unsupported_policy_choice runtime=seller unsupported_choices={} \
+             next_action=edit_policy diagnostic=seller runtime cannot execute fresh-TC republish or \
+             buyer-side cleanup_unopened from this seller daemon before/following an offer; supported seller \
+             terminal actions today are seller.on.after_deal_done=retire and \
+             seller.on.buyer_no_show=retire_gateway",
+            unsupported.join(",")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -377,10 +426,7 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-fn set_missing_path(value: &mut Value, path: &str, new_value: Value) {
-    if get_path(value, path).is_some() {
-        return;
-    }
+fn set_path(value: &mut Value, path: &str, new_value: Value) {
     let mut cur = value;
     let mut parts = path.split('.').peekable();
     while let Some(part) = parts.next() {
@@ -399,6 +445,25 @@ fn set_missing_path(value: &mut Value, path: &str, new_value: Value) {
             *cur = Value::Object(Map::new());
         }
     }
+}
+
+fn set_missing_path(value: &mut Value, path: &str, new_value: Value) {
+    if get_path(value, path).is_none() {
+        set_path(value, path, new_value);
+    }
+}
+
+fn refresh_seller_legend(value: &mut Value) {
+    set_path(
+        value,
+        "_legend.allowed.seller.on.after_deal_done",
+        Value::from(SellerAfterDealDoneAction::runtime_supported_values().join(" | ")),
+    );
+    set_path(
+        value,
+        "_legend.allowed.seller.on.buyer_no_show",
+        Value::from(SellerBuyerNoShowAction::runtime_supported_values().join(" | ")),
+    );
 }
 
 fn field_valid(value: Option<&Value>, kind: FieldKind) -> bool {
@@ -622,12 +687,14 @@ pub(crate) fn load_seller_runtime_policy(explicit: Option<&Path>) -> Result<Sell
         "hold" => SellerDisputeAgainstMeAction::Hold,
         _ => unreachable!("validated choice"),
     };
-    Ok(SellerRuntimePolicy {
+    let policy = SellerRuntimePolicy {
         after_deal_done,
         buyer_no_show,
         dispute_against_me,
         max_open_deals: int("seller.max_open_deals"),
-    })
+    };
+    validate_seller_runtime_capabilities(&policy)?;
+    Ok(policy)
 }
 
 fn scaffold_roles(value: &mut Value, role: PolicyRoleArg) {
@@ -675,6 +742,7 @@ fn scaffold_roles(value: &mut Value, role: PolicyRoleArg) {
                 Value::from(field.kind.allowed()),
             );
         }
+        refresh_seller_legend(value);
     }
 }
 
@@ -704,7 +772,12 @@ pub(crate) fn run_policy(args: PolicyArgs) -> Result<()> {
         }
         PolicyCommand::Show(args) => {
             let path = resolve_policy_path(args.path.as_deref())?;
-            let value = read_policy(&path)?;
+            let mut value = read_policy(&path)?;
+            if get_path(&value, "seller").is_some()
+                || get_path(&value, "_legend.allowed.seller").is_some()
+            {
+                refresh_seller_legend(&mut value);
+            }
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -738,6 +811,12 @@ pub(crate) fn run_policy(args: PolicyArgs) -> Result<()> {
             }
             Ok(())
         }
+        PolicyCommand::Validate(args) => match args.role {
+            PolicyValidateRoleArg::Seller => {
+                load_seller_runtime_policy(args.path.as_deref())?;
+                Ok(())
+            }
+        },
     }
 }
 

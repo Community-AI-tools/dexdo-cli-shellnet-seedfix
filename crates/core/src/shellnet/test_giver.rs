@@ -1,9 +1,8 @@
 use super::*;
+use crate::canonical_multisig;
 use gosh_ackinacki::airegistry::calls::encode_internal_payload;
 use gosh_ackinacki::airegistry::deploy::DeployMessage;
 use gosh_ackinacki::config::AiRegistryConfig;
-use gosh_ackinacki::wallet::contracts::{MULTISIG_ABI_JSON, MULTISIG_TVC};
-use gosh_ackinacki::wallet::deploy::{prepare_deploy, DeployParams};
 use gosh_ackinacki::wallet::giver::GiverClient;
 
 const OPERATIONAL_WALLET_REQ_CONFIRMS: u8 = 1;
@@ -11,7 +10,7 @@ const OPERATIONAL_WALLET_REQ_CONFIRMS: u8 = 1;
 impl RealChainBackend {
     /// Provision an operational multisig wallet(1-of-1) for a key: deterministic deploy address
     /// -> giver fund -> submit -> `Active`. Needed to send INTERNAL calls with ECC -- e.g.
-    /// `fundProbeCommission` requires SHELL in `msg.currencies`(an external message cannot attach currency).
+    /// `fundSellerBond` requires SHELL in `msg.currencies`(an external message cannot attach currency).
     pub async fn deploy_multisig(&self, keys: &KeyPair) -> Result<Address> {
         let prepared = prepare_operational_multisig_deploy(keys).await?;
         self.fund_deploy_wait(&prepared.address, &prepared.message_boc_b64)
@@ -19,16 +18,11 @@ impl RealChainBackend {
     }
 
     /// The **deterministic** address of the owner's operational multisig for `keys` -- WITHOUT a deploy
-    /// (`prepare_deploy` computes the address from the key+code).: one `--note-key` seed controls both the note
-    /// and the operational wallet, so the wallet address is derived from the seed -- no separate `--wallet-addr` is needed.
-    pub fn multisig_address(keys: &KeyPair) -> Result<Address> {
-        let params = DeployParams {
-            agent_pubkey: keys.public_hex().to_string(),
-            controller_pubkey: keys.public_hex().to_string(),
-            owner_pubkey: keys.public_hex().to_string(),
-            initial_value: 0,
-        };
-        let prepared = prepare_deploy(&params, keys.secret_hex())?;
+    /// (the prepared deploy computes the address from the key+code).: one `--note-key` seed controls both the
+    /// note and the operational wallet, so the wallet address is derived from the seed -- no separate
+    /// `--wallet-addr` is needed.
+    pub async fn multisig_address(keys: &KeyPair) -> Result<Address> {
+        let prepared = prepare_operational_multisig_deploy(keys).await?;
         let derived = Address::parse(&prepared.address)?;
         // accept an explicit operator wallet address via env `DEXDO_WALLET_ADDRESS`,
         // possibly in the GOSH `half1::half2` display form. Normalize through the single
@@ -48,12 +42,10 @@ impl RealChainBackend {
         Ok(derived)
     }
 
-    /// The seller posts the probe-commission: the wallet sends an INTERNAL `fundProbeCommission()`
-    /// to the TC with `shell_ecc` SHELL(ECC[2]). Via `sendTransaction`(NOT `submitTransaction`):
-    /// `sendTransaction` works for both the historical 2-of-3 test wallets and the current autonomous
-    /// operational wallets; `submitTransaction` would queue forever on the former. Excess SHELL over the
-    /// commission is returned.
-    pub async fn fund_probe_commission(
+    /// The seller posts the exact `2P` seller bond: the canonical v2 wallet sends an INTERNAL
+    /// `fundSellerBond()` to the TC with `shell_ecc` SHELL(ECC[2]) via direct `sendTransaction`.
+    /// Excess SHELL over the required seller bond is returned.
+    pub async fn fund_seller_bond(
         &self,
         wallet: &Address,
         wallet_keys: &KeyPair,
@@ -62,23 +54,22 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let ctx = local_context()?;
         let payload =
-            encode_internal_payload(&ctx, TOKENCONTRACT_ABI, "fundProbeCommission", json!({}))
-                .await?;
+            encode_internal_payload(&ctx, TOKENCONTRACT_ABI, "fundSellerBond", json!({})).await?;
         let mut cc = serde_json::Map::new();
         cc.insert("2".to_string(), json!(shell_ecc.to_string()));
         let msg = encode_external_call(
             &ctx,
-            MULTISIG_ABI_JSON,
+            canonical_multisig::MULTISIG_ABI_JSON,
             &wallet.with_workchain(),
             "sendTransaction",
-            json!({
-                "dest": tc.with_workchain(),
-                "value": "1000000000", // 1 vmshell forward gas
-                "cc": Value::Object(cc),
-                "bounce": false,
-                "flags": 1,
-                "payload": payload,
-            }),
+            canonical_multisig::send_transaction_params(
+                tc.with_workchain(),
+                1_000_000_000,
+                cc,
+                false,
+                1,
+                payload,
+            ),
             wallet_keys.public_hex(),
             wallet_keys.secret_hex(),
         )
@@ -97,7 +88,7 @@ impl RealChainBackend {
 
     /// Send an active account additional **ECC[2] SHELL** from the giver(flag 1). `fund_deploy_address` gives
     /// native gas to an uninit address, but NOT ECC[2]; a wallet that sends SHELL in internal calls
-    /// (e.g. `fundProbeCommission`) needs ECC[2] sent separately, after activation.
+    /// (e.g. `fundSellerBond`) needs ECC[2] sent separately, after activation.
     pub async fn giver_send_shell(&self, address: &str, amount: u128) -> Result<()> {
         self.giver_client()?.send_shell(address, amount).await
     }
@@ -192,9 +183,8 @@ impl RealChainBackend {
     /// `TokenContract`: native funding of an uninit **cross-dapp** address is privileged (only the giver
     /// can -- the prior `404`), but ECC[2] is
     /// permission-free. Mirrors the SDK giver `fund_deploy_address` (`sendCurrencyWithFlag` flag 16 then
-    /// 2, attaching `ecc:{2:amount}`) but from the operator multisig via `sendTransaction` carrying
-    /// `cc:{2: shell_ecc}` (`sendTransaction`, not `submitTransaction`: the deploy multisig is 2-of-3, so
-    /// `submitTransaction` would only queue). Then send the deploy message and wait for `Active`.
+    /// 2, attaching `ecc:{2:amount}`) but from the one-custodian canonical v2 wallet via direct
+    /// `sendTransaction` carrying `cc:{2: shell_ecc}`. Then send the deploy message and wait for `Active`.
     async fn fund_deploy_from_wallet_ecc(
         &self,
         wallet: &Address,
@@ -206,22 +196,21 @@ impl RealChainBackend {
         let ctx = local_context()?;
         let mut cc = serde_json::Map::new();
         cc.insert("2".to_string(), json!(shell_ecc.to_string()));
-        let cc = Value::Object(cc);
         // Mirror the giver `fund_deploy_address`: two ECC[2] sends to the uninit address, flags 16 then 2.
         for flags in [16u8, 2u8] {
             let fund = encode_external_call(
                 &ctx,
-                MULTISIG_ABI_JSON,
+                canonical_multisig::MULTISIG_ABI_JSON,
                 &wallet.with_workchain(),
                 "sendTransaction",
-                json!({
-                    "dest": address,
-                    "value": shell_ecc.to_string(),
-                    "cc": cc.clone(),
-                    "bounce": false,
-                    "flags": flags,
-                    "payload": "",
-                }),
+                canonical_multisig::send_transaction_params(
+                    address.to_string(),
+                    shell_ecc,
+                    cc.clone(),
+                    false,
+                    flags,
+                    String::new(),
+                ),
                 wallet_keys.public_hex(),
                 wallet_keys.secret_hex(),
             )
@@ -390,19 +379,17 @@ impl RealChainBackend {
     }
 }
 
-/// Test-giver operational wallet deploy: same embedded multisig code/stateInit as the SDK helper,
-/// but constructor `reqConfirms=1`, because shellnet onboard forwards vouchers through
-/// `submitTransaction` and expects first-signature execution.
+/// Test-giver deploy of the sole canonical v2 wallet with one pubkey custodian.
 async fn prepare_operational_multisig_deploy(keys: &KeyPair) -> Result<DeployMessage> {
     let ctx = local_context()?;
     let owner = format!("0x{}", keys.public_hex());
     build_deploy(
         &ctx,
-        MULTISIG_ABI_JSON,
-        MULTISIG_TVC,
+        canonical_multisig::MULTISIG_ABI_JSON,
+        canonical_multisig::MULTISIG_TVC,
         json!({}),
         json!({
-            "owners_pubkey": [owner.clone(), owner.clone(), owner],
+            "owners_pubkey": [owner],
             "owners_address": [],
             "reqConfirms": OPERATIONAL_WALLET_REQ_CONFIRMS,
             "reqConfirmsData": OPERATIONAL_WALLET_REQ_CONFIRMS,
@@ -419,20 +406,16 @@ mod operational_multisig_deploy_tests {
     use super::*;
 
     #[tokio::test]
-    async fn operational_multisig_keeps_sdk_deterministic_address() {
+    async fn canonical_multisig_v2_deploy_is_deterministic() {
         let keys = KeyPair::generate();
-        let params = DeployParams {
-            agent_pubkey: keys.public_hex().to_string(),
-            controller_pubkey: keys.public_hex().to_string(),
-            owner_pubkey: keys.public_hex().to_string(),
-            initial_value: 0,
-        };
-        let sdk = prepare_deploy(&params, keys.secret_hex()).expect("sdk deploy");
-        let operational = prepare_operational_multisig_deploy(&keys)
+        let first = prepare_operational_multisig_deploy(&keys)
             .await
-            .expect("operational deploy");
+            .expect("first canonical v2 deploy");
+        let second = prepare_operational_multisig_deploy(&keys)
+            .await
+            .expect("second canonical v2 deploy");
 
-        assert_eq!(operational.address, sdk.address);
-        assert!(!operational.message_boc_b64.is_empty());
+        assert_eq!(first.address, second.address);
+        assert!(!first.message_boc_b64.is_empty());
     }
 }

@@ -6,6 +6,9 @@ use std::time::Duration;
 /// SHELL -- the system's settlement unit. Integer count of minimal units.
 pub type Shell = u64;
 
+/// Canonical order-book price quantum: `1e9` raw ECC[2] units = 1 SHELL.
+pub const PRICE_STEP: u128 = 1_000_000_000;
+
 /// Fixed protocol constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolConsts {
@@ -15,7 +18,7 @@ pub struct ProtocolConsts {
     pub settle_window: Duration,
     /// Stream inactivity timeout(no new tokens). `STREAM_TIMEOUT = 600s`.
     pub stream_timeout: Duration,
-    /// Dispute window; on timeout -> split. `DISPUTE_WINDOW = 600s`.
+    /// Dispute window; timeout burns equal buyer/seller `D/D`. `DISPUTE_WINDOW = 600s`.
     pub dispute_window: Duration,
     /// Rebate rate cap, bps; strictly < `platform_fee_bps`. `REBATE_MAX_BPS = 200`.
     pub rebate_max_bps: u32,
@@ -55,18 +58,13 @@ impl Default for ProtocolConsts {
 pub struct DobParams {
     /// Tick size in tokens; reference value 1M.
     pub tick_size: u64,
-    /// Seller's probe commission on the first(probe) tick. Reference: the fee from a single tick.
-    pub seller_probe_commission: Shell,
 }
 
 impl DobParams {
-    /// Canonical reference for: `TICK_SIZE = 1M`,
-    /// `SELLER_PROBE_COMMISSION` ~ the platform fee from a single tick at `P = 1000`
-    /// -- the concrete number is chosen by the deploy.
+    /// Canonical reference for: `TICK_SIZE = 1M`.
     pub const fn canonical() -> Self {
         Self {
             tick_size: 1_000_000,
-            seller_probe_commission: 25, // = 250 bps * P(=1000) / 10000; reference "on the order of the fee from a tick"
         }
     }
 }

@@ -55,7 +55,7 @@ pub struct ModelConfig {
     /// The tokenizer family for `SignalManifest.tokenizer_family` -- instead of
     /// a substring hardcode. The buyer's profile matches by family.
     pub tokenizer_family: String,
-    /// Default tick price in SHELL.
+    /// Default tick price in raw ECC[2] units(`PRICE_STEP = 1_000_000_000` raw = 1 SHELL).
     pub price_per_tick: u64,
     /// Upstream capabilities. By default -- conservative(no `logprobs`).
     #[serde(default)]
@@ -158,6 +158,25 @@ impl ModelConfig {
             ),
         }
     }
+
+    /// Validate that this entry can be used as the buyer's exact-model reference.
+    pub fn require_executable_reference(&self) -> Result<()> {
+        let url = reqwest::Url::parse(&self.base_url)
+            .with_context(|| format!("invalid reference endpoint for \"{}\"", self.frame_model))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            bail!(
+                "reference endpoint for \"{}\" must be an absolute http(s) URL",
+                self.frame_model
+            );
+        }
+        if self.served_model.trim().is_empty() {
+            bail!(
+                "reference served_model for \"{}\" is empty",
+                self.frame_model
+            );
+        }
+        self.require_api_key_present()
+    }
 }
 
 #[cfg(test)]
@@ -172,7 +191,7 @@ mod tests {
           "served_model": "qwen/qwen3-32b",
           "api_key_env": "GROQ_API_KEY",
           "tokenizer_family": "qwen",
-          "price_per_tick": 1000,
+          "price_per_tick": 1000000000,
           "capabilities": { "logprobs": true, "top_logprobs": 5 }
         }
       }
@@ -236,6 +255,22 @@ mod tests {
     }
 
     #[test]
+    fn executable_reference_requires_url_model_and_key() {
+        let cfg = ModelsConfig::from_json(SAMPLE).unwrap();
+        let mut model = cfg.get("qwen").unwrap().clone();
+        model.api_key_env = "PATH".into();
+        model
+            .require_executable_reference()
+            .expect("valid configured reference");
+
+        model.base_url = "file:///tmp/reference".into();
+        assert!(model.require_executable_reference().is_err());
+        model.base_url = "https://api.groq.com/openai/v1".into();
+        model.served_model.clear();
+        assert!(model.require_executable_reference().is_err());
+    }
+
+    #[test]
     fn verification_fields_default_when_absent_backward_compatible() {
         // The SAMPLE(and any pre-existing single-model models.json) has no identity_aliases / vocab_size /
         // fingerprints -- it MUST still load, with the new fields defaulting to empty/None(backward-compat).
@@ -260,7 +295,7 @@ mod tests {
               "served_model": "qwen/qwen3-32b",
               "api_key_env": "GROQ_API_KEY",
               "tokenizer_family": "qwen",
-              "price_per_tick": 1000,
+              "price_per_tick": 1000000000,
               "identity_aliases": ["Qwen/Qwen3-32B"],
               "vocab_size": 152064,
               "fingerprints": [

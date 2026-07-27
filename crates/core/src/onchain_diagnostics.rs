@@ -156,9 +156,9 @@ pub fn contract_error_names(code: i64) -> &'static [&'static str] {
         327 => &["airegistry::ERR_STREAM_TIMEOUT_OPEN"],
         328 => &["airegistry::ERR_INSUFFICIENT_DEPOSIT"],
         329 => &["airegistry::ERR_STILL_OPEN"],
-        332 => &["airegistry::ERR_PROBE_NOT_FUNDED"],
+        332 => &["airegistry::ERR_BOND_NOT_FUNDED"],
         333 => &[
-            "airegistry::ERR_PROBE_ALREADY_FUNDED",
+            "airegistry::ERR_BOND_ALREADY_FUNDED",
             "iob::ERR_NOT_DEPLOYER_NOTE",
         ],
         334 => &["airegistry::ERR_NOT_PROBE", "iob::ERR_NO_LIQUIDITY"],
@@ -718,6 +718,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("airegistry::ERR_ALREADY_OPEN"), "{err}");
+    }
+
+    #[test]
+    fn seller_bond_exit_codes_use_v4_0_28_names() {
+        let not_funded = validate_onchain_submit_response(json!({"result": {"exit_code": 332}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            not_funded.contains("airegistry::ERR_BOND_NOT_FUNDED"),
+            "{not_funded}"
+        );
+        let already_funded =
+            validate_onchain_submit_response(json!({"result": {"exit_code": 333}}))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            already_funded.contains("airegistry::ERR_BOND_ALREADY_FUNDED"),
+            "{already_funded}"
+        );
     }
 
     #[test]

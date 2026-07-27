@@ -1,6 +1,6 @@
 ---
 name: dexdo-buy-model
-description: Guides a BUYER end-to-end through buying model inference on the dexdo market (real shellnet) -- install the client, deploy a wallet-funded private note, prepare the note key, receive the deal address from the seller (market.json or token_contract), read the real price with `dexdo market`/`dexdo quote`, fill the required failure policy (`dexdo policy init --role buyer`), run `dexdo buyer --local-listen` (places the buy and brings up a local OpenAI-compatible endpoint), use the purchased model from any OpenAI client (curl / OPENAI_BASE_URL), and check by-fact accounting (`dexdo status`/`dexdo history`) -- how much SHELL was paid, how many ticks were received, and what is locked. Load this when the user wants to BUY a model, connect to a seller, use someone else's model locally, or check what they paid for. For the seller side, use the `dexdo-sell-model` skill.
+description: Guides a BUYER end-to-end through buying model inference on the dexdo market (real shellnet) -- install the client, deploy a wallet-funded private note, prepare the note key, receive the deal address from the seller (market.json or token_contract), read the real price with `dexdo market`/`dexdo quote`, fill the required failure policy (`dexdo policy init --role buyer`), run `dexdo buyer --local-listen` (places the buy and brings up a local OpenAI-compatible endpoint), use the purchased model from any OpenAI client (curl / OPENAI_BASE_URL), and check by-fact accounting (`dexdo status`/`dexdo history`) -- how much SHELL was paid, how many ticks were received, and what per-deal escrow remains frozen. Load this when the user wants to BUY a model, connect to a seller, use someone else's model locally, or check what they paid for. For the seller side, use the `dexdo-sell-model` skill.
 ---
 
 # dexdo -- buying model access (buyer side)
@@ -12,11 +12,11 @@ is green. Secrets (wallet seed/key, note owner secret, the pool file) are never 
 If any command fails, run `dexdo doctor` first -- it reports the shellnet version, manifest
 freshness, and whether your `policy.json` is complete.
 
-**Prerequisite:** a deployed and funded UpdateCustodian multisig wallet holding test tokens plus its
-seed phrase (or key file). The wallet must have exactly one custodian whose public key matches the
-supplied funding key. Other wallet contract types are not currently supported, and the CLI does not
-create or fund the multisig. Buying also requires a live market with a seller ask; Phase 4 shows how
-to discover one.
+**Prerequisite:** a deployed and funded `UpdateCustodianMultisigWallet_v2` v2.2.0 wallet holding
+test tokens plus its seed phrase (or key file). The wallet must have exactly one custodian whose
+public key matches the supplied funding key. Other wallet contract types are not supported, and the
+CLI does not create or fund the multisig. Buying also requires a live market with a seller ask;
+Phase 4 shows how to discover one.
 
 ---
 
@@ -121,7 +121,7 @@ defaults to this path and uses the entry for model identity verification:
       "served_model": "qwen/qwen3-32b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
-      "price_per_tick": 1000,
+      "price_per_tick": 1000000000,
       "identity_aliases": ["Qwen/Qwen3-32B"],
       "vocab_size": 152064,
       "fingerprints": [
@@ -143,7 +143,7 @@ Set `--max-price-per-tick` from the real ask, not a guess. With the seller's `ma
 read the book and price the deal read-only (writes nothing):
 
 ```sh
-# The resting asks (price per tick, in whole SHELL) and their deal addresses:
+# The resting asks (raw ECC[2] per tick; 1000000000 = 1 SHELL) and their deal addresses:
 dexdo market qwen--qwen3--32b --market market.json --contracts contracts/deployed.shellnet.json
 
 # Executable cost for the ticks you intend to buy -- `total_with_fee` is the SHELL escrow you need:
@@ -188,7 +188,7 @@ This writes each required field as `UNSET`. Edit the file (or `dexdo policy edit
     },
     "failover": {
       "max_sellers_to_try": 3,
-      "total_spend_cap_shells": 100000
+      "total_spend_cap_shells": 24600000000
     }
   }
 }
@@ -204,15 +204,17 @@ Allowed values (the scaffold also lists these under `_legend.allowed`):
 - `buyer.on.bad_output_scam`: `stop | dispute | stop_and_blacklist` -- use `stop`/`dispute`
   (`stop_and_blacklist` is not yet supported and fails closed when it fires).
 - `buyer.failover.max_sellers_to_try`: integer >= 1.
-- `buyer.failover.total_spend_cap_shells`: integer >= 1 (whole SHELL) -- total spend ceiling across
-  failover; set it above one deal's escrow (`total_with_fee` from Phase 5).
+- `buyer.failover.total_spend_cap_shells`: integer >= 1 in raw ECC[2] units (the field keeps its
+  legacy name) -- total spend ceiling across failover. The example covers three attempts at the
+  Phase 5 price/tick count (`3 x 8200000000` raw); otherwise size it from the quoted
+  `total_with_fee`.
 
 Confirm with `dexdo policy show`.
 
 `policy.json` is the recovery control point. Manage it with `dexdo policy init`,
 `dexdo policy show`, and `dexdo policy edit`: it decides how no handover, malformed handover, a
 dead gateway, an empty or stalled stream, or suspected scam is handled. A stop closes the deal and
-honors finalized delivery, a dispute freezes both notes for arbitration, reclaim waits for the
+honors finalized delivery, a dispute freezes only that TC's contested funds for arbitration, reclaim waits for the
 contract timeout and returns eligible escrow, and `next_seller` performs bounded failover within the
 configured seller and spend caps.
 
@@ -225,14 +227,15 @@ dexdo buyer \
   --note-key note.secret.hex \
   --models models.json \
   --ticks 8 \
-  --max-price-per-tick 10 \
+  --max-price-per-tick 1000000000 \
   --local-listen 127.0.0.1:8080 \
   --contracts contracts/deployed.shellnet.json
 ```
 
-The value `10` is only a micro-priced example. Replace it with the best ask you recorded in Phase 4
-or a nearby ceiling in the same integer units. The automatic escrow is calculated from your ceiling,
-not from the eventual fill price, so an unnecessarily high ceiling locks unnecessarily high escrow.
+The value `1000000000` is one `PRICE_STEP` (1 SHELL). Replace it with the best ask you recorded in
+Phase 4 or a nearby ceiling in the same raw ECC[2] units; the value must be a positive whole
+`PRICE_STEP` multiple. The automatic escrow is calculated from your ceiling, not from the eventual
+fill price, so an unnecessarily high ceiling locks unnecessarily high escrow.
 
 To buy from the discovered model order book without `market.json`, use:
 
@@ -243,14 +246,16 @@ dexdo buyer \
   --note-key note.secret.hex \
   --models models.json \
   --ticks 8 \
-  --max-price-per-tick 10 \
+  --max-price-per-tick 1000000000 \
   --local-listen 127.0.0.1:8080 \
   --contracts contracts/deployed.shellnet.json
 ```
 
 For a specific bare deal, add `--token-contract 0:<ADDRESS>` to that model command. `--ticks` is how
-many ticks you buy. `--max-price-per-tick` must be at least the ask. Escrow is computed automatically
-as `ticks x max-price-per-tick` plus the book fee. Do not set `--escrow` without a reason:
+many ticks you buy. `--max-price-per-tick` is your per-tick ceiling in raw ECC[2]
+(`1000000000` = 1 SHELL); it must be a positive whole `PRICE_STEP` multiple and at least the ask.
+Escrow is computed automatically as `ticks x max-price-per-tick` plus the book fee. Do not set
+`--escrow` without a reason:
 over-funding a resting buy can strand the surplus. Wait for the line
 `consumer API listening (loopback)` -- the endpoint is ready.
 
@@ -300,16 +305,14 @@ dexdo status 0:<TOKEN-CONTRACT> --contracts contracts/deployed.shellnet.json
 
 It shows how much SHELL you paid (`finalized_owed`), the lifecycle `state=`
 (`placed`/`probe`/`streaming`/`stopped`/`disputed`) with boolean flags (`funded`/`opened`/
-`probe_accepted`), and what is locked (`buyer_locked`, <= 2 ticks -- the invariant). Stream responses
+`probe_accepted`), and what buyer escrow remains held in that TC (`buyer_locked`, <= 2 ticks -- the invariant). Stream responses
 also carry `usage` per request. Run these in a separate terminal while the buyer is up.
 
 ## Phase 10. Anti-abuse and recovery
 
-`dexdo note withdraw` can refuse with `ERR_STREAM_LOCKED (405)` while a stream or dispute is live.
-It can also return `ERR_NOTE_BUSY (121)` when another note operation or stake state makes withdrawal
-unsafe. These gates are intentional, not a bug: the note lock prevents either side from reusing the
-same capital during a live deal or dispute, which makes wash trading, freeriding, and note hopping
-unprofitable (spec sections 4.3 and 4.4).
+Each deal keeps its own buyer escrow and seller `2P` bond in that TokenContract. A dispute freezes
+only that deal's contested amount and bond; it does not lock either actor's whole PrivateNote, so
+independent deals remain possible.
 
 Use the recovery action that matches the failure:
 
@@ -319,9 +322,7 @@ Use the recovery action that matches the failure:
 +--------------------------------------+-------------------------------------+-------------------------------------------------------------+
 | Buyer process died on an OPEN deal   | dexdo recover                       | Stops the orphan; finalized delivered ticks are still paid. |
 | Seller no-show or deal never opened  | dexdo reclaim                       | Returns eligible escrow after the contract timeout.         |
-| Fraud or model substitution observed | dexdo dispute                       | Locks both notes pending arbitration.                       |
-| Withdrawal fails with 405            | dexdo note stream-locks             | Lists locks, deal addresses, and the force-clear deadline.  |
-| Stale locks past the max-lock window | PrivateNote.forceClearStreamLocks() | Owner backstop clears stale locks after the deadline.       |
+| Fraud or model substitution observed | dexdo dispute                       | Freezes this deal's contested funds pending resolution.     |
 +--------------------------------------+-------------------------------------+-------------------------------------------------------------+
 ```
 
@@ -333,24 +334,13 @@ dexdo recover --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
   --token-contract 0:<TOKEN-CONTRACT> --contracts contracts/deployed.shellnet.json
 ```
 
-Replace `recover` with `reclaim` or `dispute` for those situations. Inspect a blocked withdrawal
-without signing anything:
-
-```sh
-dexdo note stream-locks --note-addr "$NOTE_ADDR" \
-  --contracts contracts/deployed.shellnet.json
-```
-
-First bring every listed deal to a clean end: stop or settle it, resolve its dispute, or let the
-stream/dispute timeout expire. Once no stream or dispute lock remains, `dexdo note withdraw` passes
-the lock gate. After the reported max-lock deadline, `PrivateNote.forceClearStreamLocks()` is the
-owner-only backstop for stale locks. The current CLI reports that deadline but does not expose the
-force-clear call as a subcommand or flag; it must be submitted with an owner-signing contract tool.
+Replace `recover` with `reclaim` or `dispute` for those situations. Resolve a disputed TC with the
+seller's `release-dispute` path or arbitration; no whole-note unlock or force-clear step exists.
 
 ## Wrap-up
 
 Stop `dexdo buyer` (Ctrl-C) when the session is done -- the deal closes cleanly and leftover escrow
-returns to the note. Your on-chain lock per open deal never exceeds 2 ticks. Qualifier: under the
+returns to the note. Your on-chain exposure per open deal never exceeds 2 ticks. Qualifier: under the
 default `proactive` continuity, a `--local-listen` buyer left running idle may keep pre-buying fresh
 deals (extra probe/idle spend beyond that 2-tick lock), so stop it -- or use `--continuity-mode
 on-demand` -- when you are not actively sending requests.

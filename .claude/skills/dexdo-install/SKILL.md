@@ -81,11 +81,11 @@ network access to `shellnet.ackinacki.org`.
 The binary is ready, but real trading needs these from the operator -- gather them now so the sell/buy
 flow does not stall:
 
-1. A deployed and funded **UpdateCustodian multisig wallet** holding test tokens, plus its **seed
-   phrase** (or a key file). The wallet must have exactly one custodian whose public key matches the
-   supplied funding key. Other wallet contract types are not currently supported, and the CLI does
-   not create or fund multisig wallets. This wallet funds note deploys and per-deal markets. Keep the
-   seed/key private -- pass it by file path, never inline.
+1. A deployed and funded **`UpdateCustodianMultisigWallet_v2` v2.2.0 wallet** holding test tokens,
+   plus its **seed phrase** (or a key file). The wallet must have exactly one custodian whose public
+   key matches the supplied funding key. Other wallet contract types are not supported, and the CLI
+   does not create or fund multisig wallets. This wallet funds note deploys and per-deal markets.
+   Keep the seed/key private -- pass it by file path, never inline.
 2. A **model access key** for the seller only (for example `GROQ_API_KEY`), exported in the
    environment (`export GROQ_API_KEY=...`), never written to logs or files that get committed.
 3. A completed **failure policy**. Scaffold and fill it now:
@@ -132,7 +132,7 @@ Read the current price, provision one per-deal market, then run the gateway:
 ```sh
 dexdo market qwen--qwen3--32b --note-addr "$NOTE_ADDR" --contracts contracts/deployed.shellnet.json
 dexdo provision --note-addr "$NOTE_ADDR" --note-key note.secret.hex --frame-model qwen--qwen3--32b \
-  --nonce 1 --price-per-tick 1000 --max-ticks 1024 --deposit-shells 20 --output market.json \
+  --nonce 1 --price-per-tick 1000000000 --max-ticks 1024 --deposit-shells 20 --output market.json \
   --contracts contracts/deployed.shellnet.json
 export GROQ_API_KEY=<your-key>
 dexdo seller --market market.json --model qwen --models models.json \
@@ -151,7 +151,7 @@ Read an executable quote, place the buy, then send OpenAI-style requests to the 
 ```sh
 dexdo quote --market market.json --ticks 8 --contracts contracts/deployed.shellnet.json
 dexdo buyer --market market.json --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
-  --ticks 8 --max-price-per-tick 1000 --local-listen 127.0.0.1:8080 \
+  --ticks 8 --max-price-per-tick 1000000000 --local-listen 127.0.0.1:8080 \
   --contracts contracts/deployed.shellnet.json
 # in another shell, send OpenAI-style requests to the buyer's local endpoint:
 curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \

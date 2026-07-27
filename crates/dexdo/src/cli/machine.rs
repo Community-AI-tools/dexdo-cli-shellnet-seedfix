@@ -339,11 +339,6 @@ fn sanitize_error_cause(cause: &str) -> String {
 }
 
 fn redact_local_paths(text: &str) -> String {
-    const UNIX_ROOTS: &[&str] = &[
-        "/tmp/", "/home/", "/media/", "/root/", "/var/", "/opt/", "/users/", "/etc/", "/usr/",
-        "/srv/", "/run/", "/mnt/",
-    ];
-
     fn is_boundary(previous: Option<char>) -> bool {
         previous.is_none_or(|ch| {
             ch.is_whitespace() || matches!(ch, '=' | '(' | '[' | '{' | '"' | '\'' | ',' | ';')
@@ -361,27 +356,26 @@ fn redact_local_paths(text: &str) -> String {
             .unwrap_or(text.len())
     }
 
-    fn starts_local_path(text: &str, lower: &str, start: usize) -> bool {
+    fn starts_local_path(text: &str, start: usize) -> bool {
         let previous = text[..start].chars().next_back();
         if !is_boundary(previous) {
             return false;
         }
-        let rest = &lower[start..];
-        if UNIX_ROOTS.iter().any(|root| rest.starts_with(root)) || rest.starts_with("\\\\") {
+        let rest = &text[start..];
+        if rest.starts_with('/') || rest.starts_with("\\\\") {
             return true;
         }
-        let bytes = &text.as_bytes()[start..];
+        let bytes = rest.as_bytes();
         bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'\\' | b'/')
     }
 
-    let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
     while cursor < text.len() {
-        if starts_local_path(text, &lower, cursor) {
+        if starts_local_path(text, cursor) {
             out.push_str("<redacted-path>");
             cursor = path_end(text, cursor);
             continue;
@@ -637,15 +631,12 @@ pub(crate) fn forbidden_machine_fragment(text: &str) -> Option<&'static str> {
         "prompt",
         "provider response",
         "deal_path",
-        "/tmp/",
-        "/home/",
-        "/media/",
-        "\\users\\",
     ];
     forbidden
         .iter()
         .copied()
         .find(|needle| lower.contains(needle))
+        .or_else(|| (redact_local_paths(text) != text).then_some("absolute local path"))
 }
 
 #[cfg(test)]
@@ -961,5 +952,29 @@ mod tests {
             Some("deal_path")
         );
         assert!(forbidden_machine_fragment(r#"{"deal_handle":"deal-0-abc"}"#).is_none());
+    }
+
+    #[test]
+    fn machine_error_redacts_absolute_paths_without_a_root_allowlist() {
+        for path in [
+            "/app/private/note.key",
+            "/data/dexdo/pool.json",
+            "/workspace/deals/current.json",
+            "/custom-root/runtime/state",
+        ] {
+            let cause = sanitize_error_cause(&format!("failed to read {path}"));
+            assert_eq!(cause, "failed to read <redacted-path>");
+            assert_eq!(
+                forbidden_machine_fragment(&format!(r#"{{"cause":"{path}"}}"#)),
+                Some("absolute local path")
+            );
+        }
+    }
+
+    #[test]
+    fn machine_error_path_redaction_preserves_public_urls_and_relative_paths() {
+        let cause = "request https://shellnet.ackinacki.org/graphql failed in cache/state.json";
+        assert_eq!(sanitize_error_cause(cause), cause);
+        assert!(forbidden_machine_fragment(cause).is_none());
     }
 }

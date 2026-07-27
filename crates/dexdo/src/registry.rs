@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 pub const MODEL_REGISTRY_ABI_JSON: &str =
-    include_str!("../../../contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
+    include_str!("../../../contracts/compiled/airegistry/ModelRegistry.abi.json");
 pub const MODEL_REGISTRY_VALIDATION_SCHEMA: &str = "dexdo.model_registry_validation.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,11 +834,13 @@ mod tests {
     #[derive(Default)]
     struct FakeReader {
         entries: Mutex<BTreeMap<String, Option<ModelRegistryEntry>>>,
+        queries: Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl ModelRegistryReader for FakeReader {
         async fn model(&self, frame_model: &str) -> Result<Option<ModelRegistryEntry>> {
+            self.queries.lock().unwrap().push(frame_model.to_string());
             Ok(self
                 .entries
                 .lock()
@@ -856,6 +858,10 @@ mod tests {
                 .unwrap()
                 .insert(frame_model.to_string(), entry);
             self
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries.lock().unwrap().clone()
         }
     }
 
@@ -915,7 +921,9 @@ mod tests {
         let body = &source[reader_impl..impl_end];
 
         assert!(
-            source.contains("include_str!(\"../../../contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json\")"),
+            source.contains(
+                "include_str!(\"../../../contracts/compiled/airegistry/ModelRegistry.abi.json\")"
+            ),
             "ModelRegistry ABI must be embedded"
         );
         assert!(
@@ -1018,25 +1026,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_identity_resolves_qwen_frame_to_live_registry_name() {
-        let reader = FakeReader::default().with(
-            "Qwen/Qwen3-32B",
-            Some(registered_entry("Qwen/Qwen3-32B", ADDR1)),
-        );
-        let identity = resolve_registered_model_identity(
-            &reader,
-            RegistryRole::Buyer,
-            REG,
-            "qwen--qwen3--32b",
-        )
-        .await
-        .unwrap();
-        assert_eq!(identity.requested_model, "qwen--qwen3--32b");
-        assert_eq!(identity.registry_model, "Qwen/Qwen3-32B");
-        assert_eq!(
-            identity.model_hash,
-            dexdo_core::model_hash_for("Qwen/Qwen3-32B")
-        );
+    async fn content_identity_resolves_each_qwen_alias_in_bounded_candidate_order() {
+        for requested in ["qwen--qwen3--32b", "qwen/qwen3-32b", "Qwen/Qwen3-32B"] {
+            let reader = FakeReader::default().with(
+                "Qwen/Qwen3-32B",
+                Some(registered_entry("Qwen/Qwen3-32B", ADDR1)),
+            );
+            let identity =
+                resolve_registered_model_identity(&reader, RegistryRole::Buyer, REG, requested)
+                    .await
+                    .unwrap();
+            assert_eq!(identity.requested_model, requested);
+            assert_eq!(identity.registry_model, "Qwen/Qwen3-32B");
+            assert_eq!(
+                identity.model_hash,
+                dexdo_core::model_hash_for("Qwen/Qwen3-32B")
+            );
+            assert_eq!(identity.order_book, ADDR1);
+            let candidates = registry_identity_candidates(requested);
+            let registered = candidates
+                .iter()
+                .position(|candidate| candidate == "Qwen/Qwen3-32B")
+                .unwrap();
+            assert!(candidates.len() <= 3);
+            assert_eq!(reader.queries(), candidates[..=registered]);
+        }
     }
 
     #[test]
@@ -1073,10 +1087,18 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("does not resolve"), "{err}");
+        assert!(err.contains("buyer"), "{err}");
+        assert!(err.contains(REG), "{err}");
         assert!(
             err.contains("qwen--qwen3.6--27b"),
             "specific variant is reported: {err}"
         );
+        for candidate in registry_identity_candidates("qwen--qwen3.6--27b") {
+            assert!(
+                err.contains(&candidate),
+                "missing candidate {candidate}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

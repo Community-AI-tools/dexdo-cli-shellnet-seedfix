@@ -1,14 +1,11 @@
 //! Note-management command handlers(Track C8/C9/C12, move-only).
 
-use crate::cli::args::{
-    NoteBalanceArgs, NoteDeployArgs, NoteRecoverArgs, NoteStreamLocksArgs, NoteWithdrawArgs,
-};
+use crate::cli::args::{NoteBalanceArgs, NoteDeployArgs, NoteRecoverArgs, NoteWithdrawArgs};
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     is_note_deploy_wallet_busy_error, note_deploy_error, note_deploy_fold_state_into_pool,
     note_deploy_multisig_secret_hex, note_deploy_now_unix, note_deploy_recovery_pool_guard,
-    note_deploy_same_file_pool_guard, note_endpoint_url, now_unix_secs, shellnet_doctor_preflight,
-    unix_now_secs,
+    note_deploy_same_file_pool_guard, note_endpoint_url, shellnet_doctor_preflight, unix_now_secs,
 };
 #[cfg(feature = "shellnet")]
 use crate::cli::support::read_secret_hex;
@@ -79,95 +76,6 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
 #[cfg(not(feature = "shellnet"))]
 pub(crate) async fn run_note_recover(_args: NoteRecoverArgs) -> Result<()> {
     bail!("note recover unavailable: build with `--features shellnet`")
-}
-
-#[cfg(feature = "shellnet")]
-/// Return the clearable-at Unix second. The contract requires strict `>` after the maximum delay.
-fn note_stream_lock_deadline(last_change_unix: u64) -> u64 {
-    last_change_unix.saturating_add(dexdo_core::shellnet::PRIVATE_NOTE_STREAM_LOCK_MAX_SECS)
-}
-
-#[cfg(feature = "shellnet")]
-fn render_note_stream_locks(
-    note: &str,
-    status: &dexdo_core::shellnet::NoteStreamLockStatus,
-    now_unix: u64,
-) -> String {
-    let total = status.stream_count.saturating_add(status.dispute_count);
-    let clear_after = note_stream_lock_deadline(status.last_change_unix);
-    let remaining = if total > 0 {
-        clear_after.saturating_sub(now_unix)
-    } else {
-        0
-    };
-    let mut out = format!(
-        "note={note}\nstream_locks={}\ndispute_locks={}\nlast_change_unix={}\n",
-        status.stream_count, status.dispute_count, status.last_change_unix
-    );
-    if total == 0 {
-        out.push_str("force_clear_after_unix=none\nremaining_secs=0\n");
-    } else {
-        out.push_str(&format!(
-            "force_clear_after_unix={clear_after}\nremaining_secs={remaining}\n"
-        ));
-    }
-    out.push_str(&format!("history_complete={}\n", status.history_complete));
-    for entry in &status.entries {
-        out.push_str(&format!(
-            "lock kind={} deal={} changed_at_unix={} force_clear_after_unix={clear_after}\n",
-            entry.kind.as_str(),
-            entry.deal,
-            entry.changed_at_unix,
-        ));
-        match entry.kind {
-            dexdo_core::shellnet::NoteStreamLockKind::Stream => out.push_str(&format!(
-                "recovery deal={} reclaim=\"dexdo reclaim --token-contract {} --note-addr {note} \
-                 --note-key <PATH>\" stop_now=\"dexdo stop --token-contract {} --note-addr {note} \
-                 --note-key <PATH>\"\n",
-                entry.deal, entry.deal, entry.deal
-            )),
-            dexdo_core::shellnet::NoteStreamLockKind::Dispute => out.push_str(&format!(
-                "recovery deal={} action=resolve_dispute_before_force_clear\n",
-                entry.deal
-            )),
-        }
-    }
-    let unresolved = usize::try_from(total)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(status.entries.len());
-    if unresolved > 0 {
-        out.push_str(&format!("unresolved_lock_deals={unresolved}\n"));
-    }
-    out
-}
-
-/// `dexdo note stream-locks`: list authoritative lock counters and reconstructed deal addresses.
-#[cfg(feature = "shellnet")]
-pub(crate) async fn run_note_stream_locks(args: NoteStreamLocksArgs) -> Result<()> {
-    use dexdo_core::{Address, RealChainBackend};
-
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    let note = Address::parse(&args.note_addr)
-        .map_err(|error| anyhow::anyhow!("--note-addr {}: {error}", args.note_addr))?;
-    let note_display = note.with_workchain();
-    let chain = RealChainBackend::connect(manifest)?;
-    let status = chain
-        .note_stream_lock_status(&note)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("PrivateNote {note_display} is not active"))?;
-    print!(
-        "{}",
-        render_note_stream_locks(&note_display, &status, now_unix_secs()?)
-    );
-    Ok(())
-}
-
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_note_stream_locks(_args: NoteStreamLocksArgs) -> Result<()> {
-    bail!("note stream-locks unavailable: build with `--features shellnet`")
 }
 
 #[cfg(feature = "shellnet")]
@@ -400,12 +308,6 @@ impl NoteDeployVoucherFailpoints {
 const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 2_000_000_000;
 #[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
-    "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414";
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
-    "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571";
 
 #[cfg(feature = "shellnet")]
 fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> {
@@ -415,16 +317,15 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
         .or_else(|| code_hash.strip_prefix("0X"))
         .unwrap_or(code_hash)
         .to_ascii_lowercase();
-    if code_hash == NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH
-        || code_hash == NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH
-    {
+    if code_hash == dexdo_core::canonical_multisig::CODE_HASH {
         return Ok(());
     }
     bail!(
         "unsupported funding wallet code_hash {code_hash}; dexdo note deploy supports only \
-         UpdateCustodianMultisigWallet code hashes \
-         {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH} and \
-         {NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
+         {} {} code_hash {}",
+        dexdo_core::canonical_multisig::CONTRACT_NAME,
+        dexdo_core::canonical_multisig::VERSION,
+        dexdo_core::canonical_multisig::CODE_HASH,
     )
 }
 
@@ -434,14 +335,14 @@ fn note_deploy_update_custodian_send_transaction_params(
     cc: serde_json::Map<String, serde_json::Value>,
     voucher_body: String,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "dest": root_pn.with_workchain(),
-        "value": NOTE_DEPLOY_SUBMIT_NATIVE_VALUE.to_string(),
-        "cc": serde_json::Value::Object(cc),
-        "bounce": true,
-        "flags": 1,
-        "payload": voucher_body,
-    })
+    dexdo_core::canonical_multisig::send_transaction_params(
+        root_pn.with_workchain(),
+        NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
+        cc,
+        true,
+        1,
+        voucher_body,
+    )
 }
 
 #[cfg(feature = "shellnet")]
@@ -506,7 +407,7 @@ fn ensure_multisig_key_is_sole_custodian(
     if custodian_entries.len() != 1 {
         bail!(
             "funding wallet {funding_wallet} has {} custodians; direct \
-             UpdateCustodianMultisigWallet.sendTransaction \
+             UpdateCustodianMultisigWallet_v2.sendTransaction \
              requires exactly one pubkey custodian, and --multisig-key must match it",
             custodian_entries.len()
         );
@@ -518,7 +419,7 @@ fn ensure_multisig_key_is_sole_custodian(
     let [sole_custodian] = pubkeys.as_slice() else {
         bail!(
             "funding wallet {funding_wallet} has zero pubkey custodians in getCustodians output; \
-             direct UpdateCustodianMultisigWallet.sendTransaction requires exactly one pubkey custodian"
+             direct UpdateCustodianMultisigWallet_v2.sendTransaction requires exactly one pubkey custodian"
         );
     };
     if multisig_key_is_sole_custodian(derived_pubkey, custodians) {
@@ -601,7 +502,7 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
         let output = self
             .run_getter(
                 multisig_address,
-                dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON,
+                dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
                 "getCustodians",
                 serde_json::json!({}),
             )
@@ -680,7 +581,7 @@ async fn note_deploy_build_voucher_submit_boc(
     );
     let boc = encode_external_call(
         &ctx,
-        dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON,
+        dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
         &multisig_address.with_workchain(),
         "sendTransaction",
         note_deploy_update_custodian_send_transaction_params(root_pn, cc, voucher_body),
@@ -690,7 +591,7 @@ async fn note_deploy_build_voucher_submit_boc(
     .await
     .map_err(|e| {
         anyhow::anyhow!(
-            "encode UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: {e}"
+            "encode UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: {e}"
         )
     })?;
     Ok(boc)
@@ -743,7 +644,7 @@ async fn note_deploy_submit_voucher_boc(
     .await
     .map_err(|e| {
         anyhow::anyhow!(
-            "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: {e}"
+            "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: {e}"
         )
     })?;
     Ok(())
@@ -777,10 +678,9 @@ impl NoteDeployVoucherSubmitter for dexdo_core::ChainClient {
 
 #[cfg(feature = "shellnet")]
 fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher:")
-        && is_note_deploy_wallet_busy_error(error)
+    error.to_string().contains(
+        "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher:",
+    ) && is_note_deploy_wallet_busy_error(error)
 }
 
 #[cfg(feature = "shellnet")]
@@ -1012,7 +912,7 @@ async fn note_deploy_mint_voucher_recoverable(
         let proof = prove_voucher_for_event(ProveVoucherForEventParams {
             endpoint: endpoint.to_string(),
             event,
-            sk_u_hex: checkpoint.sk_u_hex.clone(),
+            sk_u_hex: checkpoint.sk_u_hex.to_string(),
             sk_u_commit_hex: checkpoint.sk_u_commit_hex.clone(),
             voucher_value,
             voucher_token_type,
@@ -2146,13 +2046,7 @@ pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
         .get_account(&note)
         .await
         .map_err(|e| anyhow::anyhow!("read PrivateNote account {note_display}: {e}"))?;
-    if account.is_none() {
-        build_note_balance_view(
-            &note_display,
-            None,
-            unknown_note_getter_balance_maps("account was not readable"),
-        )?;
-    }
+    chain.assert_note_balance_private_note_account(&note, account.as_ref())?;
     let details = match chain.private_note_details(&note).await {
         Ok(details) => note_getter_balance_maps(details.as_ref()),
         Err(e) => unknown_note_getter_balance_maps(format!("getDetails error: {e}")),
@@ -2330,10 +2224,7 @@ mod tests {
     #[cfg(feature = "shellnet")]
     impl FixedFundingWalletReader {
         fn returning(custodians: serde_json::Value) -> Self {
-            Self::with_code_hash(
-                super::NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH,
-                custodians,
-            )
+            Self::with_code_hash(dexdo_core::canonical_multisig::CODE_HASH, custodians)
         }
 
         fn with_code_hash(code_hash: &str, custodians: serde_json::Value) -> Self {
@@ -2554,10 +2445,10 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
-    fn note_deploy_update_custodian_is_the_only_wallet_canon() {
+    fn note_deploy_update_custodian_v2_is_the_only_wallet_canon() {
         let abi: serde_json::Value =
-            serde_json::from_str(dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON)
-                .expect("parse SDK canonical UpdateCustodian ABI");
+            serde_json::from_str(dexdo_core::canonical_multisig::MULTISIG_ABI_JSON)
+                .expect("parse canonical UpdateCustodianMultisigWallet_v2 ABI");
         let functions = abi["functions"].as_array().expect("ABI functions");
         let send_transaction = functions
             .iter()
@@ -2571,9 +2462,10 @@ mod tests {
                 { "name": "cc", "type": "map(uint32,varuint32)" },
                 { "name": "bounce", "type": "bool" },
                 { "name": "flags", "type": "uint8" },
-                { "name": "payload", "type": "cell" }
+                { "name": "payload", "type": "cell" },
+                { "name": "dapp_id", "type": "uint256" }
             ]),
-            "SDK canonical UpdateCustodian sendTransaction shape"
+            "canonical UpdateCustodianMultisigWallet_v2 sendTransaction shape"
         );
         let get_custodians = functions
             .iter()
@@ -2603,56 +2495,59 @@ mod tests {
         let fields = params.as_object().expect("wallet-forward params object");
         assert_eq!(
             fields.len(),
-            6,
-            "UpdateCustodian sendTransaction has six inputs"
+            7,
+            "UpdateCustodianMultisigWallet_v2 sendTransaction has seven inputs"
         );
-        assert!(
-            !fields.contains_key("dapp_id"),
-            "trailing dapp_id is forbidden"
-        );
-        assert!(
-            !dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON.contains("dapp_id"),
-            "UpdateCustodian ABI must not grow a Generic-wallet dapp_id"
+        assert_eq!(
+            fields["dapp_id"], "4",
+            "RootPN wallet forward must carry the canonical system dapp_id"
         );
     }
 
     #[cfg(feature = "shellnet")]
     #[test]
-    fn note_deploy_accepts_legacy_update_custodian_code_hash() {
+    fn note_deploy_accepts_only_update_custodian_v2_code_hash() {
         super::ensure_note_deploy_update_custodian_code_hash(&format!(
             "0X{}",
-            super::NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH.to_ascii_uppercase()
+            dexdo_core::canonical_multisig::CODE_HASH.to_ascii_uppercase()
         ))
-        .expect("legacy UpdateCustodian hash");
+        .expect("canonical UpdateCustodianMultisigWallet_v2 hash");
     }
 
     #[cfg(feature = "shellnet")]
     #[test]
-    fn note_deploy_accepts_managed_update_custodian_code_hash() {
-        super::ensure_note_deploy_update_custodian_code_hash(
-            super::NOTE_DEPLOY_MANAGED_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH,
-        )
-        .expect("managed UpdateCustodian hash");
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn note_deploy_rejects_generic_multisig_code_hash() {
-        let error = super::ensure_note_deploy_update_custodian_code_hash(
-            "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
-        )
-        .expect_err("Generic Multisig must be unsupported")
-        .to_string();
-        assert!(error.contains("supports only UpdateCustodian"), "{error}");
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn note_deploy_rejects_unknown_wallet_code_hash() {
-        let error = super::ensure_note_deploy_update_custodian_code_hash(&"00".repeat(32))
-            .expect_err("unknown wallet must be unsupported")
-            .to_string();
-        assert!(error.contains("supports only UpdateCustodian"), "{error}");
+    fn note_deploy_rejects_every_obsolete_or_unknown_wallet_code_hash() {
+        for (family, code_hash) in [
+            (
+                "old UpdateCustodianMultisigWallet",
+                "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414",
+            ),
+            (
+                "old managed UpdateCustodianMultisigWallet",
+                "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571",
+            ),
+            (
+                "generic Multisig",
+                "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+            ),
+            (
+                "unknown",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let error = super::ensure_note_deploy_update_custodian_code_hash(code_hash)
+                .expect_err(family)
+                .to_string();
+            assert!(error.contains(code_hash), "{family}: {error}");
+            assert!(
+                error.contains(dexdo_core::canonical_multisig::CONTRACT_NAME),
+                "{family}: {error}"
+            );
+            assert!(
+                error.contains(dexdo_core::canonical_multisig::CODE_HASH),
+                "{family}: {error}"
+            );
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -2821,7 +2716,7 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_fresh_path_rejects_generic_wallet_before_all_artifacts_and_submit() {
+    async fn note_deploy_fresh_path_rejects_non_v2_wallets_before_all_artifacts_and_submit() {
         use crate::cli::note::NoteDeployVoucherKind;
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2831,60 +2726,91 @@ mod tests {
             .expect("parse fixture wallet");
         let multisig_keys =
             dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key");
-        let wallet_reader = FixedFundingWalletReader::with_code_hash(
-            "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
-            serde_json::json!({
-                "custodians": [{
-                    "index": "0",
-                    "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
-                }]
-            }),
-        );
-        let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
-        let boc_builder = CountingVoucherBocBuilder::default();
-        let submitter = CountingVoucherSubmitter::default();
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
-        let mut recovery = test_recovery_state();
-        let owner = recovery.owner_public_key_hex.clone();
-        let token_type = recovery.token_type;
-        let raw_value = recovery.raw_value;
-        let recovery_path = temp.path().join("custodian-recovery.json");
+        for (family, code_hash) in [
+            (
+                "old-update-custodian",
+                "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414",
+            ),
+            (
+                "old-managed-update-custodian",
+                "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571",
+            ),
+            (
+                "generic-multisig",
+                "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+            ),
+        ] {
+            let wallet_reader = FixedFundingWalletReader::with_code_hash(
+                code_hash,
+                serde_json::json!({
+                    "custodians": [{
+                        "index": "0",
+                        "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+                    }]
+                }),
+            );
+            let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+            let boc_builder = CountingVoucherBocBuilder::default();
+            let submitter = CountingVoucherSubmitter::default();
+            let mut recovery = test_recovery_state();
+            let owner = recovery.owner_public_key_hex.clone();
+            let owner_secret = recovery.owner_secret_key_hex.to_string();
+            let token_type = recovery.token_type;
+            let raw_value = recovery.raw_value;
+            let recovery_path = temp.path().join(format!("{family}-recovery.json"));
 
-        let error = super::note_deploy_mint_voucher_recoverable(
-            &client,
-            &recovery_path,
-            &mut recovery,
-            NoteDeployVoucherKind::Deposit,
-            &multisig_address,
-            &key_loader,
-            &wallet_reader,
-            &boc_builder,
-            &submitter,
-            &owner,
-            token_type,
-            raw_value,
-            false,
-            &halo2_paths,
-            Default::default(),
-        )
-        .await
-        .expect_err("Generic funding wallet must fail closed")
-        .to_string();
+            let error = super::note_deploy_mint_voucher_recoverable(
+                &client,
+                &recovery_path,
+                &mut recovery,
+                NoteDeployVoucherKind::Deposit,
+                &multisig_address,
+                &key_loader,
+                &wallet_reader,
+                &boc_builder,
+                &submitter,
+                &owner,
+                token_type,
+                raw_value,
+                false,
+                &halo2_paths,
+                Default::default(),
+            )
+            .await
+            .expect_err("every non-v2 funding wallet must fail closed")
+            .to_string();
 
-        assert!(error.contains("supports only UpdateCustodian"), "{error}");
-        assert_eq!(key_loader.calls.get(), 1);
-        assert_eq!(wallet_reader.code_hash_calls.get(), 1);
-        assert_eq!(
-            wallet_reader.custodian_calls.get(),
-            0,
-            "unsupported code must stop before getter"
-        );
-        assert_eq!(boc_builder.calls.get(), 0);
-        assert_eq!(submitter.calls.get(), 0);
-        assert!(recovery
-            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
-            .is_none());
-        assert!(!recovery_path.exists());
+            assert!(error.contains(code_hash), "{family}: {error}");
+            assert!(
+                error.contains(dexdo_core::canonical_multisig::CONTRACT_NAME),
+                "{family}: {error}"
+            );
+            assert!(
+                !error.contains(multisig_keys.secret_hex()),
+                "{family}: funding secret leaked: {error}"
+            );
+            assert!(
+                !error.contains(&owner_secret),
+                "{family}: note owner secret leaked: {error}"
+            );
+            assert_eq!(key_loader.calls.get(), 1, "{family}");
+            assert_eq!(wallet_reader.code_hash_calls.get(), 1, "{family}");
+            assert_eq!(
+                wallet_reader.custodian_calls.get(),
+                0,
+                "{family}: unsupported code must stop before getter"
+            );
+            assert_eq!(boc_builder.calls.get(), 0, "{family}");
+            assert_eq!(submitter.calls.get(), 0, "{family}");
+            assert!(
+                recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .is_none(),
+                "{family}"
+            );
+            assert!(!recovery_path.exists(), "{family}");
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -3166,7 +3092,7 @@ mod tests {
     #[test]
     fn note_deploy_wallet_replay_conflict_is_busy_retryable_and_actionable() {
         let raw = anyhow::anyhow!(
-            "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: block manager rejected \
+            "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: block manager rejected \
              message code=TVM_ERROR; exit-code:52 nonce desynchronized"
         );
 
@@ -3242,7 +3168,7 @@ mod tests {
     #[test]
     fn note_deploy_unrelated_errors_are_not_relabeled_as_history_proof_expired() {
         for raw in [
-            "UpdateCustodianMultisigWallet.sendTransaction failed: exit_code=403",
+            "UpdateCustodianMultisigWallet_v2.sendTransaction failed: exit_code=403",
             "prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover",
             "wallet submit failed: exit_code=52 replay protection exception",
             "generic SDK transport error",
@@ -3301,7 +3227,7 @@ mod tests {
                 attempts.push(attempt);
                 if attempt < 3 {
                     Err(anyhow::anyhow!(
-                        "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: \
+                        "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: \
                          tvm_error exit-code:52 nonce desynchronized"
                     ))
                 } else {
@@ -3335,7 +3261,7 @@ mod tests {
             async |attempt| {
                 attempts.push(attempt);
                 Err(anyhow::anyhow!(
-                    "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: \
+                    "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: \
                      tvm_error exit-code:52 nonce desynchronized"
                 ))
             },
@@ -3478,7 +3404,7 @@ mod tests {
             voucher_value: raw_value,
             voucher_token_type: token_type,
             layer_number: 1,
-            sk_u_hex,
+            sk_u_hex: sk_u_hex.into(),
             sk_u_commit_hex,
         });
         checkpoint
@@ -4039,76 +3965,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn note_stream_lock_deadline_is_exact_first_clearable_second() {
-        const LAST_CHANGE_UNIX: u64 = 1_000_000;
-        assert_eq!(
-            super::note_stream_lock_deadline(LAST_CHANGE_UNIX),
-            LAST_CHANGE_UNIX + dexdo_core::shellnet::PRIVATE_NOTE_STREAM_LOCK_MAX_SECS
-        );
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn stream_locks_command_decodes_and_lists_locked_deals_with_timers() {
-        const PRIVATE_NOTE_ABI: &str =
-            include_str!("../../../../contracts/compiled_0.79.3/dex/PrivateNote.abi.json");
-        const STREAM_DEAL: &str =
-            "0:1111111111111111111111111111111111111111111111111111111111111111";
-        const DISPUTE_DEAL: &str =
-            "0:2222222222222222222222222222222222222222222222222222222222222222";
-        let context = dexdo_core::airegistry::deploy::local_context().expect("local TVM context");
-        let stream_call = dexdo_core::airegistry::calls::encode_internal_payload(
-            &context,
-            PRIVATE_NOTE_ABI,
-            "streamLock",
-            serde_json::json!({
-                "sellerPubkey": format!("0x{}", "1".repeat(64)),
-                "nonce": "7",
-            }),
-        )
-        .await
-        .expect("encode streamLock inbound call");
-        let dispute_call = dexdo_core::airegistry::calls::encode_internal_payload(
-            &context,
-            PRIVATE_NOTE_ABI,
-            "streamDisputeLock",
-            serde_json::json!({
-                "sellerPubkey": format!("0x{}", "2".repeat(64)),
-                "nonce": "8",
-            }),
-        )
-        .await
-        .expect("encode streamDisputeLock inbound call");
-        let status = dexdo_core::shellnet::NoteStreamLockStatus::from_successful_inbound_calls(
-            1,
-            1,
-            1_000,
-            [
-                (900, stream_call.as_str(), true, Some(STREAM_DEAL)),
-                (1_000, dispute_call.as_str(), true, Some(DISPUTE_DEAL)),
-            ],
-        )
-        .expect("decode and reconstruct active lock deals");
-
-        let rendered = super::render_note_stream_locks("0:note", &status, 1_100);
-        assert!(rendered.contains("stream_locks=1"), "{rendered}");
-        assert!(rendered.contains("dispute_locks=1"), "{rendered}");
-        assert!(
-            rendered.contains(&format!("kind=stream deal={STREAM_DEAL}")),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(&format!("kind=dispute deal={DISPUTE_DEAL}")),
-            "{rendered}"
-        );
-        assert!(rendered.contains("force_clear_after_unix="), "{rendered}");
-        assert!(rendered.contains("history_complete=true"), "{rendered}");
-        assert!(rendered.contains(&format!("dexdo reclaim --token-contract {STREAM_DEAL}")));
-        assert!(rendered.contains(&format!("dexdo stop --token-contract {STREAM_DEAL}")));
-    }
-
     /// the command body is read-only and address-only: no key read and no signed/write helper.
     #[test]
     fn note_balance_command_path_is_read_only() {
@@ -4129,7 +3985,21 @@ mod tests {
             "expected both run_note_balance variants in the inspected range: {body}"
         );
         assert!(body.contains(".get_account("), "{body}");
+        assert!(
+            body.contains(".assert_note_balance_private_note_account("),
+            "{body}"
+        );
         assert!(body.contains(".private_note_details("), "{body}");
+        let get_account = body.find(".get_account(").unwrap();
+        let identity_guard = body
+            .find(".assert_note_balance_private_note_account(")
+            .unwrap();
+        let get_details = body.find(".private_note_details(").unwrap();
+        let render = body.rfind("render_note_balance(&view)").unwrap();
+        assert!(
+            get_account < identity_guard && identity_guard < get_details && get_details < render,
+            "identity guard must run after get_account and before getter/render: {body}"
+        );
         for forbidden in [
             "read_secret_hex",
             "note_key",

@@ -23,18 +23,18 @@ struct EndpointsFile {
 struct StreamCell {
     machine: StreamMachine,
     buyer_pubkey: NotePubkey,
-    seller_locked: Shell,
-    buyer_locked: Shell,
-    seller_received: Shell,
-    buyer_refunded: Shell,
-    burned: Shell,
+    seller_locked: u128,
+    buyer_locked: u128,
+    seller_received: u128,
+    buyer_refunded: u128,
+    burned: u128,
     closed: bool,
     /// The agreed ceiling on delivered ticks. Guard in `advance_tick`
     /// the mock does not deliver more than the offer, just as the real TC is bounded by deposit.
     #[serde(default = "unbounded_max_ticks")]
     max_ticks: u64,
-    /// A dispute is open: the tick is frozen(not burned), the notes are locked -- until `release_dispute`,
-    /// which returns the tick to the buyer., `Dispute` mode.
+    /// A dispute is open: this deal's contested amount and seller bond are frozen(not burned)
+    /// until `release_dispute`, which returns the contested amount to the buyer.
     #[serde(default)]
     disputed: bool,
 }
@@ -56,11 +56,6 @@ struct MockState {
     /// Seller(hex of the note's ed-pubkey) per offer -- for discovery/blacklist.
     #[serde(default)]
     offer_sellers: HashMap<TokenContract, String>,
-    /// Notes locked by a dispute: `TC.dispute()` locks BOTH notes -- both the seller's and
-    /// **the buyer's**. A locked note does not trade: a new offer(seller) / `place_buy`(buyer)
-    /// are rejected with `ERR_STREAM_LOCKED`, until `release_dispute` resolves the dispute.
-    #[serde(default)]
-    locked_notes: HashSet<String>,
     matches: HashMap<TokenContract, Match>,
     streams: HashMap<TokenContract, StreamCell>,
 }
@@ -134,13 +129,6 @@ impl ChainBackend for MockChainBackend {
         Ok(st
             .offers
             .values()
-            // Notes locked by a dispute do not trade -- their offers are not in discovery.
-            .filter(|o| {
-                st.offer_sellers
-                    .get(&o.token_contract)
-                    .map(|s| !st.locked_notes.contains(s))
-                    .unwrap_or(true)
-            })
             .map(|o| OfferListing {
                 seller_id: st
                     .offer_sellers
@@ -164,12 +152,6 @@ impl ChainBackend for MockChainBackend {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        // a note locked by a dispute cannot trade(ERR_STREAM_LOCKED).
-        if st.locked_notes.contains(&seller_id) {
-            return Err(ChainError::Locked(format!(
-                "seller {seller_id} note locked by dispute"
-            )));
-        }
         if st.offers.contains_key(&offer.token_contract) {
             return Err(ChainError::Chain(format!(
                 "duplicate active sell order for TokenContract {}: cancel/fill the old order before reposting",
@@ -189,14 +171,6 @@ impl ChainBackend for MockChainBackend {
     ) -> Result<(), ChainError> {
         let _g = self.lock.lock().unwrap();
         let mut st = self.load_state()?;
-        // a buyer's note locked by a dispute cannot trade (failover in `dispute` mode is
-        // impossible until `release_dispute` unlocks it) -- `ERR_STREAM_LOCKED`.
-        let buyer_id = note_id_hex(&note.pubkey());
-        if st.locked_notes.contains(&buyer_id) {
-            return Err(ChainError::Locked(format!(
-                "buyer note {buyer_id} locked by dispute"
-            )));
-        }
         let offer = st
             .offers
             .get(token_contract)
@@ -257,13 +231,13 @@ impl ChainBackend for MockChainBackend {
             .map(|o| o.max_ticks)
             .unwrap_or(u64::MAX);
         // the first tick is frozen(the buyer locked 1 tick), the seller posted
-        // SELLER_PROBE_COMMISSION from the stake. There is no prepayment ahead.
+        // the 2P mirror bond. There is no prepayment ahead.
         let machine = StreamMachine::open(m.price_per_tick, &self.params);
         let cell = StreamCell {
             machine,
             buyer_pubkey: m.buyer_pubkey.clone(),
-            seller_locked: self.params.seller_probe_commission,
-            buyer_locked: m.price_per_tick, // probe tick frozen
+            seller_locked: 2 * u128::from(m.price_per_tick),
+            buyer_locked: u128::from(m.price_per_tick), // probe tick frozen
             seller_received: 0,
             buyer_refunded: 0,
             burned: 0,
@@ -297,16 +271,14 @@ impl ChainBackend for MockChainBackend {
             .streams
             .get_mut(token_contract)
             .ok_or_else(|| ChainError::NoStream(token_contract.clone()))?;
-        // the probe is accepted -> the probe tick goes to the seller, its commission is returned.
+        // the probe is accepted -> the probe tick goes to the seller; the 2P mirror
+        // bond STAYS locked(it collateralises the whole deal until a terminal state).
         cell.machine
             .on_probe_accepted()
             .map_err(|e| ChainError::EndpointsFile(e.0.to_string()))?;
-        let p = cell.machine.price();
-        cell.buyer_locked = cell.buyer_locked.saturating_sub(p);
+        let p = u128::from(cell.machine.price());
+        cell.buyer_locked -= p;
         cell.seller_received += p;
-        cell.seller_locked = cell
-            .seller_locked
-            .saturating_sub(self.params.seller_probe_commission);
         // The two-tick invariant kicks in: the next tick is prepaid, one more is frozen.
         cell.buyer_locked += 2 * p;
         self.store_state(&st)
@@ -326,8 +298,12 @@ impl ChainBackend for MockChainBackend {
         // the mock does not deliver more than the offer's `max_ticks`(the real TC is bounded by deposit). We count
         // finalized ticks by-fact(`seller_received / p`) and reject delivery beyond the ceiling.
         let p = cell.machine.price();
-        let delivered = if p > 0 { cell.seller_received / p } else { 0 };
-        if delivered >= cell.max_ticks {
+        let delivered = if p > 0 {
+            cell.seller_received / u128::from(p)
+        } else {
+            0
+        };
+        if delivered >= u128::from(cell.max_ticks) {
             return Err(ChainError::Limit(format!(
                 "advance_tick: max_ticks ({}) reached -- the mock does not deliver beyond the offer",
                 cell.max_ticks
@@ -336,7 +312,7 @@ impl ChainBackend for MockChainBackend {
         cell.machine
             .on_tick_delivered()
             .map_err(|e| ChainError::EndpointsFile(e.0.to_string()))?;
-        cell.seller_received += p;
+        cell.seller_received += u128::from(p);
         // `buyer_locked` does NOT change: the 2P window holds -- 1 tick is finalized to the seller, the next
         // is already frozen(deposited by the previous transition). Previously there was a `sub(p).add(p)`(no-op)
         // here, which read as a bug -- the arithmetic was removed.
@@ -354,14 +330,22 @@ impl ChainBackend for MockChainBackend {
             .streams
             .get_mut(token_contract)
             .ok_or_else(|| ChainError::NoStream(token_contract.clone()))?;
+        if cell.closed {
+            return Err(ChainError::Chain(format!(
+                "stop: {token_contract} is already closed"
+            )));
+        }
         let settlement = cell.machine.buyer_stop();
         match &settlement {
             Settlement::BurnBoth(b) => {
-                // the buyer's probe tick + the seller's commission -- burned, to no one.
+                // the buyer's probe tick P + a mirror P from the seller bond are
+                // burned, to no one; the remaining bond returns to the seller(bond fully resolved).
                 cell.burned += b.total();
-                cell.buyer_locked = cell.buyer_locked.saturating_sub(b.buyer);
-                cell.seller_locked = cell.seller_locked.saturating_sub(b.seller);
-                // Neither seller_received nor buyer_refunded grows: scam revenue = 0.
+                cell.buyer_refunded += b.buyer_refund;
+                cell.buyer_locked -= u128::from(b.buyer);
+                cell.buyer_locked -= b.buyer_refund;
+                cell.seller_locked = 0;
+                // The seller receives no service revenue; only unused principal is refunded.
             }
             Settlement::AmicableSplit {
                 to_seller_ticks,
@@ -369,15 +353,18 @@ impl ChainBackend for MockChainBackend {
             } => {
                 // the prepaid(delivered) tick -> to the seller, the frozen buffer -> to the buyer.
                 // Both of the buyer's still-locked ticks are resolved: the lock is released entirely.
-                let to_seller = to_seller_ticks * cell.machine.price();
+                let to_seller = u128::from(*to_seller_ticks) * u128::from(cell.machine.price());
                 cell.seller_received += to_seller;
                 cell.buyer_refunded += *to_buyer_refund;
-                cell.buyer_locked = cell
-                    .buyer_locked
-                    .saturating_sub(to_seller)
-                    .saturating_sub(*to_buyer_refund);
+                cell.buyer_locked -= to_seller;
+                cell.buyer_locked -= *to_buyer_refund;
+                // clean close -> the seller mirror bond returns in full.
+                cell.seller_locked = 0;
             }
-            Settlement::SellerNoShow { .. } => {}
+            Settlement::SellerNoShow { .. } => {
+                // no-show is not slashed -> the seller mirror bond returns in full.
+                cell.seller_locked = 0;
+            }
         }
         cell.machine.close();
         cell.closed = true;
@@ -392,34 +379,24 @@ impl ChainBackend for MockChainBackend {
         token_contract: &TokenContract,
         _note: &dyn Note,
     ) -> Result<Settlement, ChainError> {
-        // a dispute FREEZES(does NOT burn, unlike `stop`) -- the buyer's tick is locked until
-        // `release_dispute`, which returns it to the buyer; we lock the seller's note (`ERR_STREAM_LOCKED`
-        // on new offers/discovery). Scam revenue stays 0. We return the EXPECTED post-release outcome.
+        // a dispute FREEZES this TC's contested buyer amount and seller bond (does NOT burn,
+        // unlike `stop`) until `release_dispute`. Other TCs owned by either note remain independent.
+        // Scam revenue stays 0. We return the EXPECTED post-release outcome.
         let _g = self.lock.lock().unwrap();
         let mut st = self.load_state()?;
-        let (to_buyer, commission, buyer_id) = {
+        let (to_buyer, seller_bond) = {
             let cell = st
                 .streams
                 .get_mut(token_contract)
                 .ok_or_else(|| ChainError::NoStream(token_contract.clone()))?;
             cell.machine.buyer_dispute();
             cell.disputed = true;
-            (
-                cell.buyer_locked,
-                cell.seller_locked,
-                note_id_hex(&cell.buyer_pubkey),
-            )
+            (cell.buyer_locked, cell.seller_locked)
         };
-        // `TC.dispute()` locks BOTH notes -- the seller's AND the buyer's. The buyer's note is locked ->
-        // failover of this request is impossible(`place_buy` will be rejected), the request waits for `release_dispute`.
-        if let Some(seller) = st.offer_sellers.get(token_contract).cloned() {
-            st.locked_notes.insert(seller);
-        }
-        st.locked_notes.insert(buyer_id);
         self.store_state(&st)?;
         Ok(Settlement::SellerNoShow {
             to_buyer_refund: to_buyer,
-            seller_commission_returned: commission,
+            seller_bond_returned: seller_bond,
         })
     }
 
@@ -427,8 +404,8 @@ impl ChainBackend for MockChainBackend {
         &self,
         token_contract: &TokenContract,
     ) -> Result<Settlement, ChainError> {
-        // the seller concedes -> the frozen tick is returned to the buyer, the commission -- to the seller
-        // (unlock), WITHOUT burn; the seller's notes are unlocked. Scam revenue = 0.
+        // the seller concedes -> the frozen amount is returned to the buyer and the seller bond
+        // is returned, WITHOUT burn. Other deals were never affected. Scam revenue = 0.
         let _g = self.lock.lock().unwrap();
         let mut st = self.load_state()?;
         let settlement = {
@@ -442,25 +419,18 @@ impl ChainBackend for MockChainBackend {
                 )));
             }
             let to_buyer = cell.buyer_locked;
-            let commission = cell.seller_locked;
+            let seller_bond = cell.seller_locked;
             cell.buyer_refunded += to_buyer;
             cell.buyer_locked = 0;
-            cell.seller_locked = cell.seller_locked.saturating_sub(commission);
+            cell.seller_locked -= seller_bond;
             cell.disputed = false;
             cell.machine.close();
             cell.closed = true;
-            let settlement = Settlement::SellerNoShow {
+            Settlement::SellerNoShow {
                 to_buyer_refund: to_buyer,
-                seller_commission_returned: commission,
-            };
-            (settlement, note_id_hex(&cell.buyer_pubkey))
+                seller_bond_returned: seller_bond,
+            }
         };
-        let (settlement, buyer_id) = settlement;
-        // Unlock BOTH notes -- the dispute is resolved.
-        if let Some(seller) = st.offer_sellers.get(token_contract).cloned() {
-            st.locked_notes.remove(&seller);
-        }
-        st.locked_notes.remove(&buyer_id);
         self.store_state(&st)?;
         Ok(settlement)
     }
@@ -478,16 +448,31 @@ impl ChainBackend for MockChainBackend {
         let settlement = cell.machine.seller_timeout();
         if let Settlement::SellerNoShow {
             to_buyer_refund,
-            seller_commission_returned,
+            seller_bond_returned,
         } = &settlement
         {
-            // the buyer takes the frozen tick, pays zero; the seller's
-            // commission is returned to them -- NOT burned.
-            cell.buyer_refunded += *to_buyer_refund;
-            cell.buyer_locked = cell.buyer_locked.saturating_sub(*to_buyer_refund);
-            cell.seller_locked = cell
+            let buyer_locked =
+                cell.buyer_locked
+                    .checked_sub(*to_buyer_refund)
+                    .ok_or_else(|| {
+                        ChainError::Chain(
+                            "mock seller_timeout buyer refund exceeds persisted buyer lock"
+                                .to_string(),
+                        )
+                    })?;
+            let seller_locked = cell
                 .seller_locked
-                .saturating_sub(*seller_commission_returned);
+                .checked_sub(*seller_bond_returned)
+                .ok_or_else(|| {
+                    ChainError::Chain(
+                        "mock seller_timeout bond return exceeds persisted seller lock".to_string(),
+                    )
+                })?;
+            // the buyer takes the frozen tick, pays zero; the seller's
+            // exact seller bond is returned -- NOT burned.
+            cell.buyer_refunded += *to_buyer_refund;
+            cell.buyer_locked = buyer_locked;
+            cell.seller_locked = seller_locked;
         }
         cell.machine.close();
         cell.closed = true;
@@ -514,7 +499,7 @@ impl ChainBackend for MockChainBackend {
         self.store_state(&st)?;
         Ok(Settlement::SellerNoShow {
             to_buyer_refund: 0,
-            seller_commission_returned: 0,
+            seller_bond_returned: 0,
         })
     }
 
@@ -616,7 +601,8 @@ impl ChainBackend for MockChainBackend {
                         DealRole::Buyer => s.buyer_locked,
                         DealRole::Seller => s.seller_locked,
                     };
-                    exposure = exposure.saturating_add(locked);
+                    exposure =
+                        exposure.saturating_add(Shell::try_from(locked).unwrap_or(Shell::MAX));
                 }
             }
             deals.push(DealView {
@@ -646,9 +632,72 @@ fn burn_net_fee(cell: &mut StreamCell, consts: &ProtocolConsts) {
     if p == 0 {
         return;
     }
-    let delivered_ticks = cell.seller_received / p;
+    let delivered_ticks = cell.seller_received / u128::from(p);
     if delivered_ticks == 0 {
         return;
     }
-    cell.burned += crate::settle::net_burn(delivered_ticks, p, consts);
+    let delivered_ticks =
+        u64::try_from(delivered_ticks).expect("mock delivered ticks are bounded by max_ticks");
+    cell.burned += u128::from(crate::settle::net_burn(delivered_ticks, p, consts));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::note::LocalNote;
+
+    #[tokio::test]
+    async fn high_price_timeout_rejects_legacy_wrapped_seller_lock() {
+        let base =
+            std::env::temp_dir().join(format!("dexdo-high-price-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let chain = MockChainBackend::new(
+            base.join("eps.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let seller = LocalNote::from_seed(&[15u8; 32]);
+        let buyer = LocalNote::from_seed(&[16u8; 32]);
+        let tc = "tc-high-price-timeout".to_string();
+        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
+        let price = u64::MAX - (u64::MAX % step);
+        let p = u128::from(price);
+        let wrapped_legacy_bond = u128::from((2 * p) as u64);
+
+        chain
+            .post_offer(
+                SellOffer {
+                    price_per_tick: price,
+                    max_ticks: 1,
+                    token_contract: tc.clone(),
+                },
+                &seller,
+            )
+            .await
+            .unwrap();
+        chain.place_buy(&tc, &buyer).await.unwrap();
+        chain.open_stream(&tc, vec![], &seller).await.unwrap();
+
+        let mut state = chain.load_state().unwrap();
+        state.streams.get_mut(&tc).unwrap().seller_locked = wrapped_legacy_bond;
+        chain.store_state(&state).unwrap();
+
+        let error = chain
+            .seller_timeout(&tc)
+            .await
+            .expect_err("a legacy wrapped seller lock must fail closed")
+            .to_string();
+        assert!(
+            error.contains("bond return exceeds persisted seller lock"),
+            "{error}"
+        );
+        let unchanged = chain.snapshot(&tc).await.unwrap();
+        assert!(!unchanged.closed);
+        assert_eq!(unchanged.seller_locked, wrapped_legacy_bond);
+        assert_eq!(unchanged.buyer_locked, p);
+        assert_eq!(unchanged.buyer_refunded, 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
