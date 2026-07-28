@@ -308,6 +308,9 @@ impl NoteDeployVoucherFailpoints {
 const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 2_000_000_000;
 #[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH: &str =
+    "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f";
 
 #[cfg(feature = "shellnet")]
 fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> {
@@ -320,9 +323,15 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
     if code_hash == dexdo_core::canonical_multisig::CODE_HASH {
         return Ok(());
     }
+    let wallet_family = if code_hash == NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH {
+        "generic Multisig"
+    } else {
+        "unknown"
+    };
     bail!(
-        "unsupported funding wallet code_hash {code_hash}; dexdo note deploy supports only \
-         {} {} code_hash {}",
+        "unsupported funding wallet family {wallet_family}, code_hash {code_hash}; \
+         dexdo note deploy supports only {} {} code_hash {}; \
+         preflight rejected before submit; no transaction was submitted and no funds moved",
         dexdo_core::canonical_multisig::CONTRACT_NAME,
         dexdo_core::canonical_multisig::VERSION,
         dexdo_core::canonical_multisig::CODE_HASH,
@@ -330,12 +339,12 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
 }
 
 #[cfg(feature = "shellnet")]
-fn note_deploy_update_custodian_send_transaction_params(
+fn note_deploy_update_custodian_submit_transaction_params(
     root_pn: &dexdo_core::Address,
     cc: serde_json::Map<String, serde_json::Value>,
     voucher_body: String,
 ) -> serde_json::Value {
-    dexdo_core::canonical_multisig::send_transaction_params(
+    dexdo_core::canonical_multisig::submit_transaction_params(
         root_pn.with_workchain(),
         NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
         cc,
@@ -375,27 +384,12 @@ fn multisig_custodian_pubkeys(custodians: &serde_json::Value) -> Vec<String> {
 }
 
 #[cfg(feature = "shellnet")]
-fn multisig_key_is_sole_custodian(derived_pubkey: &str, custodians: &serde_json::Value) -> bool {
-    let Some(custodian_entries) = custodians
-        .get("custodians")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    if custodian_entries.len() != 1 {
-        return false;
-    }
-    let pubkeys = multisig_custodian_pubkeys(custodians);
-    normalize_multisig_pubkey(derived_pubkey).is_some_and(|derived| pubkeys.as_slice() == [derived])
-}
-
-#[cfg(feature = "shellnet")]
-fn ensure_multisig_key_is_sole_custodian(
+fn ensure_multisig_key_is_custodian(
     funding_wallet: &str,
     derived_pubkey: &str,
     custodians: &serde_json::Value,
 ) -> Result<()> {
-    let custodian_entries = custodians
+    custodians
         .get("custodians")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
@@ -404,30 +398,22 @@ fn ensure_multisig_key_is_sole_custodian(
                  `custodians` array (ABI/getter output mismatch)"
             )
         })?;
-    if custodian_entries.len() != 1 {
-        bail!(
-            "funding wallet {funding_wallet} has {} custodians; direct \
-             UpdateCustodianMultisigWallet_v2.sendTransaction \
-             requires exactly one pubkey custodian, and --multisig-key must match it",
-            custodian_entries.len()
-        );
-    }
 
     let derived = normalize_multisig_pubkey(derived_pubkey)
         .unwrap_or_else(|| derived_pubkey.trim().to_ascii_lowercase());
     let pubkeys = multisig_custodian_pubkeys(custodians);
-    let [sole_custodian] = pubkeys.as_slice() else {
+    if pubkeys.is_empty() {
         bail!(
             "funding wallet {funding_wallet} has zero pubkey custodians in getCustodians output; \
-             direct UpdateCustodianMultisigWallet_v2.sendTransaction requires exactly one pubkey custodian"
+             UpdateCustodianMultisigWallet_v2.submitTransaction requires a matching pubkey custodian"
         );
-    };
-    if multisig_key_is_sole_custodian(derived_pubkey, custodians) {
+    }
+    if pubkeys.contains(&derived) {
         return Ok(());
     }
     bail!(
-        "--multisig-key derives pubkey 0x{derived}, but funding wallet {funding_wallet}'s sole \
-         custodian is 0x{sole_custodian}. Provide the sole custodian's key \
+        "--multisig-key derives pubkey 0x{derived}, but it is not a custodian of funding wallet \
+         {funding_wallet}. Provide a custodian key \
          (--multisig-key / --multisig-seed-file); no wallet message was submitted."
     )
 }
@@ -454,6 +440,35 @@ fn require_get_custodians_output(
 }
 
 #[cfg(feature = "shellnet")]
+fn require_get_parameters_output(
+    funding_wallet: &str,
+    output: Option<serde_json::Value>,
+) -> Result<u8> {
+    let output = output.ok_or_else(|| {
+        anyhow::anyhow!(
+            "funding wallet {funding_wallet} is Active, but getParameters returned no output \
+             (ABI/getter output mismatch)"
+        )
+    })?;
+    let value = output.get("requiredTxnConfirms").ok_or_else(|| {
+        anyhow::anyhow!(
+            "funding wallet {funding_wallet} is Active, but getParameters returned no \
+             requiredTxnConfirms (ABI/getter output mismatch)"
+        )
+    })?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "funding wallet {funding_wallet} returned invalid requiredTxnConfirms \
+                 {value} (ABI/getter output mismatch)"
+            )
+        })
+}
+
+#[cfg(feature = "shellnet")]
 #[async_trait::async_trait(?Send)]
 trait NoteDeployFundingWalletReader {
     async fn funding_wallet_code_hash(
@@ -465,6 +480,16 @@ trait NoteDeployFundingWalletReader {
         &self,
         multisig_address: &dexdo_core::Address,
     ) -> Result<serde_json::Value>;
+
+    async fn funding_wallet_required_txn_confirms(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<u8>;
+
+    async fn funding_wallet_ecc_balances(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<Vec<(u32, u128)>>;
 }
 
 #[cfg(feature = "shellnet")]
@@ -512,6 +537,53 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
             })?;
         require_get_custodians_output(&funding_multisig_address, output)
     }
+
+    async fn funding_wallet_required_txn_confirms(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<u8> {
+        let funding_multisig_address = multisig_address.with_workchain();
+        let output = self
+            .run_getter(
+                multisig_address,
+                dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
+                "getParameters",
+                serde_json::json!({}),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "read transaction threshold of funding wallet \
+                     {funding_multisig_address}: {e}"
+                )
+            })?;
+        require_get_parameters_output(&funding_multisig_address, output)
+    }
+
+    async fn funding_wallet_ecc_balances(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<Vec<(u32, u128)>> {
+        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_wallet = self
+            .get_account(multisig_address)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "read ECC balances of funding wallet {funding_multisig_address}: {e}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("funding wallet {funding_multisig_address} not found")
+            })?;
+        if !funding_wallet.is_active() {
+            bail!(
+                "funding wallet {funding_multisig_address} is not Active (acc_type={})",
+                funding_wallet.status
+            );
+        }
+        Ok(funding_wallet.ecc)
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -528,11 +600,86 @@ async fn note_deploy_preflight_key_owns_wallet(
     let custodians = wallet_reader
         .funding_wallet_custodians(multisig_address)
         .await?;
-    ensure_multisig_key_is_sole_custodian(
+    ensure_multisig_key_is_custodian(
         &funding_multisig_address,
         multisig_keys.public_hex(),
         &custodians,
-    )
+    )?;
+    let required_txn_confirms = wallet_reader
+        .funding_wallet_required_txn_confirms(multisig_address)
+        .await?;
+    if required_txn_confirms != 1 {
+        bail!(
+            "funding wallet {funding_multisig_address} requires {required_txn_confirms} transaction \
+             confirmations; dexdo note deploy requires a Hot wallet with reqConfirms=1 and submitted \
+             no transaction. For a Vault, first confirm the Vault -> Hot transfer manually, then run \
+             note deploy against the funded Hot wallet."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_ecc_name(
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    requested_token_type: u32,
+    currency_id: u32,
+) -> String {
+    match currency_id {
+        2 if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
+            && requested_token_type == 2 =>
+        {
+            "requested token and SHELL ECC[2]".to_string()
+        }
+        2 => "SHELL ECC[2]".to_string(),
+        id => format!("requested token ECC[{id}]"),
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_preflight_wallet_ecc(
+    wallet_reader: &dyn NoteDeployFundingWalletReader,
+    multisig_address: &dexdo_core::Address,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    recovery: &crate::cli::note::NoteDeployRecoveryState,
+    voucher_token_type: u32,
+    voucher_value: u64,
+) -> Result<Vec<(u32, u128)>> {
+    let wallet = multisig_address.with_workchain();
+    let balances = wallet_reader
+        .funding_wallet_ecc_balances(multisig_address)
+        .await?;
+    let shell = recovery.ecc_shell_deposit as u128;
+    let require = |currency_id: u32, amount: u128| -> Result<()> {
+        let available = balances
+            .iter()
+            .find(|(id, _)| *id == currency_id)
+            .map(|(_, value)| *value)
+            .unwrap_or(0);
+        if available < amount {
+            let missing = amount - available;
+            let currency = note_deploy_ecc_name(kind, recovery.token_type, currency_id);
+            bail!(
+                "funding wallet {wallet} has insufficient {currency}: available={available} raw, \
+                 required={amount} raw, missing={missing} raw; no wallet POST was submitted. Fund \
+                 {currency} and retry the same `dexdo note deploy --recovery` command."
+            );
+        }
+        Ok(())
+    };
+    let requested =
+        if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type == 2 {
+            (voucher_value as u128)
+                .checked_add(shell)
+                .ok_or_else(|| anyhow::anyhow!("note deploy required ECC[2] amount overflow"))?
+        } else {
+            voucher_value as u128
+        };
+    require(voucher_token_type, requested)?;
+    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type != 2 {
+        require(2, shell)?;
+    }
+    Ok(balances)
 }
 
 #[cfg(feature = "shellnet")]
@@ -583,15 +730,15 @@ async fn note_deploy_build_voucher_submit_boc(
         &ctx,
         dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
         &multisig_address.with_workchain(),
-        "sendTransaction",
-        note_deploy_update_custodian_send_transaction_params(root_pn, cc, voucher_body),
+        "submitTransaction",
+        note_deploy_update_custodian_submit_transaction_params(root_pn, cc, voucher_body),
         multisig_keys.public_hex(),
         multisig_keys.secret_hex(),
     )
     .await
     .map_err(|e| {
         anyhow::anyhow!(
-            "encode UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: {e}"
+            "encode UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: {e}"
         )
     })?;
     Ok(boc)
@@ -625,12 +772,23 @@ impl NoteDeployVoucherBocBuilder for dexdo_core::ChainClient {
 }
 
 #[cfg(feature = "shellnet")]
+#[derive(Debug, Clone)]
+struct NoteDeployWalletActionReceipt {
+    transaction_hash: String,
+    compute_exit_code: Option<i64>,
+    aborted: bool,
+    action_result_code: i64,
+    outmsg_count: u64,
+    wallet_ecc_balances: Option<Vec<(u32, u128)>>,
+}
+
+#[cfg(feature = "shellnet")]
 async fn note_deploy_submit_voucher_boc(
     endpoint: &str,
     multisig_address: &dexdo_core::Address,
     boc: &str,
     http: &reqwest::Client,
-) -> Result<()> {
+) -> Result<Option<NoteDeployWalletActionReceipt>> {
     use dexdo_core::ackinacki_wallet::query::send_message_routed;
     dexdo_core::shellnet_clock_skew_preflight(endpoint).await?;
     send_message_routed(
@@ -644,10 +802,28 @@ async fn note_deploy_submit_voucher_boc(
     .await
     .map_err(|e| {
         anyhow::anyhow!(
-            "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: {e}"
+            "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: {e}"
         )
     })?;
-    Ok(())
+    dexdo_core::shellnet::observe_note_deploy_wallet_action(
+        http,
+        endpoint,
+        boc,
+        multisig_address.bare(),
+        multisig_address.bare(),
+    )
+    .await
+    .map(|receipt| {
+        receipt.map(|receipt| NoteDeployWalletActionReceipt {
+            transaction_hash: receipt.transaction_hash,
+            compute_exit_code: None,
+            aborted: receipt.aborted,
+            action_result_code: receipt.action_result_code,
+            outmsg_count: receipt.outmsg_count,
+            wallet_ecc_balances: receipt.wallet_ecc_balances,
+        })
+    })
+    .map_err(|e| anyhow::anyhow!("observe finalized note-deploy wallet action: {e}"))
 }
 
 #[cfg(feature = "shellnet")]
@@ -659,7 +835,7 @@ trait NoteDeployVoucherSubmitter {
         multisig_address: &dexdo_core::Address,
         boc: &str,
         http: &reqwest::Client,
-    ) -> Result<()>;
+    ) -> Result<Option<NoteDeployWalletActionReceipt>>;
 }
 
 #[cfg(feature = "shellnet")]
@@ -671,15 +847,65 @@ impl NoteDeployVoucherSubmitter for dexdo_core::ChainClient {
         multisig_address: &dexdo_core::Address,
         boc: &str,
         http: &reqwest::Client,
-    ) -> Result<()> {
+    ) -> Result<Option<NoteDeployWalletActionReceipt>> {
         note_deploy_submit_voucher_boc(endpoint, multisig_address, boc, http).await
     }
 }
 
 #[cfg(feature = "shellnet")]
+fn note_deploy_action_failed(aborted: bool, action_result_code: i64) -> bool {
+    aborted || action_result_code != 0
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_verify_failed_action_had_no_effect(
+    receipt: &NoteDeployWalletActionReceipt,
+    before_ecc: &[(u32, u128)],
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    voucher_token_type: u32,
+) -> Result<()> {
+    if receipt.outmsg_count != 0 {
+        bail!(
+            "wallet transaction produced {} outbound message(s), so absence of a matching \
+             RootPN voucher effect is not proven",
+            receipt.outmsg_count
+        );
+    }
+    let wallet_ecc_balances = receipt.wallet_ecc_balances.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("finalized failed wallet action has no exact wallet ECC state")
+    })?;
+    let balance = |balances: &[(u32, u128)], currency_id| {
+        balances
+            .iter()
+            .find(|(id, _)| *id == currency_id)
+            .map_or(0, |(_, value)| *value)
+    };
+    let mut currency_ids = vec![voucher_token_type];
+    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type != 2 {
+        currency_ids.push(2);
+    }
+    for currency_id in currency_ids {
+        let before = balance(before_ecc, currency_id);
+        let after = balance(wallet_ecc_balances, currency_id);
+        if before != after {
+            bail!(
+                "wallet ECC[{currency_id}] changed from {before} to {after}, so absence of the \
+                 corresponding voucher effect is not proven"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_action_result_label(code: i64) -> Option<&'static str> {
+    (code == 38).then_some("NOT_ENOUGH_EXTRA")
+}
+
+#[cfg(feature = "shellnet")]
 fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
     error.to_string().contains(
-        "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher:",
+        "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher:",
     ) && is_note_deploy_wallet_busy_error(error)
 }
 
@@ -828,6 +1054,15 @@ async fn note_deploy_mint_voucher_recoverable(
             let funding_keys = guarded_funding_keys.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("fresh voucher submit is missing its guarded funding key")
             })?;
+            let before_wallet_ecc = note_deploy_preflight_wallet_ecc(
+                wallet_reader,
+                multisig_address,
+                kind,
+                recovery,
+                voucher_token_type,
+                voucher_value,
+            )
+            .await?;
             let boc = voucher_boc_builder
                 .build_voucher_submit_boc(multisig_address, funding_keys, &root_pn, &checkpoint)
                 .await?;
@@ -843,9 +1078,78 @@ async fn note_deploy_mint_voucher_recoverable(
                 kind.label(),
                 recovery_path.display()
             );
-            voucher_submitter
+            let receipt = voucher_submitter
                 .submit_voucher_boc(endpoint, multisig_address, &boc, &http)
-                .await?;
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "{} voucher wallet POST outcome is ambiguous: {error}; recovery {} remains \
+                         submit_maybe_sent and will not submit a second wallet POST. Inspect the \
+                         exact wallet transaction/account state and matching RootPN voucher evidence \
+                         before manual recovery.",
+                        kind.label(),
+                        recovery_path.display()
+                    )
+                })?;
+            let receipt = receipt.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} voucher wallet POST has no bounded finalized receipt; recovery {} remains \
+                     submit_maybe_sent and will not submit a second wallet POST. Inspect the exact \
+                     wallet transaction/account state and matching RootPN voucher evidence before \
+                     manual recovery.",
+                    kind.label(),
+                    recovery_path.display()
+                )
+            })?;
+            if note_deploy_action_failed(receipt.aborted, receipt.action_result_code) {
+                note_deploy_verify_failed_action_had_no_effect(
+                    &receipt,
+                    &before_wallet_ecc,
+                    kind,
+                    checkpoint.token_type,
+                )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "{} voucher wallet transaction {} failed definitively, but voucher \
+                             effect absence could not be proven: {error}; recovery {} remains \
+                             submit_maybe_sent and will not submit a second wallet POST. Inspect the \
+                             exact wallet transaction/account state and matching RootPN voucher \
+                             evidence before manual recovery.",
+                            kind.label(),
+                            receipt.transaction_hash,
+                            recovery_path.display()
+                        )
+                    })?;
+                checkpoint.submit_maybe_sent = false;
+                note_deploy_persist_voucher_checkpoint(
+                    recovery_path,
+                    recovery,
+                    kind,
+                    checkpoint.clone(),
+                )?;
+                let label = note_deploy_action_result_label(receipt.action_result_code)
+                    .map(|label| format!(" ({label})"))
+                    .unwrap_or_default();
+                let compute_exit = receipt
+                    .compute_exit_code
+                    .map_or_else(|| "<unavailable>".to_string(), |code| code.to_string());
+                let currency =
+                    note_deploy_ecc_name(kind, recovery.token_type, checkpoint.token_type);
+                bail!(
+                    "funding wallet {} {} voucher transaction {} failed definitively: \
+                     compute_exit_code={compute_exit}, aborted={}, action_result_code={}{}; the exact \
+                     wallet action produced zero outbound messages and left the required ECC unchanged, \
+                     so no corresponding RootPN voucher effect occurred. Fund {currency} and retry \
+                     `dexdo note deploy --recovery {}`.",
+                    multisig_address.with_workchain(),
+                    kind.label(),
+                    receipt.transaction_hash,
+                    receipt.aborted,
+                    receipt.action_result_code,
+                    label,
+                    recovery_path.display()
+                );
+            }
             if failpoints.after_submit(kind) {
                 bail!(
                     "simulated interruption after {} voucher wallet submit. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
@@ -2216,9 +2520,12 @@ mod tests {
     struct FixedFundingWalletReader {
         code_hash: Option<String>,
         custodians: Option<serde_json::Value>,
+        required_txn_confirms: Option<u8>,
+        ecc_balances: Option<Vec<(u32, u128)>>,
         failure: Option<&'static str>,
         code_hash_calls: std::cell::Cell<usize>,
         custodian_calls: std::cell::Cell<usize>,
+        threshold_calls: std::cell::Cell<usize>,
     }
 
     #[cfg(feature = "shellnet")]
@@ -2231,19 +2538,35 @@ mod tests {
             Self {
                 code_hash: Some(code_hash.to_string()),
                 custodians: Some(custodians),
+                required_txn_confirms: Some(1),
+                ecc_balances: Some(vec![(1, u128::MAX), (2, u128::MAX)]),
                 failure: None,
                 code_hash_calls: std::cell::Cell::new(0),
                 custodian_calls: std::cell::Cell::new(0),
+                threshold_calls: std::cell::Cell::new(0),
             }
+        }
+
+        fn with_required_txn_confirms(mut self, required_txn_confirms: u8) -> Self {
+            self.required_txn_confirms = Some(required_txn_confirms);
+            self
+        }
+
+        fn with_balances(mut self, ecc_balances: Vec<(u32, u128)>) -> Self {
+            self.ecc_balances = Some(ecc_balances);
+            self
         }
 
         fn failing(message: &'static str) -> Self {
             Self {
                 code_hash: None,
                 custodians: None,
+                required_txn_confirms: None,
+                ecc_balances: None,
                 failure: Some(message),
                 code_hash_calls: std::cell::Cell::new(0),
                 custodian_calls: std::cell::Cell::new(0),
+                threshold_calls: std::cell::Cell::new(0),
             }
         }
     }
@@ -2275,6 +2598,30 @@ mod tests {
             self.custodians
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("fixed wallet reader has no custodians"))
+        }
+
+        async fn funding_wallet_required_txn_confirms(
+            &self,
+            _multisig_address: &dexdo_core::Address,
+        ) -> anyhow::Result<u8> {
+            self.threshold_calls.set(self.threshold_calls.get() + 1);
+            if let Some(message) = self.failure {
+                anyhow::bail!("{message}");
+            }
+            self.required_txn_confirms
+                .ok_or_else(|| anyhow::anyhow!("fixed wallet reader has no transaction threshold"))
+        }
+
+        async fn funding_wallet_ecc_balances(
+            &self,
+            _multisig_address: &dexdo_core::Address,
+        ) -> anyhow::Result<Vec<(u32, u128)>> {
+            if let Some(message) = self.failure {
+                anyhow::bail!("{message}");
+            }
+            self.ecc_balances
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("fixed wallet reader has no ECC balances"))
         }
     }
 
@@ -2309,10 +2656,35 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
-    #[derive(Default)]
     struct CountingVoucherSubmitter {
         calls: std::cell::Cell<usize>,
         saw_nonempty_boc: std::cell::Cell<bool>,
+        outcome: Result<Option<super::NoteDeployWalletActionReceipt>, &'static str>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl Default for CountingVoucherSubmitter {
+        fn default() -> Self {
+            Self::returning(Some(issue_678_receipt(false, 0)))
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl CountingVoucherSubmitter {
+        fn returning(receipt: Option<super::NoteDeployWalletActionReceipt>) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                saw_nonempty_boc: std::cell::Cell::new(false),
+                outcome: Ok(receipt),
+            }
+        }
+
+        fn failing(message: &'static str) -> Self {
+            Self {
+                outcome: Err(message),
+                ..Self::returning(None)
+            }
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -2324,16 +2696,80 @@ mod tests {
             _multisig_address: &dexdo_core::Address,
             boc: &str,
             _http: &reqwest::Client,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<Option<super::NoteDeployWalletActionReceipt>> {
             self.calls.set(self.calls.get() + 1);
             self.saw_nonempty_boc.set(!boc.is_empty());
-            Ok(())
+            self.outcome.clone().map_err(anyhow::Error::msg)
         }
     }
 
     #[cfg(feature = "shellnet")]
     fn preflight_fixture_keys() -> dexdo_core::KeyPair {
         dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key")
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn issue_678_wallet_reader(ecc_balances: Vec<(u32, u128)>) -> FixedFundingWalletReader {
+        let keys = preflight_fixture_keys();
+        FixedFundingWalletReader::returning(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": format!("0x{}", keys.public_hex()),
+            }]
+        }))
+        .with_balances(ecc_balances)
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn issue_678_receipt(
+        aborted: bool,
+        action_result_code: i64,
+    ) -> super::NoteDeployWalletActionReceipt {
+        super::NoteDeployWalletActionReceipt {
+            transaction_hash: "issue-678-transaction".to_string(),
+            compute_exit_code: Some(0),
+            aborted,
+            action_result_code,
+            outmsg_count: 0,
+            wallet_ecc_balances: Some(vec![(1, 100_000_000_000), (2, 100_000_000_000)]),
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn run_issue_678_deposit(
+        recovery_path: &std::path::Path,
+        recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+        wallet_reader: &FixedFundingWalletReader,
+        submitter: &CountingVoucherSubmitter,
+        failpoints: super::NoteDeployVoucherFailpoints,
+    ) -> anyhow::Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")?;
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))?;
+        let key_loader = FixedFundingKeyLoader::returning(&preflight_fixture_keys());
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let owner = recovery.owner_public_key_hex.clone();
+        let token_type = recovery.token_type;
+        let raw_value = recovery.raw_value;
+        super::note_deploy_mint_voucher_recoverable(
+            &client,
+            recovery_path,
+            recovery,
+            NoteDeployVoucherKind::Deposit,
+            &multisig_address,
+            &key_loader,
+            wallet_reader,
+            &boc_builder,
+            submitter,
+            &owner,
+            token_type,
+            raw_value,
+            false,
+            &dexdo_core::private_note::Halo2Paths::from_env(),
+            failpoints,
+        )
+        .await
     }
 
     #[cfg(feature = "shellnet")]
@@ -2369,17 +2805,17 @@ mod tests {
             }]
         }))
         .await
-        .expect_err("an address-only custodian cannot authorize a pubkey-signed direct send")
+        .expect_err("an address-only custodian cannot authorize a pubkey-signed submit")
         .to_string();
         assert!(error.contains("zero pubkey custodians"), "{error}");
-        assert!(error.contains("exactly one pubkey custodian"), "{error}");
+        assert!(error.contains("matching pubkey custodian"), "{error}");
     }
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_preflight_rejects_multiple_custodians() {
+    async fn note_deploy_preflight_accepts_matching_multi_custodian_hot() {
         let keys = preflight_fixture_keys();
-        let error = run_preflight_with_fixed_custodians(serde_json::json!({
+        run_preflight_with_fixed_custodians(serde_json::json!({
             "custodians": [
                 {
                     "index": "0",
@@ -2392,15 +2828,12 @@ mod tests {
             ]
         }))
         .await
-        .expect_err("membership is insufficient when direct sendTransaction would exit 108")
-        .to_string();
-        assert!(error.contains("has 2 custodians"), "{error}");
-        assert!(error.contains("exactly one pubkey custodian"), "{error}");
+        .expect("a matching custodian with reqConfirms=1 must pass");
     }
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_preflight_rejects_mismatched_sole_custodian() {
+    async fn note_deploy_preflight_rejects_key_absent_from_custodians() {
         let error = run_preflight_with_fixed_custodians(serde_json::json!({
             "custodians": [{
                 "index": "0",
@@ -2408,9 +2841,9 @@ mod tests {
             }]
         }))
         .await
-        .expect_err("a mismatched sole funding key must fail closed")
+        .expect_err("a funding key absent from custodians must fail closed")
         .to_string();
-        assert!(error.contains("sole custodian is"), "{error}");
+        assert!(error.contains("is not a custodian"), "{error}");
         assert!(error.contains("no wallet message was submitted"), "{error}");
     }
 
@@ -2426,6 +2859,69 @@ mod tests {
         }))
         .await
         .expect("the matching sole pubkey custodian must pass");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_issue_678_ecc_preflight_stops_exact_shortfalls_before_post() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let wallet = format!("0:{}", "a".repeat(64));
+        let raw = 100_000_000_000u128;
+        for (case, token_type, balances, currency, available, required) in [
+            (
+                "requested-token",
+                1,
+                vec![(1, raw - 1), (2, raw)],
+                "requested token ECC[1]",
+                raw - 1,
+                raw,
+            ),
+            (
+                "shell",
+                1,
+                vec![(1, raw), (2, raw - 1)],
+                "SHELL ECC[2]",
+                raw - 1,
+                raw,
+            ),
+            (
+                "combined-ecc-2",
+                2,
+                vec![(2, raw * 2 - 1)],
+                "requested token and SHELL ECC[2]",
+                raw * 2 - 1,
+                raw * 2,
+            ),
+        ] {
+            let mut recovery = test_recovery_state();
+            recovery.token_type = token_type;
+            let reader = issue_678_wallet_reader(balances);
+            let submitter = CountingVoucherSubmitter::default();
+            let recovery_path = temp.path().join(format!("{case}.json"));
+
+            let error = run_issue_678_deposit(
+                &recovery_path,
+                &mut recovery,
+                &reader,
+                &submitter,
+                Default::default(),
+            )
+            .await
+            .expect_err("insufficient ECC must fail before wallet POST")
+            .to_string();
+
+            assert_eq!(
+                error,
+                format!(
+                    "funding wallet {wallet} has insufficient {currency}: available={} raw, \
+                     required={required} raw, missing=1 raw; no wallet POST was submitted. Fund \
+                     {currency} and retry the same `dexdo note deploy --recovery` command.",
+                    available
+                ),
+                "{case}"
+            );
+            assert_eq!(submitter.calls.get(), 0, "{case}");
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -2450,22 +2946,22 @@ mod tests {
             serde_json::from_str(dexdo_core::canonical_multisig::MULTISIG_ABI_JSON)
                 .expect("parse canonical UpdateCustodianMultisigWallet_v2 ABI");
         let functions = abi["functions"].as_array().expect("ABI functions");
-        let send_transaction = functions
+        let submit_transaction = functions
             .iter()
-            .find(|function| function["name"] == "sendTransaction")
-            .expect("canonical sendTransaction function");
+            .find(|function| function["name"] == "submitTransaction")
+            .expect("canonical submitTransaction function");
         assert_eq!(
-            send_transaction["inputs"],
+            submit_transaction["inputs"],
             serde_json::json!([
                 { "name": "dest", "type": "address" },
                 { "name": "value", "type": "uint128" },
                 { "name": "cc", "type": "map(uint32,varuint32)" },
                 { "name": "bounce", "type": "bool" },
-                { "name": "flags", "type": "uint8" },
+                { "name": "flag", "type": "uint8" },
                 { "name": "payload", "type": "cell" },
                 { "name": "dapp_id", "type": "uint256" }
             ]),
-            "canonical UpdateCustodianMultisigWallet_v2 sendTransaction shape"
+            "canonical UpdateCustodianMultisigWallet_v2 submitTransaction shape"
         );
         let get_custodians = functions
             .iter()
@@ -2487,7 +2983,17 @@ mod tests {
         );
         let root_pn = dexdo_core::Address::parse(&format!("0:{}", "b".repeat(64)))
             .expect("parse RootPN fixture");
-        let params = super::note_deploy_update_custodian_send_transaction_params(
+        let get_parameters = functions
+            .iter()
+            .find(|function| function["name"] == "getParameters")
+            .expect("canonical getParameters function");
+        assert_eq!(get_parameters["inputs"], serde_json::json!([]));
+        assert!(get_parameters["outputs"]
+            .as_array()
+            .expect("getParameters outputs")
+            .iter()
+            .any(|output| output["name"] == "requiredTxnConfirms"));
+        let params = super::note_deploy_update_custodian_submit_transaction_params(
             &root_pn,
             serde_json::Map::new(),
             "fixture-body".to_string(),
@@ -2496,12 +3002,41 @@ mod tests {
         assert_eq!(
             fields.len(),
             7,
-            "UpdateCustodianMultisigWallet_v2 sendTransaction has seven inputs"
+            "UpdateCustodianMultisigWallet_v2 submitTransaction has seven inputs"
         );
+        assert_eq!(fields["flag"], 1);
+        assert!(!fields.contains_key("flags"));
         assert_eq!(
             fields["dapp_id"], "4",
             "RootPN wallet forward must carry the canonical system dapp_id"
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_get_parameters_requires_exact_transaction_threshold() {
+        let wallet = format!("0:{}", "a".repeat(64));
+        for value in [serde_json::json!(1), serde_json::json!("1")] {
+            assert_eq!(
+                super::require_get_parameters_output(
+                    &wallet,
+                    Some(serde_json::json!({ "requiredTxnConfirms": value }))
+                )
+                .expect("numeric or ABI-string threshold"),
+                1
+            );
+        }
+        for output in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({ "requiredTxnConfirms": "bad" })),
+            Some(serde_json::json!({ "requiredTxnConfirms": 256 })),
+        ] {
+            let error = super::require_get_parameters_output(&wallet, output)
+                .expect_err("missing or invalid threshold must fail closed")
+                .to_string();
+            assert!(error.contains("getParameters") || error.contains("requiredTxnConfirms"));
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -2517,35 +3052,54 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_rejects_every_obsolete_or_unknown_wallet_code_hash() {
-        for (family, code_hash) in [
+        for (case, wallet_family, code_hash) in [
             (
                 "old UpdateCustodianMultisigWallet",
+                "unknown",
                 "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414",
             ),
             (
                 "old managed UpdateCustodianMultisigWallet",
+                "unknown",
                 "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571",
             ),
             (
-                "generic Multisig",
-                "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+                "candidate v2.1.0 UpdateCustodianMultisigWallet",
+                "unknown",
+                "31e402bb4fc2bb740634ab00b074f2e4ae772f0744d8aabb7c51d44f430d86e3",
             ),
             (
+                "generic Multisig",
+                "generic Multisig",
+                super::NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH,
+            ),
+            (
+                "unknown",
                 "unknown",
                 "0000000000000000000000000000000000000000000000000000000000000000",
             ),
         ] {
             let error = super::ensure_note_deploy_update_custodian_code_hash(code_hash)
-                .expect_err(family)
+                .expect_err(case)
                 .to_string();
-            assert!(error.contains(code_hash), "{family}: {error}");
+            assert!(error.contains(code_hash), "{case}: {error}");
+            assert!(
+                error.contains(&format!("family {wallet_family}")),
+                "{case}: {error}"
+            );
             assert!(
                 error.contains(dexdo_core::canonical_multisig::CONTRACT_NAME),
-                "{family}: {error}"
+                "{case}: {error}"
             );
             assert!(
                 error.contains(dexdo_core::canonical_multisig::CODE_HASH),
-                "{family}: {error}"
+                "{case}: {error}"
+            );
+            assert!(
+                error.contains(
+                    "preflight rejected before submit; no transaction was submitted and no funds moved"
+                ),
+                "{case}: {error}"
             );
         }
     }
@@ -2615,7 +3169,7 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_fresh_path_rejects_non_custodian_before_all_artifacts_and_submit() {
+    async fn note_deploy_fresh_path_rejects_non_custodian_or_vault_before_submit() {
         use crate::cli::note::NoteDeployVoucherKind;
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2628,17 +3182,35 @@ mod tests {
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
         let cases = [
             (
-                "wrong-sole-key",
+                "key-absent",
                 serde_json::json!({
                     "custodians": [{
                         "index": "0",
                         "owner_pubkey": format!("0x{}", "11".repeat(32)),
                     }]
                 }),
-                "sole custodian is",
+                1,
+                "is not a custodian",
             ),
             (
-                "non-sole-key",
+                "key-absent-multi",
+                serde_json::json!({
+                    "custodians": [
+                        {
+                            "index": "0",
+                            "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                        },
+                        {
+                            "index": "1",
+                            "owner_pubkey": format!("0x{}", "22".repeat(32)),
+                        }
+                    ]
+                }),
+                1,
+                "is not a custodian",
+            ),
+            (
+                "vault",
                 serde_json::json!({
                     "custodians": [
                         {
@@ -2651,13 +3223,15 @@ mod tests {
                         }
                     ]
                 }),
-                "has 2 custodians",
+                2,
+                "first confirm the Vault -> Hot transfer manually",
             ),
         ];
 
-        for (case, custodians, expected_error) in cases {
+        for (case, custodians, required_txn_confirms, expected_error) in cases {
             let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
-            let wallet_reader = FixedFundingWalletReader::returning(custodians);
+            let wallet_reader = FixedFundingWalletReader::returning(custodians)
+                .with_required_txn_confirms(required_txn_confirms);
             let boc_builder = CountingVoucherBocBuilder::default();
             let submitter = CountingVoucherSubmitter::default();
             let mut recovery = test_recovery_state();
@@ -2684,13 +3258,18 @@ mod tests {
                 Default::default(),
             )
             .await
-            .expect_err("the real fresh path must reject a wrong/non-sole custodian")
+            .expect_err("the real fresh path must reject an absent key or Vault")
             .to_string();
 
             assert!(error.contains(expected_error), "{case}: {error}");
             assert_eq!(key_loader.calls.get(), 1, "{case}");
             assert_eq!(wallet_reader.code_hash_calls.get(), 1, "{case}");
             assert_eq!(wallet_reader.custodian_calls.get(), 1, "{case}");
+            assert_eq!(
+                wallet_reader.threshold_calls.get(),
+                usize::from(case == "vault"),
+                "{case}"
+            );
             assert_eq!(
                 boc_builder.calls.get(),
                 0,
@@ -2727,18 +3306,26 @@ mod tests {
         let multisig_keys =
             dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key");
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
-        for (family, code_hash) in [
+        for (case, wallet_family, code_hash) in [
             (
                 "old-update-custodian",
+                "unknown",
                 "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414",
             ),
             (
                 "old-managed-update-custodian",
+                "unknown",
                 "f2f4e7171bfbf21493dec3f5ad93b61813d46ada75d4bc1ab6bd7be60192c571",
             ),
             (
+                "candidate-v2.1.0",
+                "unknown",
+                "31e402bb4fc2bb740634ab00b074f2e4ae772f0744d8aabb7c51d44f430d86e3",
+            ),
+            (
                 "generic-multisig",
-                "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+                "generic Multisig",
+                super::NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH,
             ),
         ] {
             let wallet_reader = FixedFundingWalletReader::with_code_hash(
@@ -2758,7 +3345,7 @@ mod tests {
             let owner_secret = recovery.owner_secret_key_hex.to_string();
             let token_type = recovery.token_type;
             let raw_value = recovery.raw_value;
-            let recovery_path = temp.path().join(format!("{family}-recovery.json"));
+            let recovery_path = temp.path().join(format!("{case}-recovery.json"));
 
             let error = super::note_deploy_mint_voucher_recoverable(
                 &client,
@@ -2781,41 +3368,265 @@ mod tests {
             .expect_err("every non-v2 funding wallet must fail closed")
             .to_string();
 
-            assert!(error.contains(code_hash), "{family}: {error}");
+            assert!(error.contains(code_hash), "{case}: {error}");
+            assert!(
+                error.contains(&format!("family {wallet_family}")),
+                "{case}: {error}"
+            );
             assert!(
                 error.contains(dexdo_core::canonical_multisig::CONTRACT_NAME),
-                "{family}: {error}"
+                "{case}: {error}"
+            );
+            assert!(
+                error.contains(
+                    "preflight rejected before submit; no transaction was submitted and no funds moved"
+                ),
+                "{case}: {error}"
             );
             assert!(
                 !error.contains(multisig_keys.secret_hex()),
-                "{family}: funding secret leaked: {error}"
+                "{case}: funding secret leaked: {error}"
             );
             assert!(
                 !error.contains(&owner_secret),
-                "{family}: note owner secret leaked: {error}"
+                "{case}: note owner secret leaked: {error}"
             );
-            assert_eq!(key_loader.calls.get(), 1, "{family}");
-            assert_eq!(wallet_reader.code_hash_calls.get(), 1, "{family}");
+            assert_eq!(key_loader.calls.get(), 1, "{case}");
+            assert_eq!(wallet_reader.code_hash_calls.get(), 1, "{case}");
             assert_eq!(
                 wallet_reader.custodian_calls.get(),
                 0,
-                "{family}: unsupported code must stop before getter"
+                "{case}: unsupported code must stop before getter"
             );
-            assert_eq!(boc_builder.calls.get(), 0, "{family}");
-            assert_eq!(submitter.calls.get(), 0, "{family}");
+            assert_eq!(wallet_reader.threshold_calls.get(), 0, "{case}");
+            assert_eq!(boc_builder.calls.get(), 0, "{case}");
+            assert_eq!(submitter.calls.get(), 0, "{case}");
             assert!(
                 recovery
                     .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
                     .is_none(),
-                "{family}"
+                "{case}"
             );
-            assert!(!recovery_path.exists(), "{family}");
+            assert!(!recovery_path.exists(), "{case}");
         }
     }
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_fresh_path_matching_custodian_reaches_signed_boc_and_submit_seam() {
+    async fn note_deploy_issue_678_action_38_persists_no_effect_and_funded_recovery_posts_once() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("action-38-recovery.json");
+        let raw = 100_000_000_000u128;
+        let reader = issue_678_wallet_reader(vec![(1, raw), (2, raw)]);
+        let failed_submitter =
+            CountingVoucherSubmitter::returning(Some(issue_678_receipt(true, 38)));
+        let failpoints = super::NoteDeployVoucherFailpoints {
+            before_voucher_event_wait: true,
+            ..Default::default()
+        };
+        let mut recovery = test_recovery_state();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_issue_678_deposit(
+                &recovery_path,
+                &mut recovery,
+                &reader,
+                &failed_submitter,
+                failpoints,
+            ),
+        )
+        .await
+        .expect("definitive action failure must not enter the 480s VoucherGenerated wait")
+        .expect_err("aborted action result 38 must fail")
+        .to_string();
+
+        for fact in [
+            "deposit voucher transaction",
+            "compute_exit_code=0",
+            "aborted=true",
+            "action_result_code=38 (NOT_ENOUGH_EXTRA)",
+            "exact wallet action produced zero outbound messages",
+            "required ECC unchanged",
+            "Fund requested token ECC[1]",
+        ] {
+            assert!(error.contains(fact), "missing {fact}: {error}");
+        }
+        assert!(!error.contains("simulated interruption"), "{error}");
+        assert_eq!(failed_submitter.calls.get(), 1);
+
+        let failed = recovery
+            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+            .expect("failed checkpoint");
+        assert!(!failed.submit_maybe_sent);
+        let deterministic_identity = (
+            failed.sk_u_hex.to_string(),
+            failed.sk_u_commit_hex.clone(),
+            failed.recipient_ephemeral_pubkey_hex.clone(),
+        );
+
+        let mut recovery = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("reload finalized failure")
+            .expect("persisted recovery");
+        let funded_reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let successful_submitter = CountingVoucherSubmitter::default();
+        let resumed_error = run_issue_678_deposit(
+            &recovery_path,
+            &mut recovery,
+            &funded_reader,
+            &successful_submitter,
+            failpoints,
+        )
+        .await
+        .expect_err("fixture stops at the existing VoucherGenerated wait boundary")
+        .to_string();
+
+        assert!(
+            resumed_error.contains("simulated interruption before voucher event wait"),
+            "{resumed_error}"
+        );
+        assert_eq!(successful_submitter.calls.get(), 1);
+        let resumed = recovery
+            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+            .expect("resumed checkpoint");
+        assert!(resumed.submit_maybe_sent);
+        assert_eq!(
+            (
+                resumed.sk_u_hex.to_string(),
+                resumed.sk_u_commit_hex.clone(),
+                resumed.recipient_ephemeral_pubkey_hex.clone(),
+            ),
+            deterministic_identity
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    /// the established passed-in multisig path still reaches the signed wallet submit seam.
+    #[tokio::test]
+    async fn note_deploy_unsubmitted_checkpoint_rejects_generic_wallet_before_first_submit() {
+        use crate::cli::note::{NoteDeployVoucherCheckpoint, NoteDeployVoucherKind};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let multisig_keys = preflight_fixture_keys();
+        let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+        let wallet_reader = FixedFundingWalletReader::with_code_hash(
+            super::NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH,
+            serde_json::json!({
+                "custodians": [{
+                    "index": "0",
+                    "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+                }]
+            }),
+        );
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let submitter = CountingVoucherSubmitter::default();
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let token_type = recovery.token_type;
+        let raw_value = recovery.raw_value;
+        let checkpoint = NoteDeployVoucherCheckpoint::new(
+            &owner,
+            token_type,
+            raw_value,
+            false,
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .expect("fixture unsubmitted checkpoint");
+        assert!(!checkpoint.submit_maybe_sent);
+        recovery
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, checkpoint)
+            .expect("persist unsubmitted checkpoint");
+        let recovery_path = temp.path().join("unsubmitted-recovery.json");
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)
+            .expect("write unsubmitted recovery");
+        let before = std::fs::read(&recovery_path).expect("read recovery before preflight");
+
+        let error = super::note_deploy_mint_voucher_recoverable(
+            &client,
+            &recovery_path,
+            &mut recovery,
+            NoteDeployVoucherKind::Deposit,
+            &multisig_address,
+            &key_loader,
+            &wallet_reader,
+            &boc_builder,
+            &submitter,
+            &owner,
+            token_type,
+            raw_value,
+            false,
+            &halo2_paths,
+            Default::default(),
+        )
+        .await
+        .expect_err("Generic funding wallet must fail before the first submit")
+        .to_string();
+
+        assert!(error.contains("family generic Multisig"), "{error}");
+        assert!(
+            error.contains(
+                "preflight rejected before submit; no transaction was submitted and no funds moved"
+            ),
+            "{error}"
+        );
+        assert!(!error.contains(multisig_keys.secret_hex()), "{error}");
+        assert!(
+            !error.contains(recovery.owner_secret_key_hex.as_str()),
+            "{error}"
+        );
+        assert!(
+            !error.contains(
+                recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .expect("persisted unsubmitted checkpoint")
+                    .sk_u_hex
+                    .as_str()
+            ),
+            "{error}"
+        );
+        assert_eq!(key_loader.calls.get(), 1);
+        assert_eq!(wallet_reader.code_hash_calls.get(), 1);
+        assert_eq!(
+            wallet_reader.custodian_calls.get(),
+            0,
+            "unsupported code must stop before getter"
+        );
+        assert_eq!(
+            boc_builder.calls.get(),
+            0,
+            "unsupported wallet must not build a voucher BOC"
+        );
+        assert_eq!(
+            submitter.calls.get(),
+            0,
+            "unsupported wallet must not submit a voucher BOC"
+        );
+        assert!(
+            !recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                .expect("persisted unsubmitted checkpoint")
+                .submit_maybe_sent,
+            "preflight rejection must not mark submit_maybe_sent"
+        );
+        assert_eq!(
+            std::fs::read(&recovery_path).expect("read recovery after preflight"),
+            before,
+            "preflight rejection must not write a wallet spend checkpoint"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_multi_custodian_hot_waits_for_downstream_voucher_result() {
         use crate::cli::note::NoteDeployVoucherKind;
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2825,17 +3636,23 @@ mod tests {
             .expect("parse fixture wallet");
         let multisig_keys = preflight_fixture_keys();
         let wallet_reader = FixedFundingWalletReader::returning(serde_json::json!({
-            "custodians": [{
-                "index": "0",
-                "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
-            }]
+            "custodians": [
+                {
+                    "index": "0",
+                    "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                },
+                {
+                    "index": "1",
+                    "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+                }
+            ]
         }));
         let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
         let boc_builder = CountingVoucherBocBuilder::default();
         let submitter = CountingVoucherSubmitter::default();
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
         let failpoints = super::NoteDeployVoucherFailpoints {
-            after_deposit_submit: true,
+            before_voucher_event_wait: true,
             ..Default::default()
         };
         let mut recovery = test_recovery_state();
@@ -2862,25 +3679,26 @@ mod tests {
             failpoints,
         )
         .await
-        .expect_err("fixture stops after the injected wallet-submit seam")
+        .expect_err("fixture stops at the downstream VoucherGenerated wait boundary")
         .to_string();
 
         assert!(
-            error.contains("simulated interruption after deposit voucher wallet submit"),
+            error.contains("simulated interruption before voucher event wait"),
             "{error}"
         );
         assert_eq!(key_loader.calls.get(), 1);
         assert_eq!(wallet_reader.code_hash_calls.get(), 1);
         assert_eq!(wallet_reader.custodian_calls.get(), 1);
+        assert_eq!(wallet_reader.threshold_calls.get(), 1);
         assert_eq!(boc_builder.calls.get(), 1);
         assert!(
             boc_builder.saw_nonempty_boc.get(),
-            "matching sole key must produce a signed BOC"
+            "matching Hot custodian must produce a signed BOC"
         );
         assert_eq!(
             submitter.calls.get(),
             1,
-            "matching sole key must reach wallet submit"
+            "matching Hot custodian must reach wallet submit"
         );
         assert!(
             submitter.saw_nonempty_boc.get(),
@@ -2900,11 +3718,16 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn note_deploy_submit_maybe_sent_resume_skips_funding_key_and_wallet_preflight() {
-        use crate::cli::note::{NoteDeployVoucherCheckpoint, NoteDeployVoucherKind};
+    async fn assert_issue_678_restart_never_posts(recovery_path: &std::path::Path) {
+        use crate::cli::note::NoteDeployVoucherKind;
 
-        let temp = tempfile::tempdir().expect("temp dir");
+        let before = std::fs::read(recovery_path).expect("read recovery before restart");
+        let mut recovery = crate::cli::note::load_note_deploy_recovery(recovery_path)
+            .expect("load ambiguous recovery")
+            .expect("ambiguous recovery exists");
+        let owner = recovery.owner_public_key_hex.clone();
+        let token_type = recovery.token_type;
+        let raw_value = recovery.raw_value;
         let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
             .expect("connect offline fixture endpoint");
         let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
@@ -2915,88 +3738,186 @@ mod tests {
             FixedFundingWalletReader::failing("submitted recovery must not read funding wallet");
         let boc_builder = CountingVoucherBocBuilder::default();
         let submitter = CountingVoucherSubmitter::default();
-        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
         let failpoints = super::NoteDeployVoucherFailpoints {
             before_voucher_event_wait: true,
             ..Default::default()
         };
 
-        let mut resumed_recovery = test_recovery_state();
-        let resumed_owner = resumed_recovery.owner_public_key_hex.clone();
-        let resumed_token_type = resumed_recovery.token_type;
-        let resumed_raw_value = resumed_recovery.raw_value;
-        let mut checkpoint = NoteDeployVoucherCheckpoint::new(
-            &resumed_owner,
-            resumed_token_type,
-            resumed_raw_value,
-            false,
-            "b".repeat(64),
-            "c".repeat(64),
-        )
-        .expect("fixture voucher checkpoint");
-        checkpoint.submit_maybe_sent = true;
-        resumed_recovery
-            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, checkpoint)
-            .expect("persist resumed checkpoint");
-        let resumed_recovery_path = temp.path().join("resumed-recovery.json");
-        crate::cli::note::write_note_deploy_recovery(&resumed_recovery_path, &resumed_recovery)
-            .expect("write resumed recovery");
-        let before = std::fs::read(&resumed_recovery_path).expect("read recovery before resume");
-        let mut resumed_recovery =
-            crate::cli::note::load_note_deploy_recovery(&resumed_recovery_path)
-                .expect("load submitted recovery")
-                .expect("submitted recovery exists");
-
-        let resumed_error = super::note_deploy_mint_voucher_recoverable(
+        let error = super::note_deploy_mint_voucher_recoverable(
             &client,
-            &resumed_recovery_path,
-            &mut resumed_recovery,
+            recovery_path,
+            &mut recovery,
             NoteDeployVoucherKind::Deposit,
             &multisig_address,
             &key_loader,
             &wallet_reader,
             &boc_builder,
             &submitter,
-            &resumed_owner,
-            resumed_token_type,
-            resumed_raw_value,
+            &owner,
+            token_type,
+            raw_value,
             false,
-            &halo2_paths,
+            &dexdo_core::private_note::Halo2Paths::from_env(),
             failpoints,
         )
         .await
         .expect_err("fixture must stop before the live event wait")
         .to_string();
         assert!(
-            resumed_error.contains("simulated interruption before voucher event wait"),
-            "{resumed_error}"
+            error.contains("simulated interruption before voucher event wait"),
+            "{error}"
         );
-        assert!(
-            !resumed_error.contains("submitted recovery must not read funding wallet"),
-            "{resumed_error}"
-        );
-        assert!(
-            !resumed_error.contains("submitted recovery must not load funding key"),
-            "{resumed_error}"
-        );
+        assert!(!error.contains("submitted recovery must"), "{error}");
         assert_eq!(key_loader.calls.get(), 0);
         assert_eq!(wallet_reader.code_hash_calls.get(), 0);
         assert_eq!(wallet_reader.custodian_calls.get(), 0);
+        assert_eq!(boc_builder.calls.get(), 0);
+        assert_eq!(submitter.calls.get(), 0);
         assert_eq!(
-            boc_builder.calls.get(),
-            0,
-            "reconciliation must not build another signed wallet BOC"
-        );
-        assert_eq!(
-            submitter.calls.get(),
-            0,
-            "reconciliation must not submit another wallet BOC"
-        );
-        assert_eq!(
-            std::fs::read(&resumed_recovery_path).expect("read recovery after resume seam"),
+            std::fs::read(recovery_path).expect("read recovery after restart"),
             before,
-            "read-only reconciliation seam must not rewrite the journal without new chain facts"
+            "restart must not rewrite ambiguous recovery state"
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_issue_678_ambiguous_observer_persists_and_restart_never_posts_twice() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let resumed_recovery_path = temp.path().join("ambiguous-recovery.json");
+        let first_reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let first_submitter =
+            CountingVoucherSubmitter::failing("transport/observer timeout containing text 38");
+        let mut resumed_recovery = test_recovery_state();
+        let ambiguous_error = run_issue_678_deposit(
+            &resumed_recovery_path,
+            &mut resumed_recovery,
+            &first_reader,
+            &first_submitter,
+            Default::default(),
+        )
+        .await
+        .expect_err("transport/observer failure must remain ambiguous")
+        .to_string();
+
+        assert!(
+            ambiguous_error.contains("transport/observer timeout containing text 38"),
+            "{ambiguous_error}"
+        );
+        assert!(
+            !ambiguous_error.contains("NOT_ENOUGH_EXTRA"),
+            "{ambiguous_error}"
+        );
+        assert_eq!(first_submitter.calls.get(), 1);
+        let ambiguous = resumed_recovery
+            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+            .expect("ambiguous checkpoint");
+        assert!(ambiguous.submit_maybe_sent);
+
+        assert_issue_678_restart_never_posts(&resumed_recovery_path).await;
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_issue_678_ok_none_receipt_persists_and_restart_posts_zero() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("no-finalized-receipt.json");
+        let reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let submitter = CountingVoucherSubmitter::returning(None);
+        let mut recovery = test_recovery_state();
+
+        let error = run_issue_678_deposit(
+            &recovery_path,
+            &mut recovery,
+            &reader,
+            &submitter,
+            Default::default(),
+        )
+        .await
+        .expect_err("Ok(None) finalized receipt must remain ambiguous")
+        .to_string();
+
+        assert!(error.contains("no bounded finalized receipt"), "{error}");
+        assert!(
+            error.contains("will not submit a second wallet POST"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Inspect the exact wallet transaction"),
+            "{error}"
+        );
+        assert_eq!(submitter.calls.get(), 1);
+        assert!(
+            recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                .expect("ambiguous checkpoint")
+                .submit_maybe_sent
+        );
+        assert_issue_678_restart_never_posts(&recovery_path).await;
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_issue_678_matching_effect_never_clears_submit_guard() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let raw = 100_000_000_000u128;
+        let mut outbound_effect = issue_678_receipt(true, 38);
+        outbound_effect.outmsg_count = 1;
+        let mut matching_ecc_effect = issue_678_receipt(true, 38);
+        matching_ecc_effect.wallet_ecc_balances = Some(vec![(1, raw - 1), (2, raw)]);
+        let mut missing_ecc = issue_678_receipt(true, 38);
+        missing_ecc.wallet_ecc_balances = None;
+
+        for (case, receipt, expected) in [
+            (
+                "outbound-effect",
+                outbound_effect,
+                "produced 1 outbound message(s)",
+            ),
+            ("matching-ecc-effect", matching_ecc_effect, "ECC[1] changed"),
+            ("missing-ecc", missing_ecc, "no exact wallet ECC state"),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let recovery_path = temp.path().join(format!("{case}.json"));
+            let reader = issue_678_wallet_reader(vec![(1, raw), (2, raw)]);
+            let submitter = CountingVoucherSubmitter::returning(Some(receipt));
+            let mut recovery = test_recovery_state();
+
+            let error = run_issue_678_deposit(
+                &recovery_path,
+                &mut recovery,
+                &reader,
+                &submitter,
+                Default::default(),
+            )
+            .await
+            .expect_err("unproven no-effect state must fail closed")
+            .to_string();
+
+            assert!(
+                error.contains("effect absence could not be proven"),
+                "{case}: {error}"
+            );
+            assert!(error.contains(expected), "{case}: {error}");
+            assert!(
+                error.contains("will not submit a second wallet POST"),
+                "{case}: {error}"
+            );
+            assert_eq!(submitter.calls.get(), 1, "{case}");
+            assert!(
+                recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .expect("guarded checkpoint")
+                    .submit_maybe_sent,
+                "{case}"
+            );
+            assert_issue_678_restart_never_posts(&recovery_path).await;
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -3063,7 +3984,7 @@ mod tests {
         .expect_err("a later fresh voucher leg must run the wallet guard")
         .to_string();
 
-        assert!(error.contains("sole custodian is"), "{error}");
+        assert!(error.contains("is not a custodian"), "{error}");
         assert_eq!(key_loader.calls.get(), 1);
         assert_eq!(wallet_reader.code_hash_calls.get(), 1);
         assert_eq!(wallet_reader.custodian_calls.get(), 1);
@@ -3090,9 +4011,24 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
+    fn note_deploy_issue_678_action_result_38_label_uses_only_the_exact_numeric_code() {
+        assert!(super::note_deploy_action_failed(true, 0));
+        assert!(super::note_deploy_action_failed(false, 38));
+        assert!(!super::note_deploy_action_failed(false, 0));
+        assert_eq!(
+            super::note_deploy_action_result_label(38),
+            Some("NOT_ENOUGH_EXTRA")
+        );
+        for code in [380, 138, 0] {
+            assert_eq!(super::note_deploy_action_result_label(code), None);
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
     fn note_deploy_wallet_replay_conflict_is_busy_retryable_and_actionable() {
         let raw = anyhow::anyhow!(
-            "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: block manager rejected \
+            "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: block manager rejected \
              message code=TVM_ERROR; exit-code:52 nonce desynchronized"
         );
 
@@ -3168,7 +4104,7 @@ mod tests {
     #[test]
     fn note_deploy_unrelated_errors_are_not_relabeled_as_history_proof_expired() {
         for raw in [
-            "UpdateCustodianMultisigWallet_v2.sendTransaction failed: exit_code=403",
+            "UpdateCustodianMultisigWallet_v2.submitTransaction failed: exit_code=403",
             "prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover",
             "wallet submit failed: exit_code=52 replay protection exception",
             "generic SDK transport error",
@@ -3227,7 +4163,7 @@ mod tests {
                 attempts.push(attempt);
                 if attempt < 3 {
                     Err(anyhow::anyhow!(
-                        "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: \
+                        "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: \
                          tvm_error exit-code:52 nonce desynchronized"
                     ))
                 } else {
@@ -3261,7 +4197,7 @@ mod tests {
             async |attempt| {
                 attempts.push(attempt);
                 Err(anyhow::anyhow!(
-                    "submit UpdateCustodianMultisigWallet_v2.sendTransaction -> RootPN.generateVoucher: \
+                    "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: \
                      tvm_error exit-code:52 nonce desynchronized"
                 ))
             },

@@ -1,6 +1,6 @@
 //! Canonical dexdo funding wallet artifact.
-//! Source: `gosh-sh/acki-nacki` dev
-//! `6ad89549a0b845ed70094b24b23fad3223cdd5e8`.
+//! Source: `gosh-sh/ackinacki-kit` v5.0.0
+//! `28f3434ed34d285c55e2e9b3ec50432a3f3adfbd`.
 
 use serde_json::{Map, Value};
 
@@ -33,6 +33,25 @@ pub fn send_transaction_params(
     })
 }
 
+pub fn submit_transaction_params(
+    dest: String,
+    value: u128,
+    cc: Map<String, Value>,
+    bounce: bool,
+    flag: u8,
+    payload: String,
+) -> Value {
+    serde_json::json!({
+        "dest": dest,
+        "value": value.to_string(),
+        "cc": Value::Object(cc),
+        "bounce": bounce,
+        "flag": flag,
+        "payload": payload,
+        "dapp_id": ROOT_PN_DAPP_ID,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v2_artifacts_match_ackinacki_dev() {
+    fn canonical_v2_artifacts_match_ackinacki_kit_v5_release() {
         assert_eq!(sha256_hex(MULTISIG_ABI_JSON.as_bytes()), ABI_SHA256);
         assert_eq!(sha256_hex(MULTISIG_TVC), TVC_SHA256);
 

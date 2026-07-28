@@ -23,10 +23,10 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 
 pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, DealInitError>> + Send>>;
 pub type DealInitializer = Arc<dyn Fn() -> DealInitFuture + Send + Sync>;
@@ -177,6 +177,29 @@ impl SellerStallsMidStreamAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryKind {
+    CleanupUnopened,
+    ReclaimOpened,
+}
+
+impl RecoveryKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::CleanupUnopened => 1,
+            Self::ReclaimOpened => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::CleanupUnopened),
+            2 => Some(Self::ReclaimOpened),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuyerApiFailurePolicy {
     pub verification_bail: VerificationBailAction,
     pub dead_gateway: DeadGatewayAction,
@@ -273,11 +296,18 @@ impl ApiDeal {
         self.active_requests.fetch_add(1, Ordering::SeqCst);
         ConsumerRequestGuard {
             active_requests: self.active_requests.clone(),
+            accepted_output_generation: self.accepted_output_generation.clone(),
+            session: self.session.clone(),
+            failure_heartbeat: None,
         }
     }
 
+    pub fn has_active_request(&self) -> bool {
+        self.active_requests.load(Ordering::SeqCst) > 0
+    }
+
     pub fn has_active_or_recent_request(&self, now_secs: u64, recent_window_secs: u64) -> bool {
-        if self.active_requests.load(Ordering::SeqCst) > 0 {
+        if self.has_active_request() {
             return true;
         }
         let last = self.last_request_started_unix_secs.load(Ordering::SeqCst);
@@ -287,11 +317,36 @@ impl ApiDeal {
 
 pub(crate) struct ConsumerRequestGuard {
     active_requests: Arc<AtomicU64>,
+    accepted_output_generation: Arc<AtomicU64>,
+    session: Arc<SessionSettle>,
+    failure_heartbeat: Option<dexdo_core::chain::HeartbeatGuard>,
+}
+
+impl ConsumerRequestGuard {
+    pub(crate) fn arm_upstream_failure(&mut self) {
+        self.failure_heartbeat = Some(dexdo_core::chain::HeartbeatGuard::new(
+            self.accepted_output_generation.clone(),
+        ));
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.failure_heartbeat = None;
+    }
 }
 
 impl Drop for ConsumerRequestGuard {
     fn drop(&mut self) {
         self.active_requests.fetch_sub(1, Ordering::SeqCst);
+        if self
+            .failure_heartbeat
+            .as_ref()
+            .is_some_and(dexdo_core::chain::HeartbeatGuard::unchanged)
+        {
+            self.session.close_recovery_episode(
+                RecoveryKind::ReclaimOpened,
+                "consumer-request-ended-before-accepted-output",
+            );
+        }
     }
 }
 
@@ -302,6 +357,7 @@ impl Drop for ConsumerRequestGuard {
 pub struct RouteManager {
     active: RwLock<Option<ApiDeal>>,
     initializer: Option<DealInitializer>,
+    replace_settled: bool,
     initializer_timeout: Duration,
     initializer_lock: Mutex<()>,
 }
@@ -311,6 +367,7 @@ impl RouteManager {
         Self {
             active: RwLock::new(Some(active)),
             initializer: None,
+            replace_settled: false,
             initializer_timeout: DEFAULT_DEAL_INIT_TIMEOUT,
             initializer_lock: Mutex::new(()),
         }
@@ -320,9 +377,38 @@ impl RouteManager {
         Self {
             active: RwLock::new(None),
             initializer: Some(initializer),
+            replace_settled: false,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
         }
+    }
+
+    pub fn recoverable_lazy(initializer: DealInitializer, initializer_timeout: Duration) -> Self {
+        Self {
+            active: RwLock::new(None),
+            initializer: Some(initializer),
+            replace_settled: true,
+            initializer_timeout,
+            initializer_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn recoverable_lazy_with_active(
+        active: ApiDeal,
+        initializer: DealInitializer,
+        initializer_timeout: Duration,
+    ) -> Self {
+        Self {
+            active: RwLock::new(Some(active)),
+            initializer: Some(initializer),
+            replace_settled: true,
+            initializer_timeout,
+            initializer_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn is_lazy(&self) -> bool {
+        self.initializer.is_some()
     }
 
     pub async fn current(&self) -> Option<ApiDeal> {
@@ -331,11 +417,15 @@ impl RouteManager {
 
     pub async fn current_or_prepare(&self) -> Result<ApiDeal, DealInitError> {
         if let Some(active) = self.current().await {
-            return Ok(active);
+            if !self.replace_settled || !active.session.is_settled() {
+                return Ok(active);
+            }
         }
         let _guard = self.initializer_lock.lock().await;
         if let Some(active) = self.current().await {
-            return Ok(active);
+            if !self.replace_settled || !active.session.is_settled() {
+                return Ok(active);
+            }
         }
         let initializer = self
             .initializer
@@ -417,13 +507,15 @@ pub(crate) async fn handle_stream_error_policy(
     match action {
         StreamErrorPolicyAction::RequestScoped => {}
         StreamErrorPolicyAction::DeadGateway => {
+            let heartbeat = deal.accepted_output_guard();
             deal.session
-                .settle_dead_gateway("stream-error-before-token")
+                .settle_dead_gateway("stream-error-before-token", &heartbeat)
                 .await;
         }
         StreamErrorPolicyAction::SellerStallsMidStream => {
+            let heartbeat = deal.accepted_output_guard();
             deal.session
-                .settle_seller_stalls_mid_stream("seller-stalls-mid-stream")
+                .settle_seller_stalls_mid_stream("seller-stalls-mid-stream", &heartbeat)
                 .await;
         }
     }
@@ -638,6 +730,10 @@ pub struct SessionSettle {
     note: Arc<dyn Note>,
     settled: AtomicBool,
     closed: AtomicBool,
+    closed_tx: watch::Sender<bool>,
+    recovery_episode: AtomicU8,
+    recovery_closed_session: AtomicBool,
+    handler_recovery_reconciliation: AtomicBool,
     drop_backup_enabled: AtomicBool,
     settle_lock: Mutex<()>,
     failure_policy: BuyerApiFailurePolicy,
@@ -682,12 +778,17 @@ impl SessionSettle {
         note: Arc<dyn Note>,
         failure_policy: BuyerApiFailurePolicy,
     ) -> Self {
+        let (closed_tx, _closed_rx) = watch::channel(false);
         Self {
             chain,
             token_contract,
             note,
             settled: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            closed_tx,
+            recovery_episode: AtomicU8::new(0),
+            recovery_closed_session: AtomicBool::new(false),
+            handler_recovery_reconciliation: AtomicBool::new(false),
             drop_backup_enabled: AtomicBool::new(true),
             settle_lock: Mutex::new(()),
             failure_policy,
@@ -709,8 +810,110 @@ impl SessionSettle {
         self.closed.load(Ordering::SeqCst)
     }
 
-    fn close_local_api(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+    fn close_local_api(&self) -> bool {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.closed_tx.send_replace(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn closed_receiver(&self) -> watch::Receiver<bool> {
+        self.closed_tx.subscribe()
+    }
+
+    pub fn recovery_episode(&self) -> Option<RecoveryKind> {
+        RecoveryKind::from_code(self.recovery_episode.load(Ordering::SeqCst))
+    }
+
+    pub fn take_handler_recovery_reconciliation(&self) -> Option<RecoveryKind> {
+        self.handler_recovery_reconciliation
+            .swap(false, Ordering::SeqCst)
+            .then(|| self.recovery_episode())
+            .flatten()
+    }
+
+    pub fn close_recovery_episode(&self, kind: RecoveryKind, reason: &str) -> bool {
+        if self.settled.load(Ordering::SeqCst) {
+            return false;
+        }
+        let started = self
+            .recovery_episode
+            .compare_exchange(0, kind.code(), Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if self.close_local_api() && self.recovery_episode.load(Ordering::SeqCst) == kind.code() {
+            self.recovery_closed_session.store(true, Ordering::SeqCst);
+        }
+        if started {
+            tracing::warn!(
+                %reason,
+                token_contract = %self.token_contract,
+                recovery_action = ?kind,
+                "consumer API: closed failed session and latched one recovery episode"
+            );
+        }
+        started
+    }
+
+    fn begin_recovery_attempt(&self, kind: RecoveryKind, handler_origin: bool) -> bool {
+        let existing = self.recovery_episode.load(Ordering::SeqCst);
+        let started = if existing == 0 {
+            self.recovery_episode
+                .compare_exchange(0, kind.code(), Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        } else {
+            false
+        };
+        let current = self.recovery_episode.load(Ordering::SeqCst);
+        if current != kind.code() {
+            return false;
+        }
+        if !handler_origin
+            && !started
+            && self.handler_recovery_reconciliation.load(Ordering::SeqCst)
+        {
+            tracing::debug!(
+                token_contract = %self.token_contract,
+                recovery_action = ?kind,
+                outcome = "handler_result_needs_fact_read",
+                "consumer API: suppressed monitor recovery until handler ambiguity is reconciled"
+            );
+            return false;
+        }
+        if handler_origin {
+            if self.close_local_api() {
+                self.recovery_closed_session.store(true, Ordering::SeqCst);
+            }
+            if !started {
+                tracing::debug!(
+                    token_contract = %self.token_contract,
+                    recovery_action = ?kind,
+                    outcome = "episode_already_latched",
+                    "consumer API: suppressed duplicate handler recovery attempt"
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    fn cancel_recovery_without_post(&self, kind: RecoveryKind) {
+        if self
+            .recovery_episode
+            .compare_exchange(kind.code(), 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        if self.recovery_closed_session.swap(false, Ordering::SeqCst)
+            && !self.settled.load(Ordering::SeqCst)
+            && self.closed.swap(false, Ordering::SeqCst)
+        {
+            self.closed_tx.send_replace(false);
+        }
     }
 
     fn disable_drop_backup(&self) {
@@ -765,15 +968,9 @@ impl SessionSettle {
         reason: &str,
         cleanup: Option<UnopenedCleanupDecision>,
     ) {
-        let _guard = self.settle_lock.lock().await;
-        if self.settled.load(Ordering::SeqCst) {
-            return;
-        }
-        self.close_local_api();
         if cleanup == Some(UnopenedCleanupDecision::Ready) {
-            match self.chain.cleanup_unopened(&self.token_contract).await {
-                Ok(s) => {
-                    self.settled.store(true, Ordering::SeqCst);
+            match self.recover_cleanup_unopened(true).await {
+                Ok(Some(s)) => {
                     tracing::warn!(
                         %reason,
                         token_contract = %self.token_contract,
@@ -781,6 +978,7 @@ impl SessionSettle {
                         "consumer API: refused response before open and cleaned up unopened deal"
                     );
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
                         %reason,
@@ -791,6 +989,11 @@ impl SessionSettle {
                 }
             }
         } else {
+            let _guard = self.settle_lock.lock().await;
+            if self.settled.load(Ordering::SeqCst) {
+                return;
+            }
+            self.close_local_api();
             tracing::error!(
                 %reason,
                 token_contract = %self.token_contract,
@@ -807,9 +1010,93 @@ impl SessionSettle {
         if self.settled.swap(true, Ordering::SeqCst) {
             return false;
         }
+        self.recovery_closed_session.store(false, Ordering::SeqCst);
+        self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
         self.close_local_api();
         tracing::info!(%reason, "consumer API: session deal marked recovered");
         true
+    }
+
+    pub async fn mark_recovered_serialized(&self, reason: &str) -> bool {
+        let _guard = self.settle_lock.lock().await;
+        if self.settled.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.settled.store(true, Ordering::SeqCst);
+        self.recovery_closed_session.store(false, Ordering::SeqCst);
+        self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.close_local_api();
+        tracing::info!(%reason, "consumer API: session deal marked recovered");
+        true
+    }
+
+    pub async fn recover_cleanup_unopened(
+        &self,
+        handler_origin: bool,
+    ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        let _guard = self.settle_lock.lock().await;
+        if self.settled.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if !self.begin_recovery_attempt(RecoveryKind::CleanupUnopened, handler_origin) {
+            return Ok(None);
+        }
+        let settlement = match self.chain.cleanup_unopened(&self.token_contract).await {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                if handler_origin {
+                    self.handler_recovery_reconciliation
+                        .store(true, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+        };
+        self.close_local_api();
+        self.settled.store(true, Ordering::SeqCst);
+        self.recovery_closed_session.store(false, Ordering::SeqCst);
+        self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        Ok(Some(settlement))
+    }
+
+    pub async fn recover_reclaim_opened(
+        &self,
+        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        handler_origin: bool,
+    ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        let _guard = self.settle_lock.lock().await;
+        if self.settled.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if !self.begin_recovery_attempt(RecoveryKind::ReclaimOpened, handler_origin) {
+            return Ok(None);
+        }
+        let settlement = match self
+            .chain
+            .seller_timeout_if_heartbeat(&self.token_contract, heartbeat)
+            .await
+        {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                if handler_origin {
+                    self.handler_recovery_reconciliation
+                        .store(true, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+        };
+        if settlement.is_none() {
+            self.cancel_recovery_without_post(RecoveryKind::ReclaimOpened);
+            return Ok(None);
+        }
+        self.close_local_api();
+        self.settled.store(true, Ordering::SeqCst);
+        self.recovery_closed_session.store(false, Ordering::SeqCst);
+        self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        Ok(settlement)
     }
 
     /// STOP the deal once. `&self` -- the session is `Arc`-shared across the handlers. Returns whether THIS
@@ -828,6 +1115,9 @@ impl SessionSettle {
         {
             Ok(s) => {
                 self.settled.store(true, Ordering::SeqCst);
+                self.recovery_closed_session.store(false, Ordering::SeqCst);
+                self.handler_recovery_reconciliation
+                    .store(false, Ordering::SeqCst);
                 tracing::info!(%reason, settlement = ?s, "consumer API: session deal closed with STOP")
             }
             Err(e) => {
@@ -884,15 +1174,15 @@ impl SessionSettle {
         false
     }
 
-    async fn policy_seller_timeout(&self, failure_class: &str, action: &str, reason: &str) -> bool {
-        let _guard = self.settle_lock.lock().await;
-        if self.settled.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.close_local_api();
-        match self.chain.seller_timeout(&self.token_contract).await {
-            Ok(s) => {
-                self.settled.store(true, Ordering::SeqCst);
+    async fn policy_seller_timeout(
+        &self,
+        failure_class: &str,
+        action: &str,
+        reason: &str,
+        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+    ) -> bool {
+        match self.recover_reclaim_opened(heartbeat, true).await {
+            Ok(Some(s)) => {
                 tracing::warn!(
                     %reason,
                     policy_failure_class = failure_class,
@@ -902,6 +1192,17 @@ impl SessionSettle {
                     "consumer API: selected policy action reclaimed via seller_timeout"
                 );
                 true
+            }
+            Ok(None) => {
+                tracing::info!(
+                    %reason,
+                    policy_failure_class = failure_class,
+                    policy_action = action,
+                    token_contract = %self.token_contract,
+                    result = "accepted_output_heartbeat_changed",
+                    "consumer API: cancelled seller_timeout before submit"
+                );
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -1038,11 +1339,15 @@ impl SessionSettle {
         }
     }
 
-    pub async fn settle_dead_gateway(&self, reason: &str) -> bool {
+    pub async fn settle_dead_gateway(
+        &self,
+        reason: &str,
+        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+    ) -> bool {
         let action = self.failure_policy.dead_gateway;
         match action {
             DeadGatewayAction::RetryThenReclaim => {
-                self.policy_seller_timeout("dead_gateway", action.as_str(), reason)
+                self.policy_seller_timeout("dead_gateway", action.as_str(), reason, heartbeat)
                     .await
             }
             DeadGatewayAction::NextSeller => {
@@ -1061,11 +1366,15 @@ impl SessionSettle {
         }
     }
 
-    pub async fn settle_empty_stream(&self, reason: &str) -> bool {
+    pub async fn settle_empty_stream(
+        &self,
+        reason: &str,
+        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+    ) -> bool {
         let action = self.failure_policy.empty_stream;
         match action {
             EmptyStreamAction::Reclaim => {
-                self.policy_seller_timeout("empty_stream", action.as_str(), reason)
+                self.policy_seller_timeout("empty_stream", action.as_str(), reason, heartbeat)
                     .await
             }
             EmptyStreamAction::NextSeller => {
@@ -1084,12 +1393,21 @@ impl SessionSettle {
         }
     }
 
-    pub async fn settle_seller_stalls_mid_stream(&self, reason: &str) -> bool {
+    pub async fn settle_seller_stalls_mid_stream(
+        &self,
+        reason: &str,
+        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+    ) -> bool {
         let action = self.failure_policy.seller_stalls_mid_stream;
         match action {
             SellerStallsMidStreamAction::AcceptDeliveredThenReclaim => {
-                self.policy_seller_timeout("seller_stalls_mid_stream", action.as_str(), reason)
-                    .await
+                self.policy_seller_timeout(
+                    "seller_stalls_mid_stream",
+                    action.as_str(),
+                    reason,
+                    heartbeat,
+                )
+                .await
             }
             SellerStallsMidStreamAction::Dispute => {
                 self.policy_dispute("seller_stalls_mid_stream", action.as_str(), reason)
@@ -1217,6 +1535,40 @@ impl ApiState {
             buyer,
             frame_model,
             deals: Arc::new(RouteManager::lazy(initializer, initializer_timeout)),
+        }
+    }
+
+    pub fn recoverable_lazy(
+        buyer: Arc<Buyer>,
+        frame_model: String,
+        initializer: DealInitializer,
+        initializer_timeout: Duration,
+    ) -> Self {
+        Self {
+            buyer,
+            frame_model,
+            deals: Arc::new(RouteManager::recoverable_lazy(
+                initializer,
+                initializer_timeout,
+            )),
+        }
+    }
+
+    pub fn recoverable_lazy_with_active(
+        buyer: Arc<Buyer>,
+        frame_model: String,
+        active: ApiDeal,
+        initializer: DealInitializer,
+        initializer_timeout: Duration,
+    ) -> Self {
+        Self {
+            buyer,
+            frame_model,
+            deals: Arc::new(RouteManager::recoverable_lazy_with_active(
+                active,
+                initializer,
+                initializer_timeout,
+            )),
         }
     }
 
@@ -1639,12 +1991,17 @@ mod tests {
         fail_cleanup_unopened: std::sync::atomic::AtomicBool,
         fail_deal_state: std::sync::atomic::AtomicBool,
         deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
+        heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<ApiDeal>>,
     }
 
     impl RecordingSettleChain {
         fn set_deal_state(&self, state: dexdo_core::DealChainState) {
             *self.deal_state.lock().unwrap() = Some(state);
         }
+    }
+
+    fn unchanged_heartbeat() -> dexdo_core::chain::HeartbeatGuard {
+        dexdo_core::chain::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
     }
 
     fn deal_state(
@@ -1782,6 +2139,25 @@ mod tests {
             })
         }
 
+        async fn seller_timeout_if_heartbeat(
+            &self,
+            token_contract: &TokenContract,
+            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+            if let Some(deal) = self
+                .heartbeat_during_reclaim_preflight
+                .lock()
+                .unwrap()
+                .take()
+            {
+                deal.record_accepted_output(unix_now_secs());
+            }
+            if !heartbeat.unchanged() {
+                return Ok(None);
+            }
+            self.seller_timeout(token_contract).await.map(Some)
+        }
+
         async fn cleanup_unopened(
             &self,
             _token_contract: &TokenContract,
@@ -1823,6 +2199,144 @@ mod tests {
         ) -> Option<dexdo_core::StreamSnapshot> {
             None
         }
+    }
+
+    fn recovery_test_deal(
+        token_contract: &str,
+        chain: Arc<RecordingSettleChain>,
+        note: Arc<dyn Note>,
+    ) -> ApiDeal {
+        ApiDeal::new(
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: token_contract.to_string(),
+                max_tokens: 100,
+            },
+            Arc::new(SessionSettle::new_with_failure_policy(
+                chain,
+                token_contract.to_string(),
+                note,
+                BuyerApiFailurePolicy {
+                    dead_gateway: DeadGatewayAction::RetryThenReclaim,
+                    ..BuyerApiFailurePolicy::default()
+                },
+            )),
+            Arc::new(ContentGate::skip()),
+        )
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn issue_547_terminal_on_demand_route_initializes_once_for_concurrent_requests(
+            pre_terminal_requests in 1usize..8,
+            concurrent_requests in 1usize..32,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let chain = Arc::new(RecordingSettleChain::default());
+                chain.fail_seller_timeout.store(true, Ordering::SeqCst);
+                let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
+                let initial = recovery_test_deal("tc-dead", chain.clone(), note.clone());
+                let initial_session = initial.session.clone();
+                let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let init_calls_for_initializer = init_calls.clone();
+                let chain_for_initializer = chain.clone();
+                let note_for_initializer = note.clone();
+                let routes = Arc::new(RouteManager::recoverable_lazy_with_active(
+                    initial,
+                    Arc::new(move || {
+                        let init_calls = init_calls_for_initializer.clone();
+                        let chain = chain_for_initializer.clone();
+                        let note = note_for_initializer.clone();
+                        Box::pin(async move {
+                            init_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(recovery_test_deal("tc-fresh", chain, note))
+                        }) as DealInitFuture
+                    }),
+                    Duration::from_secs(1),
+                ));
+
+                let heartbeat = unchanged_heartbeat();
+                assert!(
+                    !initial_session
+                        .settle_dead_gateway("injected-dead-gateway", &heartbeat)
+                        .await
+                );
+                assert!(initial_session.is_closed());
+                assert!(!initial_session.is_settled());
+                for _ in 0..pre_terminal_requests {
+                    assert_eq!(
+                        routes.current_or_prepare().await.unwrap().route.token_contract,
+                        "tc-dead"
+                    );
+                }
+                assert_eq!(
+                    init_calls.load(Ordering::SeqCst),
+                    0,
+                    "closed but nonterminal recovery must not move money"
+                );
+
+                chain.fail_seller_timeout.store(false, Ordering::SeqCst);
+                assert_eq!(
+                    initial_session.take_handler_recovery_reconciliation(),
+                    Some(RecoveryKind::ReclaimOpened),
+                    "the monitor must consume the handler failure before retrying from fresh facts"
+                );
+                assert!(initial_session
+                    .recover_reclaim_opened(&unchanged_heartbeat(), false)
+                    .await
+                    .unwrap()
+                    .is_some());
+                assert!(initial_session.is_settled());
+
+                let mut requests = Vec::with_capacity(concurrent_requests);
+                for _ in 0..concurrent_requests {
+                    let routes = routes.clone();
+                    requests.push(tokio::spawn(async move {
+                        routes.current_or_prepare().await.unwrap().route.token_contract
+                    }));
+                }
+                for request in requests {
+                    assert_eq!(request.await.unwrap(), "tc-fresh");
+                }
+                assert_eq!(
+                    init_calls.load(Ordering::SeqCst),
+                    1,
+                    "serialized lazy replacement must submit at most one fresh BUY"
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_547_accepted_output_during_reclaim_preflight_sends_no_post() {
+        let chain = Arc::new(RecordingSettleChain::default());
+        let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
+        let deal = recovery_test_deal("tc-heartbeat-race", chain.clone(), note);
+        *chain.heartbeat_during_reclaim_preflight.lock().unwrap() = Some(deal.clone());
+        let heartbeat = deal.accepted_output_guard();
+
+        let settlement = deal
+            .session
+            .recover_reclaim_opened(&heartbeat, false)
+            .await
+            .unwrap();
+
+        assert!(settlement.is_none());
+        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 0);
+        assert!(!deal.session.is_settled());
+        assert!(!deal.session.is_closed());
+        assert_eq!(
+            deal.session.recovery_episode(),
+            None,
+            "a heartbeat-cancelled reclaim must not leave a stale recovery latch"
+        );
     }
 
     #[tokio::test]
@@ -2036,7 +2550,11 @@ mod tests {
             },
         );
 
-        assert!(session.settle_dead_gateway("test-dead-gateway").await);
+        assert!(
+            session
+                .settle_dead_gateway("test-dead-gateway", &unchanged_heartbeat())
+                .await
+        );
         assert!(session.is_closed());
         assert!(session.is_settled());
         assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 1);
@@ -2165,7 +2683,11 @@ mod tests {
             },
         );
 
-        assert!(session.settle_empty_stream("test-empty").await);
+        assert!(
+            session
+                .settle_empty_stream("test-empty", &unchanged_heartbeat())
+                .await
+        );
         assert!(session.is_closed());
         assert!(session.is_settled());
         assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 1);
@@ -2189,7 +2711,11 @@ mod tests {
             },
         );
 
-        assert!(!session.settle_empty_stream("test-empty").await);
+        assert!(
+            !session
+                .settle_empty_stream("test-empty", &unchanged_heartbeat())
+                .await
+        );
         assert!(
             session.is_closed(),
             "failed seller_timeout must close the local API route to a second request"
@@ -2222,7 +2748,11 @@ mod tests {
             },
         );
 
-        assert!(session.settle_seller_stalls_mid_stream("test-stall").await);
+        assert!(
+            session
+                .settle_seller_stalls_mid_stream("test-stall", &unchanged_heartbeat())
+                .await
+        );
         assert!(session.is_closed());
         assert!(session.is_settled());
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 1);
@@ -2245,7 +2775,11 @@ mod tests {
             },
         );
 
-        assert!(!session.settle_dead_gateway("test-next").await);
+        assert!(
+            !session
+                .settle_dead_gateway("test-next", &unchanged_heartbeat())
+                .await
+        );
         assert!(
             session.is_closed(),
             "unsupported next_seller must close the local API route to a second request"
@@ -2376,7 +2910,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_policy_is_shared_by_openai_and_anthropic() {
+    fn issue_547_recovery_policy_is_shared_by_openai_and_anthropic() {
         let openai = include_str!("openai.rs");
         let anthropic = include_str!("anthropic.rs");
         for source in [openai, anthropic] {
@@ -2384,9 +2918,16 @@ mod tests {
                 source.contains("handle_stream_error_policy(&deal, received"),
                 "both consumer surfaces must route stream errors through the shared  classifier"
             );
+            assert!(
+                source.contains("let reclaim_heartbeat = deal.accepted_output_guard();")
+                    && source
+                        .contains("settle_dead_gateway(\"dead-gateway\", &reclaim_heartbeat)",),
+                "both consumer surfaces must use the same guarded dead-gateway reclaim path"
+            );
         }
         let api = include_str!("mod.rs");
-        assert!(api.contains("settle_dead_gateway(\"stream-error-before-token\")"));
-        assert!(api.contains("settle_seller_stalls_mid_stream(\"seller-stalls-mid-stream\")"));
+        assert!(api.contains("settle_dead_gateway(\"stream-error-before-token\", &heartbeat)"));
+        assert!(api
+            .contains("settle_seller_stalls_mid_stream(\"seller-stalls-mid-stream\", &heartbeat)"));
     }
 }

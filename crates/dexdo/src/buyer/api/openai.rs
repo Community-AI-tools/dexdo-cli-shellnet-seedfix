@@ -5,7 +5,7 @@
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
     handle_stream_error_policy, request_token_limit, ApiDeal, ApiState, ConsumerRequestGuard,
-    DeadGatewayAction, DealInitError,
+    DeadGatewayAction, DealInitError, StreamErrorPolicyAction,
 };
 use crate::buyer::render::{self, OpenAiChatRequest};
 use axum::extract::State;
@@ -44,7 +44,7 @@ pub async fn chat_completions(
         Ok(deal) => deal,
         Err(error) => return deal_init_rejection(&error),
     };
-    let request_guard = deal.begin_request(now_secs());
+    let mut request_guard = deal.begin_request(now_secs());
     // Session-scoped lifecycle: once the local deal is closed (terminal settlement landed or policy
     // recovery is pending) no new request may open a stream on the closed deal.
     if deal.session.is_closed() {
@@ -80,6 +80,8 @@ pub async fn chat_completions(
     let id = completion_id();
     let model = state.frame_model.clone();
     let created = now_secs();
+    let reclaim_heartbeat = deal.accepted_output_guard();
+    request_guard.arm_upstream_failure();
 
     // Open an authorized TLS gRPC stream to the(mock) seller with the canonical request(R1).
     let upstream = match state
@@ -106,7 +108,9 @@ pub async fn chat_completions(
                 {
                     Ok(s) => s,
                     Err(second) => {
-                        deal.session.settle_dead_gateway("dead-gateway").await;
+                        deal.session
+                            .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
+                            .await;
                         return reject(
                             StatusCode::BAD_GATEWAY,
                             &format!("upstream open failed after retry: {second}"),
@@ -114,7 +118,9 @@ pub async fn chat_completions(
                     }
                 }
             } else {
-                deal.session.settle_dead_gateway("dead-gateway").await;
+                deal.session
+                    .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
+                    .await;
                 return reject(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream open failed: {e}"),
@@ -163,11 +169,15 @@ fn sse_response(
     created: u64,
     max_tokens: u64,
     deal: ApiDeal,
-    request_guard: ConsumerRequestGuard,
+    mut request_guard: ConsumerRequestGuard,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let sse = async_stream::stream! {
-        let _request_guard = request_guard;
-        let mut driver = CanonStreamDriver::new(upstream, model.clone(), max_tokens);
+        let mut driver = CanonStreamDriver::new(
+            upstream,
+            deal.session.closed_receiver(),
+            model.clone(),
+            max_tokens,
+        );
         let mut first = true;
         let mut stream_error = None;
         loop {
@@ -200,9 +210,18 @@ fn sse_response(
         if bailed {
             deal.session.settle_verification_bail("verify-bail").await;
         } else if let Some(e) = &stream_error {
-            handle_stream_error_policy(&deal, received, e).await;
+            if handle_stream_error_policy(&deal, received, e).await
+                == StreamErrorPolicyAction::RequestScoped
+            {
+                request_guard.complete();
+            }
         } else if received == 0 {
-            deal.session.settle_empty_stream("empty-stream").await;
+            let heartbeat = deal.accepted_output_guard();
+            deal.session
+                .settle_empty_stream("empty-stream", &heartbeat)
+                .await;
+        } else {
+            request_guard.complete();
         }
         // the terminal chunk does NOT pass off a bail or an upstream error as a clean `stop` --
         // bail -> `content_filter`, transport error -> `error`, otherwise an honest `stop`.
@@ -246,10 +265,15 @@ async fn aggregate_response(
     created: u64,
     max_tokens: u64,
     deal: ApiDeal,
-    _request_guard: ConsumerRequestGuard,
+    mut request_guard: ConsumerRequestGuard,
 ) -> Response {
     let mut content = String::new();
-    let mut driver = CanonStreamDriver::new(upstream, model.clone(), max_tokens);
+    let mut driver = CanonStreamDriver::new(
+        upstream,
+        deal.session.closed_receiver(),
+        model.clone(),
+        max_tokens,
+    );
     let mut stream_error = None;
     loop {
         let chunk = match driver.next().await {
@@ -274,12 +298,20 @@ async fn aggregate_response(
     if bailed {
         deal.session.settle_verification_bail("verify-bail").await;
     } else if let Some(e) = stream_error {
-        handle_stream_error_policy(&deal, received, &e).await;
+        if handle_stream_error_policy(&deal, received, &e).await
+            == StreamErrorPolicyAction::RequestScoped
+        {
+            request_guard.complete();
+        }
         return reject(StatusCode::BAD_GATEWAY, &format!("stream error: {e}"));
     } else if received == 0 {
-        deal.session.settle_empty_stream("empty-stream").await;
+        let heartbeat = deal.accepted_output_guard();
+        deal.session
+            .settle_empty_stream("empty-stream", &heartbeat)
+            .await;
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
+    request_guard.complete();
     // verification bail -> `content_filter`, so the consumer can tell an aborted response apart.
     let finish_reason = if bailed { "content_filter" } else { "stop" };
     let body = render::openai_completion(&id, &model, created, &content, finish_reason);

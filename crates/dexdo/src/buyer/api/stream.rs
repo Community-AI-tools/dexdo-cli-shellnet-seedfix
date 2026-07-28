@@ -12,6 +12,7 @@ pub(super) enum CanonStreamNext {
 
 pub(super) struct CanonStreamDriver {
     upstream: tonic::Streaming<CanonChunk>,
+    session_closed: tokio::sync::watch::Receiver<bool>,
     verifier: StreamVerifier,
     received: u64,
     max_tokens: u64,
@@ -21,11 +22,13 @@ pub(super) struct CanonStreamDriver {
 impl CanonStreamDriver {
     pub(super) fn new(
         upstream: tonic::Streaming<CanonChunk>,
+        session_closed: tokio::sync::watch::Receiver<bool>,
         expected_model: String,
         max_tokens: u64,
     ) -> Self {
         Self {
             upstream,
+            session_closed,
             verifier: StreamVerifier::with_expected_model(expected_model),
             received: 0,
             max_tokens,
@@ -34,7 +37,23 @@ impl CanonStreamDriver {
     }
 
     pub(super) async fn next(&mut self) -> CanonStreamNext {
-        match self.upstream.next().await {
+        if *self.session_closed.borrow() {
+            return CanonStreamNext::Errored(
+                "deal session closed after accepted-output deadline".to_string(),
+            );
+        }
+        let next = tokio::select! {
+            next = self.upstream.next() => next,
+            changed = self.session_closed.changed() => {
+                if changed.is_ok() && *self.session_closed.borrow() {
+                    return CanonStreamNext::Errored(
+                        "deal session closed after accepted-output deadline".to_string(),
+                    );
+                }
+                self.upstream.next().await
+            }
+        };
+        match next {
             Some(Ok(chunk)) => {
                 if let Verdict::Bail(reason) = self.verifier.verify(&chunk) {
                     tracing::warn!(%reason, "verify: bail -- bailing off the stream (B10)");

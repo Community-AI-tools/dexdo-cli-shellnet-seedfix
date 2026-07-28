@@ -1183,9 +1183,28 @@ pub(crate) fn write_private_atomic_via_temp(path: &Path, tmp: &Path, bytes: &[u8
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, READ_CONTROL, WRITE_DAC};
+        opts.access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+        opts.share_mode(FILE_SHARE_DELETE);
+    }
     let mut f = opts
         .open(tmp)
         .map_err(|e| anyhow!("create temp secret file {}: {e}", tmp.display()))?;
+    #[cfg(windows)]
+    if let Err(error) = crate::cli::windows_secret_file::protect_owner_only(&f, tmp) {
+        drop(f);
+        return match std::fs::remove_file(tmp) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(anyhow!(
+                "{error}; remove empty temp secret file {} after ACL failure: {cleanup_error}",
+                tmp.display()
+            )),
+        };
+    }
     if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
         let _ = std::fs::remove_file(tmp);
         return Err(anyhow!("write temp secret file {}: {e}", tmp.display()));
@@ -2122,6 +2141,24 @@ mod note_deploy_tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "recovery file must be 0600");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_atomic_replacement_preserves_0600_and_complete_content() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, _cleanup) = temp_dir("dexdo-private-atomic-replacement-test");
+        let path = dir.join("pn_pool.json");
+        write_private_atomic(&path, b"first").unwrap();
+        write_private_atomic(&path, b"replacement-content-with-complete-tail").unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"replacement-content-with-complete-tail"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "replacement secret file must remain 0600");
     }
 
     /// Public regression: a successful deploy may replace an owner-only stale attempt because no wallet

@@ -484,9 +484,28 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, READ_CONTROL, WRITE_DAC};
+        opts.access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+        opts.share_mode(FILE_SHARE_DELETE);
+    }
     let mut f = opts
         .open(&tmp)
         .map_err(|e| anyhow::anyhow!("create temp handle {}: {e}", tmp.display()))?;
+    #[cfg(windows)]
+    if let Err(error) = crate::cli::windows_secret_file::protect_owner_only(&f, &tmp) {
+        drop(f);
+        return match std::fs::remove_file(&tmp) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "{error}; remove empty temp handle {} after ACL failure: {cleanup_error}",
+                tmp.display()
+            )),
+        };
+    }
     if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::anyhow!("write temp handle {}: {e}", tmp.display()));
@@ -548,6 +567,17 @@ mod tests {
         assert!(!json.to_ascii_lowercase().contains("secret"), "{json}");
         let parsed: DealHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, h);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deal_handle_file_remains_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = save_deal_handle(temp.path(), &sample_handle()).unwrap();
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "deal handle must remain 0600");
     }
 
     #[test]

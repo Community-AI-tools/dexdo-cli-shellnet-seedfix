@@ -3880,7 +3880,11 @@ async fn apply_oneshot_dead_gateway_policy(
         );
         return OneShotStreamPolicyOutcome::RetryCurrent;
     }
-    let submitted = session.settle_dead_gateway("dead-gateway").await;
+    let heartbeat =
+        dexdo_core::chain::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let submitted = session
+        .settle_dead_gateway("dead-gateway", &heartbeat)
+        .await;
     OneShotStreamPolicyOutcome::TerminalReport(oneshot_stream_policy_report(
         "dead_gateway",
         action,
@@ -3897,7 +3901,11 @@ async fn apply_oneshot_empty_stream_policy(
     let action = buyer_policy
         .map(|policy| policy.empty_stream.as_str())
         .unwrap_or("reclaim");
-    let submitted = session.settle_empty_stream("empty-stream").await;
+    let heartbeat =
+        dexdo_core::chain::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let submitted = session
+        .settle_empty_stream("empty-stream", &heartbeat)
+        .await;
     oneshot_stream_policy_report("empty_stream", action, token_contract, submitted)
 }
 
@@ -4023,26 +4031,70 @@ fn buyer_monitor_current_facts(
     DealFacts::closed(token_contract)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuyerMonitorRecoveryKind {
-    CleanupUnopened,
-    ReclaimOpened,
+type BuyerMonitorRecoveryKind = dexdo::buyer::api::RecoveryKind;
+
+fn buyer_monitor_recovery_is_terminal(
+    kind: BuyerMonitorRecoveryKind,
+    state: Option<&DealChainState>,
+) -> bool {
+    match (kind, state) {
+        (_, None) => true,
+        (BuyerMonitorRecoveryKind::CleanupUnopened, Some(state)) => !state.funded,
+        (BuyerMonitorRecoveryKind::ReclaimOpened, Some(state)) => !state.opened && !state.disputed,
+    }
+}
+
+fn on_demand_monitor_defers_buy(
+    enabled: bool,
+    action: &dexdo::buyer::continuity::BuyerAction,
+) -> bool {
+    use dexdo::buyer::continuity::BuyerAction;
+
+    enabled
+        && matches!(
+            action,
+            BuyerAction::PlaceNextDeal { .. } | BuyerAction::PrepareNextDeal { .. }
+        )
+}
+
+#[cfg(not(test))]
+fn buyer_monitor_poll_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+}
+
+#[cfg(test)]
+fn buyer_monitor_poll_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(10)
+}
+
+#[cfg(not(test))]
+fn buyer_monitor_recovery_backoff() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+#[cfg(test)]
+fn buyer_monitor_recovery_backoff() -> std::time::Duration {
+    std::time::Duration::from_millis(200)
 }
 
 async fn execute_buyer_monitor_recovery(
     chain: &dyn ChainBackend,
     action: dexdo::buyer::continuity::BuyerAction,
     heartbeat: Option<&dexdo_core::chain::HeartbeatGuard>,
+    session: Option<&dexdo::buyer::api::SessionSettle>,
 ) -> Option<(
     BuyerMonitorRecoveryKind,
     dexdo_core::TokenContract,
-    Result<Settlement, ChainError>,
+    Result<Option<Settlement>, ChainError>,
 )> {
     use dexdo::buyer::continuity::BuyerAction;
 
     match action {
         BuyerAction::CleanupUnopened { token_contract } => {
-            let result = chain.cleanup_unopened(&token_contract).await;
+            let result = match session {
+                Some(session) => session.recover_cleanup_unopened(false).await,
+                None => chain.cleanup_unopened(&token_contract).await.map(Some),
+            };
             Some((
                 BuyerMonitorRecoveryKind::CleanupUnopened,
                 token_contract,
@@ -4050,27 +4102,20 @@ async fn execute_buyer_monitor_recovery(
             ))
         }
         BuyerAction::ReclaimOpened { token_contract } => {
-            let result = match heartbeat {
-                Some(heartbeat) => {
+            let heartbeat = heartbeat?;
+            let result = match session {
+                Some(session) => session.recover_reclaim_opened(heartbeat, false).await,
+                None => {
                     chain
                         .seller_timeout_if_heartbeat(&token_contract, heartbeat)
                         .await
                 }
-                None => chain.seller_timeout(&token_contract).await.map(Some),
             };
-            match result {
-                Ok(Some(settlement)) => Some((
-                    BuyerMonitorRecoveryKind::ReclaimOpened,
-                    token_contract,
-                    Ok(settlement),
-                )),
-                Ok(None) => None,
-                Err(error) => Some((
-                    BuyerMonitorRecoveryKind::ReclaimOpened,
-                    token_contract,
-                    Err(error),
-                )),
-            }
+            Some((
+                BuyerMonitorRecoveryKind::ReclaimOpened,
+                token_contract,
+                result,
+            ))
         }
         _ => None,
     }
@@ -4151,9 +4196,16 @@ fn spawn_buyer_service_renewal(
         current: dexdo_core::TokenContract,
         retry_at: std::time::Instant,
     }
+    struct RecoveryRetry {
+        current: dexdo_core::TokenContract,
+        kind: BuyerMonitorRecoveryKind,
+        retry_at: std::time::Instant,
+    }
 
     const RENEWAL_FAILURE_BACKOFF_SECS: u64 = 30;
     const CONSUMER_DEMAND_RECENT_SECS: u64 = 30;
+    let on_demand_recovery =
+        continuity_mode == dexdo::buyer::continuity::ContinuityMode::OnDemand && deals.is_lazy();
 
     tokio::spawn(async move {
         use dexdo::buyer::continuity::{
@@ -4167,8 +4219,9 @@ fn spawn_buyer_service_renewal(
         };
         let mut pending: Option<PendingRenewal> = None;
         let mut prepare_retry: Option<PrepareRetry> = None;
+        let mut recovery_retry: Option<RecoveryRetry> = None;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(buyer_monitor_poll_interval()).await;
             let Some(active) = deals.current().await else {
                 continue;
             };
@@ -4179,7 +4232,71 @@ fn spawn_buyer_service_renewal(
             {
                 prepare_retry = None;
             }
-            let chain_state = match chain.deal_state(&current_tc).await {
+            if recovery_retry
+                .as_ref()
+                .is_some_and(|retry| retry.current != current_tc)
+            {
+                recovery_retry = None;
+            }
+            if recovery_retry.is_none() {
+                if let Some(kind) = active.session.take_handler_recovery_reconciliation() {
+                    recovery_retry = Some(RecoveryRetry {
+                        current: current_tc.clone(),
+                        kind,
+                        retry_at: std::time::Instant::now() + buyer_monitor_recovery_backoff(),
+                    });
+                }
+            }
+            if recovery_retry
+                .as_ref()
+                .is_some_and(|retry| std::time::Instant::now() < retry.retry_at)
+            {
+                continue;
+            }
+
+            let chain_state_read = chain.deal_state(&current_tc).await;
+            if let Some(retry) = recovery_retry.as_mut() {
+                let recovery_kind = retry.kind;
+                match &chain_state_read {
+                    Err(error) => {
+                        retry.retry_at =
+                            std::time::Instant::now() + buyer_monitor_recovery_backoff();
+                        tracing::warn!(
+                            token_contract = %current_tc,
+                            recovery_action = ?retry.kind,
+                            error = %error,
+                            backoff_ms = buyer_monitor_recovery_backoff().as_millis(),
+                            outcome = "chain_state_retry",
+                            "buyer continuity: recovery retry needs authoritative fresh deal state"
+                        );
+                        continue;
+                    }
+                    Ok(state)
+                        if buyer_monitor_recovery_is_terminal(recovery_kind, state.as_ref()) =>
+                    {
+                        active
+                            .session
+                            .mark_recovered_serialized("continuity-recovery-observed-terminal")
+                            .await;
+                        planner.keep_active(&current_tc);
+                        pending = None;
+                        recovery_retry = None;
+                        tracing::warn!(
+                            token_contract = %current_tc,
+                            recovery_action = ?recovery_kind,
+                            outcome = "terminal_by_fact",
+                            "buyer continuity: recovery outcome confirmed from fresh chain state"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {
+                        planner.keep_active(&current_tc);
+                        recovery_retry = None;
+                    }
+                }
+            }
+
+            let chain_state = match chain_state_read {
                 Ok(state) => state,
                 Err(e) => {
                     tracing::warn!(
@@ -4226,10 +4343,11 @@ fn spawn_buyer_service_renewal(
                             cfg,
                         );
                         if let Some((_kind, token_contract, result)) =
-                            execute_buyer_monitor_recovery(chain.as_ref(), recovery, None).await
+                            execute_buyer_monitor_recovery(chain.as_ref(), recovery, None, None)
+                                .await
                         {
                             match result {
-                                Ok(settlement) => {
+                                Ok(Some(settlement)) => {
                                     tracing::warn!(
                                         current = %current_tc,
                                         next = %token_contract,
@@ -4237,6 +4355,7 @@ fn spawn_buyer_service_renewal(
                                         "buyer continuity: cleaned up renewal deal that never opened"
                                     );
                                 }
+                                Ok(None) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         current = %current_tc,
@@ -4285,6 +4404,15 @@ fn spawn_buyer_service_renewal(
                 continuity_mode,
                 consumer_demand,
             );
+            if on_demand_monitor_defers_buy(on_demand_recovery, &action) {
+                planner.clear_pending_next(&current_tc);
+                tracing::debug!(
+                    token_contract = %current_tc,
+                    outcome = "defer_buy_until_consumer_request",
+                    "buyer continuity: on-demand recovery monitor suppressed fresh BUY"
+                );
+                continue;
+            }
             match action {
                 BuyerAction::ServeCurrent { .. }
                 | BuyerAction::Noop { .. }
@@ -4301,43 +4429,111 @@ fn spawn_buyer_service_renewal(
                 }
                 action @ (BuyerAction::CleanupUnopened { .. }
                 | BuyerAction::ReclaimOpened { .. }) => {
+                    if on_demand_recovery && !active.session.is_closed() {
+                        if matches!(&action, BuyerAction::ReclaimOpened { .. })
+                            && active.has_active_request()
+                        {
+                            active.session.close_recovery_episode(
+                                BuyerMonitorRecoveryKind::ReclaimOpened,
+                                "active-consumer-request-without-accepted-output-at-stream-timeout",
+                            );
+                        } else {
+                            planner.keep_active(&current_tc);
+                            tracing::debug!(
+                                token_contract = %current_tc,
+                                outcome = "healthy_session_not_recoverable",
+                                "buyer continuity: on-demand recovery waits for a failed local session"
+                            );
+                            continue;
+                        }
+                    }
                     if let Some((kind, token_contract, result)) = execute_buyer_monitor_recovery(
                         chain.as_ref(),
                         action,
                         Some(&accepted_output_heartbeat),
+                        Some(active.session.as_ref()),
                     )
                     .await
                     {
                         match (kind, result) {
-                            (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(settlement)) => {
-                                active.session.mark_recovered("continuity-cleanup");
+                            (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(Some(settlement))) => {
                                 tracing::warn!(
                                     token_contract = %token_contract,
                                     settlement = ?settlement,
+                                    outcome = "terminal",
                                     "buyer continuity: cleaned current funded-never-opened deal"
                                 );
                             }
-                            (BuyerMonitorRecoveryKind::CleanupUnopened, Err(e)) => {
-                                tracing::warn!(
+                            (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(None)) => {
+                                tracing::debug!(
                                     token_contract = %token_contract,
-                                    error = %e,
-                                    "buyer continuity: cleanup current funded-never-opened deal failed"
+                                    outcome = "already_terminal",
+                                    "buyer continuity: cleanup recovery needed no transaction"
                                 );
                             }
-                            (BuyerMonitorRecoveryKind::ReclaimOpened, Ok(settlement)) => {
-                                active.session.mark_recovered("continuity-reclaim");
+                            (BuyerMonitorRecoveryKind::CleanupUnopened, Err(e)) => {
+                                if on_demand_recovery {
+                                    planner.keep_active(&token_contract);
+                                    recovery_retry = Some(RecoveryRetry {
+                                        current: token_contract.clone(),
+                                        kind,
+                                        retry_at: std::time::Instant::now()
+                                            + buyer_monitor_recovery_backoff(),
+                                    });
+                                    tracing::warn!(
+                                        token_contract = %token_contract,
+                                        error = %e,
+                                        backoff_ms = buyer_monitor_recovery_backoff().as_millis(),
+                                        outcome = "retry_scheduled",
+                                        "buyer continuity: cleanup current funded-never-opened deal failed"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        token_contract = %token_contract,
+                                        error = %e,
+                                        "buyer continuity: cleanup current funded-never-opened deal failed"
+                                    );
+                                }
+                            }
+                            (BuyerMonitorRecoveryKind::ReclaimOpened, Ok(Some(settlement))) => {
                                 tracing::warn!(
                                     token_contract = %token_contract,
                                     settlement = ?settlement,
+                                    outcome = "terminal",
                                     "buyer continuity: reclaimed current opened idle deal"
                                 );
                             }
-                            (BuyerMonitorRecoveryKind::ReclaimOpened, Err(e)) => {
-                                tracing::warn!(
+                            (BuyerMonitorRecoveryKind::ReclaimOpened, Ok(None)) => {
+                                planner.keep_active(&token_contract);
+                                tracing::info!(
                                     token_contract = %token_contract,
-                                    error = %e,
-                                    "buyer continuity: reclaim current opened idle deal failed"
+                                    outcome = "accepted_output_heartbeat_changed",
+                                    "buyer continuity: reclaim cancelled before submit"
                                 );
+                            }
+                            (BuyerMonitorRecoveryKind::ReclaimOpened, Err(e)) => {
+                                if on_demand_recovery {
+                                    planner.keep_active(&token_contract);
+                                    recovery_retry = Some(RecoveryRetry {
+                                        current: token_contract.clone(),
+                                        kind,
+                                        retry_at: std::time::Instant::now()
+                                            + buyer_monitor_recovery_backoff(),
+                                    });
+                                    tracing::warn!(
+                                        token_contract = %token_contract,
+                                        error = %e,
+                                        backoff_ms = buyer_monitor_recovery_backoff().as_millis(),
+                                        outcome = "retry_scheduled",
+                                        "buyer continuity: reclaim current opened idle deal failed"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        token_contract = %token_contract,
+                                        error = %e,
+                                        "buyer continuity: reclaim current opened idle deal failed"
+                                    );
+                                }
                             }
                         }
                         pending = None;
@@ -5319,7 +5515,10 @@ fn build_on_demand_buyer_api_state(
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     shellnet_preflight: BuyerShellnetPreflight,
+    pre_adopted_deal: Option<dexdo::buyer::api::ApiDeal>,
+    recover_terminal_model_deal: bool,
 ) -> dexdo::buyer::api::ApiState {
+    let raised_money = Arc::new(std::sync::Mutex::new(raised_money));
     let initializer = {
         let chain = chain.clone();
         let buyer = buyer.clone();
@@ -5341,7 +5540,10 @@ fn build_on_demand_buyer_api_state(
             let models_cfg = models_cfg.clone();
             let buyer_policy = buyer_policy.clone();
             let events = events.clone();
-            let raised_money = raised_money.clone();
+            let raised_money = raised_money
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             Box::pin(async move {
                 prepare_lazy_buyer_api_deal_with_replay_backoff(
                     chain,
@@ -5361,12 +5563,38 @@ fn build_on_demand_buyer_api_state(
             }) as dexdo::buyer::api::DealInitFuture
         }) as dexdo::buyer::api::DealInitializer
     };
-    dexdo::buyer::api::ApiState::lazy(
-        buyer,
-        frame_model,
-        initializer,
-        std::time::Duration::from_secs(DEAL_WAIT_SECS),
-    )
+    let initializer_timeout = std::time::Duration::from_secs(DEAL_WAIT_SECS);
+    match (pre_adopted_deal, recover_terminal_model_deal) {
+        (Some(active), true) => dexdo::buyer::api::ApiState::recoverable_lazy_with_active(
+            buyer,
+            frame_model,
+            active,
+            initializer,
+            initializer_timeout,
+        ),
+        (Some(active), false) => dexdo::buyer::api::ApiState {
+            buyer,
+            frame_model,
+            deals: Arc::new(dexdo::buyer::api::RouteManager::new(active)),
+        },
+        (None, true) => dexdo::buyer::api::ApiState::recoverable_lazy(
+            buyer,
+            frame_model,
+            initializer,
+            initializer_timeout,
+        ),
+        (None, false) => {
+            dexdo::buyer::api::ApiState::lazy(buyer, frame_model, initializer, initializer_timeout)
+        }
+    }
+}
+
+fn model_only_on_demand_recovery_enabled(
+    _mock_chain: bool,
+    has_explicit_token_contract: bool,
+    has_market_manifest: bool,
+) -> bool {
+    !has_explicit_token_contract && !has_market_manifest
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5390,6 +5618,11 @@ async fn run_buyer_on_demand_local_api(
     let bind = args
         .local_listen
         .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
+    let recover_terminal_model_deal = model_only_on_demand_recovery_enabled(
+        args.mock.mock_chain,
+        explicit_tc.is_some(),
+        args.market.is_some(),
+    );
     let buyer = Arc::new(buyer);
     let args = Arc::new(args);
     let pre_adopted_deal = if args.resume {
@@ -5438,29 +5671,53 @@ async fn run_buyer_on_demand_local_api(
     )
     .await?;
 
-    let state = if let Some(deal) = pre_adopted_deal {
-        api::ApiState {
-            buyer,
-            frame_model: frame_model.clone(),
-            deals: Arc::new(api::RouteManager::new(deal)),
-        }
+    let initializer_args = if pre_adopted_deal.is_some() {
+        let mut args = args.as_ref().clone();
+        args.resume = false;
+        Arc::new(args)
     } else {
-        build_on_demand_buyer_api_state(
+        args.clone()
+    };
+    let initializer_raised_money = if pre_adopted_deal.is_none() {
+        raised_money
+    } else {
+        None
+    };
+    let state = build_on_demand_buyer_api_state(
+        chain.clone(),
+        buyer.clone(),
+        initializer_args,
+        explicit_tc,
+        frame_model.clone(),
+        content_check.clone(),
+        models_cfg.clone(),
+        buyer_policy,
+        api_failure_policy,
+        events.clone(),
+        initializer_raised_money,
+        shellnet_preflight,
+        pre_adopted_deal,
+        recover_terminal_model_deal,
+    );
+    let deals = state.deals.clone();
+    if recover_terminal_model_deal {
+        let escrow = args
+            .escrow
+            .unwrap_or_else(|| required_escrow_for_buy(args.ticks, args.max_price_per_tick));
+        spawn_buyer_service_renewal(
             chain,
             buyer,
-            args.clone(),
-            explicit_tc,
-            frame_model.clone(),
+            deals.clone(),
+            args.identity.note_addr.clone(),
+            args.ticks,
+            args.max_price_per_tick,
+            escrow,
+            dexdo::buyer::continuity::ContinuityMode::OnDemand,
             content_check,
             models_cfg,
-            buyer_policy,
             api_failure_policy,
-            events.clone(),
-            raised_money,
-            shellnet_preflight,
-        )
-    };
-    let deals = state.deals.clone();
+        );
+    }
     let (addr, task) = match api::serve(bind, state, args.anthropic_compat, shutdown).await {
         Ok(ok) => ok,
         Err(err) => {
@@ -9053,6 +9310,7 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    /// both established credential flags resolve to the same direct funding key.
     #[test]
     fn note_deploy_seed_file_matches_key_file_input() {
         let phrase = tvm_tonos_fixture_phrase();
@@ -9092,6 +9350,7 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    /// direct funding credential failures must not disclose seed input.
     #[test]
     fn note_deploy_seed_file_errors_do_not_echo_seed_input() {
         let dir = std::env::temp_dir().join(format!(
@@ -9158,6 +9417,36 @@ mod tests {
         assert!(!body.contains("pending_for"), "{body}");
     }
 
+    #[test]
+    fn issue_547_recovery_monitor_is_model_only_and_starts_before_serve() {
+        assert!(super::model_only_on_demand_recovery_enabled(
+            false, false, false
+        ));
+        assert!(super::model_only_on_demand_recovery_enabled(
+            true, false, false
+        ));
+        assert!(!super::model_only_on_demand_recovery_enabled(
+            false, true, false
+        ));
+        assert!(!super::model_only_on_demand_recovery_enabled(
+            false, false, true
+        ));
+
+        let source = include_str!("buyer.rs");
+        let start = source
+            .find("async fn run_buyer_on_demand_local_api")
+            .unwrap();
+        let end = source[start..]
+            .find("async fn run_buyer_inner")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert!(
+            body.find("spawn_buyer_service_renewal").unwrap() < body.find("api::serve").unwrap(),
+            "model-only recovery monitor must start before the local API serves requests"
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum ModelBuyFailure {
         Transport,
@@ -9186,6 +9475,15 @@ mod tests {
         subscription_inactive_order_id: Option<u128>,
         subscription_order_read_error_id: Option<u128>,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<dexdo::buyer::api::ApiDeal>>,
+        monitor_state_enabled: std::sync::atomic::AtomicBool,
+        monitor_deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
+        monitor_deal_state_calls: std::sync::atomic::AtomicUsize,
+        monitor_stream_timeout_secs: std::sync::atomic::AtomicU64,
+        cleanup_failures_remaining: std::sync::atomic::AtomicUsize,
+        reclaim_failures_remaining: std::sync::atomic::AtomicUsize,
+        reclaim_transport_failures_remaining: std::sync::atomic::AtomicUsize,
+        reclaim_ambiguous_remaining: std::sync::atomic::AtomicUsize,
+        reclaim_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl RecordingRecoveryChain {
@@ -9194,6 +9492,56 @@ mod tests {
                 deal_state: Some(state),
                 next_match: Some("tc-next".to_string()),
                 ..Self::default()
+            }
+        }
+
+        fn with_monitor_deal_state(state: dexdo_core::DealChainState) -> Self {
+            Self {
+                monitor_state_enabled: std::sync::atomic::AtomicBool::new(true),
+                monitor_deal_state: std::sync::Mutex::new(Some(state)),
+                monitor_stream_timeout_secs: std::sync::atomic::AtomicU64::new(1),
+                next_match: Some("tc-fresh".to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn consume_failure(counter: &std::sync::atomic::AtomicUsize) -> bool {
+            counter
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+        }
+
+        fn mark_monitor_reclaimed(&self) {
+            if self
+                .monitor_state_enabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                *self.monitor_deal_state.lock().unwrap() = Some(dexdo_core::DealChainState {
+                    funded: false,
+                    opened: false,
+                    disputed: false,
+                    probe_accepted: false,
+                    funded_time: None,
+                    last_advance: super::unix_now_secs(),
+                });
+            }
+        }
+
+        #[cfg(feature = "shellnet")]
+        fn set_monitor_deal_state(&self, state: dexdo_core::DealChainState) {
+            *self.monitor_deal_state.lock().unwrap() = Some(state);
+        }
+
+        async fn wait_before_reclaim_result(&self) {
+            let delay_ms = self
+                .reclaim_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if delay_ms != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }
     }
@@ -9307,6 +9655,24 @@ mod tests {
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             self.reclaim_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wait_before_reclaim_result().await;
+            if Self::consume_failure(&self.reclaim_ambiguous_remaining) {
+                self.mark_monitor_reclaimed();
+                return Err(dexdo_core::ChainError::Transport(
+                    "injected ambiguous reclaim result".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_failures_remaining) {
+                return Err(dexdo_core::ChainError::Contract(
+                    "injected early reclaim rejection".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_transport_failures_remaining) {
+                return Err(dexdo_core::ChainError::Transport(
+                    "injected transient reclaim transport failure".to_string(),
+                ));
+            }
+            self.mark_monitor_reclaimed();
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
                 seller_bond_returned: 0,
@@ -9331,6 +9697,24 @@ mod tests {
             }
             self.reclaim_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wait_before_reclaim_result().await;
+            if Self::consume_failure(&self.reclaim_ambiguous_remaining) {
+                self.mark_monitor_reclaimed();
+                return Err(dexdo_core::ChainError::Transport(
+                    "injected ambiguous reclaim result".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_failures_remaining) {
+                return Err(dexdo_core::ChainError::Contract(
+                    "injected early reclaim rejection".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_transport_failures_remaining) {
+                return Err(dexdo_core::ChainError::Transport(
+                    "injected transient reclaim transport failure".to_string(),
+                ));
+            }
+            self.mark_monitor_reclaimed();
             Ok(Some(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
                 seller_bond_returned: 0,
@@ -9343,6 +9727,17 @@ mod tests {
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             self.cleanup_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if Self::consume_failure(&self.cleanup_failures_remaining) {
+                return Err(dexdo_core::ChainError::Contract(
+                    "injected early cleanup rejection".to_string(),
+                ));
+            }
+            if self
+                .monitor_state_enabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                *self.monitor_deal_state.lock().unwrap() = None;
+            }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
                 seller_bond_returned: 0,
@@ -9437,9 +9832,42 @@ mod tests {
 
         async fn deal_state(
             &self,
-            _token_contract: &dexdo_core::TokenContract,
+            token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            if self
+                .monitor_state_enabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.monitor_deal_state_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if token_contract == "tc-fresh" {
+                    return Ok(Some(dexdo_core::DealChainState {
+                        funded: true,
+                        opened: true,
+                        disputed: false,
+                        probe_accepted: false,
+                        funded_time: Some(1),
+                        last_advance: super::unix_now_secs(),
+                    }));
+                }
+                return Ok(*self.monitor_deal_state.lock().unwrap());
+            }
             Ok(self.deal_state)
+        }
+
+        async fn deal_stream_timeout(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<u64, dexdo_core::ChainError> {
+            if self
+                .monitor_state_enabled
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(self
+                    .monitor_stream_timeout_secs
+                    .load(std::sync::atomic::Ordering::SeqCst));
+            }
+            Ok(600)
         }
 
         async fn snapshot(
@@ -9448,6 +9876,812 @@ mod tests {
         ) -> Option<dexdo_core::StreamSnapshot> {
             self.snapshot.clone()
         }
+    }
+
+    fn start_on_demand_recovery_runtime(
+        chain: std::sync::Arc<RecordingRecoveryChain>,
+        buyer: std::sync::Arc<dexdo::buyer::Buyer>,
+        token_contract: &str,
+        initial_handover: dexdo_core::Handover,
+        fresh_handover: dexdo_core::Handover,
+    ) -> (
+        dexdo::buyer::api::ApiState,
+        std::sync::Arc<dexdo::buyer::api::RouteManager>,
+        std::sync::Arc<dexdo::buyer::api::SessionSettle>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let note = buyer.note.clone();
+        let policy = dexdo::buyer::api::BuyerApiFailurePolicy {
+            dead_gateway: dexdo::buyer::api::DeadGatewayAction::RetryThenReclaim,
+            ..dexdo::buyer::api::BuyerApiFailurePolicy::default()
+        };
+        let session =
+            std::sync::Arc::new(dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+                chain.clone(),
+                token_contract.to_string(),
+                note.clone(),
+                policy,
+            ));
+        let active = dexdo::buyer::api::ApiDeal::new(
+            dexdo::buyer::api::Route {
+                handover: initial_handover,
+                token_contract: token_contract.to_string(),
+                max_tokens: 100,
+            },
+            session.clone(),
+            std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
+        );
+        let init_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let init_calls_for_initializer = init_calls.clone();
+        let chain_for_initializer = chain.clone();
+        let note_for_initializer = note.clone();
+        let routes = std::sync::Arc::new(
+            dexdo::buyer::api::RouteManager::recoverable_lazy_with_active(
+                active,
+                std::sync::Arc::new(move || {
+                    let init_calls = init_calls_for_initializer.clone();
+                    let chain = chain_for_initializer.clone();
+                    let note = note_for_initializer.clone();
+                    let fresh_handover = fresh_handover.clone();
+                    Box::pin(async move {
+                        init_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        dexdo_core::ChainBackend::place_buy_by_model(
+                            chain.as_ref(),
+                            note.as_ref(),
+                            2,
+                            1,
+                            2,
+                        )
+                        .await
+                        .map_err(|error| {
+                            dexdo::buyer::api::DealInitError::new(error.to_string())
+                        })?;
+                        let session = std::sync::Arc::new(
+                            dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+                                chain.clone(),
+                                "tc-fresh".to_string(),
+                                note,
+                                policy,
+                            ),
+                        );
+                        Ok(dexdo::buyer::api::ApiDeal::new(
+                            dexdo::buyer::api::Route {
+                                handover: fresh_handover,
+                                token_contract: "tc-fresh".to_string(),
+                                max_tokens: 100,
+                            },
+                            session,
+                            std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
+                        ))
+                    }) as dexdo::buyer::api::DealInitFuture
+                }),
+                std::time::Duration::from_secs(1),
+            ),
+        );
+        let state = dexdo::buyer::api::ApiState {
+            buyer: buyer.clone(),
+            frame_model: "qwen--qwen3--32b".to_string(),
+            deals: routes.clone(),
+        };
+        super::spawn_buyer_service_renewal(
+            chain,
+            buyer,
+            routes.clone(),
+            None,
+            2,
+            1,
+            2,
+            dexdo::buyer::continuity::ContinuityMode::OnDemand,
+            dexdo::buyer::api::ContentCheck::Skip,
+            std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
+            policy,
+        );
+        (state, routes, session, init_calls)
+    }
+
+    fn start_on_demand_recovery_monitor(
+        chain: std::sync::Arc<RecordingRecoveryChain>,
+        token_contract: &str,
+    ) -> (
+        std::sync::Arc<dexdo::buyer::api::RouteManager>,
+        std::sync::Arc<dexdo::buyer::api::SessionSettle>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let buyer = std::sync::Arc::new(dexdo::buyer::Buyer::generate());
+        let (_state, routes, session, init_calls) = start_on_demand_recovery_runtime(
+            chain,
+            buyer,
+            token_contract,
+            dexdo_core::Handover {
+                endpoint: "https://127.0.0.1:1".to_string(),
+                tls_fingerprint: "00".repeat(32),
+            },
+            dexdo_core::Handover {
+                endpoint: "https://127.0.0.1:2".to_string(),
+                tls_fingerprint: "11".repeat(32),
+            },
+        );
+        (routes, session, init_calls)
+    }
+
+    async fn wait_for_counter(
+        counter: &std::sync::atomic::AtomicUsize,
+        expected: usize,
+        label: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while counter.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}={expected}"));
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Clone, Copy)]
+    enum Issue547ProviderBehavior {
+        HangWithoutOutput,
+        FailAfterTwoRequests,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Clone)]
+    struct Issue547ProviderState {
+        behavior: Issue547ProviderBehavior,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        failure_barrier: std::sync::Arc<tokio::sync::Barrier>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn issue_547_provider_response(
+        axum::extract::State(state): axum::extract::State<Issue547ProviderState>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match state.behavior {
+            Issue547ProviderBehavior::HangWithoutOutput => {
+                std::future::pending::<axum::response::Response>().await
+            }
+            Issue547ProviderBehavior::FailAfterTwoRequests => {
+                state.failure_barrier.wait().await;
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "injected provider failure",
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn start_issue_547_provider(
+        behavior: Issue547ProviderBehavior,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Issue547ProviderState {
+            behavior,
+            calls: calls.clone(),
+            failure_barrier: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+        };
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(issue_547_provider_response))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind  provider");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, calls, task)
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn start_issue_547_gateway(
+        upstream: dexdo::seller::UpstreamConfig,
+        buyer: &dexdo::buyer::Buyer,
+        token_contract: &str,
+    ) -> (dexdo::seller::RunningSeller, dexdo_core::Handover) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve  gateway port");
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let seller = dexdo::seller::start_gateway_with(addr, upstream)
+            .await
+            .expect("start  TLS gateway");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(" TLS gateway binds");
+        seller.state.register_stream(
+            token_contract,
+            buyer.note.pubkey(),
+            8,
+            2,
+            dexdo_core::DobParams::canonical().tick_size,
+        );
+        let handover = dexdo_core::Handover {
+            endpoint: format!("https://{addr}"),
+            tls_fingerprint: seller.tls_fingerprint.clone(),
+        };
+        (seller, handover)
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn issue_547_http_request(
+        client: reqwest::Client,
+        api_addr: std::net::SocketAddr,
+        anthropic: bool,
+        prompt: &'static str,
+    ) -> reqwest::Response {
+        let (path, body) = if anthropic {
+            (
+                "/v1/messages",
+                serde_json::json!({
+                    "model": "qwen--qwen3--32b",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1,
+                    "stream": false
+                }),
+            )
+        } else {
+            (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "qwen--qwen3--32b",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1,
+                    "stream": false
+                }),
+            )
+        };
+        client
+            .post(format!("http://{api_addr}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{path} request failed: {error}"))
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn wait_for_issue_547_terminal(session: &dexdo::buyer::api::SessionSettle) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !session.is_settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(" recovery becomes terminal");
+    }
+
+    #[tokio::test]
+    async fn issue_547_healthy_paused_on_demand_session_is_not_reclaimed() {
+        use std::sync::atomic::Ordering;
+
+        let now = super::unix_now_secs();
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: now.saturating_sub(10),
+            },
+        ));
+        let (_routes, session, init_calls) =
+            start_on_demand_recovery_monitor(chain.clone(), "tc-healthy-paused");
+
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(!session.is_closed());
+        assert!(!session.is_settled());
+        assert_eq!(
+            chain.cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "healthy on-demand session must not be cleaned up between requests"
+        );
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            0,
+            "healthy on-demand session past streamTimeout must not be reclaimed between requests"
+        );
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn issue_547_closed_failed_session_reclaims_then_next_requests_buy_once() {
+        use std::sync::atomic::Ordering;
+
+        let now = super::unix_now_secs();
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: now.saturating_sub(10),
+            },
+        ));
+        chain.reclaim_failures_remaining.store(1, Ordering::SeqCst);
+        chain
+            .reclaim_transport_failures_remaining
+            .store(1, Ordering::SeqCst);
+        let (routes, session, init_calls) =
+            start_on_demand_recovery_monitor(chain.clone(), "tc-dead");
+
+        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        assert!(
+            !session
+                .settle_dead_gateway("dead-gateway", &heartbeat)
+                .await
+        );
+        assert!(session.is_closed());
+        assert!(!session.is_settled());
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+
+        wait_for_counter(&chain.reclaim_calls, 2, "reclaim attempts").await;
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            2,
+            "monitor ticks inside recovery backoff must not POST"
+        );
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !session.is_settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reclaim retry becomes terminal");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 3);
+        assert!(
+            chain.monitor_deal_state_calls.load(Ordering::SeqCst) >= 2,
+            "each retry must use fresh chain state"
+        );
+        assert!(!session.mark_recovered("duplicate-terminal"));
+        assert_eq!(
+            chain.place_next_calls.load(Ordering::SeqCst),
+            0,
+            "terminal recovery alone must not BUY"
+        );
+        assert!(
+            super::on_demand_monitor_defers_buy(
+                true,
+                &dexdo::buyer::continuity::BuyerAction::PlaceNextDeal {
+                    reason: "closed-current",
+                },
+            ),
+            "on-demand monitor must suppress planner PlaceNextDeal"
+        );
+        assert!(!super::on_demand_monitor_defers_buy(
+            false,
+            &dexdo::buyer::continuity::BuyerAction::PlaceNextDeal {
+                reason: "closed-current",
+            },
+        ));
+
+        let mut requests = Vec::new();
+        for _ in 0..16 {
+            let routes = routes.clone();
+            requests.push(tokio::spawn(async move {
+                routes
+                    .current_or_prepare()
+                    .await
+                    .unwrap()
+                    .route
+                    .token_contract
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap(), "tc-fresh");
+        }
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn issue_547_cleanup_clears_stale_latch_and_retries() {
+        use std::sync::atomic::Ordering;
+
+        let mut chain =
+            RecordingRecoveryChain::with_monitor_deal_state(dexdo_core::DealChainState {
+                funded: true,
+                opened: false,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: 0,
+            });
+        chain.stop_error = Some("injected failed-request STOP".to_string());
+        let chain = std::sync::Arc::new(chain);
+        chain.cleanup_failures_remaining.store(1, Ordering::SeqCst);
+        let (_routes, session, init_calls) =
+            start_on_demand_recovery_monitor(chain.clone(), "tc-unopened");
+
+        session
+            .settle("failed-request")
+            .await
+            .expect_err("failed request must leave the local session closed and recoverable");
+        assert!(session.is_closed());
+        assert!(!session.is_settled());
+
+        wait_for_counter(&chain.cleanup_calls, 1, "cleanup attempts").await;
+        assert!(!session.is_settled());
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            chain.cleanup_calls.load(Ordering::SeqCst),
+            1,
+            "monitor ticks inside cleanup backoff must not POST"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !session.is_settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cleanup retry becomes terminal");
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            chain.monitor_deal_state_calls.load(Ordering::SeqCst) >= 2,
+            "cleanup retry must use fresh chain state"
+        );
+        assert!(!session.mark_recovered("duplicate-terminal"));
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn issue_547_ambiguous_reclaim_is_confirmed_without_duplicate_post() {
+        use std::sync::atomic::Ordering;
+
+        let now = super::unix_now_secs();
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: now.saturating_sub(10),
+            },
+        ));
+        chain.reclaim_ambiguous_remaining.store(1, Ordering::SeqCst);
+        let (_routes, session, init_calls) =
+            start_on_demand_recovery_monitor(chain.clone(), "tc-ambiguous");
+
+        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        assert!(
+            !session
+                .settle_dead_gateway("dead-gateway", &heartbeat)
+                .await
+        );
+        assert!(session.is_closed());
+        assert!(!session.is_settled());
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !session.is_settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh state confirms ambiguous reclaim");
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            1,
+            "terminal by-fact confirmation must not duplicate reclaim"
+        );
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn issue_547_silent_openai_and_anthropic_requests_close_recover_and_replace_once() {
+        use std::sync::atomic::Ordering;
+
+        const KEY_ENV: &str = "DEXDO_ISSUE_547_SILENT_PROVIDER_KEY";
+        let _key = EnvVarGuard::set(KEY_ENV, std::ffi::OsStr::new("test-only"));
+        let (provider_addr, provider_calls, provider_task) =
+            start_issue_547_provider(Issue547ProviderBehavior::HangWithoutOutput).await;
+        let upstream = dexdo::seller::OpenAiConfig {
+            base_url: format!("http://{provider_addr}/v1"),
+            frame_model: "qwen--qwen3--32b".to_string(),
+            api_key_env: KEY_ENV.to_string(),
+            ..Default::default()
+        };
+
+        let buyer = std::sync::Arc::new(dexdo::buyer::Buyer::generate());
+        let (dead_seller, dead_handover) = start_issue_547_gateway(
+            dexdo::seller::UpstreamConfig::OpenAi(upstream),
+            buyer.as_ref(),
+            "tc-silent",
+        )
+        .await;
+        let (fresh_seller, fresh_handover) = start_issue_547_gateway(
+            dexdo::seller::UpstreamConfig::Mock,
+            buyer.as_ref(),
+            "tc-fresh",
+        )
+        .await;
+
+        let now = super::unix_now_secs();
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: now,
+            },
+        ));
+        chain.reclaim_failures_remaining.store(1, Ordering::SeqCst);
+        let (state, _routes, session, init_calls) = start_on_demand_recovery_runtime(
+            chain.clone(),
+            buyer,
+            "tc-silent",
+            dead_handover,
+            fresh_handover,
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (api_addr, api_task) =
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("bind  OpenAI/Anthropic API");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .unwrap();
+
+        let openai = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            false,
+            "silent OpenAI request",
+        ));
+        let anthropic = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            true,
+            "silent Anthropic request",
+        ));
+        wait_for_counter(&provider_calls, 2, "silent provider requests").await;
+        chain.set_monitor_deal_state(dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            funded_time: Some(1),
+            last_advance: now.saturating_sub(10),
+        });
+
+        let openai = openai.await.unwrap();
+        let anthropic = anthropic.await.unwrap();
+        assert_eq!(openai.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert_eq!(anthropic.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert!(session.is_closed());
+        assert_eq!(
+            init_calls.load(Ordering::SeqCst),
+            0,
+            "failed in-flight requests must not replace before terminal reclaim"
+        );
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+
+        wait_for_issue_547_terminal(session.as_ref()).await;
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            2,
+            "the deadline seam must retry one early reclaim from fresh facts"
+        );
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            chain.place_next_calls.load(Ordering::SeqCst),
+            0,
+            "terminal recovery alone must not buy"
+        );
+
+        dead_seller.server_task.abort();
+        provider_task.abort();
+        let next_openai = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            false,
+            "fresh OpenAI request",
+        ));
+        let next_anthropic = tokio::spawn(issue_547_http_request(
+            client,
+            api_addr,
+            true,
+            "fresh Anthropic request",
+        ));
+        let next_openai = next_openai.await.unwrap();
+        let next_anthropic = next_anthropic.await.unwrap();
+        assert_eq!(next_openai.status(), reqwest::StatusCode::OK);
+        assert_eq!(next_anthropic.status(), reqwest::StatusCode::OK);
+        let openai_body: serde_json::Value = next_openai.json().await.unwrap();
+        let anthropic_body: serde_json::Value = next_anthropic.json().await.unwrap();
+        assert!(openai_body["choices"].is_array(), "{openai_body}");
+        assert!(anthropic_body["content"].is_array(), "{anthropic_body}");
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            chain.place_next_calls.load(Ordering::SeqCst),
+            1,
+            "concurrent first requests after recovery must submit one BUY"
+        );
+
+        let _ = shutdown_tx.send(());
+        api_task.await.expect(" API joins");
+        fresh_seller.server_task.abort();
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn issue_547_handler_ambiguity_is_fact_confirmed_for_concurrent_http_requests() {
+        use std::sync::atomic::Ordering;
+
+        assert!(
+            super::model_only_on_demand_recovery_enabled(true, false, false),
+            "model-only mock-chain runtime must retain recovery and lazy route replacement"
+        );
+        const KEY_ENV: &str = "DEXDO_ISSUE_547_AMBIGUOUS_PROVIDER_KEY";
+        let _key = EnvVarGuard::set(KEY_ENV, std::ffi::OsStr::new("test-only"));
+        let (provider_addr, provider_calls, provider_task) =
+            start_issue_547_provider(Issue547ProviderBehavior::FailAfterTwoRequests).await;
+        let upstream = dexdo::seller::OpenAiConfig {
+            base_url: format!("http://{provider_addr}/v1"),
+            frame_model: "qwen--qwen3--32b".to_string(),
+            api_key_env: KEY_ENV.to_string(),
+            ..Default::default()
+        };
+
+        let buyer = std::sync::Arc::new(dexdo::buyer::Buyer::generate());
+        let (dead_seller, dead_handover) = start_issue_547_gateway(
+            dexdo::seller::UpstreamConfig::OpenAi(upstream),
+            buyer.as_ref(),
+            "tc-handler-ambiguous",
+        )
+        .await;
+        let (fresh_seller, fresh_handover) = start_issue_547_gateway(
+            dexdo::seller::UpstreamConfig::Mock,
+            buyer.as_ref(),
+            "tc-fresh",
+        )
+        .await;
+
+        let now = super::unix_now_secs();
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: now,
+            },
+        ));
+        chain.reclaim_ambiguous_remaining.store(1, Ordering::SeqCst);
+        chain.reclaim_delay_ms.store(100, Ordering::SeqCst);
+        let (state, _routes, session, init_calls) = start_on_demand_recovery_runtime(
+            chain.clone(),
+            buyer,
+            "tc-handler-ambiguous",
+            dead_handover,
+            fresh_handover,
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (api_addr, api_task) =
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("bind  ambiguous HTTP API");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .unwrap();
+
+        let openai = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            false,
+            "ambiguous OpenAI request",
+        ));
+        let anthropic = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            true,
+            "ambiguous Anthropic request",
+        ));
+        wait_for_counter(&provider_calls, 2, "ambiguous provider requests").await;
+        wait_for_counter(&chain.reclaim_calls, 1, "handler reclaim attempt").await;
+        chain.set_monitor_deal_state(dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            funded_time: Some(1),
+            last_advance: now.saturating_sub(10),
+        });
+        let openai = openai.await.unwrap();
+        let anthropic = anthropic.await.unwrap();
+        assert_eq!(openai.status(), reqwest::StatusCode::BAD_GATEWAY);
+        assert_eq!(anthropic.status(), reqwest::StatusCode::BAD_GATEWAY);
+        wait_for_issue_547_terminal(session.as_ref()).await;
+        assert!(session.is_closed());
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            1,
+            "the recovery episode must latch before the first ambiguous POST awaits"
+        );
+        assert_eq!(
+            chain.cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "terminal reclaim facts must not be reclassified as unopened cleanup"
+        );
+        assert!(
+            chain.monitor_deal_state_calls.load(Ordering::SeqCst) >= 1,
+            "handler ambiguity must reach the monitor's authoritative fact read"
+        );
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+
+        dead_seller.server_task.abort();
+        provider_task.abort();
+        let next_openai = tokio::spawn(issue_547_http_request(
+            client.clone(),
+            api_addr,
+            false,
+            "replacement OpenAI request",
+        ));
+        let next_anthropic = tokio::spawn(issue_547_http_request(
+            client,
+            api_addr,
+            true,
+            "replacement Anthropic request",
+        ));
+        assert_eq!(next_openai.await.unwrap().status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            next_anthropic.await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(());
+        api_task.await.expect(" API joins");
+        fresh_seller.server_task.abort();
     }
 
     #[test]
@@ -10517,16 +11751,21 @@ mod tests {
                 race_chain.as_ref(),
                 action.clone(),
                 Some(&race_heartbeat),
+                Some(race_deal.session.as_ref()),
             )
             .await
-            .is_none(),
+            .is_some_and(|(_, _, result)| matches!(result, Ok(None))),
             "newly accepted output must cancel reclaim immediately before submission"
         );
         assert_eq!(race_chain.reclaim_calls.load(Ordering::SeqCst), 0);
 
-        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
-            .await
-            .expect("reclaim action executes");
+        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let (kind, tc, result) =
+            super::execute_buyer_monitor_recovery(&chain, action, Some(&heartbeat), None)
+                .await
+                .expect("reclaim action executes");
         assert_eq!(kind, super::BuyerMonitorRecoveryKind::ReclaimOpened);
         assert_eq!(tc, "tc-open");
         assert!(result.is_ok());
@@ -10560,7 +11799,7 @@ mod tests {
                 token_contract: "tc-clean".to_string()
             }
         );
-        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
+        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None, None)
             .await
             .expect("cleanup action executes");
         assert_eq!(kind, super::BuyerMonitorRecoveryKind::CleanupUnopened);
@@ -10614,9 +11853,13 @@ mod tests {
 
         let action = BuyerContinuity::default().tick(Some(facts_at(1_300)), None, cfg);
         assert!(matches!(action, BuyerAction::ReclaimOpened { .. }));
-        let (_, _, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
-            .await
-            .expect("real dynamic threshold submits reclaim");
+        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let (_, _, result) =
+            super::execute_buyer_monitor_recovery(&chain, action, Some(&heartbeat), None)
+                .await
+                .expect("real dynamic threshold submits reclaim");
         result.expect("dynamic threshold reclaim succeeds");
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
     }
@@ -11176,6 +12419,7 @@ mod tests {
         post_count: std::sync::atomic::AtomicUsize,
         poll_count: std::sync::atomic::AtomicUsize,
         stop_count: std::sync::atomic::AtomicUsize,
+        deal_state_count: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(feature = "shellnet")]
@@ -11307,7 +12551,16 @@ mod tests {
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
             assert_eq!(token_contract, &self.fill.token_contract);
+            self.deal_state_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(deal_state(true, true, false, true)))
+        }
+
+        async fn deal_stream_timeout(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<u64, dexdo_core::ChainError> {
+            Ok(600)
         }
 
         async fn snapshot(
@@ -11473,6 +12726,8 @@ mod tests {
             None,
             None,
             super::BuyerShellnetPreflight::OfflineTest,
+            None,
+            true,
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (addr, task) =
@@ -11625,8 +12880,7 @@ mod tests {
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn buyer_recovered_on_demand_resume_emits_exact_canonical_stream_without_second_money_post(
-    ) {
+    async fn issue_547_buyer_recovered_on_demand_resume_starts_monitor_without_second_money_post() {
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-61-resume");
         let pool_path = dir.join("pool.json");
@@ -11725,6 +12979,7 @@ mod tests {
             post_count: std::sync::atomic::AtomicUsize::new(0),
             poll_count: std::sync::atomic::AtomicUsize::new(0),
             stop_count: std::sync::atomic::AtomicUsize::new(0),
+            deal_state_count: std::sync::atomic::AtomicUsize::new(0),
         });
 
         let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -11826,6 +13081,22 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(ready, "run_buyer_inner must bind the real local API");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while resumed
+                .deal_state_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("model-only on-demand recovery monitor starts before the first chat request");
+        assert_eq!(
+            resumed.post_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "startup recovery monitoring must not submit a BUY while idle"
+        );
         let response = client
             .post(format!("http://{api_addr}/v1/chat/completions"))
             .json(&serde_json::json!({

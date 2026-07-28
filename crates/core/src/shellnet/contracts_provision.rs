@@ -56,7 +56,7 @@ pub(super) const ROOTPN_TVC: &[u8] =
 /// `VoucherGenerated` format consumed by the voucher prover. The deployed 4.0.29 image updates the
 /// TokenContract/RootModel derivation pins while retaining that event format.
 pub(super) const SHELLNET_ROOTPN_V1_CODE_HASH: &str =
-    "187520fb02fef427dc16f8d8d703c301ef7251942364c98cfe2eeb30b8c658ce";
+    "fca7ffe07293b55fc31a6ffd0211f9461923563afa57141fa4e29f54d60d1ab3";
 pub(super) const ROOTORACLE_TVC: &[u8] =
     include_bytes!("../../../../contracts/compiled/dex/RootOracle.tvc");
 /// `TokenContract` StateInit(`.tvc`) -- deployed via `build_deploy` (step 2: the seller provisions
@@ -72,17 +72,17 @@ pub(super) const ROOTMODEL_TVC: &[u8] =
 /// The `TOKEN_CONTRACT_CODE_HASH` pin from `contracts/airegistry/RootModel.sol` -- against it RootModel
 /// checks the TC code when registering a deal. The embedded `TokenContract.tvc` must yield this hash.
 pub(super) const ROOTMODEL_PINNED_TC_CODE_HASH: &str =
-    "5e37dd4f51a705100dc39a9e8a1d83e270c793b9f132a3c31e8c7f04aa809ac9";
+    "d5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c";
 /// The `ROOT_MODEL_CODE_HASH` pin from `contracts/airegistry/SuperRoot.sol` -- against it SuperRoot
 /// checks the RootModel code at `registerRoot`. The embedded `RootModel.tvc` must yield this hash.
 pub(super) const SUPERROOT_PINNED_RM_CODE_HASH: &str =
-    "87e622b45a013a929626cc8c8d19a835c5fae55a660bc521ab8e34797ed38a5d";
+    "88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a";
 /// The deployed `PrivateNote` code-hash(`deployed.shellnet.json` `_note`). The orphaned-note
 /// guard(`assert_seller_note_current`) requires the seller note's on-chain `code_hash` to equal this; the
 /// `private_note_code_hash_matches_deployed_pin` test cross-checks it against the embedded `PRIVATENOTE_TVC`
 /// (test-only). Update on every PrivateNote redeploy(same cadence as `deployed.shellnet.json`).
 pub(super) const PRIVATENOTE_PINNED_CODE_HASH: &str =
-    "46239c6adea6cf767ec8e7ebcccc804bcb18370c000d2418e985c27510d8175b";
+    "4712999eb88c096fef770755b21d3b6b3fde724967424a928507a5499767e812";
 
 pub(super) fn normalize_code_hash(raw: &str) -> Option<String> {
     let h = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());

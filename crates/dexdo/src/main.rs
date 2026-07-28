@@ -374,8 +374,8 @@ mod note_cli_tests {
     const DEST_HALF_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const DEST_HALF_2: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
-    /// `dexdo note deploy` parses with the required wallet/pool flags and defaults for
-    /// nominal/token-type/endpoint.
+    /// the existing passed-in multisig contract remains the `note deploy` default:
+    /// address plus exactly one key source, with the established deploy defaults.
     #[test]
     fn note_deploy_subcommand_parses() {
         let c = Cli::try_parse_from([
@@ -400,8 +400,10 @@ mod note_cli_tests {
         assert_eq!(d.nominal, "N100");
         assert_eq!(d.token_type, "nackl");
         assert_eq!(d.endpoint, "shellnet.ackinacki.org");
+        assert_eq!(d.multisig_address, "0:wallet");
         assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
+        assert_eq!(d.pool, PathBuf::from("pn_pool.json"));
         assert_eq!(d.recovery, None);
         assert!(d.json);
         assert!(!d.simulate_interrupt_after_spend_before_pool);
@@ -425,6 +427,7 @@ mod note_cli_tests {
         let NoteCommand::Deploy(d) = n.command else {
             panic!("expected NoteCommand::Deploy");
         };
+        assert_eq!(d.multisig_address, "0:wallet");
         assert_eq!(d.multisig_key, None);
         assert_eq!(
             d.multisig_seed_file,
@@ -435,8 +438,27 @@ mod note_cli_tests {
             Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
         assert!(!d.json);
-        // The wallet address, one key input, and pool are required -- omitting any fails parse.
-        assert!(Cli::try_parse_from(["dexdo", "note", "deploy", "--pool", "p.json"]).is_err());
+        // The passed-in wallet address and one key input remain independently required.
+        assert!(Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "deploy",
+            "--multisig-key",
+            "w.keys.json",
+            "--pool",
+            "p.json",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "deploy",
+            "--multisig-address",
+            "0:wallet",
+            "--pool",
+            "p.json",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "dexdo",
             "note",

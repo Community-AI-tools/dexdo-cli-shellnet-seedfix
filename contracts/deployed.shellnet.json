@@ -1,6 +1,6 @@
 {
   "network": "shellnet",
-  "version": "4.0.29",
+  "version": "4.0.30",
   "dapp_config": "",
   "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
   "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
@@ -10,19 +10,20 @@
   "rootoracle": "0:1515151515151515151515151515151515151515151515151515151515151515",
   "seller_bond": "2P mirror seller bond held in TokenContract (spec 4.2).",
   "contract_hashes": {
-    "_note": "Canonical 4.0.29 child hashes plus read-only live fixed-root hashes.",
-    "SuperRoot": "61b2df9424afc3d776231a2d722b33be7eb260659b1e0f91e16b23cbc4b101a4",
-    "ModelRegistry": "a352e600db8450baadd39f23bc07b1024a37a3de642400dc5854ad786b31590f",
-    "RootPN": "187520fb02fef427dc16f8d8d703c301ef7251942364c98cfe2eeb30b8c658ce",
-    "RootOracle": "4d415fddc899b9d1605289cc0ed515cdd800f49eef4919ac4dad79ebe02fd454",
-    "RootModel": "87e622b45a013a929626cc8c8d19a835c5fae55a660bc521ab8e34797ed38a5d",
-    "TokenContract": "5e37dd4f51a705100dc39a9e8a1d83e270c793b9f132a3c31e8c7f04aa809ac9",
-    "InferenceOrderBook": "4d2387031620c01bdc0349c1dbf06c600e3cf4f137045f250d2d3d1b5d7031e6",
-    "PrivateNote": "46239c6adea6cf767ec8e7ebcccc804bcb18370c000d2418e985c27510d8175b",
-    "Oracle": "568b04d1a0511f2690bf07bf60a28a2ee30ad923548a3e2d3df9ed01b953201e",
-    "OracleEventList": "eed7948aecdfe897bcb7149336c30cbe557dc667036af1d3483f2f7bb055377e",
-    "PMP": "0a0ea6a2673db3042e222621fcec2c76c6412897552012e457bace77bcd63a6c",
-    "OrderBook": "77bc794cf8c8e29f825f7f9c63e7c03d13b885f29cb349cf7c18496ac0fb9540",
-    "Nullifier": "f3cf2a2c452fda4fb8c5a583bf1da12f78e8432ad21c5deaaf723df4616ef2ab"
-  }
+    "_note": "4.0.30 final v0.0.18 code hashes from gosh-sh/acki-nacki@9e8a62880e95d2af802e066a4ec4dc1bbbc867f4. The MAX_PRECHECK_LEVELS exit now fails closed like the MAX_SCAN_PER_CALL exit, so a POST_ONLY order whose precheck gave up cannot be matched by _match on a deeper level. That changes InferenceOrderBook and therefore the ModelRegistry IOB pin; every other contract is byte-unchanged. RootPN was rebuilt with sold_old 0.80.0; every other contract with sold 0.81.0; all use --tvm-version gosh and the cascade was iterated to a pin fixpoint (9 pins consistent).",
+    "SuperRoot": "b24a1b2b2d969928d78e0b1645df293bbc296eff950f0389c8466935ce31e351",
+    "ModelRegistry": "23494eb9c14efbc3cdf68eed300cb82d32b43446784bd37ad6d15ac204060371",
+    "RootPN": "fca7ffe07293b55fc31a6ffd0211f9461923563afa57141fa4e29f54d60d1ab3",
+    "RootOracle": "5415cd020d7fcfa6f6b96121ea0af1aa423a75ea0ba11f4cddf2dfe974d44774",
+    "RootModel": "88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a",
+    "TokenContract": "d5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c",
+    "InferenceOrderBook": "f32d28ead150ba0832456d5f51f51d0e666463100baf27134e083e5fc5159649",
+    "PrivateNote": "4712999eb88c096fef770755b21d3b6b3fde724967424a928507a5499767e812",
+    "Oracle": "a3670be77f99f6b4ba94bb41efaffed4b9fa1871b914319003daaff20e8e152f",
+    "OracleEventList": "179d535528bfea84b44e0a91d7ca81b6ed729cfe10eb658f4141fa78085d1a4f",
+    "PMP": "1b73ae0c56d9500f6eb936174238e1bd641572b261ce520f0098a793158d8d37",
+    "OrderBook": "9451cdb65b670840b1ffc255e850651178ce447cbb0abed939848e444bd60b90",
+    "Nullifier": "56b5e24e997df5b151b64f1f075cbb13402fbf668ce92e31f559cf751c7a9706"
+  },
+  "status": "DEPLOYED -- live shellnet == final v0.0.18 4.0.30 generation; final combined PR677/PR691/PR695 release gate pending."
 }

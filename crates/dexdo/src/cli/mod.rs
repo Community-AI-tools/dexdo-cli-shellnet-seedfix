@@ -25,3 +25,5 @@ pub(crate) mod reports;
 pub(crate) mod seller;
 pub(crate) mod seller_policy;
 pub(crate) mod support;
+#[cfg(windows)]
+pub(crate) mod windows_secret_file;

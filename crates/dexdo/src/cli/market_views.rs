@@ -50,11 +50,7 @@ async fn read_indexer_market_context(order_book: &str) -> Result<IndexerMarketCo
     let base_url = indexer::resolve_base_url(None)?;
     let client = IndexerClient::new(base_url, INDEXER_FAST_TIMEOUT)?;
     let markets = client
-        .markets(MarketsQuery {
-            inference_order_book_address: Some(order_book),
-            limit: Some(1),
-            ..MarketsQuery::default()
-        })
+        .markets(indexer_market_address_query(order_book))
         .await?;
     if !markets.markets.iter().any(|market| {
         market
@@ -76,6 +72,14 @@ async fn read_indexer_market_context(order_book: &str) -> Result<IndexerMarketCo
             depth.last_update_id
         },
     })
+}
+
+#[cfg(feature = "shellnet")]
+fn indexer_market_address_query(order_book: &str) -> MarketsQuery<'_> {
+    MarketsQuery {
+        inference_order_book_address: Some(order_book),
+        ..MarketsQuery::default()
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -828,6 +832,15 @@ mod tests {
         let target = wire_read_target();
         let orders = [wire_live_order(7, 20, "0:live")];
         super::fold_snapshot_from_orders(&target, "0:book", orders.iter())
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn indexer_market_address_lookup_omits_list_limit() {
+        let query = super::indexer_market_address_query("0:book");
+
+        assert_eq!(query.inference_order_book_address, Some("0:book"));
+        assert_eq!(query.limit, None);
     }
 
     #[cfg(feature = "shellnet")]

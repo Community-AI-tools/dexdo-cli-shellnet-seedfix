@@ -1381,7 +1381,7 @@ fn external_message_hash(boc_base64: &str) -> Result<String> {
     Ok(cell.repr_hash().to_hex_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CorrelatedActionReceipt {
     message_hash: String,
     transaction_hash: Option<String>,
@@ -1389,6 +1389,18 @@ struct CorrelatedActionReceipt {
     action_success: Option<bool>,
     result_code: Option<i64>,
     no_funds: Option<bool>,
+    outmsg_count: Option<u64>,
+    account_latest_transaction_hash: Option<String>,
+    account_ecc_balances: Option<Vec<(u32, u128)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteDeployWalletActionObservation {
+    pub transaction_hash: String,
+    pub aborted: bool,
+    pub action_result_code: i64,
+    pub outmsg_count: u64,
+    pub wallet_ecc_balances: Option<Vec<(u32, u128)>>,
 }
 
 const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
@@ -1397,12 +1409,18 @@ const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
         message(hash: $hash) {
           id dst
           dst_transaction {
-            id status aborted account_addr
+            id status aborted account_addr outmsg_cnt
             action { result_code success no_funds }
           }
         }
         account(account_id: $accountId, dapp_id: $dappId) {
-          info { id dapp_id }
+          info {
+            id dapp_id
+            balance_other { currency value }
+          }
+          transactions(last: 1) {
+            edges { node { id } }
+          }
         }
       }
     }
@@ -1682,6 +1700,20 @@ fn parse_exact_destination_receipt(
     let no_funds = transaction["action"]["no_funds"].as_bool().ok_or_else(|| {
         anyhow!("fundDeployShell finalized destination transaction has no no_funds fact")
     })?;
+    let account_ecc_balances = account["balance_other"].as_array().and_then(|balances| {
+        balances
+            .iter()
+            .map(|balance| {
+                let currency = u32::try_from(value_u128(&balance["currency"])?).ok()?;
+                let value = value_u128(&balance["value"])?;
+                Some((currency, value))
+            })
+            .collect()
+    });
+    let account_latest_transaction_hash = response
+        .pointer("/data/blockchain/account/transactions/edges/0/node/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(Some(CorrelatedActionReceipt {
         message_hash: message_hash.to_string(),
         transaction_hash: Some(transaction_hash.to_string()),
@@ -1689,6 +1721,9 @@ fn parse_exact_destination_receipt(
         action_success: Some(action_success),
         result_code: Some(result_code),
         no_funds: Some(no_funds),
+        outmsg_count: value_u64(&transaction["outmsg_cnt"]),
+        account_latest_transaction_hash,
+        account_ecc_balances,
     }))
 }
 
@@ -1744,6 +1779,58 @@ where
         }
     }
     Ok(None)
+}
+
+pub async fn observe_note_deploy_wallet_action(
+    http: &reqwest::Client,
+    endpoint: &str,
+    boc_base64: &str,
+    account_id: &str,
+    dapp_id: &str,
+) -> Result<Option<NoteDeployWalletActionObservation>> {
+    let message_hash = external_message_hash(boc_base64)?;
+    let Some(receipt) =
+        poll_finalized_destination_receipt(http, endpoint, account_id, dapp_id, &message_hash)
+            .await?
+    else {
+        return Ok(None);
+    };
+    note_deploy_wallet_action_observation(receipt).map(Some)
+}
+
+fn note_deploy_wallet_action_observation(
+    receipt: CorrelatedActionReceipt,
+) -> Result<NoteDeployWalletActionObservation> {
+    let transaction_hash = receipt
+        .transaction_hash
+        .ok_or_else(|| anyhow!("finalized note-deploy wallet receipt has no transaction hash"))?;
+    let aborted = receipt
+        .aborted
+        .ok_or_else(|| anyhow!("finalized note-deploy wallet receipt has no aborted fact"))?;
+    let result_code = receipt
+        .result_code
+        .ok_or_else(|| anyhow!("finalized note-deploy wallet receipt has no action result code"))?;
+    let account_latest_transaction_hash =
+        receipt.account_latest_transaction_hash.ok_or_else(|| {
+            anyhow!("finalized note-deploy wallet receipt has no latest wallet transaction hash")
+        })?;
+    if bare_hex(&account_latest_transaction_hash) != bare_hex(&transaction_hash) {
+        return Err(anyhow!(
+            "note-deploy wallet state is stale or advanced: observed transaction hash={}, \
+             latest wallet transaction hash={account_latest_transaction_hash}",
+            transaction_hash
+        ));
+    }
+    let outmsg_count = receipt.outmsg_count.ok_or_else(|| {
+        anyhow!("finalized note-deploy wallet receipt has no outbound-message count")
+    })?;
+    Ok(NoteDeployWalletActionObservation {
+        transaction_hash,
+        aborted,
+        action_result_code: result_code,
+        outmsg_count,
+        wallet_ecc_balances: receipt.account_ecc_balances,
+    })
 }
 
 pub(super) fn previous_page_cursor(
@@ -5584,6 +5671,7 @@ mod tests {
                 action_success: Some(false),
                 result_code: Some(38),
                 no_funds: Some(true),
+                ..Default::default()
             }),
         );
         let displayed = format!("{contextual:#}");
@@ -5610,6 +5698,7 @@ mod tests {
                 action_success: Some(false),
                 result_code: Some(401),
                 no_funds: Some(false),
+                ..Default::default()
             }),
         );
         let displayed = format!("{contextual:#}");
@@ -5639,6 +5728,7 @@ mod tests {
                 action_success: Some(false),
                 result_code: Some(38),
                 no_funds: Some(true),
+                ..Default::default()
             }),
         );
         let mismatched = format!("{mismatched:#}");
@@ -5661,6 +5751,7 @@ mod tests {
                     action_success: Some(true),
                     result_code: Some(38),
                     no_funds: Some(true),
+                    ..Default::default()
                 },
             ),
             (
@@ -5672,6 +5763,7 @@ mod tests {
                     action_success: Some(false),
                     result_code: Some(38),
                     no_funds: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -5683,6 +5775,7 @@ mod tests {
                     action_success: Some(false),
                     result_code: Some(38),
                     no_funds: Some(true),
+                    ..Default::default()
                 },
             ),
             (
@@ -5694,6 +5787,7 @@ mod tests {
                     action_success: Some(false),
                     result_code: Some(38),
                     no_funds: Some(true),
+                    ..Default::default()
                 },
             ),
         ] {
@@ -5789,6 +5883,16 @@ mod tests {
             !EXACT_MESSAGE_RECEIPT_QUERY.contains("messages("),
             "receipt lookup must not scan a bounded account-message window"
         );
+        assert!(
+            !EXACT_MESSAGE_RECEIPT_QUERY.contains("last_trans_lt"),
+            "wallet freshness must use exact transaction identity, not incompatible LT encodings"
+        );
+        for field in ["outmsg_cnt", "balance_other", "transactions(last: 1)"] {
+            assert!(
+                EXACT_MESSAGE_RECEIPT_QUERY.contains(field),
+                "receipt lookup must include {field}"
+            );
+        }
 
         let raw = json!({
             "data": {"blockchain": {
@@ -5800,10 +5904,20 @@ mod tests {
                         "status": 3,
                         "aborted": true,
                         "account_addr": TARGET,
+                        "lt": "0x62b9b6",
+                        "outmsg_cnt": 0,
                         "action": {"result_code": 38, "success": false, "no_funds": true}
                     }
                 },
-                "account": {"info": {"id": TARGET, "dapp_id": DAPP}},
+                "account": {"info": {
+                    "id": TARGET,
+                    "dapp_id": DAPP,
+                    "last_trans_lt": "0x62b9b7",
+                    "balance_other": [
+                        {"currency": 1, "value": "0x64"},
+                        {"currency": 2, "value": "0xc8"}
+                    ]
+                }, "transactions": {"edges": [{"node": {"id": "tx38"}}]}},
                 "messages": {"edges": [{"node": {
                     "id": "unrelated-newer-message",
                     "dst": format!("0:{TARGET}")
@@ -5817,6 +5931,81 @@ mod tests {
         assert_eq!(receipt.transaction_hash.as_deref(), Some("tx38"));
         assert_eq!(receipt.result_code, Some(38));
         assert_eq!(receipt.no_funds, Some(true));
+        assert_eq!(receipt.outmsg_count, Some(0));
+        assert_eq!(
+            receipt.account_latest_transaction_hash.as_deref(),
+            Some("tx38")
+        );
+        assert_eq!(receipt.account_ecc_balances, Some(vec![(1, 100), (2, 200)]));
+        assert_eq!(
+            note_deploy_wallet_action_observation(receipt)
+                .expect("exact current wallet state must be usable"),
+            NoteDeployWalletActionObservation {
+                transaction_hash: "tx38".to_string(),
+                aborted: true,
+                action_result_code: 38,
+                outmsg_count: 0,
+                wallet_ecc_balances: Some(vec![(1, 100), (2, 200)]),
+            }
+        );
+    }
+
+    #[test]
+    fn note_deploy_wallet_receipt_rejects_absent_or_stale_effect_state() {
+        let complete = CorrelatedActionReceipt {
+            message_hash: "abcd".to_string(),
+            transaction_hash: Some("tx38".to_string()),
+            aborted: Some(true),
+            action_success: Some(false),
+            result_code: Some(38),
+            no_funds: Some(true),
+            outmsg_count: Some(0),
+            account_latest_transaction_hash: Some("tx38".to_string()),
+            account_ecc_balances: Some(vec![(1, 100), (2, 200)]),
+        };
+        let mut missing_latest_transaction = complete.clone();
+        missing_latest_transaction.account_latest_transaction_hash = None;
+        let mut advanced_account = complete.clone();
+        advanced_account.account_latest_transaction_hash = Some("tx39".to_string());
+        let mut missing_outmsg_count = complete.clone();
+        missing_outmsg_count.outmsg_count = None;
+        for (case, receipt, expected) in [
+            (
+                "missing latest transaction",
+                missing_latest_transaction,
+                "no latest wallet transaction hash",
+            ),
+            ("advanced account", advanced_account, "stale or advanced"),
+            (
+                "missing outmsg count",
+                missing_outmsg_count,
+                "no outbound-message count",
+            ),
+        ] {
+            let error = note_deploy_wallet_action_observation(receipt)
+                .expect_err("incomplete or non-current effect state must fail closed");
+            assert!(error.to_string().contains(expected), "{case}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn note_deploy_success_observation_allows_eventually_indexed_ecc_state() {
+        let receipt = CorrelatedActionReceipt {
+            message_hash: "abcd".to_string(),
+            transaction_hash: Some("tx38".to_string()),
+            aborted: Some(false),
+            action_success: Some(true),
+            result_code: Some(0),
+            no_funds: Some(false),
+            outmsg_count: Some(3),
+            account_latest_transaction_hash: Some("tx38".to_string()),
+            account_ecc_balances: None,
+        };
+        let observation = note_deploy_wallet_action_observation(receipt)
+            .expect("successful action continues to downstream VoucherGenerated confirmation");
+
+        assert_eq!(observation.transaction_hash, "tx38");
+        assert_eq!(observation.wallet_ecc_balances, None);
     }
 
     #[test]
@@ -5935,6 +6124,7 @@ mod tests {
                 action_success: Some(false),
                 result_code: Some(38),
                 no_funds: Some(true),
+                ..Default::default()
             }
         );
     }

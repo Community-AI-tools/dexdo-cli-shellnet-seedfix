@@ -52,13 +52,19 @@ zeroize.workspace = true
 tvm_client = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"], optional = true }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+] }
 
 [features]
 # real shellnet backend in the `dexdo` binary itself(per-role `RealSellerBackend`/`RealBuyerBackend`).
 # OFF by default -- the default(mock) build stays lightweight and cross-platform(D6); the real path
 # (TVM SDK v3 via `dexdo-core/shellnet`) only under this feature.
-shellnet = ["dexdo-core/shellnet", "dep:fs2", "dep:tvm_client", "dep:windows-sys"]
+shellnet = ["dexdo-core/shellnet", "dep:fs2", "dep:tvm_client"]
 # (hard rule): the giver(test faucet) is test-only -- gated behind this NON-DEFAULT feature so the
 # production `dexdo` binary contains zero giver. Only the live `live_cli` harness enables it.
 test-giver = ["shellnet", "dexdo-core/test-giver"]

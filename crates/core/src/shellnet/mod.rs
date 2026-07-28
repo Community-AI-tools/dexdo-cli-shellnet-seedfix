@@ -27,9 +27,10 @@ pub use book_events::{
     fold_book_event_pages, BookEventFold, BookEventMessage, BookEventPage, LiveBookOrder,
 };
 pub use client::{
-    endpoint_urls, normalize_endpoint, resolve_endpoint, shellnet_clock_skew_preflight, Deployed,
-    MoneySubmitError, RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport,
-    ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT,
+    endpoint_urls, normalize_endpoint, observe_note_deploy_wallet_action, resolve_endpoint,
+    shellnet_clock_skew_preflight, Deployed, MoneySubmitError, NoteDeployWalletActionObservation,
+    RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport, ShellnetDoctorStatus,
+    DEFAULT_SHELLNET_ENDPOINT,
 };
 #[cfg(feature = "test-giver")]
 pub use client::{
