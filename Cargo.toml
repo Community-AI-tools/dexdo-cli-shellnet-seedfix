@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.18"
+version = "0.0.19"
 edition = "2021"
 license = "MIT"
 
@@ -48,7 +48,7 @@ zeroize = { version = "1", features = ["serde"] }
 proptest = "1"
 async-trait = "0.1"
 futures = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 # Local interface to the consumer: OpenAI/Anthropic-compatible HTTP.
 # axum 0.7 on the same hyper-1/tower stack that tonic already pulls in -- without a second HTTP stack.
 axum = "0.7"

@@ -3,7 +3,10 @@
 
 use anyhow::{bail, Result};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
-use dexdo_core::PRICE_STEP;
+use dexdo_core::{
+    params::{SHELL_CURRENCY_ID, SHELL_CURRENCY_LABEL},
+    PRICE_STEP,
+};
 use http::uri::Authority;
 use std::fmt;
 use std::net::SocketAddr;
@@ -24,6 +27,18 @@ fn parse_positive_u64(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("expected positive integer: {e}"))?;
     if value == 0 {
         return Err("expected positive integer, got 0".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_shell_currency_id(s: &str) -> Result<u32, String> {
+    let value = s.parse::<u32>().map_err(|e| {
+        format!("--token-type: expected SHELL currency id {SHELL_CURRENCY_ID}: {e}")
+    })?;
+    if value != SHELL_CURRENCY_ID {
+        return Err(format!(
+            "--token-type: dexdo markets support only SHELL currency id {SHELL_CURRENCY_ID}"
+        ));
     }
     Ok(value)
 }
@@ -1120,12 +1135,19 @@ pub(crate) struct NoteDeployArgs {
     /// PN deposit nominal.
     #[arg(long, default_value = "N100")]
     pub(crate) nominal: String,
-    /// Deposit currency.
-    #[arg(long, default_value = "nackl", value_parser = ["nackl", "shell", "usdc"])]
+    /// Deposit currency. Dexdo markets use SHELL only.
+    #[arg(
+        long,
+        default_value = SHELL_CURRENCY_LABEL,
+        value_parser = [SHELL_CURRENCY_LABEL]
+    )]
     pub(crate) token_type: String,
     /// Shellnet endpoint.
     #[arg(long, default_value = "shellnet.ackinacki.org")]
     pub(crate) endpoint: String,
+    /// Deployed shellnet contracts manifest used for the pre-spend generation check.
+    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    pub(crate) contracts: PathBuf,
     /// The `DEXDO_PN_POOL` JSON to append the deployed note to(created if absent).
     #[arg(long)]
     pub(crate) pool: PathBuf,
@@ -1223,8 +1245,12 @@ pub(crate) struct OracleProvisionArgs {
     /// Initial clean stake per outcome. Repeat exactly once per outcome; each must satisfy the contract minimum.
     #[arg(long = "initial-stake")]
     pub(crate) initial_stakes: Vec<u128>,
-    /// PMP collateral token type. `1` is NACKL, matching the live SDK PMP tests.
-    #[arg(long, default_value_t = 1)]
+    /// PMP collateral token type. Dexdo markets use SHELL(`2`) only.
+    #[arg(
+        long,
+        default_value_t = SHELL_CURRENCY_ID,
+        value_parser = parse_shell_currency_id
+    )]
     pub(crate) token_type: u32,
     /// Oracle fee paid by the PMP deployer note to this OracleEventList.
     #[arg(long, default_value_t = 0)]
@@ -1258,4 +1284,17 @@ pub(crate) struct OracleResolveArgs {
     /// Deployed-contracts manifest.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pmp_token_type_accepts_only_shell() {
+        assert_eq!(
+            super::parse_shell_currency_id("2").unwrap(),
+            dexdo_core::params::SHELL_CURRENCY_ID
+        );
+        assert!(super::parse_shell_currency_id("1").is_err());
+        assert!(super::parse_shell_currency_id("3").is_err());
+    }
 }

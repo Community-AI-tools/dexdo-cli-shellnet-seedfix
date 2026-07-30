@@ -4,6 +4,7 @@
 //! live here.
 
 use anyhow::{anyhow, bail, Result};
+use dexdo_core::params::{NOTE_DEPLOY_PROOF_LAYER_MAX, SHELL_CURRENCY_ID};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,7 +14,6 @@ use zeroize::Zeroizing;
 
 #[allow(dead_code)]
 const UNIT_SCALE: u128 = 1_000_000_000;
-const SHELL_ECC_ID: u32 = 2;
 const NOTE_DEPLOY_RECOVERY_VERSION: u32 = 1;
 
 #[allow(dead_code)]
@@ -98,8 +98,8 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     writeln!(
         &mut out,
         "SHELL currency ECC[2] (live spendable balance): {} SHELL (raw {})",
-        decimal_units(account.ecc_value(SHELL_ECC_ID)),
-        account.ecc_value(SHELL_ECC_ID)
+        decimal_units(account.ecc_value(SHELL_CURRENCY_ID)),
+        account.ecc_value(SHELL_CURRENCY_ID)
     )
     .unwrap();
     writeln!(
@@ -149,7 +149,7 @@ fn render_ecc_map(out: &mut String, title: &str, map: &NoteBalanceMap) {
             let mut entries = entries.clone();
             entries.sort_by_key(|(id, _)| *id);
             for (id, value) in entries {
-                if id == SHELL_ECC_ID {
+                if id == SHELL_CURRENCY_ID {
                     writeln!(
                         out,
                         "  ECC[2] SHELL: {} SHELL (raw {value})",
@@ -383,6 +383,8 @@ pub(crate) struct NoteDeployVoucherCheckpoint {
     pub event: Option<NoteDeployVoucherEvent>,
     #[serde(default)]
     pub proof: Option<NoteDeployVoucherProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rejected_proof_layer: Option<u8>,
 }
 
 impl std::fmt::Debug for NoteDeployVoucherCheckpoint {
@@ -470,6 +472,7 @@ impl NoteDeployVoucherCheckpoint {
             submit_maybe_sent: false,
             event: None,
             proof: None,
+            last_rejected_proof_layer: None,
         };
         checkpoint.validate("voucher checkpoint")?;
         Ok(checkpoint)
@@ -512,7 +515,92 @@ impl NoteDeployVoucherCheckpoint {
                 bail!("{label}: proof voucher_token_type does not match checkpoint");
             }
         }
+        if let Some(last_rejected) = self.last_rejected_proof_layer {
+            if !(1..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&last_rejected) {
+                bail!(
+                    "{label}: rejected proof layer is outside canonical plan 1..={NOTE_DEPLOY_PROOF_LAYER_MAX}"
+                );
+            }
+            let proof = self
+                .proof
+                .as_ref()
+                .ok_or_else(|| anyhow!("{label}: rejected layer has no persisted proof"))?;
+            if !(1..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&proof.layer_number) {
+                bail!(
+                    "{label}: current proof layer {} is outside canonical plan 1..={NOTE_DEPLOY_PROOF_LAYER_MAX}",
+                    proof.layer_number,
+                );
+            }
+            if proof.layer_number != last_rejected && proof.layer_number != last_rejected + 1 {
+                bail!(
+                    "{label}: current proof layer {} must be rejected layer {last_rejected} or its \
+                     immediate successor {}",
+                    proof.layer_number,
+                    last_rejected + 1
+                );
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn current_proof_is_rejected(&self) -> bool {
+        self.proof
+            .as_ref()
+            .is_some_and(|proof| self.last_rejected_proof_layer == Some(proof.layer_number))
+    }
+
+    pub(crate) fn reject_current_proof(&mut self) -> Result<u8> {
+        let layer = self
+            .proof
+            .as_ref()
+            .ok_or_else(|| anyhow!("voucher checkpoint has no proof to reject"))?
+            .layer_number;
+        if let Some(previous) = self.last_rejected_proof_layer {
+            if layer != previous && layer != previous.saturating_add(1) {
+                bail!(
+                    "rejected proof layer {layer} is not monotonic after rejected layer {previous}"
+                );
+            }
+        }
+        self.last_rejected_proof_layer = Some(layer);
+        self.validate("voucher checkpoint after exact 403")?;
+        Ok(layer)
+    }
+
+    pub(crate) fn next_sdk_proof_layer(&self) -> Option<u32> {
+        let last_rejected = self.last_rejected_proof_layer.unwrap_or_default();
+        (last_rejected < NOTE_DEPLOY_PROOF_LAYER_MAX).then(|| u32::from(last_rejected))
+    }
+
+    pub(crate) fn replace_rejected_proof(
+        &mut self,
+        replacement: NoteDeployVoucherProof,
+    ) -> Result<()> {
+        let rejected = self
+            .proof
+            .as_ref()
+            .filter(|_| self.current_proof_is_rejected())
+            .ok_or_else(|| anyhow!("voucher checkpoint has no rejected proof to replace"))?;
+        if replacement.deposit_identifier_hash_hex != rejected.deposit_identifier_hash_hex
+            || replacement.voucher_nominal_fr_hex != rejected.voucher_nominal_fr_hex
+            || replacement.token_type_fr_hex != rejected.token_type_fr_hex
+            || replacement.ephemeral_pubkey_hex != rejected.ephemeral_pubkey_hex
+            || replacement.voucher_value != rejected.voucher_value
+            || replacement.voucher_token_type != rejected.voucher_token_type
+            || replacement.sk_u_hex != rejected.sk_u_hex
+            || replacement.sk_u_commit_hex != rejected.sk_u_commit_hex
+        {
+            bail!("replacement proof changed paid voucher identity");
+        }
+        if replacement.layer_number != rejected.layer_number.saturating_add(1) {
+            bail!(
+                "replacement proof layer {} is not the next layer after rejected layer {}",
+                replacement.layer_number,
+                rejected.layer_number
+            );
+        }
+        self.proof = Some(replacement);
+        self.validate("voucher checkpoint with replacement proof")
     }
 
     pub(crate) fn ensure_matches(
@@ -712,6 +800,7 @@ impl NoteDeployRecoveryState {
         if self.nominal.trim().is_empty() {
             bail!("note deploy recovery file has empty nominal");
         }
+        ensure_shell_currency_id(self.token_type, "note deploy recovery file")?;
         let normalized_wallet =
             dexdo_core::normalize_wallet_address(&self.funding_multisig_address)
                 .map_err(|e| anyhow!("note deploy recovery funding_multisig_address: {e}"))?;
@@ -743,7 +832,7 @@ impl NoteDeployRecoveryState {
             voucher.ensure_matches(
                 NoteDeployVoucherKind::ShellGas,
                 &self.owner_public_key_hex,
-                SHELL_ECC_ID,
+                SHELL_CURRENCY_ID,
                 self.ecc_shell_deposit,
                 true,
             )?;
@@ -803,7 +892,7 @@ impl NoteDeployRecoveryState {
     ) -> Result<()> {
         let (token_type, raw_value, is_fee) = match kind {
             NoteDeployVoucherKind::Deposit => (self.token_type, self.raw_value, false),
-            NoteDeployVoucherKind::ShellGas => (SHELL_ECC_ID, self.ecc_shell_deposit, true),
+            NoteDeployVoucherKind::ShellGas => (SHELL_CURRENCY_ID, self.ecc_shell_deposit, true),
         };
         checkpoint.ensure_matches(
             kind,
@@ -1317,6 +1406,7 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
 /// half-deployed note into the pool would later strand the `seller`/`buyer` on an unusable note.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
+    ensure_shell_currency_id(s.token_type, "note deploy state")?;
     let address = s.pn_address.as_deref().ok_or_else(|| {
         anyhow!("pn_state has no pn_address -- note deploy did not reach deployPrivateNote (step 1)")
     })?;
@@ -1363,6 +1453,7 @@ pub(crate) fn pool_with_note_added(
     created_at_unix: u64,
     funding_multisig_address: &str,
 ) -> Result<Value> {
+    ensure_shell_currency_id(s.token_type, "note deploy state")?;
     let funding_multisig_address = dexdo_core::normalize_wallet_address(funding_multisig_address)
         .map_err(|e| anyhow!("{e}"))?;
     let mut pool = match existing {
@@ -1430,6 +1521,29 @@ pub(crate) fn pool_with_note_added(
     }
     notes.push(note);
     Ok(pool)
+}
+
+pub(crate) fn ensure_shell_pool_currency(pool: &Value) -> Result<()> {
+    let token_type = pool
+        .get("token_type")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            anyhow!(
+                "DEXDO_PN_POOL token_type is missing or malformed; dexdo markets require SHELL currency id {SHELL_CURRENCY_ID}"
+            )
+        })?;
+    let token_type = u32::try_from(token_type)
+        .map_err(|_| anyhow!("DEXDO_PN_POOL token_type {token_type} is out of range"))?;
+    ensure_shell_currency_id(token_type, "DEXDO_PN_POOL")
+}
+
+fn ensure_shell_currency_id(token_type: u32, source: &str) -> Result<()> {
+    if token_type != SHELL_CURRENCY_ID {
+        bail!(
+            "{source} token_type {token_type} is unsupported; dexdo markets require SHELL currency id {SHELL_CURRENCY_ID}"
+        );
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1550,7 +1664,7 @@ mod note_deploy_tests {
         OnboardPnState {
             endpoint: "shellnet.ackinacki.org".into(),
             nominal: "N100".into(),
-            token_type: 1,
+            token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
             ecc_shell_deposit: 100_000_000_000,
             pn_address: Some("0:abc".into()),
@@ -1561,6 +1675,55 @@ mod note_deploy_tests {
             shell_funded: true,
             sanity_checked: true,
         }
+    }
+
+    fn voucher_checkpoint_with_proof() -> NoteDeployVoucherCheckpoint {
+        let mut checkpoint = NoteDeployVoucherCheckpoint::new(
+            &"1".repeat(64),
+            SHELL_CURRENCY_ID,
+            100,
+            false,
+            "2".repeat(64),
+            "3".repeat(64),
+        )
+        .unwrap();
+        checkpoint.submit_maybe_sent = true;
+        checkpoint.event = Some(NoteDeployVoucherEvent {
+            id: "event".into(),
+            boc: "boc".into(),
+            body: "body".into(),
+            dst: format!("0:{}", "4".repeat(64)),
+            created_at: 1,
+            block_id: Some("block".into()),
+        });
+        checkpoint.proof = Some(NoteDeployVoucherProof {
+            proof: "proof-layer-1".into(),
+            deposit_identifier_hash_hex: "5".repeat(64),
+            final_layer_historical_hash_root_hex: "6".repeat(64),
+            voucher_nominal_fr_hex: "7".repeat(64),
+            token_type_fr_hex: "8".repeat(64),
+            ephemeral_pubkey_hex: "1".repeat(64),
+            voucher_value: 100,
+            voucher_token_type: SHELL_CURRENCY_ID,
+            layer_number: 1,
+            sk_u_hex: "2".repeat(64).into(),
+            sk_u_commit_hex: "3".repeat(64),
+        });
+        checkpoint.validate("fixture checkpoint").unwrap();
+        checkpoint
+    }
+
+    fn replace_with_next_layer(checkpoint: &mut NoteDeployVoucherCheckpoint) -> bool {
+        let Some(next) = checkpoint.next_sdk_proof_layer() else {
+            return false;
+        };
+        let mut replacement = checkpoint.proof.as_ref().unwrap().clone();
+        replacement.layer_number = next as u8 + 1;
+        replacement.proof = format!("proof-layer-{}", replacement.layer_number);
+        replacement.final_layer_historical_hash_root_hex =
+            replacement.layer_number.to_string().repeat(64);
+        checkpoint.replace_rejected_proof(replacement).unwrap();
+        true
     }
 
     #[test]
@@ -1604,6 +1767,7 @@ mod note_deploy_tests {
             submit_maybe_sent: false,
             event: None,
             proof: Some(proof),
+            last_rejected_proof_layer: None,
         };
         assert_zeroize_on_drop(&checkpoint.sk_u_hex);
         let checkpoint_debug = format!("{checkpoint:?}");
@@ -1620,6 +1784,181 @@ mod note_deploy_tests {
         assert!(!recovery_debug.contains("recovery-secret-sentinel"));
         assert!(recovery_debug.contains("owner_secret_key_hex: \"<redacted>\""));
         assert!(recovery_debug.contains("0:abc"));
+    }
+
+    #[test]
+    fn rejected_history_layers_roundtrip_and_exhaust_without_losing_paid_voucher() {
+        let mut checkpoint = voucher_checkpoint_with_proof();
+        let mut rejected_second_layer = checkpoint.clone();
+        rejected_second_layer.proof.as_mut().unwrap().layer_number = 2;
+        rejected_second_layer.last_rejected_proof_layer = Some(2);
+        assert_eq!(rejected_second_layer.next_sdk_proof_layer(), Some(2));
+        let mut stale_after_second_rejection = rejected_second_layer.clone();
+        stale_after_second_rejection
+            .proof
+            .as_mut()
+            .unwrap()
+            .layer_number = 1;
+        assert!(stale_after_second_rejection
+            .validate("stale recovery")
+            .is_err());
+
+        let mut skipped_layer = checkpoint.clone();
+        skipped_layer.reject_current_proof().unwrap();
+        let mut layer_three = skipped_layer.proof.as_ref().unwrap().clone();
+        layer_three.layer_number = NOTE_DEPLOY_PROOF_LAYER_MAX;
+        assert!(skipped_layer.replace_rejected_proof(layer_three).is_err());
+
+        let identity = (
+            checkpoint.sk_u_hex.clone(),
+            checkpoint.sk_u_commit_hex.clone(),
+            checkpoint.event.clone(),
+            checkpoint
+                .proof
+                .as_ref()
+                .unwrap()
+                .deposit_identifier_hash_hex
+                .clone(),
+        );
+
+        for expected_layer in 1..=NOTE_DEPLOY_PROOF_LAYER_MAX {
+            assert_eq!(
+                checkpoint.proof.as_ref().unwrap().layer_number,
+                expected_layer
+            );
+            checkpoint.reject_current_proof().unwrap();
+            if expected_layer < NOTE_DEPLOY_PROOF_LAYER_MAX {
+                assert!(replace_with_next_layer(&mut checkpoint));
+            }
+        }
+
+        assert!(checkpoint.current_proof_is_rejected());
+        assert_eq!(
+            checkpoint.last_rejected_proof_layer,
+            Some(NOTE_DEPLOY_PROOF_LAYER_MAX)
+        );
+        assert_eq!(checkpoint.next_sdk_proof_layer(), None);
+        let roundtrip: NoteDeployVoucherCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(roundtrip, checkpoint);
+        assert_eq!(
+            (
+                roundtrip.sk_u_hex,
+                roundtrip.sk_u_commit_hex,
+                roundtrip.event,
+                roundtrip
+                    .proof
+                    .as_ref()
+                    .unwrap()
+                    .deposit_identifier_hash_hex
+                    .clone(),
+            ),
+            identity
+        );
+    }
+
+    #[test]
+    fn recovery_load_rejects_proof_that_skips_the_next_layer() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-skipped-layer-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let mut recovery = complete_recovery_state();
+        let mut checkpoint = voucher_checkpoint_with_proof();
+        checkpoint.recipient_ephemeral_pubkey_hex = recovery.owner_public_key_hex.clone();
+        checkpoint.token_type = recovery.token_type;
+        checkpoint.raw_value = recovery.raw_value;
+        let proof = checkpoint.proof.as_mut().unwrap();
+        proof.ephemeral_pubkey_hex = recovery.owner_public_key_hex.clone();
+        proof.voucher_token_type = recovery.token_type;
+        proof.voucher_value = recovery.raw_value;
+        proof.layer_number = NOTE_DEPLOY_PROOF_LAYER_MAX;
+        checkpoint.last_rejected_proof_layer = Some(1);
+        recovery.deposit_voucher = Some(checkpoint);
+        write_private_atomic(&path, &serde_json::to_vec_pretty(&recovery).unwrap()).unwrap();
+
+        let error = load_note_deploy_recovery(&path).unwrap_err().to_string();
+
+        assert!(
+            error.contains(&format!(
+                "current proof layer {NOTE_DEPLOY_PROOF_LAYER_MAX}"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("rejected layer 1"), "{error}");
+        assert!(error.contains("immediate successor 2"), "{error}");
+
+        let checkpoint = recovery.deposit_voucher.as_mut().unwrap();
+        checkpoint.last_rejected_proof_layer = Some(NOTE_DEPLOY_PROOF_LAYER_MAX);
+        checkpoint.proof.as_mut().unwrap().layer_number =
+            NOTE_DEPLOY_PROOF_LAYER_MAX.saturating_add(1);
+        write_private_atomic(&path, &serde_json::to_vec_pretty(&recovery).unwrap()).unwrap();
+
+        let error = load_note_deploy_recovery(&path).unwrap_err().to_string();
+
+        assert!(
+            error.contains(&format!(
+                "current proof layer {}",
+                NOTE_DEPLOY_PROOF_LAYER_MAX.saturating_add(1)
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "outside canonical plan 1..={NOTE_DEPLOY_PROOF_LAYER_MAX}"
+            )),
+            "{error}"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn history_reproof_never_reuses_submitted_layer_or_wallet_spend(
+            exact_403_outcomes in proptest::collection::vec(proptest::bool::ANY, 0..12)
+        ) {
+            let mut checkpoint = voucher_checkpoint_with_proof();
+            let identity = (
+                checkpoint.sk_u_hex.clone(),
+                checkpoint.sk_u_commit_hex.clone(),
+                checkpoint.event.clone(),
+                checkpoint.proof.as_ref().unwrap().deposit_identifier_hash_hex.clone(),
+            );
+            let mut wallet_submit_maybe_sent = false;
+            let mut wallet_sends = 0_usize;
+            let mut submitted_layers = Vec::new();
+
+            for exact_403 in exact_403_outcomes {
+                if !wallet_submit_maybe_sent {
+                    wallet_submit_maybe_sent = true;
+                    wallet_sends += 1;
+                }
+                if checkpoint.current_proof_is_rejected()
+                    && !replace_with_next_layer(&mut checkpoint)
+                {
+                    break;
+                }
+                let layer = checkpoint.proof.as_ref().unwrap().layer_number;
+                proptest::prop_assert!(!submitted_layers.contains(&layer));
+                submitted_layers.push(layer);
+                if exact_403 {
+                    checkpoint.reject_current_proof().unwrap();
+                } else {
+                    break;
+                }
+            }
+
+            proptest::prop_assert!(wallet_sends <= 1);
+            proptest::prop_assert!(
+                submitted_layers.len() <= usize::from(NOTE_DEPLOY_PROOF_LAYER_MAX)
+            );
+            proptest::prop_assert_eq!(
+                (
+                    checkpoint.sk_u_hex.clone(),
+                    checkpoint.sk_u_commit_hex.clone(),
+                    checkpoint.event.clone(),
+                    checkpoint.proof.as_ref().unwrap().deposit_identifier_hash_hex.clone(),
+                ),
+                identity
+            );
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -1641,7 +1980,7 @@ mod note_deploy_tests {
         NoteDeployRecoveryRequest {
             endpoint,
             nominal: "N100",
-            token_type: 1,
+            token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
             ecc_shell_deposit: 100_000_000_000,
             funding_multisig_address,
@@ -1883,6 +2222,28 @@ mod note_deploy_tests {
             .unwrap_err()
             .to_string()
             .contains("not fully deployed"));
+    }
+
+    #[test]
+    fn non_shell_onboard_and_pool_fail_closed() {
+        let mut state = complete_state();
+        state.token_type = 1;
+        let error = pn_state_to_pool_note(&state).unwrap_err().to_string();
+        assert!(error.contains("require SHELL currency id 2"), "{error}");
+
+        let stale_pool = json!({"token_type": 1, "notes": []});
+        let error = ensure_shell_pool_currency(&stale_pool)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require SHELL currency id 2"), "{error}");
+    }
+
+    #[test]
+    fn recovery_rejects_non_shell_currency() {
+        let mut state = complete_recovery_state();
+        state.token_type = 1;
+        let error = state.validate().unwrap_err().to_string();
+        assert!(error.contains("require SHELL currency id 2"), "{error}");
     }
 
     /// regression: a pool entry whose stored secret cannot derive the recorded owner pubkey is

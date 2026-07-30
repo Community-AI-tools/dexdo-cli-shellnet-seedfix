@@ -7,6 +7,8 @@ use dexdo_core::note::{verify, NotePubkey, Signature};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+pub(crate) const HEALTH_CHALLENGE_TC: &str = "seller-readiness";
+
 /// The challenge bytes the buyer signs: a nonce hard-bound to the
 /// `token_contract` -- an intercepted signature cannot be replayed on another deal.
 pub fn challenge_bytes(token_contract: &str, nonce: &[u8]) -> Vec<u8> {
@@ -41,6 +43,13 @@ impl AuthRegistry {
             .insert(token_contract.to_string(), buyer_pubkey);
     }
 
+    /// Retire one terminal/failed deal without touching authorization for other
+    /// TokenContracts served by the same gateway.
+    pub fn unregister(&self, token_contract: &str) {
+        self.buyer_pubkeys.lock().unwrap().remove(token_contract);
+        self.issued.lock().unwrap().remove(token_contract);
+    }
+
     /// Issue a challenge nonce bound to the contract.
     pub fn issue_challenge(&self, token_contract: &str, nonce: Vec<u8>) {
         self.issued
@@ -49,6 +58,33 @@ impl AuthRegistry {
             .entry(token_contract.to_string())
             .or_default()
             .insert(nonce);
+    }
+
+    /// Remove one exact internally-owned challenge without affecting concurrent buyer challenges.
+    pub(crate) fn discard_challenge(&self, token_contract: &str, nonce: &[u8]) -> bool {
+        let mut issued = self.issued.lock().unwrap();
+        let empty = {
+            let Some(outstanding) = issued.get_mut(token_contract) else {
+                return false;
+            };
+            if !outstanding.remove(nonce) {
+                return false;
+            }
+            outstanding.is_empty()
+        };
+        if empty {
+            issued.remove(token_contract);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outstanding_challenge_count(&self, token_contract: &str) -> usize {
+        self.issued
+            .lock()
+            .unwrap()
+            .get(token_contract)
+            .map_or(0, HashSet::len)
     }
 
     /// Verify the buyer's response: the nonce must match the issued one, and the signature must pass
@@ -80,20 +116,7 @@ impl AuthRegistry {
         }
         // Success: consume this nonce(single-use against replay). If another concurrent verifier already consumed
         // the same nonce, this call fails closed; independent outstanding nonces for the same deal remain valid.
-        let mut issued = self.issued.lock().unwrap();
-        let empty = {
-            let Some(outstanding) = issued.get_mut(token_contract) else {
-                return false;
-            };
-            if !outstanding.remove(nonce) {
-                return false;
-            }
-            outstanding.is_empty()
-        };
-        if empty {
-            issued.remove(token_contract);
-        }
-        true
+        self.discard_challenge(token_contract, nonce)
     }
 }
 

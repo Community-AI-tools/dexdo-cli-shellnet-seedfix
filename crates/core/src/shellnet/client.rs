@@ -1386,6 +1386,7 @@ struct CorrelatedActionReceipt {
     message_hash: String,
     transaction_hash: Option<String>,
     aborted: Option<bool>,
+    compute_exit_code: Option<i64>,
     action_success: Option<bool>,
     result_code: Option<i64>,
     no_funds: Option<bool>,
@@ -1410,6 +1411,7 @@ const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
           id dst
           dst_transaction {
             id status aborted account_addr outmsg_cnt
+            compute { exit_code success }
             action { result_code success no_funds }
           }
         }
@@ -1689,17 +1691,10 @@ fn parse_exact_destination_receipt(
     let aborted = transaction["aborted"].as_bool().ok_or_else(|| {
         anyhow!("fundDeployShell finalized destination transaction has no aborted fact")
     })?;
-    let action_success = transaction["action"]["success"].as_bool().ok_or_else(|| {
-        anyhow!("fundDeployShell finalized destination transaction has no action success fact")
-    })?;
-    let result_code = transaction["action"]["result_code"]
-        .as_i64()
-        .ok_or_else(|| {
-            anyhow!("fundDeployShell finalized destination transaction has no action result code")
-        })?;
-    let no_funds = transaction["action"]["no_funds"].as_bool().ok_or_else(|| {
-        anyhow!("fundDeployShell finalized destination transaction has no no_funds fact")
-    })?;
+    let compute_exit_code = transaction["compute"]["exit_code"].as_i64();
+    let action_success = transaction["action"]["success"].as_bool();
+    let result_code = transaction["action"]["result_code"].as_i64();
+    let no_funds = transaction["action"]["no_funds"].as_bool();
     let account_ecc_balances = account["balance_other"].as_array().and_then(|balances| {
         balances
             .iter()
@@ -1718,9 +1713,10 @@ fn parse_exact_destination_receipt(
         message_hash: message_hash.to_string(),
         transaction_hash: Some(transaction_hash.to_string()),
         aborted: Some(aborted),
-        action_success: Some(action_success),
-        result_code: Some(result_code),
-        no_funds: Some(no_funds),
+        compute_exit_code,
+        action_success,
+        result_code,
+        no_funds,
         outmsg_count: value_u64(&transaction["outmsg_cnt"]),
         account_latest_transaction_hash,
         account_ecc_balances,
@@ -1796,6 +1792,48 @@ pub async fn observe_note_deploy_wallet_action(
         return Ok(None);
     };
     note_deploy_wallet_action_observation(receipt).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteDeployRootPnActionObservation {
+    pub transaction_hash: String,
+    pub compute_exit_code: i64,
+    pub aborted: bool,
+    pub action_result_code: Option<i64>,
+}
+
+pub async fn observe_note_deploy_rootpn_action(
+    http: &reqwest::Client,
+    endpoint: &str,
+    boc_base64: &str,
+    account_id: &str,
+    dapp_id: &str,
+) -> Result<Option<NoteDeployRootPnActionObservation>> {
+    let message_hash = external_message_hash(boc_base64)?;
+    let Some(receipt) =
+        poll_finalized_destination_receipt(http, endpoint, account_id, dapp_id, &message_hash)
+            .await?
+    else {
+        return Ok(None);
+    };
+    note_deploy_rootpn_action_observation(receipt).map(Some)
+}
+
+fn note_deploy_rootpn_action_observation(
+    receipt: CorrelatedActionReceipt,
+) -> Result<NoteDeployRootPnActionObservation> {
+    Ok(NoteDeployRootPnActionObservation {
+        transaction_hash: receipt.transaction_hash.ok_or_else(|| {
+            anyhow!("finalized note-deploy RootPN receipt has no transaction hash")
+        })?,
+        compute_exit_code: receipt.compute_exit_code.ok_or_else(|| {
+            anyhow!("finalized note-deploy RootPN receipt has no compute exit code")
+        })?,
+        aborted: receipt
+            .aborted
+            .ok_or_else(|| anyhow!("finalized note-deploy RootPN receipt has no aborted fact"))?,
+        action_result_code: receipt.result_code,
+    })
 }
 
 fn note_deploy_wallet_action_observation(
@@ -1887,7 +1925,6 @@ pub struct PlaceInferenceBuyReceipt {
 }
 
 /// One ordered lifecycle/settlement event emitted by a `TokenContract`.
-#[cfg(feature = "test-giver")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenContractSettlementReceipt {
     pub message_id: String,
@@ -1896,7 +1933,6 @@ pub struct TokenContractSettlementReceipt {
 }
 
 /// Exact ABI payload of a lifecycle/settlement event used by the live money-path proof.
-#[cfg(feature = "test-giver")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenContractSettlementEvent {
     ProbeAccepted {
@@ -1922,7 +1958,6 @@ pub enum TokenContractSettlementEvent {
 }
 
 /// Ordered lifecycle and settlement receipts emitted by one `TokenContract`.
-#[cfg(feature = "test-giver")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenContractSettlementReceipts {
     pub events: Vec<TokenContractSettlementReceipt>,
@@ -2048,7 +2083,6 @@ async fn fetch_all_ext_out_messages(
     Ok(messages)
 }
 
-#[cfg(feature = "test-giver")]
 fn decode_token_contract_settlement_receipts(
     mut messages: Vec<ExtOutMessage>,
 ) -> Result<TokenContractSettlementReceipts> {
@@ -2111,7 +2145,6 @@ fn decode_token_contract_settlement_receipts(
     Ok(receipts)
 }
 
-#[cfg(feature = "test-giver")]
 fn decode_external_abi_message(
     body_b64: &str,
     abi: &str,
@@ -2150,7 +2183,6 @@ fn decode_external_abi_message_boc(
     }
 }
 
-#[cfg(feature = "test-giver")]
 fn decoded_u128(tokens: &[tvm_abi::Token], name: &str) -> Option<u128> {
     tokens.iter().find_map(|token| {
         if token.name != name {
@@ -2163,7 +2195,6 @@ fn decoded_u128(tokens: &[tvm_abi::Token], name: &str) -> Option<u128> {
     })
 }
 
-#[cfg(feature = "test-giver")]
 fn decoded_address(tokens: &[tvm_abi::Token], name: &str) -> Option<String> {
     tokens.iter().find_map(|token| {
         if token.name != name {
@@ -3508,7 +3539,7 @@ impl RealChainBackend {
         flags: u8,
         deadline: u64,
         cursor: &mut MatchWatchCursor,
-        before_post: &mut (dyn FnMut(String, MatchWatchCursor) -> Result<()> + Send),
+        before_post: &mut (dyn FnMut(String, MatchWatchCursor, u128) -> Result<()> + Send),
     ) -> Result<Value> {
         let (endpoint, boc, account_id, dapp_id) = self
             .prepare_money_post(
@@ -3531,8 +3562,22 @@ impl RealChainBackend {
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         *cursor = final_cursor;
-        before_post(money_submit_identity(&boc), cursor.clone())
+        let account = self
+            .client
+            .get_account(note)
+            .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        note_balance_private_note_account(note, account.as_ref())
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let note_shell_balance = account
+            .expect("validated PrivateNote account must be present")
+            .ecc_balance(2);
+        before_post(
+            money_submit_identity(&boc),
+            cursor.clone(),
+            note_shell_balance,
+        )
+        .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         send_message_routed_money_once(
             &self.money_post_http,
             &endpoint,
@@ -3858,7 +3903,6 @@ impl RealChainBackend {
 
     /// Read ordered lifecycle receipts for one deal. `StreamStopped` proves the clean
     /// post-probe-accept split; `ProbeBurned` proves the mutually exclusive BurnBoth path.
-    #[cfg(feature = "test-giver")]
     pub async fn token_contract_settlement_receipts(
         &self,
         token_contract: &Address,
@@ -5906,6 +5950,7 @@ mod tests {
                         "account_addr": TARGET,
                         "lt": "0x62b9b6",
                         "outmsg_cnt": 0,
+                        "compute": {"exit_code": 0, "success": true},
                         "action": {"result_code": 38, "success": false, "no_funds": true}
                     }
                 },
@@ -5929,6 +5974,7 @@ mod tests {
             .expect("finalized destination receipt");
         assert_eq!(receipt.message_hash, HASH);
         assert_eq!(receipt.transaction_hash.as_deref(), Some("tx38"));
+        assert_eq!(receipt.compute_exit_code, Some(0));
         assert_eq!(receipt.result_code, Some(38));
         assert_eq!(receipt.no_funds, Some(true));
         assert_eq!(receipt.outmsg_count, Some(0));
@@ -5956,6 +6002,7 @@ mod tests {
             message_hash: "abcd".to_string(),
             transaction_hash: Some("tx38".to_string()),
             aborted: Some(true),
+            compute_exit_code: Some(0),
             action_success: Some(false),
             result_code: Some(38),
             no_funds: Some(true),
@@ -5989,11 +6036,34 @@ mod tests {
     }
 
     #[test]
+    fn note_deploy_rootpn_receipt_surfaces_exact_compute_403_without_action_phase() {
+        let receipt = note_deploy_rootpn_action_observation(CorrelatedActionReceipt {
+            message_hash: "abcd".to_string(),
+            transaction_hash: Some("tx403".to_string()),
+            aborted: Some(true),
+            compute_exit_code: Some(403),
+            ..Default::default()
+        })
+        .expect("compute abort is an exact finalized RootPN observation");
+
+        assert_eq!(
+            receipt,
+            NoteDeployRootPnActionObservation {
+                transaction_hash: "tx403".to_string(),
+                compute_exit_code: 403,
+                aborted: true,
+                action_result_code: None,
+            }
+        );
+    }
+
+    #[test]
     fn note_deploy_success_observation_allows_eventually_indexed_ecc_state() {
         let receipt = CorrelatedActionReceipt {
             message_hash: "abcd".to_string(),
             transaction_hash: Some("tx38".to_string()),
             aborted: Some(false),
+            compute_exit_code: Some(0),
             action_success: Some(true),
             result_code: Some(0),
             no_funds: Some(false),
@@ -6019,6 +6089,7 @@ mod tests {
                     "dst_transaction": {
                         "id": "tx38", "status": 3, "aborted": true,
                         "account_addr": TARGET,
+                        "compute": {"exit_code": 0, "success": true},
                         "action": {"result_code": 38, "success": false, "no_funds": true}
                     }
                 },
@@ -6078,6 +6149,7 @@ mod tests {
                     "dst_transaction": {
                         "id": "tx38", "status": 3, "aborted": true,
                         "account_addr": TARGET,
+                        "compute": {"exit_code": 0, "success": true},
                         "action": {"result_code": 38, "success": false, "no_funds": true}
                     }
                 },
@@ -6121,6 +6193,7 @@ mod tests {
                 message_hash: HASH.to_string(),
                 transaction_hash: Some("tx38".to_string()),
                 aborted: Some(true),
+                compute_exit_code: Some(0),
                 action_success: Some(false),
                 result_code: Some(38),
                 no_funds: Some(true),

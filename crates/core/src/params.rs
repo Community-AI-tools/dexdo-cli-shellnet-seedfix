@@ -6,8 +6,29 @@ use std::time::Duration;
 /// SHELL -- the system's settlement unit. Integer count of minimal units.
 pub type Shell = u64;
 
+/// Canonical ECC currency id used by every dexdo market-money path.
+pub const SHELL_CURRENCY_ID: u32 = 2;
+
+/// Canonical CLI label for the market settlement currency.
+pub const SHELL_CURRENCY_LABEL: &str = "shell";
+
 /// Canonical order-book price quantum: `1e9` raw ECC[2] units = 1 SHELL.
 pub const PRICE_STEP: u128 = 1_000_000_000;
+
+/// Minimum buy size, in ticks, needed for the probe tick plus one streaming tick.
+pub const MIN_STREAM_BUY_TICKS: u128 = 2;
+
+/// Exact byte length of the pinned Hermez K19 SRS used by `dexdo note deploy`.
+pub const HERMEZ_SRS_SIZE_BYTES: u64 = 67_109_124;
+
+/// Maximum HTTP attempts for one resumable Hermez SRS download invocation.
+pub const HERMEZ_SRS_MAX_ATTEMPTS: usize = 5;
+
+/// Initial retry delay for transient Hermez SRS download failures.
+pub const HERMEZ_SRS_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Maximum one-based history-proof layer used by `dexdo note deploy` re-proof.
+pub const NOTE_DEPLOY_PROOF_LAYER_MAX: u8 = 3;
 
 /// Fixed protocol constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +74,48 @@ impl Default for ProtocolConsts {
     }
 }
 
+/// Seller CLI liveness timings for a resting SELL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SellerLivenessParams {
+    /// Time between complete gateway/upstream health cycles.
+    pub health_interval: Duration,
+    /// Per-cycle budget for gateway and exact-model upstream readiness.
+    pub health_check_timeout: Duration,
+    /// Maximum time from a completed failed health cycle to a terminal order fact.
+    pub health_cycle_timeout: Duration,
+    /// Standalone graceful-shutdown cancellation confirmation budget.
+    pub cancel_confirmation_timeout: Duration,
+    /// Poll interval while reconciling exact order state.
+    pub cancel_confirmation_poll: Duration,
+    /// Poll interval used only to notice a terminated gateway task.
+    pub gateway_task_poll: Duration,
+}
+
+impl SellerLivenessParams {
+    /// Canonical values from.
+    pub const fn canonical() -> Self {
+        Self {
+            health_interval: Duration::from_secs(20),
+            health_check_timeout: Duration::from_secs(20),
+            health_cycle_timeout: Duration::from_secs(60),
+            cancel_confirmation_timeout: Duration::from_secs(60),
+            cancel_confirmation_poll: Duration::from_secs(2),
+            gateway_task_poll: Duration::from_millis(100),
+        }
+    }
+}
+
+impl Default for SellerLivenessParams {
+    fn default() -> Self {
+        Self::canonical()
+    }
+}
+
+/// Maximum wait for the authoritative buyer-owned `StreamStopped` receipt.
+pub const SELLER_TERMINAL_RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Poll interval while the exact `StreamStopped` receipt is not yet visible.
+pub const SELLER_TERMINAL_RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Order book deploy parameters. In they are filled by a mock; in production they are read from on-chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DobParams {
@@ -72,5 +135,42 @@ impl DobParams {
 impl Default for DobParams {
     fn default() -> Self {
         Self::canonical()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SellerLivenessParams, HERMEZ_SRS_MAX_ATTEMPTS, HERMEZ_SRS_RETRY_INITIAL_BACKOFF,
+        HERMEZ_SRS_SIZE_BYTES, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+        SELLER_TERMINAL_RECEIPT_TIMEOUT,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn seller_liveness_parameters_match_directive_668() {
+        let params = SellerLivenessParams::canonical();
+        assert_eq!(params.health_interval, Duration::from_secs(20));
+        assert_eq!(params.health_check_timeout, Duration::from_secs(20));
+        assert_eq!(params.health_cycle_timeout, Duration::from_secs(60));
+        assert_eq!(params.cancel_confirmation_timeout, Duration::from_secs(60));
+        assert_eq!(params.cancel_confirmation_poll, Duration::from_secs(2));
+        assert_eq!(params.gateway_task_poll, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn seller_terminal_receipt_parameters_are_canonical() {
+        assert_eq!(SELLER_TERMINAL_RECEIPT_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(
+            SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn hermez_srs_download_parameters_match_the_directive() {
+        assert_eq!(HERMEZ_SRS_SIZE_BYTES, 67_109_124);
+        assert_eq!(HERMEZ_SRS_MAX_ATTEMPTS, 5);
+        assert_eq!(HERMEZ_SRS_RETRY_INITIAL_BACKOFF, Duration::from_secs(1));
     }
 }

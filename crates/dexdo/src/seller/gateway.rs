@@ -1,7 +1,7 @@
 //! Seller gateway: accepting buyer connections, stream-session
 //! authorization and incremental yielding of the canonical fake-token stream.
 
-use crate::seller::auth::{challenge_bytes, AuthRegistry};
+use crate::seller::auth::{challenge_bytes, AuthRegistry, HEALTH_CHALLENGE_TC};
 use crate::seller::upstream::UpstreamConfig;
 use crate::seller::upstream::UpstreamEvent;
 use dexdo_core::note::Signature;
@@ -17,6 +17,70 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::{Request, Response, Status};
 
+#[derive(Clone, Debug)]
+pub struct UpstreamFailure {
+    pub token_contract: String,
+    pub error_class: &'static str,
+    pub retryable: bool,
+    pub grpc_status: String,
+    pub http_status: Option<u16>,
+    event_sequence: Arc<AtomicU64>,
+}
+
+impl UpstreamFailure {
+    fn from_status(token_contract: &str, status: &Status, event_sequence: Arc<AtomicU64>) -> Self {
+        let http_status = status
+            .message()
+            .strip_prefix("upstream HTTP ")
+            .and_then(|suffix| suffix.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok());
+        let message = status.message().to_ascii_lowercase();
+        let error_class = if matches!(http_status, Some(401 | 403))
+            || matches!(
+                status.code(),
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            ) {
+            "auth"
+        } else if status.code() == tonic::Code::DeadlineExceeded
+            || message.contains("timeout")
+            || message.contains("timed out")
+        {
+            "timeout"
+        } else if message.starts_with("upstream connect failed") {
+            "connect"
+        } else if http_status.is_some() {
+            "http"
+        } else {
+            "upstream"
+        };
+        let retryable = error_class != "auth"
+            && http_status.map_or_else(
+                || {
+                    matches!(
+                        status.code(),
+                        tonic::Code::DeadlineExceeded
+                            | tonic::Code::ResourceExhausted
+                            | tonic::Code::Aborted
+                            | tonic::Code::Unavailable
+                    )
+                },
+                |code| code == 408 || code == 429 || code >= 500,
+            );
+        Self {
+            token_contract: token_contract.to_string(),
+            error_class,
+            retryable,
+            grpc_status: format!("{:?}", status.code()),
+            http_status,
+            event_sequence,
+        }
+    }
+
+    pub fn next_event_seq(&self) -> u64 {
+        self.event_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 /// Per-deal delivery tracking. `count` is the **cumulative** number of canonical tokens the gateway
 /// has delivered to the buyer across ALL of this deal's gRPC streams -- a deal/session serves many sequential
 /// requests on one `token_contract`, so each stream's relay adds to the same counter. `done` means **no more
@@ -29,6 +93,20 @@ use tonic::{Request, Response, Status};
 pub struct DealDelivery {
     pub count: Arc<AtomicU64>,
     pub done: Arc<AtomicBool>,
+    event_sequence: Arc<AtomicU64>,
+    terminal_trail_emitted: Arc<AtomicBool>,
+}
+
+impl DealDelivery {
+    pub fn next_event_seq(&self) -> u64 {
+        self.event_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn claim_terminal_trail(&self) -> bool {
+        self.terminal_trail_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,8 +123,11 @@ pub struct GatewayState {
     limits: Mutex<HashMap<String, StreamLimits>>,
     /// Per-deal delivered-token tracking, created on first access.
     delivered: Mutex<HashMap<String, DealDelivery>>,
-    /// Upstream choice(mock model vs the real adapter). Immutable for the gateway's lifetime.
+    /// Startup upstream and per-TC routes selected from the existing models config.
     upstream: UpstreamConfig,
+    upstreams: Mutex<HashMap<String, UpstreamConfig>>,
+    upstream_failure_tx: mpsc::UnboundedSender<UpstreamFailure>,
+    upstream_failure_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<UpstreamFailure>>,
 }
 
 impl GatewayState {
@@ -57,12 +138,23 @@ impl GatewayState {
 
     /// Gateway with the chosen upstream.
     pub fn with_upstream(upstream: UpstreamConfig) -> Self {
+        let (upstream_failure_tx, upstream_failure_rx) = mpsc::unbounded_channel();
         Self {
             auth: AuthRegistry::new(),
             limits: Mutex::new(HashMap::new()),
             delivered: Mutex::new(HashMap::new()),
             upstream,
+            upstreams: Mutex::new(HashMap::new()),
+            upstream_failure_tx,
+            upstream_failure_rx: tokio::sync::Mutex::new(upstream_failure_rx),
         }
+    }
+
+    pub fn route_stream(&self, token_contract: &str, upstream: UpstreamConfig) {
+        self.upstreams
+            .lock()
+            .unwrap()
+            .insert(token_contract.to_string(), upstream);
     }
 
     /// Register a deal: the buyer's pubkey for authorization + the fake-token budget.
@@ -83,6 +175,14 @@ impl GatewayState {
                 tick_size,
             },
         );
+    }
+
+    /// Remove only one terminal/failed deal from the shared listener.
+    pub fn unregister_stream(&self, token_contract: &str) {
+        self.auth.unregister(token_contract);
+        self.limits.lock().unwrap().remove(token_contract);
+        self.delivered.lock().unwrap().remove(token_contract);
+        self.upstreams.lock().unwrap().remove(token_contract);
     }
 
     fn limits(&self, token_contract: &str) -> Option<StreamLimits> {
@@ -121,6 +221,19 @@ impl GatewayState {
             .or_default()
             .clone()
     }
+
+    pub(crate) fn upstream(&self, token_contract: &str) -> UpstreamConfig {
+        self.upstreams
+            .lock()
+            .unwrap()
+            .get(token_contract)
+            .cloned()
+            .unwrap_or_else(|| self.upstream.clone())
+    }
+
+    pub async fn recv_upstream_failure(&self) -> Option<UpstreamFailure> {
+        self.upstream_failure_rx.lock().await.recv().await
+    }
 }
 
 fn requested_max_tokens(req: Option<&CanonRequest>) -> Option<u64> {
@@ -144,7 +257,13 @@ async fn relay_counting(
     mut up_rx: mpsc::Receiver<Result<UpstreamEvent, Status>>,
     tx: mpsc::Sender<Result<CanonChunk, Status>>,
     count: Arc<AtomicU64>,
+    failure_context: Option<(
+        String,
+        Arc<AtomicU64>,
+        mpsc::UnboundedSender<UpstreamFailure>,
+    )>,
 ) {
+    let mut failure_reported = false;
     while let Some(event) = up_rx.recv().await {
         match event {
             Ok(UpstreamEvent::Chunk {
@@ -160,6 +279,16 @@ async fn relay_counting(
                 count.fetch_add(tokens, Ordering::Release);
             }
             Err(status) => {
+                if !failure_reported {
+                    if let Some((token_contract, event_sequence, failure_tx)) = &failure_context {
+                        let _ = failure_tx.send(UpstreamFailure::from_status(
+                            token_contract,
+                            &status,
+                            event_sequence.clone(),
+                        ));
+                    }
+                    failure_reported = true;
+                }
                 if tx.send(Err(status)).await.is_err() {
                     break;
                 }
@@ -197,6 +326,9 @@ impl Gateway for GatewayService {
         let mut nonce = vec![0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         self.state.auth.issue_challenge(&tc, nonce.clone());
+        if tc == HEALTH_CHALLENGE_TC {
+            self.state.auth.discard_challenge(&tc, &nonce);
+        }
         Ok(Response::new(Challenge {
             nonce,
             token_contract: tc,
@@ -231,8 +363,9 @@ impl Gateway for GatewayService {
         let _ = challenge_bytes(&req.token_contract, &req.nonce);
 
         let request = req.request;
+        let upstream = self.state.upstream(&req.token_contract);
         let mock_upstream = matches!(
-            self.state.upstream,
+            upstream,
             UpstreamConfig::Mock
                 | UpstreamConfig::MockWithClaimedModel(_)
                 | UpstreamConfig::MockScammer
@@ -243,11 +376,11 @@ impl Gateway for GatewayService {
         // R1: the upstream adapts the CANONICAL request that arrived in the opening
         // call alongside authorization. The mock model builds fake output from the prompt; the real
         // provider adapter proxies the request and normalizes the SSE(R1/R5/R6).
-        let upstream = self.state.upstream.clone();
         // The per-deal delivery tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so `count` accumulates over sequential requests. The relay is handed only
         // the counter -- `done` stays owned by the buyer session lifecycle, never set per-stream.
-        let delivered = self.state.delivery(&req.token_contract).count;
+        let delivery = self.state.delivery(&req.token_contract);
+        let delivered = delivery.count.clone();
         // Incremental yielding(R6): without buffering. The upstream feeds an internal channel;
         // `relay_counting` forwards each chunk to the buyer AND adds the delivered token count to the deal's
         // cumulative count, so the seller's `drive_advance` can bill only real delivered ticks.
@@ -256,7 +389,16 @@ impl Gateway for GatewayService {
             upstream.run(count, request, up_tx).await;
         });
         let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
-        tokio::spawn(relay_counting(up_rx, tx, delivered));
+        tokio::spawn(relay_counting(
+            up_rx,
+            tx,
+            delivered,
+            Some((
+                req.token_contract,
+                delivery.event_sequence,
+                self.state.upstream_failure_tx.clone(),
+            )),
+        ));
 
         let stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream)))
@@ -267,6 +409,36 @@ impl Gateway for GatewayService {
 mod tests {
     use super::*;
     use dexdo_proto::SamplingParams;
+
+    async fn relay_with_failure_seam(
+        events: Vec<Result<UpstreamEvent, Status>>,
+    ) -> (Vec<Result<CanonChunk, Status>>, Option<UpstreamFailure>) {
+        let (up_tx, up_rx) = mpsc::channel(16);
+        for event in events {
+            up_tx.send(event).await.unwrap();
+        }
+        drop(up_tx);
+        let (tx, mut rx) = mpsc::channel(16);
+        let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
+        relay_counting(
+            up_rx,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            Some((
+                "0:deal".to_string(),
+                Arc::new(AtomicU64::new(0)),
+                failure_tx,
+            )),
+        )
+        .await;
+        let mut buyer = Vec::new();
+        while let Some(item) = rx.recv().await {
+            buyer.push(item);
+        }
+        let failure = failure_rx.try_recv().ok();
+        assert!(failure_rx.try_recv().is_err(), "duplicate upstream event");
+        (buyer, failure)
+    }
 
     /// Drive one gRPC stream through `relay_counting`: emit `n_ok` `Ok` chunks (and optionally a trailing
     /// `Err`), forward to a sink, and return how many items reached the buyer. Adds delivered tokens to `count`.
@@ -292,7 +464,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let relay = tokio::spawn(relay_counting(up_rx, tx, count));
+        let relay = tokio::spawn(relay_counting(up_rx, tx, count, None));
         let mut forwarded = 0;
         while rx.recv().await.is_some() {
             forwarded += 1;
@@ -427,7 +599,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        relay_counting(up_rx, tx, count.clone()).await;
+        relay_counting(up_rx, tx, count.clone(), None).await;
         while rx.recv().await.is_some() {}
         assert_eq!(
             count.load(Ordering::Acquire),
@@ -456,12 +628,68 @@ mod tests {
             }
             up_tx.send(Ok(UpstreamEvent::Accounted(5))).await.unwrap();
         });
-        relay_counting(up_rx, tx, count.clone()).await;
+        relay_counting(up_rx, tx, count.clone(), None).await;
         let mut delivered_chunks = 0;
         while rx.recv().await.is_some() {
             delivered_chunks += 1;
         }
         assert_eq!(delivered_chunks, 2);
         assert_eq!(count.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn upstream_401_is_forwarded_unchanged_and_reported_once_without_detail() {
+        let message = "upstream HTTP 401 Unauthorized: sensitive provider error detail redacted";
+        let (buyer, failure) = relay_with_failure_seam(vec![
+            Err(Status::unavailable(message)),
+            Err(Status::unavailable(message)),
+        ])
+        .await;
+
+        assert_eq!(buyer.len(), 2);
+        assert!(buyer.iter().all(|item| item
+            .as_ref()
+            .is_err_and(|status| status.message() == message)));
+        let failure = failure.unwrap();
+        assert_eq!(failure.token_contract, "0:deal");
+        assert_eq!(failure.error_class, "auth");
+        assert!(!failure.retryable);
+        assert_eq!(failure.grpc_status, "Unavailable");
+        assert_eq!(failure.http_status, Some(401));
+        let safe = format!("{failure:?}");
+        assert!(!safe.contains("provider error"), "{safe}");
+        assert!(!safe.contains("Authorization"), "{safe}");
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_and_success_have_distinct_safe_failure_outcomes() {
+        let sequence = Arc::new(AtomicU64::new(0));
+        let connect = UpstreamFailure::from_status(
+            "0:deal",
+            &Status::unavailable("upstream connect failed: private.invalid/secret-path"),
+            sequence.clone(),
+        );
+        let timeout = UpstreamFailure::from_status(
+            "0:deal",
+            &Status::deadline_exceeded("upstream request timed out: private detail"),
+            sequence,
+        );
+        let (buyer, success) = relay_with_failure_seam(vec![Ok(UpstreamEvent::Chunk {
+            chunk: CanonChunk::default(),
+            accounted_tokens: 0,
+        })])
+        .await;
+
+        assert_eq!(connect.error_class, "connect");
+        assert!(connect.retryable);
+        assert_eq!(timeout.error_class, "timeout");
+        assert!(timeout.retryable);
+        for failure in [&connect, &timeout] {
+            let safe = format!("{failure:?}");
+            assert!(!safe.contains("secret-path"), "{safe}");
+            assert!(!safe.contains("private detail"), "{safe}");
+        }
+        assert_eq!(buyer.len(), 1);
+        assert!(success.is_none(), "success must not emit upstream_failed");
     }
 }

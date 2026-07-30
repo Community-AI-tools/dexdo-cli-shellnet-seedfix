@@ -3,6 +3,7 @@
 
 use crate::cli::args::OracleArgs;
 use anyhow::{bail, Result};
+use dexdo_core::params::SHELL_CURRENCY_ID;
 
 #[cfg(feature = "shellnet")]
 use crate::cli::args::{OracleCommand, OracleProvisionArgs, OracleResolveArgs, OracleStateArgs};
@@ -23,6 +24,14 @@ fn load_oracle_market_manifest(path: &std::path::Path) -> Result<dexdo_core::Ora
     manifest
         .validate()
         .map_err(|e| anyhow::anyhow!("--manifest {}: {e}", path.display()))?;
+    if manifest.token_type != SHELL_CURRENCY_ID {
+        bail!(
+            "--manifest {}: token_type {} is unsupported; dexdo markets require SHELL currency id {}",
+            path.display(),
+            manifest.token_type,
+            SHELL_CURRENCY_ID
+        );
+    }
     Ok(manifest)
 }
 
@@ -144,8 +153,8 @@ async fn run_oracle_provision(args: OracleProvisionArgs) -> Result<()> {
 #[cfg(feature = "shellnet")]
 async fn run_oracle_state(args: OracleStateArgs) -> Result<()> {
     use dexdo_core::{Address, RealChainBackend};
-    shellnet_doctor_preflight(&args.contracts, None).await?;
     let manifest = load_oracle_market_manifest(&args.manifest)?;
+    shellnet_doctor_preflight(&args.contracts, None).await?;
     let contracts = args
         .contracts
         .to_str()
@@ -462,6 +471,71 @@ async fn run_oracle_delete(args: OracleResolveArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "shellnet")]
+    fn oracle_manifest(token_type: u32) -> dexdo_core::OracleMarketManifest {
+        dexdo_core::OracleMarketManifest {
+            network: "shellnet".into(),
+            root_oracle: "0:root".into(),
+            oracle: "0:oracle".into(),
+            oracle_event_list: "0:list".into(),
+            oracle_list_hash: "1".into(),
+            event_id: "2".into(),
+            event_name: "event".into(),
+            pmp: "0:pmp".into(),
+            token_type,
+            inference_order_book: "0:book".into(),
+            frame_model: "model".into(),
+            deadline: 1,
+            bounds: vec!["100".into()],
+            outcome_names: vec!["below".into(), "above".into()],
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn oracle_manifest_rejects_non_shell_before_chain_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oracle-market.json");
+        std::fs::write(&path, oracle_manifest(1).to_json().unwrap()).unwrap();
+
+        let error = super::load_oracle_market_manifest(&path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "require SHELL currency id {}",
+                super::SHELL_CURRENCY_ID
+            )),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn oracle_state_rejects_non_shell_before_doctor_or_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("oracle-market.json");
+        std::fs::write(&manifest, oracle_manifest(1).to_json().unwrap()).unwrap();
+
+        let error = super::run_oracle_state(super::OracleStateArgs {
+            manifest,
+            contracts: dir.path().join("must-not-read-contracts.json"),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "require SHELL currency id {}",
+                super::SHELL_CURRENCY_ID
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("must-not-read-contracts"), "{error}");
+    }
+
     #[cfg(feature = "shellnet")]
     #[test]
     fn oracle_deadline_enforces_contract_result_gap() {

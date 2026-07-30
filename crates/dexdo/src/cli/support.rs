@@ -132,6 +132,64 @@ pub(crate) fn seller_real_backend(
     Ok((chain, note))
 }
 
+#[cfg(feature = "shellnet")]
+pub(crate) async fn provision_replacement_seller(
+    args: &SellerArgs,
+    frame_model: &str,
+    nonce: u64,
+    price_per_tick: u64,
+    max_ticks: u64,
+) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
+    use dexdo_core::{Address, KeyPair, RealChainBackend, RealSellerBackend, MODEL_TICK_SIZE};
+
+    let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("real shellnet: --note-addr is required for residual provisioning")
+    })?;
+    let note_key = args.identity.note_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("real shellnet: --note-key is required for residual provisioning")
+    })?;
+    let manifest_path = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    let secret = read_secret_hex(note_key, "--note-key")?;
+    let chain = RealChainBackend::connect(manifest_path)?;
+    let keys = KeyPair::from_secret_hex(secret.trim())
+        .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+    let note =
+        Address::parse(note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let per_deploy = deposit_per_deploy(DEFAULT_DEPOSIT_SHELLS)?;
+    chain.assert_seller_note_current(&note).await?;
+    let note_ecc = chain
+        .client()
+        .get_account(&note)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("seller note {note} disappeared before residual provision"))?
+        .ecc_balance(2);
+    ensure_provision_deposit_covered(note_ecc, DEFAULT_DEPOSIT_SHELLS, u128::from(price_per_tick))?;
+    let market = chain
+        .provision_market(
+            &keys,
+            &note,
+            frame_model,
+            nonce,
+            u128::from(price_per_tick),
+            u128::from(max_ticks),
+            per_deploy,
+        )
+        .await?;
+    let backend: Arc<dyn ChainBackend> = Arc::new(RealSellerBackend::new(
+        chain,
+        note,
+        keys,
+        dexdo_core::model_hash_for(frame_model),
+        frame_model.to_string(),
+        nonce,
+        MODEL_TICK_SIZE,
+    ));
+    Ok((market, backend))
+}
+
 #[cfg(not(feature = "shellnet"))]
 pub(crate) fn seller_real_backend(
     _args: &SellerArgs,
@@ -142,6 +200,17 @@ pub(crate) fn seller_real_backend(
     bail!(
         "real shellnet backend unavailable: build with `--features shellnet` or pass --mock-chain"
     )
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn provision_replacement_seller(
+    _args: &SellerArgs,
+    _frame_model: &str,
+    _nonce: u64,
+    _price_per_tick: u64,
+    _max_ticks: u64,
+) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
+    bail!("real shellnet backend unavailable: residual provisioning requires --features shellnet")
 }
 
 /// Real buyer backend + the buyer's `RealNote`: from a provisioned note(`--note-key`/`--note-addr`)

@@ -218,7 +218,12 @@ pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>
     {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+        if p.extension().and_then(|s| s.to_str()) != Some("json")
+            || !p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.starts_with("deal-"))
+        {
             continue;
         }
         out.push((p.clone(), load_deal_handle(&p)?));

@@ -10,7 +10,9 @@
 //! (scaled by price) for the stream cadence; tests inject short windows. This module is the
 //! offline-verifiable core of the orchestrator; wiring it into the live serve path and the session-scoped
 
-use dexdo_core::{ChainBackend, ChainError, Note, TokenContract};
+use dexdo_core::{
+    params::SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, ChainBackend, ChainError, Note, TokenContract,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,11 +136,15 @@ pub async fn drive_advance(
                 }
             } else {
                 // nothing newly delivered this window -- wait for more delivery.
-                tokio::time::sleep(windows.settle).await;
+                if wait_settle_or_closed(chain, token_contract, windows.settle).await {
+                    break;
+                }
                 continue;
             }
         }
-        tokio::time::sleep(windows.settle).await;
+        if wait_settle_or_closed(chain, token_contract, windows.settle).await {
+            break;
+        }
         match chain.advance_tick(token_contract, seller_note).await {
             Ok(()) => finalized += 1,
             Err(ChainError::Limit(_)) => break, // max_ticks / deposit ceiling -- expected exhaustion
@@ -153,6 +159,25 @@ pub async fn drive_advance(
         }
     }
     Ok(finalized)
+}
+
+async fn wait_settle_or_closed(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+    settle_window: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + settle_window;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL.min(deadline.duration_since(now)))
+            .await;
+        if deal_closed(chain, token_contract).await {
+            return true;
+        }
+    }
 }
 
 fn billed_ticks(tokens: u64, tick_size: u64) -> u128 {
@@ -295,12 +320,14 @@ mod tests {
     struct CountingBackend {
         accepts: AtomicU64,
         advances: AtomicU64,
+        closed: AtomicBool,
     }
     impl CountingBackend {
         fn new() -> Self {
             Self {
                 accepts: AtomicU64::new(0),
                 advances: AtomicU64::new(0),
+                closed: AtomicBool::new(false),
             }
         }
     }
@@ -344,7 +371,17 @@ mod tests {
             unimplemented!()
         }
         async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
-            None // never a clean close -- the bound relies on `delivered`/`delivery_done`, not a stop
+            self.closed
+                .load(Ordering::Acquire)
+                .then_some(StreamSnapshot {
+                    seller_locked: 0,
+                    buyer_locked: 0,
+                    buyer_lead: 0,
+                    seller_received: 0,
+                    buyer_refunded: 0,
+                    burned: 0,
+                    closed: true,
+                })
         }
     }
 
@@ -485,6 +522,40 @@ mod tests {
             0,
             "one delivered tick needs no stream-phase advance"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buyer_stop_interrupts_post_probe_settle_wait() {
+        let backend = Arc::new(CountingBackend::new());
+        let driver_backend = backend.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance(
+                driver_backend.as_ref(),
+                &"tc-stop".to_string(),
+                &LocalNote::generate(),
+                AdvanceWindows {
+                    probe: Duration::ZERO,
+                    settle: Duration::from_secs(1_200),
+                },
+                4,
+                1,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+
+        while backend.accepts.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        backend.closed.store(true, Ordering::Release);
+        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert!(driver.is_finished());
+        assert_eq!(driver.await.unwrap().unwrap(), 1);
+        assert_eq!(backend.advances.load(Ordering::Relaxed), 0);
     }
 
     /// regression: after `open_stream`, a matched buyer may not have connected yet. Empty delivery is not a

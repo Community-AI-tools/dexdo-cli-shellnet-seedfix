@@ -697,8 +697,8 @@ fn escape_html(s: &str) -> String {
 mod tests {
     use super::*;
     use dexdo_core::{
-        ChainBackend, ChainError, DealChainState, Match, MatchWatchCursor, Note, OfferListing,
-        SellOffer, Settlement, StreamSnapshot, TokenContract,
+        ChainBackend, ChainError, DealChainState, Match, Note, OfferListing, SellOffer, Settlement,
+        StreamSnapshot, TokenContract,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1007,14 +1007,6 @@ mod tests {
         async fn read_openable_match_now(
             &self,
             _token_contract: &TokenContract,
-        ) -> Result<Option<Match>, ChainError> {
-            Ok(None)
-        }
-
-        async fn poll_openable_match(
-            &self,
-            _token_contract: &TokenContract,
-            _cursor: &mut MatchWatchCursor,
         ) -> Result<Option<Match>, ChainError> {
             Ok(None)
         }

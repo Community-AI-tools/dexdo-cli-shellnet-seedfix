@@ -890,6 +890,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [
                     {
                         "address": note_addr,

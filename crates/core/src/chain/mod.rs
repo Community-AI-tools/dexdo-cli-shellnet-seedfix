@@ -149,6 +149,17 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Vec<OrderBookOrder>, ChainError> {
         Ok(Vec::new())
     }
+    /// Cancel one exact resting SELL owned by this seller backend. The caller must reread the
+    /// authoritative book/match state before reporting a terminal outcome.
+    async fn cancel_resting_sell_order(
+        &self,
+        token_contract: &TokenContract,
+        order_id: u128,
+    ) -> Result<(), ChainError> {
+        Err(ChainError::Chain(format!(
+            "exact resting SELL cancellation is not supported for TokenContract {token_contract}, order {order_id}"
+        )))
+    }
     /// The buyer sends a buy order; the order book records its pubkey into `token_contract`.
     async fn place_buy(
         &self,
@@ -186,7 +197,8 @@ pub trait ChainBackend: Send + Sync {
         _max_price_per_tick: u128,
         _escrow: u128,
         _cursor: &mut MatchWatchCursor,
-        _before_post: &mut (dyn FnMut(String, MatchWatchCursor) -> Result<(), ChainError> + Send),
+        _before_post: &mut (dyn FnMut(String, MatchWatchCursor, u128) -> Result<(), ChainError>
+                  + Send),
     ) -> Result<(), ChainError> {
         Err(ChainError::Chain(
             "backend cannot expose an exact pre-POST submit identity; no BOC was sent".into(),
@@ -325,15 +337,15 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<Match>, ChainError> {
         Ok(None)
     }
-    /// Gateway-owned seller watch poll. The default uses an equivalent authoritative state source (the
-    /// per-deal TC) and returns immediately; real shellnet seller backends override this to advance the
-    /// note-event cursor as well. The caller owns sleeping/backoff and persists `cursor`.
-    async fn poll_openable_match(
+    /// Poll all new owner-facing seller fills for this note/model without
+    /// reducing them to a single [`Match`]. The authoritative event retains the
+    /// filled tick count required for exact partial-capacity accounting.
+    async fn poll_seller_fills(
         &self,
-        token_contract: &TokenContract,
+        _note: &dyn Note,
         _cursor: &mut MatchWatchCursor,
-    ) -> Result<Option<Match>, ChainError> {
-        self.read_openable_match_now(token_contract).await
+    ) -> Result<Vec<MatchedFill>, ChainError> {
+        Ok(Vec::new())
     }
     /// The seller waits for/reads the match on its own `token_contract`.
     async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError>;
@@ -414,6 +426,14 @@ pub trait ChainBackend: Send + Sync {
         Err(ChainError::Chain(format!(
             "cleanup_unopened not supported for {token_contract}"
         )))
+    }
+    /// Exact buyer-owned STOP receipt. Generic closed/stopped state is not enough to
+    /// distinguish STOP from reclaim, dispute resolution, or another terminal path.
+    async fn buyer_stop_settlement(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        Ok(None)
     }
     /// Read by-fact per-deal lifecycle flags and timeout anchors from the chain. Default `None` keeps mock and
     /// unsupported backends on their local/session fallback; real shellnet buyer/deal backends override this so

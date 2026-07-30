@@ -398,8 +398,12 @@ mod note_cli_tests {
             panic!("expected NoteCommand::Deploy");
         };
         assert_eq!(d.nominal, "N100");
-        assert_eq!(d.token_type, "nackl");
+        assert_eq!(d.token_type, "shell");
         assert_eq!(d.endpoint, "shellnet.ackinacki.org");
+        assert_eq!(
+            d.contracts,
+            PathBuf::from("contracts/deployed.shellnet.json")
+        );
         assert_eq!(d.multisig_address, "0:wallet");
         assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
@@ -1522,7 +1526,7 @@ mod oracle_cli_tests {
         assert_eq!(bounds, ["100", "200"]);
         assert_eq!(outcome_names, ["below", "middle", "above"]);
         assert_eq!(initial_stakes, [10_000_000, 10_000_000, 10_000_000]);
-        assert_eq!(token_type, 1);
+        assert_eq!(token_type, dexdo_core::params::SHELL_CURRENCY_ID);
         assert_eq!(output, PathBuf::from("oracle-market.json"));
 
         let c = Cli::try_parse_from(["dexdo", "oracle", "state", "--manifest", "oracle.json"])
@@ -1947,10 +1951,29 @@ mod tests {
     fn note_deploy_token_type_help_lists_values() {
         let help = nested_subcommand_long_help(&["note", "deploy"]);
         assert!(help.contains("--token-type <TOKEN_TYPE>"), "{help}");
-        assert!(
-            help.contains("[possible values: nackl, shell, usdc]"),
-            "{help}"
-        );
+        assert!(help.contains("[possible values: shell]"), "{help}");
+        assert!(!help.to_ascii_lowercase().contains("nackl"), "{help}");
+        assert!(!help.to_ascii_lowercase().contains("usdc"), "{help}");
+    }
+
+    #[test]
+    fn note_deploy_rejects_non_shell_token_types() {
+        for token_type in ["nackl", "usdc"] {
+            let parsed = Cli::try_parse_from([
+                "dexdo",
+                "note",
+                "deploy",
+                "--multisig-address",
+                "0:wallet",
+                "--multisig-key",
+                "w.keys.json",
+                "--pool",
+                "pn_pool.json",
+                "--token-type",
+                token_type,
+            ]);
+            assert!(parsed.is_err(), "{token_type} must be rejected");
+        }
     }
 
     #[test]

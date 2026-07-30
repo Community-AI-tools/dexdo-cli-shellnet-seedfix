@@ -6,6 +6,7 @@ use crate::note::{Note, NotePubkey};
 use crate::params::{DobParams, ProtocolConsts, Shell};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,9 @@ struct StreamCell {
     /// until `release_dispute`, which returns the contested amount to the buyer.
     #[serde(default)]
     disputed: bool,
+    /// Exact mock-chain equivalent of the buyer-owned terminal contract event.
+    #[serde(default)]
+    buyer_stop_settlement: Option<(u128, u128)>,
 }
 
 /// Default `max_ticks` for the old/carried state field -- no ceiling(do not block existing streams).
@@ -53,10 +57,16 @@ struct MockState {
     /// Filled offers are no longer active book asks, but the consumed terms remain part of the deal.
     #[serde(default)]
     matched_offers: HashMap<TokenContract, SellOffer>,
+    /// Authoritative filled volume K for a consumed offer; absent legacy entries mean full fill.
+    #[serde(default)]
+    matched_ticks: HashMap<TokenContract, u64>,
     /// Seller(hex of the note's ed-pubkey) per offer -- for discovery/blacklist.
     #[serde(default)]
     offer_sellers: HashMap<TokenContract, String>,
     matches: HashMap<TokenContract, Match>,
+    /// Wall-clock source cursor for owner-facing mock fill events.
+    #[serde(default)]
+    match_created_at: HashMap<TokenContract, i64>,
     streams: HashMap<TokenContract, StreamCell>,
 }
 
@@ -119,6 +129,66 @@ impl MockChainBackend {
         std::fs::write(&self.endpoints_path, bytes)
             .map_err(|e| ChainError::EndpointsFile(e.to_string()))
     }
+
+    fn place_buy_ticks_inner(
+        &self,
+        token_contract: &TokenContract,
+        note: &dyn Note,
+        ticks: Option<u64>,
+    ) -> Result<(), ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let mut st = self.load_state()?;
+        let offer = st
+            .offers
+            .get(token_contract)
+            .ok_or_else(|| ChainError::NoMatch(token_contract.clone()))?
+            .clone();
+        let matched_ticks = ticks.unwrap_or(offer.max_ticks);
+        if matched_ticks == 0 || matched_ticks > offer.max_ticks {
+            return Err(ChainError::Chain(format!(
+                "mock buy ticks must be within 1..={}, got {matched_ticks}",
+                offer.max_ticks
+            )));
+        }
+        st.offers.remove(token_contract);
+        st.matched_offers
+            .insert(token_contract.clone(), offer.clone());
+        st.matched_ticks
+            .insert(token_contract.clone(), matched_ticks);
+        st.matches.insert(
+            token_contract.clone(),
+            Match {
+                token_contract: token_contract.clone(),
+                buyer_pubkey: note.pubkey(),
+                price_per_tick: offer.price_per_tick,
+            },
+        );
+        st.match_created_at
+            .insert(token_contract.clone(), mock_now_unix());
+        self.store_state(&st)
+    }
+
+    /// Mock order-book fill of an exact partial volume, used by the production mock e2e path.
+    pub async fn place_buy_ticks(
+        &self,
+        token_contract: &TokenContract,
+        note: &dyn Note,
+        ticks: u64,
+    ) -> Result<(), ChainError> {
+        self.place_buy_ticks_inner(token_contract, note, Some(ticks))
+    }
+}
+
+fn mock_order_id(token_contract: &str) -> u128 {
+    let digest = Sha256::digest(token_contract.as_bytes());
+    u128::from_be_bytes(digest[..16].try_into().expect("SHA-256 prefix"))
+}
+
+fn mock_now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -164,31 +234,75 @@ impl ChainBackend for MockChainBackend {
         self.store_state(&st)
     }
 
+    async fn confirm_offer_outcome(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<SellOfferOutcome>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        if st.matches.contains_key(token_contract) {
+            return Ok(Some(SellOfferOutcome::Matched));
+        }
+        Ok(st
+            .offers
+            .contains_key(token_contract)
+            .then(|| SellOfferOutcome::Rested {
+                order_id: mock_order_id(token_contract),
+            }))
+    }
+
+    async fn raw_resting_sell_orders_for_tc(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Vec<OrderBookOrder>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        let Some(offer) = st.offers.get(token_contract) else {
+            return Ok(Vec::new());
+        };
+        let owner = st
+            .offer_sellers
+            .get(token_contract)
+            .map(|seller| format!("0:{seller}"))
+            .unwrap_or_default();
+        Ok(vec![OrderBookOrder {
+            order_id: mock_order_id(token_contract),
+            owner_note: owner,
+            token_contract: Some(token_contract.clone()),
+            is_buy: false,
+            price_per_tick: u128::from(offer.price_per_tick),
+            ticks: u128::from(offer.max_ticks),
+            escrow: 0,
+            deadline: 0,
+            flags: 0,
+            timestamp: 0,
+        }])
+    }
+
+    async fn cancel_resting_sell_order(
+        &self,
+        token_contract: &TokenContract,
+        order_id: u128,
+    ) -> Result<(), ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let mut st = self.load_state()?;
+        let expected = mock_order_id(token_contract);
+        if order_id != expected || !st.offers.contains_key(token_contract) {
+            return Err(ChainError::Chain(format!(
+                "resting SELL {order_id} is absent for TokenContract {token_contract}"
+            )));
+        }
+        st.offers.remove(token_contract);
+        st.offer_sellers.remove(token_contract);
+        self.store_state(&st)
+    }
+
     async fn place_buy(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<(), ChainError> {
-        let _g = self.lock.lock().unwrap();
-        let mut st = self.load_state()?;
-        let offer = st
-            .offers
-            .get(token_contract)
-            .ok_or_else(|| ChainError::NoMatch(token_contract.clone()))?
-            .clone();
-        st.offers.remove(token_contract);
-        st.matched_offers
-            .insert(token_contract.clone(), offer.clone());
-        // The order book records the buyer's pubkey into token_contract. The order book's role is done.
-        st.matches.insert(
-            token_contract.clone(),
-            Match {
-                token_contract: token_contract.clone(),
-                buyer_pubkey: note.pubkey(),
-                price_per_tick: offer.price_per_tick,
-            },
-        );
-        self.store_state(&st)
+        self.place_buy_ticks_inner(token_contract, note, None)
     }
 
     async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError> {
@@ -209,6 +323,69 @@ impl ChainBackend for MockChainBackend {
         Ok(st.matches.get(token_contract).cloned())
     }
 
+    async fn sell_offer_terms(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u64, u64)>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        Ok(st
+            .offers
+            .get(token_contract)
+            .or_else(|| st.matched_offers.get(token_contract))
+            .map(|offer| (offer.price_per_tick, offer.max_ticks)))
+    }
+
+    async fn poll_seller_fills(
+        &self,
+        note: &dyn Note,
+        cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<MatchedFill>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        let seller_id = note_id_hex(&note.pubkey());
+        let mut batch = st
+            .matches
+            .keys()
+            .filter(|token_contract| st.offer_sellers.get(*token_contract) == Some(&seller_id))
+            .filter_map(|token_contract| {
+                let offer = st.matched_offers.get(token_contract)?;
+                let created_at = st
+                    .match_created_at
+                    .get(token_contract)
+                    .copied()
+                    .unwrap_or(cursor.since_unix);
+                (!cursor.has_seen(created_at, token_contract)).then(|| {
+                    (
+                        created_at,
+                        MatchedFill {
+                            order_id: mock_order_id(token_contract),
+                            token_contract: token_contract.clone(),
+                            ticks: u128::from(
+                                st.matched_ticks
+                                    .get(token_contract)
+                                    .copied()
+                                    .unwrap_or(offer.max_ticks),
+                            ),
+                            price_per_tick: u128::from(offer.price_per_tick),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        batch.sort_by(|(left_at, left), (right_at, right)| {
+            left_at
+                .cmp(right_at)
+                .then_with(|| left.token_contract.cmp(&right.token_contract))
+        });
+        cursor.record_seen_batch(
+            batch
+                .iter()
+                .map(|(created_at, fill)| (*created_at, fill.token_contract.clone())),
+        );
+        Ok(batch.into_iter().map(|(_, fill)| fill).collect())
+    }
+
     async fn open_stream(
         &self,
         token_contract: &TokenContract,
@@ -225,10 +402,15 @@ impl ChainBackend for MockChainBackend {
 
         // Ceiling on delivered ticks from the consumed offer.
         let max_ticks = st
-            .matched_offers
+            .matched_ticks
             .get(token_contract)
-            .or_else(|| st.offers.get(token_contract))
-            .map(|o| o.max_ticks)
+            .copied()
+            .or_else(|| {
+                st.matched_offers
+                    .get(token_contract)
+                    .or_else(|| st.offers.get(token_contract))
+                    .map(|offer| offer.max_ticks)
+            })
             .unwrap_or(u64::MAX);
         // the first tick is frozen(the buyer locked 1 tick), the seller posted
         // the 2P mirror bond. There is no prepayment ahead.
@@ -244,6 +426,7 @@ impl ChainBackend for MockChainBackend {
             closed: false,
             max_ticks,
             disputed: false,
+            buyer_stop_settlement: None,
         };
         st.streams.insert(token_contract.clone(), cell);
         self.store_state(&st)?;
@@ -336,6 +519,18 @@ impl ChainBackend for MockChainBackend {
             )));
         }
         let settlement = cell.machine.buyer_stop();
+        let clean_stop = if let Settlement::AmicableSplit {
+            to_seller_ticks,
+            to_buyer_refund,
+        } = &settlement
+        {
+            Some((
+                u128::from(*to_seller_ticks) * u128::from(cell.machine.price()),
+                *to_buyer_refund,
+            ))
+        } else {
+            None
+        };
         match &settlement {
             Settlement::BurnBoth(b) => {
                 // the buyer's probe tick P + a mirror P from the seller bond are
@@ -368,6 +563,7 @@ impl ChainBackend for MockChainBackend {
         }
         cell.machine.close();
         cell.closed = true;
+        cell.buyer_stop_settlement = clean_stop;
         // Finalize the net fee by-fact: burn the net from what was delivered.
         burn_net_fee(cell, &self.consts);
         self.store_state(&st)?;
@@ -496,11 +692,24 @@ impl ChainBackend for MockChainBackend {
         }
         st.matches.remove(token_contract);
         st.matched_offers.remove(token_contract);
+        st.matched_ticks.remove(token_contract);
         self.store_state(&st)?;
         Ok(Settlement::SellerNoShow {
             to_buyer_refund: 0,
             seller_bond_returned: 0,
         })
+    }
+
+    async fn buyer_stop_settlement(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        Ok(st
+            .streams
+            .get(token_contract)
+            .and_then(|cell| cell.buyer_stop_settlement))
     }
 
     async fn deal_state(
@@ -645,6 +854,61 @@ fn burn_net_fee(cell: &mut StreamCell, consts: &ProtocolConsts) {
 mod tests {
     use super::*;
     use crate::note::LocalNote;
+
+    #[tokio::test]
+    async fn seller_fill_poll_returns_the_whole_owner_batch_once() {
+        let base =
+            std::env::temp_dir().join(format!("dexdo-seller-fill-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let chain = MockChainBackend::new(
+            base.join("eps.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let seller = LocalNote::from_seed(&[21u8; 32]);
+        let buyer_a = LocalNote::from_seed(&[23u8; 32]);
+        let buyer_b = LocalNote::from_seed(&[24u8; 32]);
+
+        for (tc, owner, buyer, ticks) in [
+            ("tc-a", &seller, &buyer_a, 8),
+            ("tc-b", &seller, &buyer_b, 5),
+        ] {
+            chain
+                .post_offer(
+                    SellOffer {
+                        price_per_tick: 1000,
+                        max_ticks: ticks,
+                        token_contract: tc.to_string(),
+                    },
+                    owner,
+                )
+                .await
+                .unwrap();
+            chain.place_buy(&tc.to_string(), buyer).await.unwrap();
+        }
+
+        let mut cursor = MatchWatchCursor::new(mock_now_unix().saturating_sub(1));
+        let fills = chain.poll_seller_fills(&seller, &mut cursor).await.unwrap();
+
+        assert_eq!(
+            fills
+                .iter()
+                .map(|fill| (fill.token_contract.as_str(), fill.ticks))
+                .collect::<Vec<_>>(),
+            vec![("tc-a", 8), ("tc-b", 5)]
+        );
+        assert!(
+            chain
+                .poll_seller_fills(&seller, &mut cursor)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the durable cursor must suppress exact replays"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[tokio::test]
     async fn high_price_timeout_rejects_legacy_wrapped_seller_lock() {

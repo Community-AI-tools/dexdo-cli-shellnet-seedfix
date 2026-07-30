@@ -27,8 +27,9 @@ pub use book_events::{
     fold_book_event_pages, BookEventFold, BookEventMessage, BookEventPage, LiveBookOrder,
 };
 pub use client::{
-    endpoint_urls, normalize_endpoint, observe_note_deploy_wallet_action, resolve_endpoint,
-    shellnet_clock_skew_preflight, Deployed, MoneySubmitError, NoteDeployWalletActionObservation,
+    endpoint_urls, normalize_endpoint, observe_note_deploy_rootpn_action,
+    observe_note_deploy_wallet_action, resolve_endpoint, shellnet_clock_skew_preflight, Deployed,
+    MoneySubmitError, NoteDeployRootPnActionObservation, NoteDeployWalletActionObservation,
     RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport, ShellnetDoctorStatus,
     DEFAULT_SHELLNET_ENDPOINT,
 };

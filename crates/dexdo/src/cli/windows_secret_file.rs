@@ -541,7 +541,7 @@ mod tests {
             note::NoteDeployRecoveryRequest {
                 endpoint: "https://shellnet.ackinacki.org",
                 nominal: "N100",
-                token_type: 1,
+                token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
                 ecc_shell_deposit: 100_000_000_000,
                 funding_multisig_address: &wallet,

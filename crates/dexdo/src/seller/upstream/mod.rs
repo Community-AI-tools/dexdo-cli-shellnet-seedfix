@@ -11,7 +11,8 @@ pub mod anthropic;
 pub mod mock;
 pub mod openai;
 
-use dexdo_proto::{CanonChunk, CanonRequest};
+use anyhow::{bail, Result};
+use dexdo_proto::{CanonChunk, CanonRequest, ChatMessage, SamplingParams};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -56,6 +57,50 @@ pub enum UpstreamConfig {
 }
 
 impl UpstreamConfig {
+    /// Prove that the configured endpoint accepts the configured credentials and exact served
+    /// model through the same adapter used for buyer traffic. The caller owns the timeout.
+    pub async fn check_health(&self) -> Result<()> {
+        if matches!(
+            self,
+            Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer
+        ) {
+            return Ok(());
+        }
+
+        let request = CanonRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Reply with OK.".to_string(),
+            }],
+            params: Some(SamplingParams {
+                temperature: 0.0,
+                max_tokens: 1,
+                stop: Vec::new(),
+                greedy: true,
+            }),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let run = self.run(1, Some(request), tx);
+        tokio::pin!(run);
+
+        tokio::select! {
+            item = rx.recv() => match item {
+                Some(Ok(UpstreamEvent::Chunk { .. } | UpstreamEvent::Accounted(_))) => Ok(()),
+                Some(Err(status)) => {
+                    bail!("upstream readiness failed ({:?})", status.code());
+                }
+                None => bail!("upstream readiness produced no model response"),
+            },
+            _ = &mut run => match rx.try_recv() {
+                Ok(Ok(UpstreamEvent::Chunk { .. } | UpstreamEvent::Accounted(_))) => Ok(()),
+                Ok(Err(status)) => {
+                    bail!("upstream readiness failed ({:?})", status.code());
+                }
+                Err(_) => bail!("upstream readiness produced no model response"),
+            }
+        }
+    }
+
     /// Run the upstream: normalize its output into `CanonChunk` and send it incrementally into
     /// `tx`(R6). `count` is the stream's token budget: no more than `count` delivered tokens. `req` is
     /// the buyer's canonical request(R1). Finishes on upstream

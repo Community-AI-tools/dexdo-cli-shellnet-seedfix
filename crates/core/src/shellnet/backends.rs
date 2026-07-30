@@ -1,6 +1,12 @@
 #[cfg(test)]
-use super::client::{active_check, code_hash_check, is_uninit_account_404, ShellnetDoctorStatus};
-use super::client::{RealChainBackend, SellerOfferEvents};
+use super::client::{
+    active_check, code_hash_check, is_uninit_account_404, ShellnetDoctorStatus,
+    TokenContractSettlementReceipt,
+};
+use super::client::{
+    RealChainBackend, SellerOfferEvents, TokenContractSettlementEvent,
+    TokenContractSettlementReceipts,
+};
 use super::contracts_provision::*;
 use crate::chain::{
     check_buy_deposit_headroom, coalesce_equivalent_resting_asks, validate_seller_resume_state,
@@ -2601,6 +2607,33 @@ async fn real_tc_snapshot(
     })
 }
 
+fn exact_buyer_stop_settlement(
+    receipts: TokenContractSettlementReceipts,
+) -> Result<Option<(u128, u128)>, ChainError> {
+    let mut found = None;
+    for receipt in receipts.events {
+        let (to_seller, refund_to_buyer) = match receipt.event {
+            TokenContractSettlementEvent::StreamStopped {
+                to_seller,
+                refund_to_buyer,
+                ..
+            } => (to_seller, refund_to_buyer),
+            // ProbeBurned is also emitted by dispute-timeout resolution, so the
+            // event alone does not prove a buyer-owned STOP.
+            TokenContractSettlementEvent::ProbeAccepted { .. }
+            | TokenContractSettlementEvent::ProbeBurned { .. }
+            | TokenContractSettlementEvent::TickFinalized { .. } => continue,
+        };
+        if found.is_some() {
+            return Err(ChainError::Chain(
+                "TokenContract emitted more than one buyer STOP terminal event".to_string(),
+            ));
+        }
+        found = Some((to_seller, refund_to_buyer));
+    }
+    Ok(found)
+}
+
 /// Read one market's deal into a monitor [`DealView`] from the **authoritative on-chain getters** (issue,
 /// real-chain reader). The operator's [`crate::MarketManifest`] supplies only the `TokenContract` ADDRESS to
 /// read + the `model_hash` to integrity-check against; every accounting field comes from the CHAIN -- model from
@@ -2714,6 +2747,38 @@ fn settle_stop(
 mod stop_settlement_tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn only_exact_stream_stopped_is_a_buyer_stop_settlement() {
+        let buyer = "0:buyer".to_string();
+        let classify = |event| {
+            exact_buyer_stop_settlement(TokenContractSettlementReceipts {
+                events: vec![TokenContractSettlementReceipt {
+                    message_id: "receipt".to_string(),
+                    created_at: 7,
+                    event,
+                }],
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            classify(TokenContractSettlementEvent::ProbeBurned {
+                buyer: buyer.clone(),
+                burned_probe: 1,
+                burned_bond: 1,
+                refund_to_buyer: 2,
+            }),
+            None,
+            "ProbeBurned also represents dispute-timeout, not authoritative buyer STOP"
+        );
+        let stopped = classify(TokenContractSettlementEvent::StreamStopped {
+            buyer: buyer.clone(),
+            to_seller: 3,
+            refund_to_buyer: 4,
+        })
+        .unwrap();
+        assert_eq!(stopped, (3, 4));
+    }
 
     fn valid_stop_state() -> Value {
         json!({
@@ -4125,6 +4190,26 @@ impl ChainBackend for RealSellerBackend {
         .await
     }
 
+    async fn cancel_resting_sell_order(
+        &self,
+        token_contract: &TokenContract,
+        order_id: u128,
+    ) -> Result<(), ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let orders = self.raw_resting_sell_orders_for_tc(token_contract).await?;
+        if !orders.iter().any(|order| order.order_id == order_id) {
+            return Err(ChainError::Chain(format!(
+                "resting SELL {order_id} is absent for TokenContract {}",
+                tc.with_workchain()
+            )));
+        }
+        self.chain
+            .cancel_inference_order(&self.note, &self.keys, &self.model_hash, order_id)
+            .await
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     async fn read_openable_match_now(
         &self,
         token_contract: &TokenContract,
@@ -4135,32 +4220,20 @@ impl ChainBackend for RealSellerBackend {
         .await
     }
 
-    async fn poll_openable_match(
+    async fn poll_seller_fills(
         &self,
-        token_contract: &TokenContract,
+        _note: &dyn Note,
         cursor: &mut MatchWatchCursor,
-    ) -> Result<Option<Match>, ChainError> {
-        if let Some(m) = self.read_openable_match_once(token_contract).await? {
-            return Ok(Some(m));
-        }
-        let ob = self
+    ) -> Result<Vec<MatchedFill>, ChainError> {
+        let order_book = self
             .chain
             .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
             .await
             .map_err(map_err)?;
-        let want = parse_tc(token_contract)?.with_workchain();
-        let fills = self
-            .chain
-            .poll_inference_filled_tcs(&self.note, &ob, false, cursor)
+        self.chain
+            .poll_inference_filled_tcs(&self.note, &order_book, false, cursor)
             .await
-            .map_err(map_err)?;
-        if fills
-            .iter()
-            .any(|fill| fill.token_contract.eq_ignore_ascii_case(&want))
-        {
-            return self.read_openable_match_once(token_contract).await;
-        }
-        Ok(None)
+            .map_err(map_err)
     }
 
     async fn place_buy(&self, tc: &TokenContract, _note: &dyn Note) -> Result<(), ChainError> {
@@ -4265,6 +4338,19 @@ impl ChainBackend for RealSellerBackend {
     ) -> Result<Settlement, ChainError> {
         let _ = token_contract;
         Err(wrong_role("stop", "buyer"))
+    }
+
+    async fn buyer_stop_settlement(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let receipts = self
+            .chain
+            .token_contract_settlement_receipts(&tc)
+            .await
+            .map_err(map_err)?;
+        exact_buyer_stop_settlement(receipts)
     }
 
     async fn release_dispute(
@@ -4756,7 +4842,8 @@ impl ChainBackend for RealBuyerBackend {
         max_price_per_tick: u128,
         escrow: u128,
         cursor: &mut MatchWatchCursor,
-        before_post: &mut (dyn FnMut(String, MatchWatchCursor) -> Result<(), ChainError> + Send),
+        before_post: &mut (dyn FnMut(String, MatchWatchCursor, u128) -> Result<(), ChainError>
+                  + Send),
     ) -> Result<(), ChainError> {
         check_buy_deposit_headroom(escrow, ticks, max_price_per_tick).map_err(ChainError::Chain)?;
         self.chain
@@ -4795,13 +4882,14 @@ impl ChainBackend for RealBuyerBackend {
             cursor: MatchWatchCursor::default(),
             expected,
         }))?;
-        let mut callback = |identity: String, final_cursor: MatchWatchCursor| {
-            self.set_pending_fill(Some(PendingBuyerFill {
-                cursor: final_cursor.clone(),
-                expected: expected_for_callback.clone(),
-            }))?;
-            before_post(identity, final_cursor).map_err(anyhow::Error::new)
-        };
+        let mut callback =
+            |identity: String, final_cursor: MatchWatchCursor, note_shell_balance: u128| {
+                self.set_pending_fill(Some(PendingBuyerFill {
+                    cursor: final_cursor.clone(),
+                    expected: expected_for_callback.clone(),
+                }))?;
+                before_post(identity, final_cursor, note_shell_balance).map_err(anyhow::Error::new)
+            };
         let result = self
             .chain
             .place_inference_buy_with_submit_identity(

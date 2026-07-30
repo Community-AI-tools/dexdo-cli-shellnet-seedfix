@@ -334,14 +334,6 @@ pub(crate) struct SellerRuntimePolicy {
 }
 
 pub(crate) fn validate_seller_runtime_capabilities(policy: &SellerRuntimePolicy) -> Result<()> {
-    if policy.max_open_deals != 1 {
-        bail!(
-            "policy_action failure_class=seller.max_open_deals action=enforce token_contract=<not-posted> \
-             state=pre_offer result=unsupported_max_open_deals requested={} supported=1; \
-             current seller daemon owns exactly one per-deal TokenContract",
-            policy.max_open_deals
-        );
-    }
     let unsupported = [
         (
             "seller.on.after_deal_done",

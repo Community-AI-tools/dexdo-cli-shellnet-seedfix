@@ -103,6 +103,7 @@ pub(crate) struct RuntimeDealHandleInput<'a> {
     pub(crate) token_contract: &'a str,
     pub(crate) note_addr: &'a str,
     pub(crate) frame_model: &'a str,
+    pub(crate) market: Option<&'a dexdo_core::MarketManifest>,
     pub(crate) market_path: Option<&'a std::path::Path>,
     pub(crate) contracts: &'a std::path::Path,
     pub(crate) endpoint: Option<deals::DealEndpointInfo>,
@@ -149,7 +150,10 @@ fn persist_runtime_deal_handle(
     input: RuntimeDealHandleInput<'_>,
     network: &str,
 ) -> Result<deals::DealHandle> {
-    let market = input.market_path.map(load_market).transpose()?;
+    let market = match input.market {
+        Some(market) => Some(market.clone()),
+        None => input.market_path.map(load_market).transpose()?,
+    };
     let h = deals::DealHandle {
         version: deals::DEAL_HANDLE_VERSION,
         handle: deals::make_handle_id(input.token_contract, input.role),
@@ -184,8 +188,22 @@ pub(crate) fn load_pool_json(path: &std::path::Path) -> Result<Value> {
     let path = crate::cli::note::resolve_private_file_path(path, "DEXDO_PN_POOL")?;
     let bytes = std::fs::read(&path)
         .map_err(|e| anyhow::anyhow!("read DEXDO_PN_POOL {}: {e}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("parse DEXDO_PN_POOL {}: {e}", path.display()))
+    let pool = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse DEXDO_PN_POOL {}: {e}", path.display()))?;
+    crate::cli::note::ensure_shell_pool_currency(&pool)?;
+    Ok(pool)
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) fn validate_existing_pool_if_present(path: &std::path::Path) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => bail!("read --pool {}: {error}", path.display()),
+    };
+    let pool = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("--pool {} is not valid JSON: {error}", path.display()))?;
+    crate::cli::note::ensure_shell_pool_currency(&pool)
 }
 
 #[cfg(feature = "shellnet")]
@@ -449,10 +467,7 @@ pub(crate) fn is_note_deploy_wallet_busy_error(error: &anyhow::Error) -> bool {
 
 #[cfg(feature = "shellnet")]
 fn is_note_deploy_history_proof_expired_error(error: &anyhow::Error) -> bool {
-    let msg = error.to_string().to_ascii_lowercase();
-    let normalized = msg.replace(['_', '=', ':', '-'], " ");
-    msg.contains("err_invalid_history_proof")
-        || (msg.contains("rootpn.deployprivatenote") && normalized.contains("exit code 403"))
+    crate::cli::note_cmd::note_deploy_has_exact_finalized_rootpn_exit_code(error, 403)
 }
 
 #[cfg(feature = "shellnet")]
@@ -462,9 +477,9 @@ pub(crate) fn note_deploy_error(
 ) -> anyhow::Error {
     if is_note_deploy_history_proof_expired_error(&error) {
         anyhow::anyhow!(
-            "note deploy failed: history proof expired (exit 403) -- the layer-0 root aged out of the node's \
-             ~2-minute window (common on slow/ARM clients). Re-run the same `note deploy` command to retry; \
-             if it persists, set HALO2_ATTEMPT_LAYERS=1. Raw error: deploy PrivateNote from wallet \
+            "note deploy failed: history proof expired (exit 403). The same paid voucher recovery is preserved; \
+             re-run the same `note deploy --recovery` command later (action=resume_same_paid_voucher_later). \
+             Do not fund a new voucher. Raw error: deploy PrivateNote from wallet \
              {funding_multisig_address}: {error}"
         )
     } else if is_note_deploy_wallet_busy_error(&error) {
@@ -918,7 +933,16 @@ pub(crate) async fn shellnet_doctor_preflight(
     contracts: &std::path::Path,
     market: Option<&std::path::Path>,
 ) -> Result<()> {
-    let report = shellnet_doctor_report("shellnet", None, contracts, market).await?;
+    shellnet_doctor_preflight_with_endpoint(contracts, None, market).await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn shellnet_doctor_preflight_with_endpoint(
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+    market: Option<&std::path::Path>,
+) -> Result<()> {
+    let report = shellnet_doctor_report("shellnet", endpoint, contracts, market).await?;
     if !report.is_ok() {
         bail!("{}", render_shellnet_doctor_report(&report));
     }

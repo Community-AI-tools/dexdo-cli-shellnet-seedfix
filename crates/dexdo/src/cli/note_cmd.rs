@@ -5,14 +5,20 @@ use crate::cli::args::{NoteBalanceArgs, NoteDeployArgs, NoteRecoverArgs, NoteWit
 use crate::cli::commands::{
     is_note_deploy_wallet_busy_error, note_deploy_error, note_deploy_fold_state_into_pool,
     note_deploy_multisig_secret_hex, note_deploy_now_unix, note_deploy_recovery_pool_guard,
-    note_deploy_same_file_pool_guard, note_endpoint_url, shellnet_doctor_preflight, unix_now_secs,
+    note_deploy_same_file_pool_guard, note_endpoint_url, shellnet_doctor_preflight,
+    shellnet_doctor_preflight_with_endpoint, unix_now_secs, validate_existing_pool_if_present,
 };
 #[cfg(feature = "shellnet")]
 use crate::cli::support::read_secret_hex;
 use anyhow::bail;
 use anyhow::Result;
 #[cfg(feature = "shellnet")]
-use std::io::Write as _;
+use dexdo_core::params::{
+    HERMEZ_SRS_MAX_ATTEMPTS, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
+    SHELL_CURRENCY_ID,
+};
+#[cfg(feature = "shellnet")]
+use std::io::{Read as _, Write as _};
 
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
@@ -25,6 +31,7 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
     let pool_path = resolve_private_file_path(&args.pool, "--pool")?;
     let recovery_path = resolve_private_file_path(&args.recovery, "--recovery")?;
     note_deploy_recovery_pool_guard(&pool_path, &recovery_path)?;
+    validate_existing_pool_if_present(&pool_path)?;
     let recovery = load_note_deploy_recovery(&recovery_path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "note recover: recovery file {} not found",
@@ -87,8 +94,6 @@ const HERMEZ_SRS_NAME: &str = "hermez_kzg_srs_k19.bin";
 const HERMEZ_SRS_URL: &str = "https://binaries.gosh.sh/dexdo/hermez_kzg_bn254_19.srs";
 #[cfg(feature = "shellnet")]
 const HERMEZ_SRS_SHA256: &str = "9ebbbbfc3d4899435ef254c915c62f5aa94c539bde1cec52ca7d45679d2adf4a";
-#[cfg(feature = "shellnet")]
-const HERMEZ_SRS_MAX_BYTES: usize = 128 * 1024 * 1024;
 #[cfg(feature = "shellnet")]
 const HERMEZ_SRS_MARKER_NAME: &str = ".hermez_srs_sha256";
 #[cfg(feature = "shellnet")]
@@ -626,12 +631,13 @@ fn note_deploy_ecc_name(
     currency_id: u32,
 ) -> String {
     match currency_id {
-        2 if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
-            && requested_token_type == 2 =>
+        SHELL_CURRENCY_ID
+            if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
+                && requested_token_type == SHELL_CURRENCY_ID =>
         {
             "requested token and SHELL ECC[2]".to_string()
         }
-        2 => "SHELL ECC[2]".to_string(),
+        SHELL_CURRENCY_ID => "SHELL ECC[2]".to_string(),
         id => format!("requested token ECC[{id}]"),
     }
 }
@@ -667,17 +673,20 @@ async fn note_deploy_preflight_wallet_ecc(
         }
         Ok(())
     };
-    let requested =
-        if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type == 2 {
-            (voucher_value as u128)
-                .checked_add(shell)
-                .ok_or_else(|| anyhow::anyhow!("note deploy required ECC[2] amount overflow"))?
-        } else {
-            voucher_value as u128
-        };
+    let requested = if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
+        && voucher_token_type == SHELL_CURRENCY_ID
+    {
+        (voucher_value as u128)
+            .checked_add(shell)
+            .ok_or_else(|| anyhow::anyhow!("note deploy required ECC[2] amount overflow"))?
+    } else {
+        voucher_value as u128
+    };
     require(voucher_token_type, requested)?;
-    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type != 2 {
-        require(2, shell)?;
+    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
+        && voucher_token_type != SHELL_CURRENCY_ID
+    {
+        require(SHELL_CURRENCY_ID, shell)?;
     }
     Ok(balances)
 }
@@ -881,8 +890,10 @@ fn note_deploy_verify_failed_action_had_no_effect(
             .map_or(0, |(_, value)| *value)
     };
     let mut currency_ids = vec![voucher_token_type];
-    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit && voucher_token_type != 2 {
-        currency_ids.push(2);
+    if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
+        && voucher_token_type != SHELL_CURRENCY_ID
+    {
+        currency_ids.push(SHELL_CURRENCY_ID);
     }
     for currency_id in currency_ids {
         let before = balance(before_ecc, currency_id);
@@ -1029,13 +1040,29 @@ async fn note_deploy_mint_voucher_recoverable(
         }
     };
 
-    if let Some(proof) = checkpoint.proof.as_ref() {
+    if let Some(proof) = checkpoint
+        .proof
+        .as_ref()
+        .filter(|_| !checkpoint.current_proof_is_rejected())
+    {
         eprintln!(
             "note deploy recovery: reusing persisted {} voucher proof from {}; no wallet spend will be submitted.",
             kind.label(),
             recovery_path.display()
         );
         return Ok(proof.to_halo2());
+    }
+    if checkpoint.current_proof_is_rejected() {
+        eprintln!(
+            "note deploy recovery: persisted {} proof layer {} was rejected with exact 403; \
+             rebuilding the same paid voucher without another wallet spend.",
+            kind.label(),
+            checkpoint
+                .proof
+                .as_ref()
+                .map(|proof| proof.layer_number)
+                .unwrap_or_default()
+        );
     }
 
     let http = reqwest::Client::new();
@@ -1213,7 +1240,7 @@ async fn note_deploy_mint_voucher_recoverable(
             acquire_note_deploy_prover_cache_lock(&halo2_paths.prover_cache_dir)?;
         halo2_paths.ensure_srs();
         ensure_hermez_srs_and_valid_pk_cache(&halo2_paths.prover_cache_dir).await?;
-        let proof = prove_voucher_for_event(ProveVoucherForEventParams {
+        let params = ProveVoucherForEventParams {
             endpoint: endpoint.to_string(),
             event,
             sk_u_hex: checkpoint.sk_u_hex.to_string(),
@@ -1223,15 +1250,51 @@ async fn note_deploy_mint_voucher_recoverable(
             ephemeral_pubkey_hex: recipient_ephemeral_pubkey_hex.to_string(),
             history_proof_window_size: None,
             paths: halo2_paths,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?;
+        };
+        let proof = if checkpoint.current_proof_is_rejected() {
+            let Some(next_layer) = checkpoint.next_sdk_proof_layer() else {
+                bail!(
+                    "{} voucher history layer plan exhausted; paid voucher recovery remains at {}. \
+                     action=resume_same_paid_voucher_later; do not fund a new voucher.",
+                    kind.label(),
+                    recovery_path.display()
+                );
+            };
+            let previous_layers = std::env::var_os("HALO2_ATTEMPT_LAYERS");
+            std::env::set_var("HALO2_ATTEMPT_LAYERS", next_layer.to_string());
+            let result = prove_voucher_for_event(params).await;
+            match previous_layers {
+                Some(value) => std::env::set_var("HALO2_ATTEMPT_LAYERS", value),
+                None => std::env::remove_var("HALO2_ATTEMPT_LAYERS"),
+            }
+            result.map_err(|e| {
+                anyhow::anyhow!(
+                    "prove {} paid voucher on next layer {next_layer}: {e}; \
+                     action=resume_same_paid_voucher_later; recovery={}; no new wallet spend is permitted",
+                    kind.label(),
+                    recovery_path.display()
+                )
+            })?
+        } else {
+            prove_voucher_for_event(params)
+                .await
+                .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?
+        };
         // A successful proof is the cache commit point. Later chain retries and pool finalization must
         // never depend on cache metadata or on PK/VK/BP still being present.
-        promote_hermez_srs_pending_marker(&halo2_paths.prover_cache_dir, HERMEZ_SRS_SHA256)?;
+        promote_hermez_srs_pending_marker(
+            &halo2_paths.prover_cache_dir,
+            HERMEZ_SRS_SIZE_BYTES,
+            HERMEZ_SRS_SHA256,
+        )?;
         proof
     };
-    checkpoint.proof = Some(crate::cli::note::NoteDeployVoucherProof::from_halo2(&proof));
+    let persisted_proof = crate::cli::note::NoteDeployVoucherProof::from_halo2(&proof);
+    if checkpoint.current_proof_is_rejected() {
+        checkpoint.replace_rejected_proof(persisted_proof)?;
+    } else {
+        checkpoint.proof = Some(persisted_proof);
+    }
     note_deploy_persist_voucher_checkpoint(recovery_path, recovery, kind, checkpoint)?;
     eprintln!(
         "note deploy recovery: recorded {} voucher proof in {}; reruns will not re-spend this voucher.",
@@ -1242,6 +1305,202 @@ async fn note_deploy_mint_voucher_recoverable(
 }
 
 #[cfg(feature = "shellnet")]
+#[derive(Debug)]
+struct NoteDeployFinalizedRootPnExitCode(i64);
+
+#[cfg(feature = "shellnet")]
+impl std::fmt::Display for NoteDeployFinalizedRootPnExitCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "finalized RootPN exit code {}", self.0)
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl std::error::Error for NoteDeployFinalizedRootPnExitCode {}
+
+#[cfg(feature = "shellnet")]
+pub(crate) fn note_deploy_has_exact_finalized_rootpn_exit_code(
+    error: &anyhow::Error,
+    wanted: i64,
+) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<NoteDeployFinalizedRootPnExitCode>()
+            .is_some_and(|code| code.0 == wanted)
+    })
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_submit_proof_once<EffectPresent, Submit>(
+    proof: &dexdo_core::private_note::halo2::live::Halo2Proof,
+    mut effect_present: EffectPresent,
+    mut submit: Submit,
+) -> Result<bool>
+where
+    EffectPresent: AsyncFnMut(&dexdo_core::private_note::halo2::live::Halo2Proof) -> Result<bool>,
+    Submit: AsyncFnMut(&dexdo_core::private_note::halo2::live::Halo2Proof) -> Result<()>,
+{
+    match submit(proof).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if effect_present(proof).await? {
+                Ok(true)
+            } else if note_deploy_has_exact_finalized_rootpn_exit_code(&error, 403) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_run_reproof_loop<SubmitOnce, PersistAndReproof>(
+    mut proof: dexdo_core::private_note::halo2::live::Halo2Proof,
+    mut submit_once: SubmitOnce,
+    mut persist_and_reproof: PersistAndReproof,
+) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof>
+where
+    SubmitOnce: AsyncFnMut(&dexdo_core::private_note::halo2::live::Halo2Proof) -> Result<bool>,
+    PersistAndReproof: AsyncFnMut(
+        &dexdo_core::private_note::halo2::live::Halo2Proof,
+    ) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof>,
+{
+    while !submit_once(&proof).await? {
+        proof = persist_and_reproof(&proof).await?;
+    }
+    Ok(proof)
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_persist_rejected_proof(
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    proof: &dexdo_core::private_note::halo2::live::Halo2Proof,
+) -> Result<()> {
+    let mut checkpoint = recovery.voucher_checkpoint(kind).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} voucher checkpoint disappeared after exact 403",
+            kind.label()
+        )
+    })?;
+    let returned = crate::cli::note::NoteDeployVoucherProof::from_halo2(proof);
+    if checkpoint.proof.as_ref() != Some(&returned) {
+        bail!(
+            "{} voucher proof returned by prover does not match durable recovery state",
+            kind.label()
+        );
+    }
+    let rejected_layer = checkpoint.reject_current_proof()?;
+    note_deploy_persist_voucher_checkpoint(recovery_path, recovery, kind, checkpoint)?;
+    eprintln!(
+        "note deploy recovery: {} proof layer {rejected_layer} rejected with exact 403 and \
+         no on-chain effect; persisted rejection in {} before re-proving the same paid voucher.",
+        kind.label(),
+        recovery_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_rootpn_action_result(
+    method: &str,
+    submit_error: Option<anyhow::Error>,
+    receipt: Option<dexdo_core::shellnet::NoteDeployRootPnActionObservation>,
+) -> Result<()> {
+    let Some(receipt) = receipt else {
+        if let Some(error) = submit_error {
+            return Err(anyhow::anyhow!(
+                "RootPN.{method}: {error}; no bounded finalized receipt"
+            ));
+        }
+        bail!("RootPN.{method}: no bounded finalized receipt");
+    };
+    if receipt.aborted
+        || receipt.compute_exit_code != 0
+        || receipt.action_result_code.is_some_and(|code| code != 0)
+    {
+        let context = format!(
+            "RootPN.{method}: finalized transaction {} exit_code={} aborted={} action_result_code={}",
+            receipt.transaction_hash,
+            receipt.compute_exit_code,
+            receipt.aborted,
+            receipt
+                .action_result_code
+                .map_or_else(|| "<unavailable>".to_string(), |code| code.to_string())
+        );
+        return Err(anyhow::Error::new(NoteDeployFinalizedRootPnExitCode(
+            receipt.compute_exit_code,
+        ))
+        .context(context));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_submit_rootpn_call(
+    client: &dexdo_core::ChainClient,
+    root_pn: &dexdo_core::Address,
+    method: &str,
+    args: serde_json::Value,
+    pn_keys: &dexdo_core::KeyPair,
+) -> Result<()> {
+    use dexdo_core::{
+        ackinacki_wallet::query::{fetch_dapp_id, send_message_routed},
+        airegistry::{calls::encode_external_call, deploy::local_context},
+        private_note::artifacts::ROOT_PN_ABI_JSON,
+    };
+
+    dexdo_core::shellnet_clock_skew_preflight(client.endpoint()).await?;
+    let boc = encode_external_call(
+        &local_context()?,
+        ROOT_PN_ABI_JSON,
+        &root_pn.with_workchain(),
+        method,
+        args,
+        pn_keys.public_hex(),
+        pn_keys.secret_hex(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("encode RootPN.{method}: {error}"))?;
+    let http = reqwest::Client::new();
+    let dapp_id = fetch_dapp_id(&http, client.endpoint(), root_pn.bare()).await?;
+    let submit_error = send_message_routed(
+        &http,
+        client.endpoint(),
+        &boc,
+        root_pn.bare(),
+        &dapp_id,
+        None,
+    )
+    .await
+    .err()
+    .map(|error| anyhow::anyhow!(error));
+    let receipt = match dexdo_core::shellnet::observe_note_deploy_rootpn_action(
+        &http,
+        client.endpoint(),
+        &boc,
+        root_pn.bare(),
+        &dapp_id,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(observe_error) => {
+            let submit_context = submit_error.as_ref().map_or_else(
+                || "POST returned success".to_string(),
+                |error| format!("POST returned {error}"),
+            );
+            return Err(observe_error.context(format!(
+                "observe finalized RootPN.{method} receipt after {submit_context}"
+            )));
+        }
+    };
+    note_deploy_rootpn_action_result(method, submit_error, receipt)
+}
+
+#[cfg(feature = "shellnet")]
 async fn note_deploy_submit_private_note(
     client: &dexdo_core::ChainClient,
     root_pn: &dexdo_core::Address,
@@ -1249,33 +1508,26 @@ async fn note_deploy_submit_private_note(
     deposit_zk: &dexdo_core::private_note::halo2::live::Halo2Proof,
     deposit_identifier_hash: &str,
 ) -> Result<()> {
-    use dexdo_core::private_note::{
-        artifacts::ROOT_PN_ABI_JSON,
-        proof::{hex_u256_to_dec, pubkey_to_dec},
-    };
+    use dexdo_core::private_note::proof::{hex_u256_to_dec, pubkey_to_dec};
 
-    dexdo_core::shellnet_clock_skew_preflight(client.endpoint()).await?;
-    client
-        .call(
-            root_pn,
-            ROOT_PN_ABI_JSON,
-            "deployPrivateNote",
-            serde_json::json!({
-                "zkproof": deposit_zk.proof,
-                "depositIdentifierHash": deposit_identifier_hash,
-                "finalLayerHistoricalHashRoot": hex_u256_to_dec(&deposit_zk.final_layer_historical_hash_root_hex)?,
-                "voucherNominalFr": hex_u256_to_dec(&deposit_zk.voucher_nominal_fr_hex)?,
-                "tokenTypeFr": hex_u256_to_dec(&deposit_zk.token_type_fr_hex)?,
-                "ephemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
-                "value": deposit_zk.voucher_value,
-                "tokenType": deposit_zk.voucher_token_type,
-                "layerNumber": deposit_zk.layer_number,
-            }),
-            pn_keys,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("RootPN.deployPrivateNote: {e}"))
-        .map(|_| ())
+    note_deploy_submit_rootpn_call(
+        client,
+        root_pn,
+        "deployPrivateNote",
+        serde_json::json!({
+            "zkproof": deposit_zk.proof,
+            "depositIdentifierHash": deposit_identifier_hash,
+            "finalLayerHistoricalHashRoot": hex_u256_to_dec(&deposit_zk.final_layer_historical_hash_root_hex)?,
+            "voucherNominalFr": hex_u256_to_dec(&deposit_zk.voucher_nominal_fr_hex)?,
+            "tokenTypeFr": hex_u256_to_dec(&deposit_zk.token_type_fr_hex)?,
+            "ephemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
+            "value": deposit_zk.voucher_value,
+            "tokenType": deposit_zk.voucher_token_type,
+            "layerNumber": deposit_zk.layer_number,
+        }),
+        pn_keys,
+    )
+    .await
 }
 
 #[cfg(feature = "shellnet")]
@@ -1291,7 +1543,7 @@ async fn deploy_private_note_from_multisig_recoverable(
     failpoints: NoteDeployVoucherFailpoints,
 ) -> Result<crate::cli::note::OnboardPnState> {
     use dexdo_core::private_note::{
-        artifacts::{PRIVATE_NOTE_ABI_JSON, ROOT_PN_ABI_JSON, ROOT_PN_ADDRESS},
+        artifacts::{PRIVATE_NOTE_ABI_JSON, ROOT_PN_ADDRESS},
         proof::{hex_u256_to_dec, pubkey_to_dec, CURRENCY_ID_SHELL, ECC_SHELL_DEPOSIT_RAW},
     };
     use dexdo_core::Address;
@@ -1351,78 +1603,76 @@ async fn deploy_private_note_from_multisig_recoverable(
             .map_err(|e| anyhow::anyhow!("halo2 deposit voucher: {e}"))?;
 
             let dih_dec = hex_u256_to_dec(&deposit_zk.deposit_identifier_hash_hex)?;
-            if had_persisted_deposit_proof {
-                let pn_address = note_deploy_private_note_address(client, &root_pn, &dih_dec)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "RootPN.getPrivateNoteAddress before repeat deployPrivateNote: {e}"
-                        )
-                    })?;
-                let pn = Address::parse(&pn_address)?;
-                if note_deploy_wait_existing_active(client, &pn, Duration::from_secs(120)).await? {
-                    let deployed_at_unix = note_deploy_now_unix()?;
-                    recovery.mark_private_note_deployed(
-                        pn_address.clone(),
-                        dih_dec.clone(),
-                        deployed_at_unix,
-                    )?;
-                    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
-                    eprintln!(
-                        "note deploy recovery: recovered active PrivateNote {pn_address} from persisted \
-                         deposit proof in {}; skipping repeat deployPrivateNote submit.",
-                        recovery_path.display()
-                    );
-                    resumed_existing_note = true;
-                    (pn_address, dih_dec)
-                } else {
+            let pn_address = note_deploy_private_note_address(client, &root_pn, &dih_dec)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("RootPN.getPrivateNoteAddress before deployPrivateNote: {e}")
+                })?;
+            let pn = Address::parse(&pn_address)?;
+            let recovered_active = had_persisted_deposit_proof
+                && note_deploy_wait_existing_active(client, &pn, Duration::from_secs(120)).await?;
+            if recovered_active {
+                resumed_existing_note = true;
+                eprintln!(
+                    "note deploy recovery: recovered active PrivateNote {pn_address} from persisted \
+                     deposit proof in {}; skipping repeat deployPrivateNote submit.",
+                    recovery_path.display()
+                );
+            } else {
+                if had_persisted_deposit_proof {
                     eprintln!(
                         "note deploy recovery: persisted deposit proof in {} has no active PrivateNote yet; \
                          submitting deployPrivateNote once.",
                         recovery_path.display()
                     );
-                    note_deploy_submit_private_note(
-                        client,
-                        &root_pn,
-                        pn_keys,
-                        &deposit_zk,
-                        &dih_dec,
-                    )
-                    .await?;
-
-                    let pn_address =
-                        note_deploy_private_note_address(client, &root_pn, &dih_dec).await?;
-                    let pn = Address::parse(&pn_address)?;
-                    note_deploy_wait_active(client, &pn, Duration::from_secs(120)).await?;
-                    if failpoints.after_deploy_before_note_record {
-                        bail!(
-                            "simulated interruption after deployPrivateNote active before recovery note record. \
-                             Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> \
-                             --pool <pool>` to discover the active PrivateNote without repeating deployPrivateNote.",
-                            recovery_path.display()
-                        );
-                    }
-                    let deployed_at_unix = note_deploy_now_unix()?;
-                    recovery.mark_private_note_deployed(
-                        pn_address.clone(),
-                        dih_dec.clone(),
-                        deployed_at_unix,
-                    )?;
-                    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
-                    eprintln!(
-                        "note deploy recovery: recorded deployed PrivateNote {pn_address} in {}; a later recovery \
-                         will not repeat deployPrivateNote.",
-                        recovery_path.display()
-                    );
-                    (pn_address, dih_dec)
                 }
-            } else {
-                note_deploy_submit_private_note(client, &root_pn, pn_keys, &deposit_zk, &dih_dec)
-                    .await?;
+                note_deploy_run_reproof_loop(
+                    deposit_zk,
+                    async |proof| {
+                        note_deploy_submit_proof_once(
+                            proof,
+                            async |_proof| {
+                                note_deploy_wait_existing_active(client, &pn, Duration::ZERO).await
+                            },
+                            async |proof| {
+                                note_deploy_submit_private_note(
+                                    client, &root_pn, pn_keys, proof, &dih_dec,
+                                )
+                                .await
+                            },
+                        )
+                        .await
+                    },
+                    async |rejected_proof| {
+                        note_deploy_persist_rejected_proof(
+                            recovery_path,
+                            recovery,
+                            crate::cli::note::NoteDeployVoucherKind::Deposit,
+                            rejected_proof,
+                        )?;
+                        note_deploy_mint_voucher_recoverable(
+                            client,
+                            recovery_path,
+                            recovery,
+                            crate::cli::note::NoteDeployVoucherKind::Deposit,
+                            multisig_address,
+                            funding_key_loader,
+                            client,
+                            client,
+                            client,
+                            pn_keys.public_hex(),
+                            deposit_token_type,
+                            deposit_raw_value,
+                            false,
+                            halo2_paths,
+                            failpoints,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("halo2 deposit voucher: {e}"))
+                    },
+                )
+                .await?;
 
-                let pn_address =
-                    note_deploy_private_note_address(client, &root_pn, &dih_dec).await?;
-                let pn = Address::parse(&pn_address)?;
                 note_deploy_wait_active(client, &pn, Duration::from_secs(120)).await?;
                 if failpoints.after_deploy_before_note_record {
                     bail!(
@@ -1432,20 +1682,22 @@ async fn deploy_private_note_from_multisig_recoverable(
                         recovery_path.display()
                     );
                 }
-                let deployed_at_unix = note_deploy_now_unix()?;
-                recovery.mark_private_note_deployed(
-                    pn_address.clone(),
-                    dih_dec.clone(),
-                    deployed_at_unix,
-                )?;
-                crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+            }
+            let deployed_at_unix = note_deploy_now_unix()?;
+            recovery.mark_private_note_deployed(
+                pn_address.clone(),
+                dih_dec.clone(),
+                deployed_at_unix,
+            )?;
+            crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+            if !recovered_active {
                 eprintln!(
                     "note deploy recovery: recorded deployed PrivateNote {pn_address} in {}; a later recovery \
                      will not repeat deployPrivateNote.",
                     recovery_path.display()
                 );
-                (pn_address, dih_dec)
             }
+            (pn_address, dih_dec)
         }
         _ => {
             bail!(
@@ -1493,27 +1745,72 @@ async fn deploy_private_note_from_multisig_recoverable(
             .await
             .map_err(|e| anyhow::anyhow!("halo2 SHELL gas voucher: {e}"))?;
 
-            dexdo_core::shellnet_clock_skew_preflight(client.endpoint()).await?;
-            client
-                .call(
-                    &root_pn,
-                    ROOT_PN_ABI_JSON,
-                    "sendEccShellToPrivateNote",
-                    json!({
-                        "proof": gas_zk.proof,
-                        "nullifierHash": hex_u256_to_dec(&gas_zk.deposit_identifier_hash_hex)?,
-                        "depositIdentifierHash": deposit_identifier_hash,
-                        "finalLayerHistoricalHashRoot": hex_u256_to_dec(&gas_zk.final_layer_historical_hash_root_hex)?,
-                        "voucherNominalFr": hex_u256_to_dec(&gas_zk.voucher_nominal_fr_hex)?,
-                        "tokenTypeFr": hex_u256_to_dec(&gas_zk.token_type_fr_hex)?,
-                        "value": gas_zk.voucher_value,
-                        "layerNumber": gas_zk.layer_number,
-                        "recipientEphemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
-                    }),
-                    pn_keys,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("RootPN.sendEccShellToPrivateNote: {e}"))?;
+            note_deploy_run_reproof_loop(
+                gas_zk,
+                async |proof| {
+                    note_deploy_submit_proof_once(
+                        proof,
+                        async |_proof| {
+                            note_deploy_wait_existing_shell_funding(
+                                client,
+                                &pn,
+                                expected_shell,
+                                Duration::ZERO,
+                            )
+                            .await
+                        },
+                        async |proof| {
+                            note_deploy_submit_rootpn_call(
+                                client,
+                                &root_pn,
+                                "sendEccShellToPrivateNote",
+                                json!({
+                                    "proof": proof.proof,
+                                    "nullifierHash": hex_u256_to_dec(&proof.deposit_identifier_hash_hex)?,
+                                    "depositIdentifierHash": deposit_identifier_hash,
+                                    "finalLayerHistoricalHashRoot": hex_u256_to_dec(&proof.final_layer_historical_hash_root_hex)?,
+                                    "voucherNominalFr": hex_u256_to_dec(&proof.voucher_nominal_fr_hex)?,
+                                    "tokenTypeFr": hex_u256_to_dec(&proof.token_type_fr_hex)?,
+                                    "value": proof.voucher_value,
+                                    "layerNumber": proof.layer_number,
+                                    "recipientEphemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
+                                }),
+                                pn_keys,
+                            )
+                            .await
+                        },
+                    )
+                    .await
+                },
+                async |rejected_proof| {
+                    note_deploy_persist_rejected_proof(
+                        recovery_path,
+                        recovery,
+                        crate::cli::note::NoteDeployVoucherKind::ShellGas,
+                        rejected_proof,
+                    )?;
+                    note_deploy_mint_voucher_recoverable(
+                        client,
+                        recovery_path,
+                        recovery,
+                        crate::cli::note::NoteDeployVoucherKind::ShellGas,
+                        multisig_address,
+                        funding_key_loader,
+                        client,
+                        client,
+                        client,
+                        pn_keys.public_hex(),
+                        CURRENCY_ID_SHELL,
+                        ECC_SHELL_DEPOSIT_RAW,
+                        true,
+                        halo2_paths,
+                        failpoints,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("halo2 SHELL gas voucher: {e}"))
+                },
+            )
+            .await?;
             if !note_deploy_wait_existing_shell_funding(
                 client,
                 &pn,
@@ -1552,7 +1849,7 @@ async fn note_deploy_wait_existing_shell_funding(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(acc) = client.get_account(note).await? {
-            if acc.ecc_balance(2) >= expected_shell_ecc {
+            if acc.ecc_balance(SHELL_CURRENCY_ID) >= expected_shell_ecc {
                 return Ok(true);
             }
         }
@@ -1630,10 +1927,41 @@ async fn note_deploy_wait_active(
     }
 }
 
-#[cfg(feature = "shellnet")]
+#[cfg(all(feature = "shellnet", test))]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(feature = "shellnet")]
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("open {} for SHA-256: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| anyhow::anyhow!("read {} for SHA-256: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(feature = "shellnet")]
+fn hermez_srs_file_matches(
+    path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_size)
+        && sha256_file(path).is_ok_and(|sha256| sha256 == expected_sha256)
 }
 
 #[cfg(feature = "shellnet")]
@@ -1739,11 +2067,6 @@ fn write_file_atomically(path: &std::path::Path, bytes: &[u8], label: &str) -> R
 }
 
 #[cfg(feature = "shellnet")]
-fn install_hermez_srs_atomically(srs_path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    write_file_atomically(srs_path, bytes, "Hermez SRS")
-}
-
-#[cfg(feature = "shellnet")]
 fn remove_file_if_exists(path: &std::path::Path, label: &str) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1753,6 +2076,44 @@ fn remove_file_if_exists(path: &std::path::Path, label: &str) -> Result<()> {
             path.display()
         )),
     }
+}
+
+#[cfg(feature = "shellnet")]
+fn publish_hermez_srs_part(
+    part_path: &std::path::Path,
+    srs_path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<()> {
+    let size = std::fs::metadata(part_path)
+        .map_err(|error| anyhow::anyhow!("inspect {}: {error}", part_path.display()))?
+        .len();
+    if size != expected_size {
+        if size > expected_size {
+            remove_file_if_exists(part_path, "oversized Hermez SRS partial")?;
+        }
+        bail!(
+            "Hermez SRS size mismatch in {}: got {size}, expected {expected_size}",
+            part_path.display()
+        );
+    }
+    let sha256 = sha256_file(part_path)?;
+    if sha256 != expected_sha256 {
+        remove_file_if_exists(part_path, "incompatible Hermez SRS partial")?;
+        bail!(
+            "Hermez SRS sha256 mismatch: got {sha256}, expected {expected_sha256}; \
+             removed incompatible partial {}",
+            part_path.display()
+        );
+    }
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(part_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| anyhow::anyhow!("sync {}: {error}", part_path.display()))?;
+    atomic_replace(part_path, srs_path)
+        .map_err(|error| anyhow::anyhow!("publish {}: {error}", srs_path.display()))
 }
 
 #[cfg(feature = "shellnet")]
@@ -1774,6 +2135,7 @@ fn prover_cache_artifacts_complete(prover_cache_dir: &std::path::Path) -> bool {
 #[cfg(feature = "shellnet")]
 fn promote_hermez_srs_pending_marker(
     prover_cache_dir: &std::path::Path,
+    expected_size: u64,
     expected_sha256: &str,
 ) -> Result<()> {
     let pending = prover_cache_dir.join(HERMEZ_SRS_PENDING_MARKER_NAME);
@@ -1787,10 +2149,7 @@ fn promote_hermez_srs_pending_marker(
         );
     }
     let srs_path = prover_cache_dir.join(HERMEZ_SRS_NAME);
-    let srs_matches = std::fs::read(&srs_path)
-        .map(|bytes| sha256_hex(&bytes) == expected_sha256)
-        .unwrap_or(false);
-    if !srs_matches {
+    if !hermez_srs_file_matches(&srs_path, expected_size, expected_sha256) {
         bail!(
             "refuse to publish prover cache marker: Hermez SRS {} is missing or corrupt",
             srs_path.display()
@@ -1818,20 +2177,110 @@ fn transient_reqwest_error(error: &reqwest::Error) -> bool {
 }
 
 #[cfg(feature = "shellnet")]
-async fn fetch_hermez_srs_once(
+fn hermez_srs_progress_line(
+    attempt: usize,
+    downloaded: u64,
+    total: u64,
+    resumed_offset: u64,
+) -> String {
+    let percent = downloaded.saturating_mul(100) / total;
+    format!(
+        "note deploy: Hermez SRS progress attempt={attempt}/{HERMEZ_SRS_MAX_ATTEMPTS} \
+         downloaded={downloaded} total={total} percent={percent}% resumed_offset={resumed_offset}"
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_hermez_content_range(
+    response: &reqwest::Response,
+    requested_offset: u64,
+    expected_size: u64,
+) -> Result<()> {
+    let value = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .ok_or_else(|| anyhow::anyhow!("download Hermez SRS: HTTP 206 missing Content-Range"))?
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("download Hermez SRS: non-text Content-Range"))?;
+    let (range, total) = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| anyhow::anyhow!("download Hermez SRS: invalid Content-Range unit"))?
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("download Hermez SRS: invalid Content-Range"))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("download Hermez SRS: invalid Content-Range"))?;
+    if start.parse() != Ok(requested_offset)
+        || end.parse() != Ok(expected_size - 1)
+        || total.parse() != Ok(expected_size)
+    {
+        bail!(
+            "download Hermez SRS: invalid Content-Range; expected bytes \
+             {requested_offset}-{}/{expected_size}",
+            expected_size - 1
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn hermez_srs_partial_len(part_path: &std::path::Path, expected_size: u64) -> Result<u64> {
+    let metadata = match std::fs::metadata(part_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => bail!("inspect {}: {error}", part_path.display()),
+    };
+    if !metadata.is_file() {
+        bail!("Hermez SRS partial {} is not a file", part_path.display());
+    }
+    let size = metadata.len();
+    if size > expected_size {
+        remove_file_if_exists(part_path, "oversized Hermez SRS partial")?;
+        bail!(
+            "download Hermez SRS: oversized partial {} has {size} bytes, expected at most \
+             {expected_size}; removed it",
+            part_path.display()
+        );
+    }
+    Ok(size)
+}
+
+#[cfg(feature = "shellnet")]
+fn sync_hermez_srs_partial(file: &mut std::fs::File) -> Result<()> {
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn fetch_hermez_srs_attempt(
     client: &reqwest::Client,
     url: &str,
-) -> std::result::Result<Vec<u8>, (bool, anyhow::Error)> {
+    part_path: &std::path::Path,
+    expected_size: u64,
+    attempt: usize,
+    range_restart_used: &mut bool,
+) -> std::result::Result<(), (bool, anyhow::Error)> {
     use futures::StreamExt as _;
 
-    let response = client.get(url).send().await.map_err(|error| {
+    let requested_offset =
+        hermez_srs_partial_len(part_path, expected_size).map_err(|error| (false, error))?;
+    if requested_offset == expected_size {
+        return Ok(());
+    }
+
+    let mut request = client.get(url);
+    if requested_offset > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={requested_offset}-"));
+    }
+    let response = request.send().await.map_err(|error| {
         (
             transient_reqwest_error(&error),
             anyhow::anyhow!("download Hermez SRS: {error}"),
         )
     })?;
     let status = response.status();
-    if !status.is_success() {
+    if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
         let transient =
             status.is_server_error() || status.as_u16() == 408 || status.as_u16() == 429;
         return Err((
@@ -1839,62 +2288,149 @@ async fn fetch_hermez_srs_once(
             anyhow::anyhow!("download Hermez SRS: HTTP {status}"),
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > HERMEZ_SRS_MAX_BYTES as u64)
-    {
+
+    let (effective_offset, append) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        validate_hermez_content_range(&response, requested_offset, expected_size)
+            .map_err(|error| (false, error))?;
+        eprintln!(
+            "note deploy: Hermez SRS response attempt={attempt}/{HERMEZ_SRS_MAX_ATTEMPTS} \
+             status=206 content_range=bytes {requested_offset}-{}/{expected_size}",
+            expected_size - 1
+        );
+        (requested_offset, true)
+    } else {
+        if requested_offset > 0 {
+            if *range_restart_used {
+                return Err((
+                    false,
+                    anyhow::anyhow!(
+                        "download Hermez SRS: server ignored Range more than once; preserving partial {}",
+                        part_path.display()
+                    ),
+                ));
+            }
+            *range_restart_used = true;
+            eprintln!(
+                "note deploy: Hermez SRS response attempt={attempt}/{HERMEZ_SRS_MAX_ATTEMPTS} \
+                 status=200 ignored Range bytes={requested_offset}-; restarting once from byte 0"
+            );
+        }
+        (0, false)
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(append)
+        .truncate(!append)
+        .open(part_path)
+        .map_err(|error| {
+            (
+                false,
+                anyhow::anyhow!("open {}: {error}", part_path.display()),
+            )
+        })?;
+    eprintln!(
+        "{}",
+        hermez_srs_progress_line(attempt, effective_offset, expected_size, effective_offset)
+    );
+    let mut downloaded = effective_offset;
+    let mut last_percent = downloaded.saturating_mul(100) / expected_size;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                if let Err(sync_error) = sync_hermez_srs_partial(&mut file) {
+                    return Err((false, sync_error));
+                }
+                return Err((true, anyhow::anyhow!("download Hermez SRS body: {error}")));
+            }
+        };
+        let next_len = downloaded.saturating_add(chunk.len() as u64);
+        if next_len > expected_size {
+            file.set_len(effective_offset)
+                .map_err(|error| (false, anyhow::anyhow!("truncate partial: {error}")))?;
+            sync_hermez_srs_partial(&mut file).map_err(|error| (false, error))?;
+            return Err((
+                false,
+                anyhow::anyhow!("download Hermez SRS: body exceeds expected {expected_size} bytes"),
+            ));
+        }
+        file.write_all(&chunk).map_err(|error| {
+            (
+                false,
+                anyhow::anyhow!("write {}: {error}", part_path.display()),
+            )
+        })?;
+        downloaded = next_len;
+        let percent = downloaded.saturating_mul(100) / expected_size;
+        if percent >= last_percent.saturating_add(5) || downloaded == expected_size {
+            eprintln!(
+                "{}",
+                hermez_srs_progress_line(attempt, downloaded, expected_size, effective_offset)
+            );
+            last_percent = percent;
+        }
+    }
+    sync_hermez_srs_partial(&mut file).map_err(|error| (false, error))?;
+    if downloaded != expected_size {
         return Err((
-            false,
+            true,
             anyhow::anyhow!(
-                "download Hermez SRS: Content-Length exceeds {} bytes",
-                HERMEZ_SRS_MAX_BYTES
+                "download Hermez SRS: premature EOF at {downloaded} of {expected_size} bytes"
             ),
         ));
     }
-
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            (
-                transient_reqwest_error(&error),
-                anyhow::anyhow!("download Hermez SRS body: {error}"),
-            )
-        })?;
-        let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
-            (
-                false,
-                anyhow::anyhow!("download Hermez SRS: body length overflow"),
-            )
-        })?;
-        if next_len > HERMEZ_SRS_MAX_BYTES {
-            return Err((
-                false,
-                anyhow::anyhow!(
-                    "download Hermez SRS: body exceeds {} bytes",
-                    HERMEZ_SRS_MAX_BYTES
-                ),
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    Ok(())
 }
 
 #[cfg(feature = "shellnet")]
-async fn fetch_hermez_srs_with_retry(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    for attempt in 1..=2 {
-        match fetch_hermez_srs_once(client, url).await {
-            Ok(bytes) => return Ok(bytes),
-            Err((true, error)) if attempt == 1 => {
-                eprintln!(
-                    "note deploy: transient Hermez SRS download error; retrying once: {error}"
-                );
+async fn fetch_hermez_srs_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    part_path: &std::path::Path,
+    expected_size: u64,
+) -> Result<()> {
+    let mut range_restart_used = false;
+    for attempt in 1..=HERMEZ_SRS_MAX_ATTEMPTS {
+        match fetch_hermez_srs_attempt(
+            client,
+            url,
+            part_path,
+            expected_size,
+            attempt,
+            &mut range_restart_used,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err((false, error)) => return Err(error),
+            Err((true, error)) if attempt == HERMEZ_SRS_MAX_ATTEMPTS => {
+                return Err(anyhow::anyhow!(
+                    "download Hermez SRS failed after {HERMEZ_SRS_MAX_ATTEMPTS} attempts: {error}; \
+                     partial download kept at {}; rerun `dexdo note deploy` to resume",
+                    part_path.display()
+                ))
             }
-            Err((_, error)) => return Err(error),
+            Err((true, error)) => {
+                let delay = HERMEZ_SRS_RETRY_INITIAL_BACKOFF.saturating_mul(1 << (attempt - 1));
+                eprintln!(
+                    "note deploy: transient Hermez SRS download error on attempt \
+                     {attempt}/{HERMEZ_SRS_MAX_ATTEMPTS}; retrying in {}s from partial {}: {error}",
+                    delay.as_secs(),
+                    part_path.display()
+                );
+                tokio::time::sleep(if cfg!(test) {
+                    std::time::Duration::ZERO
+                } else {
+                    delay
+                })
+                .await;
+            }
         }
     }
-    unreachable!("two-attempt Hermez SRS download loop must return")
+    unreachable!("bounded Hermez SRS download loop must return")
 }
 
 /// Mitigates for the `dexdo note deploy` path. Its deposit and SHELL voucher proof steps use the Hermez KZG
@@ -1909,26 +2445,14 @@ pub(crate) async fn ensure_hermez_srs_and_valid_pk_cache(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| anyhow::anyhow!("build Hermez SRS HTTP client: {e}"))?;
-    ensure_hermez_srs_and_valid_pk_cache_with(prover_cache_dir, |url| {
-        let url = url.to_owned();
-        async move { fetch_hermez_srs_with_retry(&client, &url).await }
-    })
-    .await
-}
-
-#[cfg(feature = "shellnet")]
-async fn ensure_hermez_srs_and_valid_pk_cache_with<F, Fut>(
-    prover_cache_dir: &std::path::Path,
-    fetch: F,
-) -> Result<()>
-where
-    F: FnOnce(&str) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
     ensure_hermez_srs_and_valid_pk_cache_with_options(
         prover_cache_dir,
+        HERMEZ_SRS_SIZE_BYTES,
         HERMEZ_SRS_SHA256,
-        fetch,
+        move |part_path| async move {
+            fetch_hermez_srs_with_retry(&client, HERMEZ_SRS_URL, &part_path, HERMEZ_SRS_SIZE_BYTES)
+                .await
+        },
         invalidate_stale_pk_cache,
     )
     .await
@@ -1937,13 +2461,14 @@ where
 #[cfg(feature = "shellnet")]
 async fn ensure_hermez_srs_and_valid_pk_cache_with_options<F, Fut, I>(
     prover_cache_dir: &std::path::Path,
+    expected_size: u64,
     expected_sha256: &str,
     fetch: F,
     invalidate: I,
 ) -> Result<()>
 where
-    F: FnOnce(&str) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
     I: FnOnce(&std::path::Path) -> Result<()>,
 {
     std::fs::create_dir_all(prover_cache_dir).map_err(|e| {
@@ -1953,20 +2478,21 @@ where
         )
     })?;
     let srs_path = prover_cache_dir.join(HERMEZ_SRS_NAME);
-    let have_valid_srs = std::fs::read(&srs_path)
-        .map(|bytes| sha256_hex(&bytes) == expected_sha256)
-        .unwrap_or(false);
-    if !have_valid_srs {
+    if !hermez_srs_file_matches(&srs_path, expected_size, expected_sha256) {
+        let part_path = prover_cache_dir.join(format!("{HERMEZ_SRS_NAME}.part"));
+        let partial_size = std::fs::metadata(&part_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         eprintln!(
-            "note deploy: fetching Hermez KZG SRS once -> {}",
-            srs_path.display()
+            "note deploy: fetching/resuming Hermez KZG SRS partial={} downloaded={} total={} \
+             final={}",
+            part_path.display(),
+            partial_size,
+            expected_size,
+            srs_path.display(),
         );
-        let bytes = fetch(HERMEZ_SRS_URL).await?;
-        let got = sha256_hex(&bytes);
-        if got != expected_sha256 {
-            anyhow::bail!("Hermez SRS sha256 mismatch: got {got}, expected {expected_sha256}");
-        }
-        install_hermez_srs_atomically(&srs_path, &bytes)?;
+        fetch(part_path.clone()).await?;
+        publish_hermez_srs_part(&part_path, &srs_path, expected_size, expected_sha256)?;
     }
 
     // The final marker certifies a successful proof, not merely successful invalidation. A pending marker makes
@@ -2008,8 +2534,18 @@ fn note_deploy_recovery_needs_new_proof(
 }
 
 #[cfg(feature = "shellnet")]
+fn note_deploy_generation_mismatch(error: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {error:#}",
+        crate::cli::machine::NOTE_DEPLOY_GENERATION_MISMATCH_MARKER
+    )
+}
+
+#[cfg(feature = "shellnet")]
 #[async_trait::async_trait(?Send)]
 trait NoteDeployResolvedOps {
+    async fn preflight_doctor(&mut self) -> Result<()>;
+
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState>;
 
     async fn preflight_prover(&mut self) -> Result<()>;
@@ -2031,9 +2567,11 @@ async fn run_note_deploy_resolved<O>(ops: &mut O) -> Result<()>
 where
     O: NoteDeployResolvedOps,
 {
-    // Loading and validating recovery is the first orchestration action. Cache/SRS work is allowed only if the
-    // persisted state proves that this run can reach a new proof. Completed and persisted-proof recoveries must
-    // remain able to finish chain recovery and pool finalization with a missing or contended cache.
+    ops.preflight_doctor().await?;
+    // After the read-only generation guard, recovery loading is the first stateful action. Cache/SRS work is
+    // allowed only if the persisted state proves that this run can reach a new proof. Completed and
+    // persisted-proof recoveries must remain able to finish chain recovery and pool finalization with a missing
+    // or contended cache.
     let mut recovery = ops.load_recovery().await?;
     recovery.validate()?;
     if note_deploy_recovery_needs_new_proof(&recovery) {
@@ -2092,6 +2630,16 @@ fn note_deploy_json_result(
 #[cfg(feature = "shellnet")]
 #[async_trait::async_trait(?Send)]
 impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
+    async fn preflight_doctor(&mut self) -> Result<()> {
+        shellnet_doctor_preflight_with_endpoint(
+            &self.args.contracts,
+            Some(self.recovery_request.endpoint),
+            None,
+        )
+        .await
+        .map_err(note_deploy_generation_mismatch)
+    }
+
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState> {
         use crate::cli::note::{
             load_note_deploy_recovery, recovery_owner_key_written_message, NoteDeployRecoveryState,
@@ -2266,12 +2814,20 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
         default_note_deploy_recovery_path, resolve_private_file_path, NoteDeployRecoveryRequest,
     };
     use dexdo_core::{
+        params::SHELL_CURRENCY_LABEL,
         private_note::{proof::ECC_SHELL_DEPOSIT_RAW, Halo2Paths, Nominal, TokenType},
         ChainClient,
     };
 
+    if args.token_type != SHELL_CURRENCY_LABEL {
+        anyhow::bail!(
+            "note deploy: --token-type `{}` is unsupported; dexdo markets require `{SHELL_CURRENCY_LABEL}`",
+            args.token_type
+        );
+    }
     let pool_path = resolve_private_file_path(&args.pool, "--pool")?;
     note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &pool_path)?;
+    validate_existing_pool_if_present(&pool_path)?;
     let funding_multisig_address = dexdo_core::normalize_wallet_address(&args.multisig_address)
         .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
     let nominal = Nominal::parse(&args.nominal)?;
@@ -2420,6 +2976,9 @@ pub(crate) async fn run_note_withdraw(_args: NoteWithdrawArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
+    use dexdo_core::params::SHELL_CURRENCY_ID;
+
+    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn unsafe_clock_produces_zero_posts_in_note_deploy_direct_send() {
         use std::sync::{
@@ -2472,6 +3031,152 @@ mod tests {
             );
             task.abort();
         }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn invalid_existing_pool_cases() -> [(&'static str, serde_json::Value); 3] {
+        [
+            ("missing", serde_json::json!({"notes": []})),
+            (
+                "malformed",
+                serde_json::json!({"token_type": "2", "notes": []}),
+            ),
+            (
+                "non-shell",
+                serde_json::json!({"token_type": 1, "notes": []}),
+            ),
+        ]
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_rejects_existing_bad_currency_before_network_or_wallet() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind network trap");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        for (case, pool) in invalid_existing_pool_cases() {
+            let pool_path = temp.path().join(format!("{case}.pool.json"));
+            let original = serde_json::to_vec_pretty(&pool).unwrap();
+            std::fs::write(&pool_path, &original).unwrap();
+            let recovery_path = temp.path().join(format!("{case}.recovery.json"));
+            let args = super::NoteDeployArgs {
+                json: false,
+                multisig_address: "not-a-wallet".to_string(),
+                multisig_key: Some(temp.path().join("must-not-read.key")),
+                multisig_seed_file: None,
+                nominal: "N100".to_string(),
+                token_type: dexdo_core::params::SHELL_CURRENCY_LABEL.to_string(),
+                endpoint: endpoint.clone(),
+                contracts: temp.path().join("must-not-read-contracts.json"),
+                pool: pool_path.clone(),
+                recovery: Some(recovery_path.clone()),
+                simulate_interrupt_after_spend_before_pool: false,
+                simulate_interrupt_after_deposit_voucher_submit: false,
+                simulate_interrupt_after_deposit_voucher_event: false,
+                simulate_interrupt_after_shell_voucher_submit: false,
+                simulate_interrupt_after_deploy_before_note_record: false,
+            };
+
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                super::run_note_deploy(args),
+            )
+            .await
+            .expect("pool currency rejection must not wait for network")
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                error.contains("DEXDO_PN_POOL token_type"),
+                "{case}: {error}"
+            );
+            assert!(
+                error.contains(&format!("SHELL currency id {SHELL_CURRENCY_ID}")),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&pool_path).unwrap(),
+                original,
+                "{case}: pool must remain unchanged"
+            );
+            assert!(
+                !recovery_path.exists(),
+                "{case}: recovery write means wallet work started"
+            );
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "invalid existing pools must produce zero network requests"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_recover_rejects_existing_bad_currency_before_getter() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind network trap");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let recovery_path = temp.path().join("ready.recovery.json");
+        let mut recovery = test_recovery_state();
+        recovery.endpoint = endpoint;
+        recovery
+            .mark_private_note_deployed(format!("0:{}", "b".repeat(64)), "c".repeat(64), 1)
+            .unwrap();
+        recovery.mark_shell_funded_and_checked().unwrap();
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery).unwrap();
+        let original_recovery = std::fs::read(&recovery_path).unwrap();
+
+        for (case, pool) in invalid_existing_pool_cases() {
+            let pool_path = temp.path().join(format!("{case}.recover.pool.json"));
+            let original_pool = serde_json::to_vec_pretty(&pool).unwrap();
+            std::fs::write(&pool_path, &original_pool).unwrap();
+
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                super::run_note_recover(super::NoteRecoverArgs {
+                    recovery: recovery_path.clone(),
+                    pool: pool_path.clone(),
+                }),
+            )
+            .await
+            .expect("pool currency rejection must not wait for getter")
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                error.contains("DEXDO_PN_POOL token_type"),
+                "{case}: {error}"
+            );
+            assert!(
+                error.contains(&format!("SHELL currency id {SHELL_CURRENCY_ID}")),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&pool_path).unwrap(),
+                original_pool,
+                "{case}: pool must remain unchanged"
+            );
+            assert_eq!(
+                std::fs::read(&recovery_path).unwrap(),
+                original_recovery,
+                "{case}: recovery must remain unconsumed"
+            );
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "invalid existing pools must produce zero getter requests"
+        );
     }
 
     #[cfg(feature = "shellnet")]
@@ -2731,7 +3436,7 @@ mod tests {
             aborted,
             action_result_code,
             outmsg_count: 0,
-            wallet_ecc_balances: Some(vec![(1, 100_000_000_000), (2, 100_000_000_000)]),
+            wallet_ecc_balances: Some(vec![(SHELL_CURRENCY_ID, 200_000_000_000)]),
         }
     }
 
@@ -2867,34 +3572,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let wallet = format!("0:{}", "a".repeat(64));
         let raw = 100_000_000_000u128;
-        for (case, token_type, balances, currency, available, required) in [
-            (
-                "requested-token",
-                1,
-                vec![(1, raw - 1), (2, raw)],
-                "requested token ECC[1]",
-                raw - 1,
-                raw,
-            ),
-            (
-                "shell",
-                1,
-                vec![(1, raw), (2, raw - 1)],
-                "SHELL ECC[2]",
-                raw - 1,
-                raw,
-            ),
-            (
-                "combined-ecc-2",
-                2,
-                vec![(2, raw * 2 - 1)],
-                "requested token and SHELL ECC[2]",
-                raw * 2 - 1,
-                raw * 2,
-            ),
-        ] {
+        for (case, balances, currency, available, required) in [(
+            "combined-ecc-2",
+            vec![(SHELL_CURRENCY_ID, raw * 2 - 1)],
+            "requested token and SHELL ECC[2]",
+            raw * 2 - 1,
+            raw * 2,
+        )] {
             let mut recovery = test_recovery_state();
-            recovery.token_type = token_type;
             let reader = issue_678_wallet_reader(balances);
             let submitter = CountingVoucherSubmitter::default();
             let recovery_path = temp.path().join(format!("{case}.json"));
@@ -3121,8 +3806,9 @@ mod tests {
             multisig_key: Some(key_path),
             multisig_seed_file: None,
             nominal: "N100".to_string(),
-            token_type: "nackl".to_string(),
+            token_type: "shell".to_string(),
             endpoint: "http://127.0.0.1:9".to_string(),
+            contracts: std::path::PathBuf::from("contracts/deployed.shellnet.json"),
             pool: pool_path.clone(),
             recovery: Some(recovery_path.clone()),
             simulate_interrupt_after_spend_before_pool: false,
@@ -3134,7 +3820,7 @@ mod tests {
         let recovery_request = crate::cli::note::NoteDeployRecoveryRequest {
             endpoint: "http://127.0.0.1:9",
             nominal: "N100",
-            token_type: 1,
+            token_type: dexdo_core::params::SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
             ecc_shell_deposit: 100_000_000_000,
             funding_multisig_address: &funding_wallet,
@@ -3419,7 +4105,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery_path = temp.path().join("action-38-recovery.json");
         let raw = 100_000_000_000u128;
-        let reader = issue_678_wallet_reader(vec![(1, raw), (2, raw)]);
+        let reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, raw * 2)]);
         let failed_submitter =
             CountingVoucherSubmitter::returning(Some(issue_678_receipt(true, 38)));
         let failpoints = super::NoteDeployVoucherFailpoints {
@@ -3450,7 +4136,7 @@ mod tests {
             "action_result_code=38 (NOT_ENOUGH_EXTRA)",
             "exact wallet action produced zero outbound messages",
             "required ECC unchanged",
-            "Fund requested token ECC[1]",
+            "Fund requested token and SHELL ECC[2]",
         ] {
             assert!(error.contains(fact), "missing {fact}: {error}");
         }
@@ -3470,7 +4156,7 @@ mod tests {
         let mut recovery = crate::cli::note::load_note_deploy_recovery(&recovery_path)
             .expect("reload finalized failure")
             .expect("persisted recovery");
-        let funded_reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let funded_reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, u128::MAX)]);
         let successful_submitter = CountingVoucherSubmitter::default();
         let resumed_error = run_issue_678_deposit(
             &recovery_path,
@@ -3787,7 +4473,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir");
         let resumed_recovery_path = temp.path().join("ambiguous-recovery.json");
-        let first_reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let first_reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, u128::MAX)]);
         let first_submitter =
             CountingVoucherSubmitter::failing("transport/observer timeout containing text 38");
         let mut resumed_recovery = test_recovery_state();
@@ -3826,7 +4512,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery_path = temp.path().join("no-finalized-receipt.json");
-        let reader = issue_678_wallet_reader(vec![(1, u128::MAX), (2, u128::MAX)]);
+        let reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, u128::MAX)]);
         let submitter = CountingVoucherSubmitter::returning(None);
         let mut recovery = test_recovery_state();
 
@@ -3869,7 +4555,7 @@ mod tests {
         let mut outbound_effect = issue_678_receipt(true, 38);
         outbound_effect.outmsg_count = 1;
         let mut matching_ecc_effect = issue_678_receipt(true, 38);
-        matching_ecc_effect.wallet_ecc_balances = Some(vec![(1, raw - 1), (2, raw)]);
+        matching_ecc_effect.wallet_ecc_balances = Some(vec![(SHELL_CURRENCY_ID, raw * 2 - 1)]);
         let mut missing_ecc = issue_678_receipt(true, 38);
         missing_ecc.wallet_ecc_balances = None;
 
@@ -3879,12 +4565,12 @@ mod tests {
                 outbound_effect,
                 "produced 1 outbound message(s)",
             ),
-            ("matching-ecc-effect", matching_ecc_effect, "ECC[1] changed"),
+            ("matching-ecc-effect", matching_ecc_effect, "ECC[2] changed"),
             ("missing-ecc", missing_ecc, "no exact wallet ECC state"),
         ] {
             let temp = tempfile::tempdir().expect("temp dir");
             let recovery_path = temp.path().join(format!("{case}.json"));
-            let reader = issue_678_wallet_reader(vec![(1, raw), (2, raw)]);
+            let reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, raw * 2)]);
             let submitter = CountingVoucherSubmitter::returning(Some(receipt));
             let mut recovery = test_recovery_state();
 
@@ -4065,26 +4751,76 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    fn finalized_rootpn_error(method: &str, code: i64) -> anyhow::Error {
+        super::note_deploy_rootpn_action_result(
+            method,
+            None,
+            Some(dexdo_core::shellnet::NoteDeployRootPnActionObservation {
+                transaction_hash: format!("tx-{method}-{code}"),
+                compute_exit_code: code,
+                aborted: true,
+                action_result_code: None,
+            }),
+        )
+        .expect_err("finalized RootPN failure")
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_rootpn_final_receipt_overrides_block_manager_wrapper() {
+        let error = super::note_deploy_rootpn_action_result(
+            "deployPrivateNote",
+            Some(anyhow::anyhow!(
+                "block manager rejected message [TVM_ERROR]"
+            )),
+            Some(dexdo_core::shellnet::NoteDeployRootPnActionObservation {
+                transaction_hash: "tx403".to_string(),
+                compute_exit_code: 403,
+                aborted: true,
+                action_result_code: None,
+            }),
+        )
+        .expect_err("the exact finalized compute abort must be returned");
+        assert!(
+            super::note_deploy_has_exact_finalized_rootpn_exit_code(&error, 403),
+            "{error:#}"
+        );
+
+        super::note_deploy_rootpn_action_result(
+            "deployPrivateNote",
+            Some(anyhow::anyhow!(
+                "block manager rejected message [TVM_ERROR]"
+            )),
+            Some(dexdo_core::shellnet::NoteDeployRootPnActionObservation {
+                transaction_hash: "tx-ok".to_string(),
+                compute_exit_code: 0,
+                aborted: false,
+                action_result_code: Some(0),
+            }),
+        )
+        .expect("the exact successful receipt is authoritative");
+    }
+
+    #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_history_proof_403_is_actionable_without_relabeling_other_errors() {
-        for raw in [
-            "RootPN.deployPrivateNote: block manager rejected message code=TVM_ERROR; \
-             exit_code=403 (dex::ERR_INVALID_HISTORY_PROOF)",
-            "RootPN.deployPrivateNote failed: ERR_INVALID_HISTORY_PROOF",
-        ] {
-            let error = crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw))
-                .to_string();
+        for method in ["deployPrivateNote", "sendEccShellToPrivateNote"] {
+            let receipt_error = finalized_rootpn_error(method, 403);
+            let raw = receipt_error.to_string();
+            let error =
+                crate::cli::commands::note_deploy_error("0:wallet", receipt_error).to_string();
             assert!(
                 error.contains("history proof expired (exit 403)"),
                 "{error}"
             );
             assert!(
-                error.contains("Re-run the same `note deploy` command"),
+                error.contains("action=resume_same_paid_voucher_later"),
                 "{error}"
             );
-            assert!(error.contains("HALO2_ATTEMPT_LAYERS=1"), "{error}");
+            assert!(error.contains("Do not fund a new voucher"), "{error}");
+            assert!(!error.contains("HALO2_ATTEMPT_LAYERS"), "{error}");
             assert!(
-                error.contains(raw),
+                error.contains(&raw),
                 "raw SDK error must be retained: {error}"
             );
         }
@@ -4105,6 +4841,8 @@ mod tests {
     fn note_deploy_unrelated_errors_are_not_relabeled_as_history_proof_expired() {
         for raw in [
             "UpdateCustodianMultisigWallet_v2.submitTransaction failed: exit_code=403",
+            "RootPN.deployPrivateNote: block manager rejected message; exit_code=403",
+            "RootPN.deployPrivateNote failed: ERR_INVALID_HISTORY_PROOF",
             "prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover",
             "wallet submit failed: exit_code=52 replay protection exception",
             "generic SDK transport error",
@@ -4112,6 +4850,24 @@ mod tests {
             let error = crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw))
                 .to_string();
             assert!(!error.contains("history proof expired"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_reproof_routes_only_typed_finalized_403() {
+        assert!(super::note_deploy_has_exact_finalized_rootpn_exit_code(
+            &finalized_rootpn_error("deployPrivateNote", 403),
+            403
+        ));
+        for code in [4030, 1403, 137] {
+            assert!(
+                !super::note_deploy_has_exact_finalized_rootpn_exit_code(
+                    &finalized_rootpn_error("deployPrivateNote", code),
+                    403
+                ),
+                "{code}"
+            );
         }
     }
 
@@ -4283,7 +5039,7 @@ mod tests {
             NoteDeployRecoveryRequest {
                 endpoint: "http://127.0.0.1:9",
                 nominal: "N100",
-                token_type: 1,
+                token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
                 ecc_shell_deposit: 100_000_000_000,
                 funding_multisig_address: &format!("0:{}", "a".repeat(64)),
@@ -4350,14 +5106,432 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    fn install_fixture_replacement(
+        recovery_path: &std::path::Path,
+        recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+        kind: crate::cli::note::NoteDeployVoucherKind,
+    ) -> anyhow::Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+        let mut checkpoint = recovery
+            .voucher_checkpoint(kind)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("fixture voucher checkpoint missing"))?;
+        if !checkpoint.current_proof_is_rejected() {
+            return checkpoint
+                .proof
+                .as_ref()
+                .map(crate::cli::note::NoteDeployVoucherProof::to_halo2)
+                .ok_or_else(|| anyhow::anyhow!("fixture voucher proof missing"));
+        }
+        let next_layer = checkpoint.next_sdk_proof_layer().ok_or_else(|| {
+            anyhow::anyhow!("fixture history plan exhausted; action=resume_same_paid_voucher_later")
+        })? as u8
+            + 1;
+        let mut replacement = checkpoint
+            .proof
+            .as_ref()
+            .expect("rejected fixture proof")
+            .to_halo2();
+        replacement.proof = format!("fixture-replacement-layer-{next_layer}");
+        replacement.final_layer_historical_hash_root_hex = "9".repeat(64);
+        replacement.layer_number = next_layer;
+        checkpoint.replace_rejected_proof(crate::cli::note::NoteDeployVoucherProof::from_halo2(
+            &replacement,
+        ))?;
+        recovery.set_voucher_checkpoint(kind, checkpoint)?;
+        crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+        Ok(replacement)
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn assert_exact_403_reproof_for_kind(kind: crate::cli::note::NoteDeployVoucherKind) {
+        use std::cell::{Cell, RefCell};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join(format!("{}.recovery.json", kind.label()));
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let (token_type, raw_value, is_fee, fixture_digit) = match kind {
+            crate::cli::note::NoteDeployVoucherKind::Deposit => {
+                (recovery.token_type, recovery.raw_value, false, 'b')
+            }
+            crate::cli::note::NoteDeployVoucherKind::ShellGas => {
+                (2, recovery.ecc_shell_deposit, true, 'f')
+            }
+        };
+        let original =
+            persisted_voucher_checkpoint(&owner, token_type, raw_value, is_fee, fixture_digit);
+        recovery
+            .set_voucher_checkpoint(kind, original.clone())
+            .expect("persist original voucher");
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)
+            .expect("write original recovery");
+
+        let wallet_submitter = CountingVoucherSubmitter::default();
+        let wallet =
+            dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64))).expect("fixture wallet");
+        super::NoteDeployVoucherSubmitter::submit_voucher_boc(
+            &wallet_submitter,
+            "http://127.0.0.1:9",
+            &wallet,
+            "paid-voucher-boc",
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect("record the one paid wallet submit");
+
+        let effect_reads = Cell::new(0_usize);
+        let expected_effect_present = Cell::new(false);
+        let submitted_layers = RefCell::new(Vec::new());
+        let original_proof = original.proof.as_ref().expect("original proof").to_halo2();
+        let accepted_proof = super::note_deploy_run_reproof_loop(
+            original_proof,
+            async |proof| {
+                super::note_deploy_submit_proof_once(
+                    proof,
+                    async |_proof| {
+                        effect_reads.set(effect_reads.get() + 1);
+                        Ok(expected_effect_present.get())
+                    },
+                    async |proof| {
+                        submitted_layers.borrow_mut().push(proof.layer_number);
+                        if proof.layer_number == 1 {
+                            let method = match kind {
+                                crate::cli::note::NoteDeployVoucherKind::Deposit => {
+                                    "deployPrivateNote"
+                                }
+                                crate::cli::note::NoteDeployVoucherKind::ShellGas => {
+                                    "sendEccShellToPrivateNote"
+                                }
+                            };
+                            return Err(finalized_rootpn_error(method, 403));
+                        }
+                        expected_effect_present.set(true);
+                        Ok(())
+                    },
+                )
+                .await
+            },
+            async |rejected_proof| {
+                super::note_deploy_persist_rejected_proof(
+                    &recovery_path,
+                    &mut recovery,
+                    kind,
+                    rejected_proof,
+                )?;
+                install_fixture_replacement(&recovery_path, &mut recovery, kind)
+            },
+        )
+        .await
+        .expect("production reproof loop");
+
+        assert_eq!(accepted_proof.layer_number, 2);
+        assert_eq!(
+            wallet_submitter.calls.get(),
+            1,
+            "wallet voucher spend must stay one"
+        );
+        assert_eq!(*submitted_layers.borrow(), [1, 2]);
+        assert_eq!(effect_reads.get(), 1);
+        assert!(
+            expected_effect_present.get(),
+            "{} replacement submit did not produce its expected effect",
+            kind.label()
+        );
+        let checkpoint = recovery
+            .voucher_checkpoint(kind)
+            .expect("final voucher checkpoint");
+        assert_eq!(checkpoint.last_rejected_proof_layer, Some(1));
+        assert_eq!(
+            checkpoint.proof.as_ref().expect("replacement").layer_number,
+            2
+        );
+        assert_eq!(checkpoint.sk_u_hex, original.sk_u_hex);
+        assert_eq!(checkpoint.sk_u_commit_hex, original.sk_u_commit_hex);
+        assert_eq!(checkpoint.event, original.event);
+        assert_eq!(
+            checkpoint.recipient_ephemeral_pubkey_hex,
+            original.recipient_ephemeral_pubkey_hex
+        );
+        assert_eq!(checkpoint.token_type, original.token_type);
+        assert_eq!(checkpoint.raw_value, original.raw_value);
+        assert_eq!(checkpoint.is_fee, original.is_fee);
+        assert_eq!(
+            checkpoint
+                .proof
+                .as_ref()
+                .expect("replacement")
+                .deposit_identifier_hash_hex,
+            original
+                .proof
+                .as_ref()
+                .expect("original proof")
+                .deposit_identifier_hash_hex
+        );
+        let persisted = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("load final recovery")
+            .expect("final recovery exists");
+        assert_eq!(persisted.voucher_checkpoint(kind), Some(checkpoint));
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_deposit_exact_403_reproofs_same_paid_voucher_once() {
+        assert_exact_403_reproof_for_kind(crate::cli::note::NoteDeployVoucherKind::Deposit).await;
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_shell_exact_403_reproofs_same_paid_voucher_once() {
+        assert_exact_403_reproof_for_kind(crate::cli::note::NoteDeployVoucherKind::ShellGas).await;
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_submit_error_with_effect_race_skips_reproof_and_resubmit() {
+        use std::cell::{Cell, RefCell};
+
+        for submit_error in [
+            "RootPN.deployPrivateNote: exit_code=403",
+            "RootPN.deployPrivateNote: transport timeout",
+        ] {
+            let mut recovery = test_recovery_state();
+            let owner = recovery.owner_public_key_hex.clone();
+            let checkpoint = persisted_voucher_checkpoint(
+                &owner,
+                recovery.token_type,
+                recovery.raw_value,
+                false,
+                'b',
+            );
+            recovery
+                .set_voucher_checkpoint(
+                    crate::cli::note::NoteDeployVoucherKind::Deposit,
+                    checkpoint.clone(),
+                )
+                .expect("persist voucher");
+
+            let effect_reads = Cell::new(0_usize);
+            let submitted_layers = RefCell::new(Vec::new());
+            let proof = checkpoint.proof.as_ref().expect("proof").to_halo2();
+            let accepted = super::note_deploy_submit_proof_once(
+                &proof,
+                async |_proof| {
+                    effect_reads.set(effect_reads.get() + 1);
+                    Ok(true)
+                },
+                async |proof| {
+                    submitted_layers.borrow_mut().push(proof.layer_number);
+                    anyhow::bail!("{submit_error}")
+                },
+            )
+            .await
+            .expect("effect appearing after submit error is success by fact");
+
+            assert!(accepted);
+            assert_eq!(effect_reads.get(), 1);
+            assert_eq!(*submitted_layers.borrow(), [1]);
+            assert_eq!(
+                recovery
+                    .deposit_voucher
+                    .as_ref()
+                    .expect("voucher")
+                    .last_rejected_proof_layer,
+                None
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_replacement_persisted_before_submit_resumes_without_old_layer() {
+        use std::cell::RefCell;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("replacement-crash.recovery.json");
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let checkpoint = persisted_voucher_checkpoint(
+            &owner,
+            recovery.token_type,
+            recovery.raw_value,
+            false,
+            'b',
+        );
+        recovery
+            .set_voucher_checkpoint(
+                crate::cli::note::NoteDeployVoucherKind::Deposit,
+                checkpoint.clone(),
+            )
+            .expect("persist rejected layer");
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)
+            .expect("write recovery");
+        let original_proof = checkpoint.proof.as_ref().expect("proof").to_halo2();
+        super::note_deploy_persist_rejected_proof(
+            &recovery_path,
+            &mut recovery,
+            crate::cli::note::NoteDeployVoucherKind::Deposit,
+            &original_proof,
+        )
+        .expect("persist rejected proof");
+        install_fixture_replacement(
+            &recovery_path,
+            &mut recovery,
+            crate::cli::note::NoteDeployVoucherKind::Deposit,
+        )
+        .expect("persist replacement before submit");
+        drop(recovery);
+        let recovery = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("load replacement after simulated restart")
+            .expect("replacement recovery exists");
+        assert_eq!(
+            recovery
+                .deposit_voucher
+                .as_ref()
+                .and_then(|voucher| voucher.proof.as_ref())
+                .expect("persisted replacement")
+                .layer_number,
+            2
+        );
+
+        let submitted_layers = RefCell::new(Vec::new());
+        let replacement = recovery
+            .deposit_voucher
+            .as_ref()
+            .and_then(|voucher| voucher.proof.as_ref())
+            .expect("persisted replacement")
+            .to_halo2();
+        let accepted = super::note_deploy_submit_proof_once(
+            &replacement,
+            async |_proof| Ok(false),
+            async |proof| {
+                submitted_layers.borrow_mut().push(proof.layer_number);
+                Ok(())
+            },
+        )
+        .await
+        .expect("restart must submit the persisted replacement");
+        assert!(accepted);
+        assert_eq!(*submitted_layers.borrow(), [2]);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_non_403_and_observer_outage_preserve_proof_without_fallback() {
+        use std::cell::Cell;
+
+        for (case, effect_observer_fails, receipt_outcome, submit_error) in [
+            (
+                "non-403",
+                false,
+                "raw",
+                "RootPN.deployPrivateNote: exit_code=137",
+            ),
+            (
+                "transport",
+                false,
+                "raw",
+                "RootPN.deployPrivateNote: transport timeout",
+            ),
+            (
+                "effect-observer",
+                true,
+                "raw",
+                "RootPN.deployPrivateNote: exit_code=403",
+            ),
+            (
+                "missing-receipt",
+                false,
+                "missing",
+                "block manager rejected message; exit_code=403",
+            ),
+            (
+                "receipt-observer",
+                false,
+                "observer",
+                "block manager rejected message; exit_code=403",
+            ),
+        ] {
+            let mut recovery = test_recovery_state();
+            let owner = recovery.owner_public_key_hex.clone();
+            let checkpoint = persisted_voucher_checkpoint(
+                &owner,
+                recovery.token_type,
+                recovery.raw_value,
+                false,
+                'b',
+            );
+            recovery
+                .set_voucher_checkpoint(
+                    crate::cli::note::NoteDeployVoucherKind::Deposit,
+                    checkpoint.clone(),
+                )
+                .expect("persist voucher");
+            let submits = Cell::new(0_usize);
+            let proof = checkpoint.proof.as_ref().expect("proof").to_halo2();
+
+            let error = super::note_deploy_submit_proof_once(
+                &proof,
+                async |_proof| {
+                    if effect_observer_fails {
+                        anyhow::bail!("effect observer outage")
+                    }
+                    Ok(false)
+                },
+                async |_proof| {
+                    submits.set(submits.get() + 1);
+                    let error = anyhow::anyhow!("{submit_error}");
+                    match receipt_outcome {
+                        "missing" => super::note_deploy_rootpn_action_result(
+                            "deployPrivateNote",
+                            Some(error),
+                            None,
+                        ),
+                        "observer" => {
+                            Err(anyhow::anyhow!("receipt observer outage").context(error))
+                        }
+                        _ => Err(error),
+                    }
+                },
+            )
+            .await
+            .expect_err("ambiguous result must propagate instead of returning the re-proof signal");
+            let user_error = crate::cli::commands::note_deploy_error("0:wallet", error).to_string();
+            assert!(
+                !user_error.contains("history proof expired"),
+                "{case}: {user_error}"
+            );
+            assert_eq!(submits.get(), 1, "{case}");
+            assert_eq!(
+                recovery.deposit_voucher.as_ref().expect("voucher").proof,
+                checkpoint.proof,
+                "{case}"
+            );
+            assert_eq!(
+                recovery
+                    .deposit_voucher
+                    .as_ref()
+                    .expect("voucher")
+                    .last_rejected_proof_layer,
+                None
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
     #[derive(Debug, Default)]
     struct FakeNoteDeployResolvedOps {
         recovery: Option<crate::cli::note::NoteDeployRecoveryState>,
         pool_path: std::path::PathBuf,
         cache_unavailable_or_contended: bool,
+        doctor_preflight_error: Option<&'static str>,
         events: Vec<&'static str>,
+        doctor_preflight_calls: usize,
+        recovery_loads: usize,
+        key_material_actions: usize,
         preflight_calls: usize,
+        wallet_signs: usize,
         wallet_submits: usize,
+        voucher_generations: usize,
         proof_calls: usize,
         chain_resumes: usize,
         pool_finalizations: usize,
@@ -4368,9 +5542,22 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[async_trait::async_trait(?Send)]
     impl super::NoteDeployResolvedOps for FakeNoteDeployResolvedOps {
+        async fn preflight_doctor(&mut self) -> anyhow::Result<()> {
+            self.doctor_preflight_calls += 1;
+            self.events.push("doctor_preflight");
+            if let Some(error) = self.doctor_preflight_error {
+                return Err(super::note_deploy_generation_mismatch(anyhow::anyhow!(
+                    error
+                )));
+            }
+            Ok(())
+        }
+
         async fn load_recovery(
             &mut self,
         ) -> anyhow::Result<crate::cli::note::NoteDeployRecoveryState> {
+            self.recovery_loads += 1;
+            self.key_material_actions += 1;
             self.events.push("recovery_load");
             self.recovery
                 .take()
@@ -4416,7 +5603,9 @@ mod tests {
                     anyhow::bail!("fresh recovery reached wallet submit before prover preflight");
                 }
                 self.events.push("wallet_submit");
+                self.wallet_signs += 1;
                 self.wallet_submits += 1;
+                self.voucher_generations += 1;
                 self.events.push("prove");
                 self.proof_calls += 1;
                 self.events.push("chain_resume");
@@ -4459,8 +5648,278 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
-    fn no_fetch(_url: &str) -> std::future::Ready<anyhow::Result<Vec<u8>>> {
+    fn no_fetch(_part_path: std::path::PathBuf) -> std::future::Ready<anyhow::Result<()>> {
         std::future::ready(Err(anyhow::anyhow!("fetcher must not be called")))
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct SrsHttpReply {
+        status: &'static str,
+        content_range: Option<String>,
+        content_length: usize,
+        body: Vec<u8>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl SrsHttpReply {
+        fn new(status: &'static str, content_range: Option<String>, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                content_range,
+                content_length: body.len(),
+                body,
+            }
+        }
+
+        fn declared_length(mut self, content_length: usize) -> Self {
+            self.content_length = content_length;
+            self
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn download_srs_fixture(
+        part_path: &std::path::Path,
+        expected_size: u64,
+        replies: Vec<SrsHttpReply>,
+    ) -> (anyhow::Result<()>, Vec<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SRS HTTP fixture");
+        let url = format!("http://{}/srs", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.expect("accept SRS request");
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await.expect("read SRS request");
+                requests.push(String::from_utf8_lossy(&request[..read]).to_ascii_lowercase());
+
+                let mut headers = format!(
+                    "HTTP/1.1 {}\r\nConnection: close\r\nContent-Length: {}\r\n",
+                    reply.status, reply.content_length
+                );
+                if let Some(range) = reply.content_range {
+                    headers.push_str(&format!("Content-Range: {range}\r\n"));
+                }
+                headers.push_str("\r\n");
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("write SRS response headers");
+                socket
+                    .write_all(&reply.body)
+                    .await
+                    .expect("write SRS response body");
+            }
+            requests
+        });
+        let result = super::fetch_hermez_srs_with_retry(
+            &reqwest::Client::new(),
+            &url,
+            part_path,
+            expected_size,
+        )
+        .await;
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("SRS fixture received all expected requests")
+            .expect("SRS fixture task");
+        (result, requests)
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_hermez_interrupted_body_streams_partial_then_resumes_exact_range() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let expected = (0..16_384).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let cut = 4_096;
+        let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+        let (result, requests) = download_srs_fixture(
+            &part_path,
+            expected.len() as u64,
+            vec![
+                SrsHttpReply::new("200 OK", None, expected[..cut].to_vec())
+                    .declared_length(expected.len()),
+                SrsHttpReply::new(
+                    "206 Partial Content",
+                    Some(format!(
+                        "bytes {cut}-{}/{}",
+                        expected.len() - 1,
+                        expected.len()
+                    )),
+                    expected[cut..].to_vec(),
+                ),
+            ],
+        )
+        .await;
+        result.expect("resume interrupted SRS body");
+        assert_eq!(std::fs::read(&part_path).unwrap(), expected);
+        assert!(!requests[0].contains("\r\nrange:"));
+        assert!(requests[1].contains(&format!("\r\nrange: bytes={cut}-\r\n")));
+        assert!(!temp.path().join(super::HERMEZ_SRS_NAME).exists());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_hermez_process_restart_keeps_partial_and_exhausts_five_attempts() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let expected = vec![0x5a; 4_096];
+        let chunk = 128;
+        let mut replies = Vec::new();
+        for attempt in 0..super::HERMEZ_SRS_MAX_ATTEMPTS {
+            let offset = attempt * chunk;
+            replies.push(SrsHttpReply::new(
+                if attempt == 0 {
+                    "200 OK"
+                } else {
+                    "206 Partial Content"
+                },
+                (attempt > 0)
+                    .then(|| format!("bytes {offset}-{}/{}", expected.len() - 1, expected.len())),
+                expected[offset..offset + chunk].to_vec(),
+            ));
+        }
+        let final_path = temp.path().join(super::HERMEZ_SRS_NAME);
+        let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+
+        let (result, requests) =
+            download_srs_fixture(&part_path, expected.len() as u64, replies).await;
+        let error = result.expect_err("five interrupted responses must exhaust retry budget");
+        assert!(
+            error.to_string().contains("failed after 5 attempts"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("premature EOF"), "{error:#}");
+        assert!(error.to_string().contains("rerun `dexdo note deploy`"));
+        assert_eq!(requests.len(), super::HERMEZ_SRS_MAX_ATTEMPTS);
+        assert_eq!(
+            std::fs::metadata(&part_path).unwrap().len(),
+            (5 * chunk) as u64
+        );
+        assert!(!final_path.exists());
+
+        let offset = 5 * chunk;
+        let (result, requests) = download_srs_fixture(
+            &part_path,
+            expected.len() as u64,
+            vec![SrsHttpReply::new(
+                "206 Partial Content",
+                Some(format!(
+                    "bytes {offset}-{}/{}",
+                    expected.len() - 1,
+                    expected.len()
+                )),
+                expected[offset..].to_vec(),
+            )],
+        )
+        .await;
+        result.expect("restart resumes saved partial");
+        assert!(requests[0].contains(&format!("\r\nrange: bytes={offset}-\r\n")));
+        assert_eq!(std::fs::read(part_path).unwrap(), expected);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_hermez_range_ignored_once_restarts_without_append_corruption() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let expected = vec![0x3c; 2_048];
+        let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+        std::fs::write(&part_path, &expected[..333]).unwrap();
+        let (result, requests) = download_srs_fixture(
+            &part_path,
+            expected.len() as u64,
+            vec![SrsHttpReply::new("200 OK", None, expected.clone())],
+        )
+        .await;
+        result.expect("one ignored Range restarts cleanly");
+        assert!(requests[0].contains("\r\nrange: bytes=333-\r\n"));
+        assert_eq!(std::fs::read(part_path).unwrap(), expected);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_hermez_bad_range_or_status_is_permanent_and_preserves_partial() {
+        for (status, content_range, expected_error) in [
+            ("206 Partial Content", None, "Content-Range"),
+            (
+                "206 Partial Content",
+                Some("bytes 9-31/32".to_string()),
+                "Content-Range",
+            ),
+            (
+                "206 Partial Content",
+                Some("bytes 8-31/33".to_string()),
+                "Content-Range",
+            ),
+            ("404 Not Found", None, "404"),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+            std::fs::write(&part_path, [7_u8; 8]).unwrap();
+            let body = if status == "206 Partial Content" {
+                vec![7; 24]
+            } else {
+                Vec::new()
+            };
+            let (result, requests) = download_srs_fixture(
+                &part_path,
+                32,
+                vec![SrsHttpReply::new(status, content_range, body)],
+            )
+            .await;
+            let error = result.expect_err("permanent response must fail");
+            assert!(error.to_string().contains(expected_error), "{error:#}");
+            assert_eq!(requests.len(), 1, "permanent response was retried");
+            assert_eq!(std::fs::read(part_path).unwrap(), [7_u8; 8]);
+            assert!(!temp.path().join(super::HERMEZ_SRS_NAME).exists());
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_hermez_oversize_partial_and_body_never_publish() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+        std::fs::write(&part_path, [0_u8; 33]).unwrap();
+        let error = super::fetch_hermez_srs_with_retry(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9/srs",
+            &part_path,
+            32,
+        )
+        .await
+        .expect_err("oversized partial must fail before HTTP");
+        assert!(error.to_string().contains("oversized partial"), "{error:#}");
+        assert!(!part_path.exists());
+
+        let (result, _) = download_srs_fixture(
+            &part_path,
+            32,
+            vec![SrsHttpReply::new("200 OK", None, vec![0; 33])],
+        )
+        .await;
+        let error = result.expect_err("oversized body must fail");
+        assert!(error.to_string().contains("body exceeds"), "{error:#}");
+        assert_eq!(std::fs::metadata(&part_path).unwrap().len(), 0);
+        assert!(!temp.path().join(super::HERMEZ_SRS_NAME).exists());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_hermez_progress_is_numeric_and_secret_free() {
+        let fresh = super::hermez_srs_progress_line(1, 0, 1_000, 0);
+        let resumed = super::hermez_srs_progress_line(2, 750, 1_000, 500);
+        assert!(fresh.contains("attempt=1/5 downloaded=0 total=1000 percent=0% resumed_offset=0"));
+        assert!(resumed
+            .contains("attempt=2/5 downloaded=750 total=1000 percent=75% resumed_offset=500"));
+        for line in [fresh, resumed] {
+            assert!(!line.contains("http"));
+            assert!(!line.contains("wallet"));
+            assert!(!line.contains("note secret"));
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -4478,6 +5937,7 @@ mod tests {
 
         super::ensure_hermez_srs_and_valid_pk_cache_with_options(
             dir,
+            srs.len() as u64,
             &expected,
             no_fetch,
             super::invalidate_stale_pk_cache,
@@ -4496,12 +5956,17 @@ mod tests {
     async fn note_deploy_wrong_hermez_srs_download_is_rejected_without_install() {
         let temp = tempfile::tempdir().expect("temp dir");
         let dir = temp.path();
-        let expected = super::sha256_hex(b"expected SRS");
+        let expected_srs = b"expected SRS";
+        let expected = super::sha256_hex(expected_srs);
 
         let error = super::ensure_hermez_srs_and_valid_pk_cache_with_options(
             dir,
+            expected_srs.len() as u64,
             &expected,
-            |_| async { Ok(b"wrong SRS".to_vec()) },
+            |part_path| async move {
+                std::fs::write(part_path, b"wrong SRS!!!")?;
+                Ok(())
+            },
             super::invalidate_stale_pk_cache,
         )
         .await
@@ -4509,6 +5974,9 @@ mod tests {
 
         assert!(error.to_string().contains("sha256 mismatch"), "{error:#}");
         assert!(!dir.join(super::HERMEZ_SRS_NAME).exists());
+        assert!(!dir
+            .join(format!("{}.part", super::HERMEZ_SRS_NAME))
+            .exists());
         assert!(!dir.join(super::HERMEZ_SRS_MARKER_NAME).exists());
         assert!(!dir.join(super::HERMEZ_SRS_PENDING_MARKER_NAME).exists());
     }
@@ -4528,6 +5996,7 @@ mod tests {
 
         super::ensure_hermez_srs_and_valid_pk_cache_with_options(
             dir,
+            srs.len() as u64,
             &expected,
             no_fetch,
             super::invalidate_stale_pk_cache,
@@ -4563,6 +6032,7 @@ mod tests {
 
             super::ensure_hermez_srs_and_valid_pk_cache_with_options(
                 dir,
+                srs.len() as u64,
                 &expected,
                 no_fetch,
                 super::invalidate_stale_pk_cache,
@@ -4583,7 +6053,7 @@ mod tests {
             for name in super::PROVER_CACHE_ARTIFACTS {
                 write_test_file(dir, name, format!("clean-keygen-{name}").as_bytes());
             }
-            super::promote_hermez_srs_pending_marker(dir, &expected)
+            super::promote_hermez_srs_pending_marker(dir, srs.len() as u64, &expected)
                 .expect("commit successful proof cache");
             assert!(!dir.join(super::HERMEZ_SRS_PENDING_MARKER_NAME).exists());
             assert_eq!(
@@ -4599,10 +6069,18 @@ mod tests {
     fn note_deploy_atomic_install_replaces_existing_corrupt_srs() {
         let temp = tempfile::tempdir().expect("temp dir");
         let srs_path = temp.path().join(super::HERMEZ_SRS_NAME);
+        let part_path = temp.path().join(format!("{}.part", super::HERMEZ_SRS_NAME));
+        let replacement = b"verified replacement";
         write_test_file(temp.path(), super::HERMEZ_SRS_NAME, b"corrupt");
+        std::fs::write(&part_path, replacement).expect("write verified partial");
 
-        super::install_hermez_srs_atomically(&srs_path, b"verified replacement")
-            .expect("replace existing SRS");
+        super::publish_hermez_srs_part(
+            &part_path,
+            &srs_path,
+            replacement.len() as u64,
+            &super::sha256_hex(replacement),
+        )
+        .expect("replace existing SRS");
 
         assert_eq!(
             std::fs::read(&srs_path).expect("read replaced SRS"),
@@ -4628,7 +6106,7 @@ mod tests {
             write_test_file(dir, name, format!("successful-proof-{name}").as_bytes());
         }
 
-        super::promote_hermez_srs_pending_marker(dir, &expected)
+        super::promote_hermez_srs_pending_marker(dir, srs.len() as u64, &expected)
             .expect("atomically replace marker");
 
         assert!(!dir.join(super::HERMEZ_SRS_PENDING_MARKER_NAME).exists());
@@ -4637,6 +6115,92 @@ mod tests {
                 .expect("read promoted marker"),
             expected
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn assert_note_deploy_generation_rejected_before_writes(
+        mut ops: FakeNoteDeployResolvedOps,
+    ) -> anyhow::Error {
+        let pool_path = ops.pool_path.clone();
+        let error = super::run_note_deploy_resolved(&mut ops)
+            .await
+            .expect_err("stale or unreadable generation must reject note deploy");
+        assert_eq!(ops.doctor_preflight_calls, 1);
+        assert_eq!(ops.recovery_loads, 0);
+        assert_eq!(ops.key_material_actions, 0);
+        assert_eq!(ops.preflight_calls, 0);
+        assert_eq!(ops.wallet_signs, 0);
+        assert_eq!(ops.wallet_submits, 0);
+        assert_eq!(ops.voucher_generations, 0);
+        assert_eq!(ops.proof_calls, 0);
+        assert_eq!(ops.chain_resumes, 0);
+        assert_eq!(ops.pool_finalizations, 0);
+        assert_eq!(ops.events, ["doctor_preflight"]);
+        assert!(
+            ops.recovery.is_some(),
+            "recovery must not be loaded/mutated"
+        );
+        assert!(!pool_path.exists(), "pool must not be created or mutated");
+        error
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_generation_failures_are_stable_and_precede_all_writes() {
+        let cases = [
+            (
+                "stale RootPN",
+                "dexdo doctor: FAIL network=shellnet\nchecks:\n  FAIL RootPN code hash \
+                 expected=1111111111111111111111111111111111111111111111111111111111111111 \
+                 actual=2222222222222222222222222222222222222222222222222222222222222222",
+            ),
+            (
+                "stale PrivateNote",
+                "dexdo doctor: FAIL network=shellnet\nchecks:\n  FAIL PrivateNote code hash (RootPN pin) \
+                 expected=3333333333333333333333333333333333333333333333333333333333333333 \
+                 actual=4444444444444444444444444444444444444444444444444444444444444444",
+            ),
+            (
+                "mixed manifest",
+                "dexdo doctor: FAIL network=shellnet\nchecks:\n  FAIL RootPN code hash \
+                 expected=1111111111111111111111111111111111111111111111111111111111111111 \
+                 actual=2222222222222222222222222222222222222222222222222222222222222222\n  \
+                 FAIL PrivateNote code hash (RootPN pin) \
+                 expected=3333333333333333333333333333333333333333333333333333333333333333 \
+                 actual=4444444444444444444444444444444444444444444444444444444444444444",
+            ),
+            (
+                "unreadable observation",
+                "observe live RootPN/PrivateNote generation: shellnet returned unreadable account state",
+            ),
+        ];
+
+        for (name, doctor_error) in cases {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let ops = FakeNoteDeployResolvedOps {
+                recovery: Some(test_recovery_state()),
+                pool_path: temp.path().join(format!("{name}-pool.json")),
+                doctor_preflight_error: Some(doctor_error),
+                ..Default::default()
+            };
+            let error = assert_note_deploy_generation_rejected_before_writes(ops).await;
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.starts_with(crate::cli::machine::NOTE_DEPLOY_GENERATION_MISMATCH_MARKER),
+                "{name}: {rendered}"
+            );
+            assert!(rendered.contains(doctor_error), "{name}: {rendered}");
+
+            let code =
+                crate::cli::machine::classify_error(crate::cli::machine::OP_NOTE_DEPLOY, &error);
+            assert_eq!(code, crate::cli::machine::ErrorCode::StaleClient, "{name}");
+            assert_eq!(code.as_str(), "STALE_CLIENT", "{name}");
+            assert_eq!(
+                code.safe_message(),
+                crate::cli::machine::NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE,
+                "{name}"
+            );
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -4669,7 +6233,12 @@ mod tests {
         assert_eq!(ops.pool_finalizations, 1);
         assert_eq!(
             ops.events,
-            ["recovery_load", "completed_recovery", "pool_finalize"]
+            [
+                "doctor_preflight",
+                "recovery_load",
+                "completed_recovery",
+                "pool_finalize"
+            ]
         );
         assert!(
             ops.pool_path.exists(),
@@ -4727,7 +6296,12 @@ mod tests {
         assert_eq!(ops.pool_finalizations, 1);
         assert_eq!(
             ops.events,
-            ["recovery_load", "chain_resume", "pool_finalize"]
+            [
+                "doctor_preflight",
+                "recovery_load",
+                "chain_resume",
+                "pool_finalize"
+            ]
         );
         assert!(ops.pool_path.exists(), "chain recovery did not write pool");
         assert!(ops.deposit_proof_preserved);
@@ -4749,13 +6323,19 @@ mod tests {
             .expect("fresh recovery should preflight, prove, resume, and finalize");
 
         assert_eq!(ops.preflight_calls, 1);
+        assert_eq!(ops.doctor_preflight_calls, 1);
+        assert_eq!(ops.recovery_loads, 1);
+        assert_eq!(ops.key_material_actions, 1);
+        assert_eq!(ops.wallet_signs, 1);
         assert_eq!(ops.wallet_submits, 1);
+        assert_eq!(ops.voucher_generations, 1);
         assert_eq!(ops.proof_calls, 1);
         assert_eq!(ops.chain_resumes, 1);
         assert_eq!(ops.pool_finalizations, 1);
         assert_eq!(
             ops.events,
             [
+                "doctor_preflight",
                 "recovery_load",
                 "prover_preflight",
                 "wallet_submit",
@@ -4778,6 +6358,7 @@ mod tests {
 
         let error = super::ensure_hermez_srs_and_valid_pk_cache_with_options(
             dir,
+            srs.len() as u64,
             &expected,
             no_fetch,
             |cache_dir| {
@@ -4816,6 +6397,7 @@ mod tests {
 
         let error = super::ensure_hermez_srs_and_valid_pk_cache_with_options(
             dir,
+            b"new expected SRS".len() as u64,
             &expected_new_sha,
             |_| async { Err(anyhow::anyhow!("injected interrupted download")) },
             super::invalidate_stale_pk_cache,
@@ -4957,7 +6539,7 @@ mod tests {
         let rendered = super::note_deploy_json_result(
             "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "N100",
-            1,
+            dexdo_core::params::SHELL_CURRENCY_ID,
             std::path::Path::new("pn_pool.json"),
             1,
         )
@@ -4972,7 +6554,7 @@ mod tests {
             "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(value["nominal"], "N100");
-        assert_eq!(value["token_type"], 1);
+        assert_eq!(value["token_type"], dexdo_core::params::SHELL_CURRENCY_ID);
         assert_eq!(value["pool_path"], "pn_pool.json");
         assert_eq!(value["note_count"], 1);
         assert!(value["error"].is_null());

@@ -4,6 +4,7 @@
 pub mod advance;
 pub mod auth;
 pub mod gateway;
+pub mod liveness;
 pub mod models;
 pub mod tls;
 pub mod upstream;
@@ -15,7 +16,8 @@ pub use upstream::{anthropic::AnthropicConfig, openai::OpenAiConfig, UpstreamCon
 use anyhow::{anyhow, bail, Result};
 use dexdo_core::{
     normalize_wallet_address, ChainBackend, DobParams, Handover, LocalNote, Match,
-    MatchWatchCursor, Note, OrderBookOrder, SellOffer, SellOfferOutcome, TokenContract,
+    MatchWatchCursor, MatchedFill, Note, OrderBookOrder, SellOffer, SellOfferOutcome,
+    TokenContract,
 };
 use gateway::{GatewayService, GatewayState};
 use std::net::SocketAddr;
@@ -23,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tls::GatewayTls;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 pub const DEFAULT_MATCH_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -31,6 +34,7 @@ const SELLER_OPEN_STATE_READ_ATTEMPTS: usize = 3;
 const SELLER_OPEN_STATE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Seller configuration for one stream.
+#[derive(Debug, Clone)]
 pub struct SellerConfig {
     /// Contract -- the deal's handover point.
     pub token_contract: TokenContract,
@@ -53,6 +57,13 @@ pub enum SellerOfferStartup {
     Posted { outcome: Option<SellOfferOutcome> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SellerOfferInspection {
+    Funded,
+    Resting { order_id: u128 },
+    Vacant,
+}
+
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
@@ -61,6 +72,8 @@ pub struct RunningSeller {
     /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519(F1).
     pub note: Arc<dyn Note>,
     pub server_task: tokio::task::JoinHandle<()>,
+    /// The socket address actually bound before the server task was spawned.
+    pub listen_addr: SocketAddr,
     /// Fingerprint of the gateway's self-signed TLS certificate -- goes into the handover.
     pub tls_fingerprint: String,
 }
@@ -79,6 +92,43 @@ struct SellerMatchWatchCursor {
     source: MatchWatchCursor,
     last_polled_unix: Option<u64>,
     opened_at_unix: Option<u64>,
+    #[serde(default)]
+    fill: Option<SellerFillLineage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SellerFillLineage {
+    pub order_id: u128,
+    pub offered_ticks: u64,
+    pub matched_ticks: u64,
+    pub residual_ticks: u64,
+    pub price_per_tick: u64,
+    #[serde(default)]
+    pub replacement_nonce: Option<u64>,
+    #[serde(default)]
+    pub replacement_token_contract: Option<TokenContract>,
+}
+
+impl SellerFillLineage {
+    fn validate(&self) -> Result<()> {
+        if self.offered_ticks < 2
+            || self.matched_ticks == 0
+            || self.matched_ticks > self.offered_ticks
+            || self.residual_ticks != self.offered_ticks - self.matched_ticks
+        {
+            bail!(
+                "invalid seller fill lineage: N={} K={} R={}; expected N>=2, 1<=K<=N and R=N-K",
+                self.offered_ticks,
+                self.matched_ticks,
+                self.residual_ticks
+            );
+        }
+        if self.replacement_token_contract.is_some() && self.replacement_nonce.is_none() {
+            bail!("invalid seller fill lineage: replacement TokenContract has no reserved nonce");
+        }
+        Ok(())
+    }
 }
 
 impl SellerMatchWatchCursor {
@@ -89,7 +139,80 @@ impl SellerMatchWatchCursor {
             source: MatchWatchCursor::new(now_unix()? as i64),
             last_polled_unix: None,
             opened_at_unix: None,
+            fill: None,
         })
+    }
+
+    fn record_fill(
+        &mut self,
+        cfg: &SellerConfig,
+        authoritative_price: u64,
+        authoritative_ticks: u64,
+        fill: &MatchedFill,
+    ) -> Result<bool> {
+        if !fill
+            .token_contract
+            .eq_ignore_ascii_case(&cfg.token_contract)
+        {
+            bail!(
+                "seller fill TokenContract {} does not match {}",
+                fill.token_contract,
+                cfg.token_contract
+            );
+        }
+        let matched_ticks = u64::try_from(fill.ticks)
+            .map_err(|_| anyhow!("seller fill ticks {} exceed u64", fill.ticks))?;
+        let price_per_tick = u64::try_from(fill.price_per_tick)
+            .map_err(|_| anyhow!("seller fill price {} exceeds u64", fill.price_per_tick))?;
+        if (cfg.price_per_tick, cfg.max_ticks) != (authoritative_price, authoritative_ticks) {
+            bail!(
+                "seller config price/ticks ({},{}) do not match TokenContract.getDeal ({authoritative_price},{authoritative_ticks}) for {}",
+                cfg.price_per_tick,
+                cfg.max_ticks,
+                cfg.token_contract
+            );
+        }
+        if authoritative_ticks < 2 || matched_ticks == 0 || matched_ticks > authoritative_ticks {
+            bail!(
+                "seller fill ticks must be within 1..={} for offer size >=2, got {}",
+                authoritative_ticks,
+                matched_ticks
+            );
+        }
+        if price_per_tick != authoritative_price {
+            bail!(
+                "seller fill price {price_per_tick} does not match TokenContract.getDeal price {authoritative_price}"
+            );
+        }
+        let next = SellerFillLineage {
+            order_id: fill.order_id,
+            offered_ticks: authoritative_ticks,
+            matched_ticks,
+            residual_ticks: authoritative_ticks - matched_ticks,
+            price_per_tick,
+            replacement_nonce: self.fill.as_ref().and_then(|fill| fill.replacement_nonce),
+            replacement_token_contract: self
+                .fill
+                .as_ref()
+                .and_then(|fill| fill.replacement_token_contract.clone()),
+        };
+        match &self.fill {
+            Some(existing) if existing == &next => Ok(false),
+            Some(existing) => bail!(
+                "conflicting seller fill for {}: existing order_id={} N={} K={}, new order_id={} N={} K={}",
+                cfg.token_contract,
+                existing.order_id,
+                existing.offered_ticks,
+                existing.matched_ticks,
+                next.order_id,
+                next.offered_ticks,
+                next.matched_ticks
+            ),
+            None => {
+                self.fill = Some(next);
+                Ok(true)
+            }
+        }
     }
 
     fn load_or_new(path: &Path, token_contract: &TokenContract) -> Result<Self> {
@@ -148,6 +271,50 @@ impl SellerMatchWatchCursor {
     }
 }
 
+pub fn read_seller_fill_lineage(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<Option<SellerFillLineage>> {
+    let fill = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?.fill;
+    if let Some(fill) = fill.as_ref() {
+        fill.validate()?;
+    }
+    Ok(fill)
+}
+
+pub fn persist_seller_replacement(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+    nonce: u64,
+    replacement_token_contract: Option<&str>,
+) -> Result<SellerFillLineage> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    let fill = cursor.fill.as_mut().ok_or_else(|| {
+        anyhow!("seller match for {token_contract} has no authoritative owner fill lineage")
+    })?;
+    fill.validate()?;
+    match fill.replacement_nonce {
+        Some(existing) if existing != nonce => {
+            bail!("seller replacement for {token_contract} reserved nonce {existing}, not {nonce}")
+        }
+        None => fill.replacement_nonce = Some(nonce),
+        _ => {}
+    }
+    if let Some(replacement) = replacement_token_contract {
+        match fill.replacement_token_contract.as_deref() {
+            Some(existing) if !existing.eq_ignore_ascii_case(replacement) => bail!(
+                "seller replacement for {token_contract} is linked to {existing}, not {replacement}"
+            ),
+            None => fill.replacement_token_contract = Some(replacement.to_string()),
+            _ => {}
+        }
+    }
+    fill.validate()?;
+    let result = fill.clone();
+    cursor.save(cursor_path)?;
+    Ok(result)
+}
+
 fn now_unix() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -180,6 +347,15 @@ pub async fn start_gateway_with_note(
     upstream: UpstreamConfig,
     note: Arc<dyn Note>,
 ) -> Result<RunningSeller> {
+    start_gateway_with_note_tls(addr, upstream, note, GatewayTls::generate()?).await
+}
+
+pub async fn start_gateway_with_note_tls(
+    addr: SocketAddr,
+    upstream: UpstreamConfig,
+    note: Arc<dyn Note>,
+    gw_tls: GatewayTls,
+) -> Result<RunningSeller> {
     let state = Arc::new(GatewayState::with_upstream(upstream));
     let service = GatewayService::new(state.clone()).into_server();
 
@@ -187,26 +363,34 @@ pub async fn start_gateway_with_note(
     // default explicitly(ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
-    // the gateway's self-signed TLS certificate; trust comes from the encrypted handover.
-    let gw_tls = GatewayTls::generate()?;
     let tls_fingerprint = gw_tls.fingerprint.clone();
     let identity = Identity::from_pem(gw_tls.cert_pem, gw_tls.key_pem);
     let tls_config = ServerTlsConfig::new().identity(identity);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| anyhow!("bind seller gateway {addr}: {error}"))?;
+    let listen_addr = listener
+        .local_addr()
+        .map_err(|error| anyhow!("read bound seller gateway address: {error}"))?;
+    let incoming = TcpListenerStream::new(listener);
+    let mut builder = Server::builder()
+        .tls_config(tls_config)
+        .map_err(|error| anyhow!("configure seller gateway TLS: {error}"))?;
 
     let server_task = tokio::spawn(async move {
-        match Server::builder().tls_config(tls_config) {
-            Ok(mut builder) => {
-                if let Err(e) = builder.add_service(service).serve(addr).await {
-                    tracing::error!("gateway server stopped: {e}");
-                }
-            }
-            Err(e) => tracing::error!("gateway TLS config failed: {e}"),
+        if let Err(error) = builder
+            .add_service(service)
+            .serve_with_incoming(incoming)
+            .await
+        {
+            tracing::error!("gateway server stopped: {error}");
         }
     });
     Ok(RunningSeller {
         state,
         note,
         server_task,
+        listen_addr,
         tls_fingerprint,
     })
 }
@@ -221,8 +405,8 @@ pub async fn post_offer(
     post_offer_with_note(seller.note.as_ref(), chain, cfg).await
 }
 
-/// Like [`post_offer`], but uses a note directly. The CLI calls this before
-/// opening the gateway so TCP listening cannot be mistaken for market readiness.
+/// Like [`post_offer`], but uses a note directly. The CLI calls this only after
+/// gateway, advertised endpoint and exact upstream readiness have passed.
 pub async fn post_offer_with_note(
     note: &dyn Note,
     chain: &dyn ChainBackend,
@@ -340,17 +524,16 @@ fn validate_resting_offer(
     Ok(())
 }
 
-/// Classify authoritative startup state before binding the gateway. A funded match resumes the
-/// existing match path; one exact raw resting SELL resumes its watcher; only an empty exact-TC
-/// result permits one fresh post.
-pub async fn prepare_seller_offer(
-    note: &dyn Note,
+/// Read the authoritative seller state without posting. This lets gateway/upstream readiness run
+/// before a fresh SELL while still identifying an existing resting SELL that must be cancelled on
+/// failed restart readiness.
+pub async fn inspect_seller_offer(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     expected_owner: Option<&str>,
-) -> Result<SellerOfferStartup> {
+) -> Result<SellerOfferInspection> {
     match chain.read_openable_match_now(&cfg.token_contract).await {
-        Ok(Some(_)) => return Ok(SellerOfferStartup::ResumedFunded),
+        Ok(Some(_)) => return Ok(SellerOfferInspection::Funded),
         Ok(None) => {}
         Err(error) => {
             return Err(anyhow!(
@@ -370,17 +553,10 @@ pub async fn prepare_seller_offer(
             )
         })?;
     match raw_orders.as_slice() {
-        [] => {
-            chain
-                .assert_token_contract_fresh(&cfg.token_contract)
-                .await?;
-            post_offer_with_note(note, chain, cfg).await?;
-            let outcome = chain.confirm_offer_outcome(&cfg.token_contract).await?;
-            Ok(SellerOfferStartup::Posted { outcome })
-        }
+        [] => Ok(SellerOfferInspection::Vacant),
         [order] => {
             validate_resting_offer(order, expected_owner, cfg)?;
-            Ok(SellerOfferStartup::ResumedResting {
+            Ok(SellerOfferInspection::Resting {
                 order_id: order.order_id,
             })
         }
@@ -398,6 +574,31 @@ pub async fn prepare_seller_offer(
                 ),
             ))
         }
+    }
+}
+
+/// Classify authoritative startup state after readiness. A funded match resumes the existing
+/// match path; one exact raw resting SELL resumes its watcher; only an empty exact-TC result permits
+/// one fresh post.
+pub async fn prepare_seller_offer(
+    note: &dyn Note,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+) -> Result<SellerOfferStartup> {
+    match inspect_seller_offer(chain, cfg, expected_owner).await? {
+        SellerOfferInspection::Vacant => {
+            chain
+                .assert_token_contract_fresh(&cfg.token_contract)
+                .await?;
+            post_offer_with_note(note, chain, cfg).await?;
+            let outcome = chain.confirm_offer_outcome(&cfg.token_contract).await?;
+            Ok(SellerOfferStartup::Posted { outcome })
+        }
+        SellerOfferInspection::Resting { order_id } => {
+            Ok(SellerOfferStartup::ResumedResting { order_id })
+        }
+        SellerOfferInspection::Funded => Ok(SellerOfferStartup::ResumedFunded),
     }
 }
 
@@ -501,15 +702,92 @@ pub async fn provision_match(
 
 /// Perform only the read-only match poll, leaving provisioning to the caller.
 async fn poll_match(
+    seller: &RunningSeller,
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     cursor_path: &Path,
 ) -> Result<(SellerMatchWatchCursor, Option<Match>)> {
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
     cursor.last_polled_unix = Some(now_unix()?);
-    let found = chain
-        .poll_openable_match(&cfg.token_contract, &mut cursor.source)
+    let fills = chain
+        .poll_seller_fills(seller.note.as_ref(), &mut cursor.source)
         .await?;
+    let mut matching = fills
+        .into_iter()
+        .filter(|fill| {
+            fill.token_contract
+                .eq_ignore_ascii_case(&cfg.token_contract)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        bail!(
+            "seller fill poll returned {} fills for TokenContract {}",
+            matching.len(),
+            cfg.token_contract
+        );
+    }
+    if let Some(fill) = matching.pop() {
+        let (authoritative_price, authoritative_ticks) = chain
+            .sell_offer_terms(&cfg.token_contract)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "TokenContract {} getDeal is unavailable for authoritative seller fill accounting",
+                    cfg.token_contract
+                )
+            })?;
+        cursor.record_fill(cfg, authoritative_price, authoritative_ticks, &fill)?;
+        cursor.save(cursor_path)?;
+    }
+    let mut openable_match = None;
+    if cursor.fill.is_none() {
+        openable_match = chain.read_openable_match_now(&cfg.token_contract).await?;
+        if cursor.opened_at_unix.is_some() || openable_match.is_some() {
+            let mut history = MatchWatchCursor::new(0);
+            let mut fills = chain
+                .poll_seller_fills(seller.note.as_ref(), &mut history)
+                .await?
+                .into_iter()
+                .filter(|fill| {
+                    fill.token_contract
+                        .eq_ignore_ascii_case(&cfg.token_contract)
+                })
+                .collect::<Vec<_>>();
+            if fills.len() > 1 {
+                bail!(
+                    "seller owner history returned {} fills for TokenContract {}",
+                    fills.len(),
+                    cfg.token_contract
+                );
+            }
+            let fill = fills.pop().ok_or_else(|| {
+                anyhow!(
+                    "legacy seller cursor for opened TokenContract {} has no persisted fill and \
+                     the authoritative owner history cannot recover it; refusing to resume or \
+                     start advance with guessed capacity",
+                    cfg.token_contract
+                )
+            })?;
+            let (authoritative_price, authoritative_ticks) = chain
+                .sell_offer_terms(&cfg.token_contract)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "TokenContract {} getDeal is unavailable while recovering legacy seller fill",
+                        cfg.token_contract
+                    )
+                })?;
+            cursor.record_fill(cfg, authoritative_price, authoritative_ticks, &fill)?;
+            cursor.save(cursor_path)?;
+        }
+    }
+    let found = if cursor.fill.is_some() {
+        // A restart must restore in-memory gateway auth for an already-opened
+        // deal even though the durable source cursor suppresses the old fill.
+        Some(chain.read_match(&cfg.token_contract).await?)
+    } else {
+        openable_match
+    };
     Ok((cursor, found))
 }
 
@@ -521,7 +799,8 @@ pub async fn poll_match_and_maybe_open(
     cfg: &SellerConfig,
     cursor_path: &Path,
 ) -> Result<Option<Match>> {
-    let (mut cursor, found) = poll_match(chain, cfg, cursor_path).await?;
+    let (mut cursor, found) = poll_match(seller, chain, cfg, cursor_path).await?;
+    cursor.save(cursor_path)?;
     if let Some(m) = found {
         provision_match(seller, chain, cfg, m.clone()).await?;
         cursor.opened_at_unix.get_or_insert(now_unix()?);
@@ -533,16 +812,18 @@ pub async fn poll_match_and_maybe_open(
     }
 }
 
-/// Gateway-owned match watcher. This is intentionally an indefinite loop: as long as the offer remains a valid
-/// resting/openable deal, no five-minute seller timeout tears down the process.
-pub async fn watch_and_serve_match(
+/// Wait for one authoritative match without beginning the on-chain handover write.
+/// Keeping this phase read-only lets the resting-offer supervisor select shutdown/health safely. Once a
+/// match is observed, [`serve_watched_match`] runs the existing handover path to completion outside that
+/// cancellable select.
+pub async fn wait_for_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     watch: &SellerMatchWatchConfig,
 ) -> Result<Match> {
     loop {
-        let (mut cursor, found) = match poll_match(chain, cfg, &watch.cursor_path).await {
+        let (cursor, found) = match poll_match(seller, chain, cfg, &watch.cursor_path).await {
             Ok(polled) => polled,
             Err(error)
                 if error
@@ -561,14 +842,38 @@ pub async fn watch_and_serve_match(
             Err(error) => return Err(error),
         };
         if let Some(m) = found {
-            provision_match(seller, chain, cfg, m.clone()).await?;
-            cursor.opened_at_unix.get_or_insert(now_unix()?);
             cursor.save(&watch.cursor_path)?;
             return Ok(m);
         }
         cursor.save(&watch.cursor_path)?;
         tokio::time::sleep(watch.poll_interval).await;
     }
+}
+
+pub async fn serve_watched_match(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+    matched: Match,
+) -> Result<Match> {
+    provision_match(seller, chain, cfg, matched.clone()).await?;
+    let mut cursor = SellerMatchWatchCursor::load_or_new(&watch.cursor_path, &cfg.token_contract)?;
+    cursor.opened_at_unix.get_or_insert(now_unix()?);
+    cursor.save(&watch.cursor_path)?;
+    Ok(matched)
+}
+
+/// Gateway-owned match watcher. This is intentionally an indefinite loop: as long as the offer remains a valid
+/// resting/openable deal, no five-minute seller timeout tears down the process.
+pub async fn watch_and_serve_match(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+) -> Result<Match> {
+    let matched = wait_for_match(seller, chain, cfg, watch).await?;
+    serve_watched_match(seller, chain, cfg, watch, matched).await
 }
 
 #[cfg(test)]
@@ -578,21 +883,51 @@ mod tests {
         validate_seller_resume_state, ChainError, DealChainState, LocalNote, NotePubkey,
         OfferListing, SellOffer, Settlement, StreamSnapshot,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use dexdo_proto::{CanonRequest, ChallengeRequest, GatewayClient, StreamRequest};
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    async fn gateway_request(
+        client: &mut GatewayClient<tonic::transport::Channel>,
+        note: &dyn Note,
+        token_contract: &str,
+    ) -> StreamRequest {
+        let challenge = client
+            .get_challenge(ChallengeRequest {
+                token_contract: token_contract.to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        StreamRequest {
+            token_contract: token_contract.to_string(),
+            signature: note
+                .sign(&crate::seller::auth::challenge_bytes(
+                    token_contract,
+                    &challenge.nonce,
+                ))
+                .0
+                .to_vec(),
+            nonce: challenge.nonce,
+            request: Some(CanonRequest::default()),
+        }
+    }
 
     struct PollBackend {
         matched: Option<Match>,
         handover: Mutex<Option<Vec<u8>>>,
         opens: AtomicU64,
         open_failures_remaining: AtomicU64,
-        opened: bool,
+        opened: AtomicBool,
         poll_failures_remaining: AtomicU64,
         polls: AtomicU64,
         state_failures_remaining: AtomicU64,
         state_reads: AtomicU64,
         expect_last_seen: Option<i64>,
         record_created_at: i64,
+        matched_ticks: u128,
+        offer_ticks: u64,
     }
 
     impl PollBackend {
@@ -606,13 +941,15 @@ mod tests {
                 handover: Mutex::new(None),
                 opens: AtomicU64::new(0),
                 open_failures_remaining: AtomicU64::new(0),
-                opened: false,
+                opened: AtomicBool::new(false),
                 poll_failures_remaining: AtomicU64::new(0),
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
                 expect_last_seen,
                 record_created_at,
+                matched_ticks: 8,
+                offer_ticks: 8,
             }
         }
 
@@ -622,13 +959,15 @@ mod tests {
                 handover: Mutex::new(handover_present.then(|| b"existing-handover".to_vec())),
                 opens: AtomicU64::new(0),
                 open_failures_remaining: AtomicU64::new(0),
-                opened,
+                opened: AtomicBool::new(opened),
                 poll_failures_remaining: AtomicU64::new(0),
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
                 expect_last_seen: None,
                 record_created_at: 1,
+                matched_ticks: 8,
+                offer_ticks: 8,
             }
         }
 
@@ -644,6 +983,16 @@ mod tests {
 
         fn with_open_failures(mut self, failures: u64) -> Self {
             self.open_failures_remaining = AtomicU64::new(failures);
+            self
+        }
+
+        fn with_matched_ticks(mut self, ticks: u128) -> Self {
+            self.matched_ticks = ticks;
+            self
+        }
+
+        fn with_offer_ticks(mut self, ticks: u64) -> Self {
+            self.offer_ticks = ticks;
             self
         }
     }
@@ -662,19 +1011,42 @@ mod tests {
             unimplemented!()
         }
 
-        async fn poll_openable_match(
+        async fn poll_seller_fills(
             &self,
-            token_contract: &TokenContract,
+            _: &dyn Note,
             cursor: &mut MatchWatchCursor,
-        ) -> Result<Option<Match>, ChainError> {
+        ) -> Result<Vec<MatchedFill>, ChainError> {
             self.polls.fetch_add(1, Ordering::Relaxed);
             if self.poll_failures_remaining.load(Ordering::Relaxed) > 0 {
                 self.poll_failures_remaining.fetch_sub(1, Ordering::Relaxed);
                 return Err(ChainError::Transport("connection reset".to_string()));
             }
-            assert_eq!(cursor.last_seen_created_at, self.expect_last_seen);
-            cursor.record_seen_batch([(self.record_created_at, token_contract.clone())]);
-            Ok(self.matched.clone())
+            if let Some(expected) = self.expect_last_seen {
+                assert_eq!(cursor.last_seen_created_at, Some(expected));
+            }
+            let Some(matched) = &self.matched else {
+                return Ok(Vec::new());
+            };
+            if cursor.has_seen(self.record_created_at, &matched.token_contract) {
+                return Ok(Vec::new());
+            }
+            cursor.record_seen_batch([(self.record_created_at, matched.token_contract.clone())]);
+            Ok(vec![MatchedFill {
+                order_id: 1,
+                token_contract: matched.token_contract.clone(),
+                ticks: self.matched_ticks,
+                price_per_tick: u128::from(matched.price_per_tick),
+            }])
+        }
+
+        async fn sell_offer_terms(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<(u64, u64)>, ChainError> {
+            Ok(self
+                .matched
+                .as_ref()
+                .map(|matched| (matched.price_per_tick, self.offer_ticks)))
         }
 
         async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError> {
@@ -697,6 +1069,7 @@ mod tests {
                 ));
             }
             self.handover.lock().unwrap().replace(enc_endpoint);
+            self.opened.store(true, Ordering::Relaxed);
             Ok(())
         }
 
@@ -732,7 +1105,7 @@ mod tests {
             }
             Ok(Some(DealChainState {
                 funded: true,
-                opened: self.opened,
+                opened: self.opened.load(Ordering::Relaxed),
                 disputed: false,
                 probe_accepted: false,
                 funded_time: Some(1),
@@ -867,17 +1240,36 @@ mod tests {
             Ok(self.startup_match.clone())
         }
 
-        async fn poll_openable_match(
+        async fn poll_seller_fills(
             &self,
-            _: &TokenContract,
-            _: &mut MatchWatchCursor,
-        ) -> Result<Option<Match>, ChainError> {
+            _: &dyn Note,
+            cursor: &mut MatchWatchCursor,
+        ) -> Result<Vec<MatchedFill>, ChainError> {
             self.poll_calls.fetch_add(1, Ordering::Relaxed);
             if self.poll_failures_remaining.load(Ordering::Relaxed) > 0 {
                 self.poll_failures_remaining.fetch_sub(1, Ordering::Relaxed);
                 return Err(ChainError::Transport("temporary watch timeout".to_string()));
             }
-            Ok(self.watcher_match.clone())
+            let Some(matched) = &self.watcher_match else {
+                return Ok(Vec::new());
+            };
+            cursor.record_seen_batch([(1, matched.token_contract.clone())]);
+            Ok(vec![MatchedFill {
+                order_id: 835,
+                token_contract: matched.token_contract.clone(),
+                ticks: 8,
+                price_per_tick: u128::from(matched.price_per_tick),
+            }])
+        }
+
+        async fn sell_offer_terms(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<(u64, u64)>, ChainError> {
+            Ok(self
+                .watcher_match
+                .as_ref()
+                .map(|matched| (matched.price_per_tick, 8)))
         }
 
         async fn place_buy(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
@@ -944,6 +1336,7 @@ mod tests {
             state: Arc::new(GatewayState::new()),
             note: Arc::new(LocalNote::generate()),
             server_task: tokio::spawn(std::future::pending()),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
             tls_fingerprint: "test-fingerprint".to_string(),
         }
     }
@@ -1378,7 +1771,11 @@ mod tests {
         let buyer = LocalNote::generate();
         let first_seen = now_unix().unwrap() as i64 + 1;
 
-        let first = PollBackend::new(None, None, first_seen);
+        let first = PollBackend::new(
+            Some(sample_match("tc-other-owner-fill", buyer.pubkey())),
+            None,
+            first_seen,
+        );
         assert!(
             poll_match_and_maybe_open(&seller, &first, &cfg, &cursor_path)
                 .await
@@ -1404,6 +1801,189 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
         assert_eq!(saved.source.last_seen_created_at, Some(first_seen + 1));
         assert!(saved.opened_at_unix.is_some());
+        assert_eq!(
+            saved.fill,
+            Some(SellerFillLineage {
+                order_id: 1,
+                offered_ticks: 8,
+                matched_ticks: 8,
+                residual_ticks: 0,
+                price_per_tick: 1000,
+                replacement_nonce: None,
+                replacement_token_contract: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_opened_cursor_recovers_fill_before_auth_resume() {
+        let cursor_path = temp_cursor_path("legacy-opened-fill-recovery");
+        let seller = test_seller();
+        let tc = "tc-legacy-opened";
+        let cfg = test_cfg(tc);
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(sample_match(tc, buyer.pubkey()), true, true);
+        std::fs::write(
+            &cursor_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "token_contract": tc,
+                "source": {
+                    "since_unix": 0,
+                    "last_seen_created_at": 1,
+                    "seen_token_contracts_at_last_seen": [tc],
+                },
+                "last_polled_unix": 1,
+                "opened_at_unix": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let matched = poll_match_and_maybe_open(&seller, &backend, &cfg, &cursor_path)
+            .await
+            .unwrap()
+            .expect("legacy opened deal must resume from authoritative owner history");
+
+        assert_eq!(matched.token_contract, tc);
+        assert_eq!(
+            backend.opens.load(Ordering::Relaxed),
+            0,
+            "an already-opened legacy deal must not repeat open_stream"
+        );
+        let saved: SellerMatchWatchCursor =
+            serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.fill,
+            Some(SellerFillLineage {
+                order_id: 1,
+                offered_ticks: 8,
+                matched_ticks: 8,
+                residual_ticks: 0,
+                price_per_tick: 1000,
+                replacement_nonce: None,
+                replacement_token_contract: None,
+            })
+        );
+        let nonce = b"legacy-resume";
+        seller.state.auth.issue_challenge(tc, nonce.to_vec());
+        let signature = buyer.sign(&crate::seller::auth::challenge_bytes(tc, nonce));
+        assert!(seller.state.auth.verify_response(tc, nonce, &signature));
+    }
+
+    #[tokio::test]
+    async fn partial_fill_lineage_is_saved_before_open_stream() {
+        let cursor_path = temp_cursor_path("partial-before-open");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-partial-before-open");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match("tc-partial-before-open", buyer.pubkey())),
+            None,
+            now_unix().unwrap() as i64 + 1,
+        )
+        .with_matched_ticks(3)
+        .with_open_failures(1);
+
+        let error = poll_match_and_maybe_open(&seller, &backend, &cfg, &cursor_path)
+            .await
+            .expect_err("the signed open write fails after the fill is persisted");
+
+        assert!(error.to_string().contains("timeout after signed writes"));
+        let saved: SellerMatchWatchCursor =
+            serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.fill,
+            Some(SellerFillLineage {
+                order_id: 1,
+                offered_ticks: 8,
+                matched_ticks: 3,
+                residual_ticks: 5,
+                price_per_tick: 1000,
+                replacement_nonce: None,
+                replacement_token_contract: None,
+            })
+        );
+        assert!(
+            saved.opened_at_unix.is_none(),
+            "the cursor must not claim that a failed open completed"
+        );
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_tc_size_mismatch_fails_before_persist_or_open() {
+        let cursor_path = temp_cursor_path("authoritative-size-mismatch");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-authoritative-size-mismatch");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match(
+                "tc-authoritative-size-mismatch",
+                buyer.pubkey(),
+            )),
+            None,
+            now_unix().unwrap() as i64 + 1,
+        )
+        .with_matched_ticks(3)
+        .with_offer_ticks(9);
+
+        let error = poll_match_and_maybe_open(&seller, &backend, &cfg, &cursor_path)
+            .await
+            .expect_err("manifest/config N must be cross-checked against getDeal")
+            .to_string();
+
+        assert!(error.contains("TokenContract.getDeal"), "{error}");
+        assert!(!cursor_path.exists());
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
+    }
+
+    proptest! {
+        #[test]
+        fn seller_fill_lineage_conserves_capacity_and_rejects_invalid_replay(
+            (offered, matched) in (2u64..10_000)
+                .prop_flat_map(|offered| (Just(offered), 1u64..=offered))
+        ) {
+            let tc = "tc-fill-lineage-property";
+            let mut cfg = test_cfg(tc);
+            cfg.max_ticks = offered;
+            let fill = MatchedFill {
+                order_id: 41,
+                token_contract: tc.to_string(),
+                ticks: u128::from(matched),
+                price_per_tick: u128::from(cfg.price_per_tick),
+            };
+            let mut cursor = SellerMatchWatchCursor::new(&cfg.token_contract).unwrap();
+
+            prop_assert!(cursor
+                .record_fill(&cfg, cfg.price_per_tick, offered, &fill)
+                .unwrap());
+            let lineage = cursor.fill.as_ref().unwrap();
+            prop_assert_eq!(
+                lineage.matched_ticks + lineage.residual_ticks,
+                lineage.offered_ticks
+            );
+            prop_assert!(!cursor
+                .record_fill(&cfg, cfg.price_per_tick, offered, &fill)
+                .unwrap());
+
+            let mut conflicting = fill.clone();
+            conflicting.order_id += 1;
+            prop_assert!(cursor
+                .record_fill(&cfg, cfg.price_per_tick, offered, &conflicting)
+                .is_err());
+
+            for invalid in [0, offered + 1] {
+                let mut invalid_cursor =
+                    SellerMatchWatchCursor::new(&cfg.token_contract).unwrap();
+                let mut invalid_fill = fill.clone();
+                invalid_fill.ticks = u128::from(invalid);
+                prop_assert!(invalid_cursor
+                    .record_fill(&cfg, cfg.price_per_tick, offered, &invalid_fill)
+                    .is_err());
+                prop_assert!(invalid_cursor.fill.is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -1415,7 +1995,7 @@ mod tests {
         let backend = PollBackend::new(
             Some(sample_match("tc-transient-network", buyer.pubkey())),
             None,
-            1,
+            now_unix().unwrap() as i64 + 1,
         )
         .with_poll_failures(1);
         let watch = SellerMatchWatchConfig {
@@ -1446,7 +2026,7 @@ mod tests {
         let backend = PollBackend::new(
             Some(sample_match("tc-post-match-transport", buyer.pubkey())),
             None,
-            1,
+            now_unix().unwrap() as i64 + 1,
         )
         .with_open_failures(1);
         let watch = SellerMatchWatchConfig {
@@ -1630,5 +2210,60 @@ mod tests {
         let plaintext = buyer.decrypt(&enc).expect("buyer decrypts handover");
         let handover = Handover::from_bytes(&plaintext).expect("handover json");
         assert_eq!(handover.endpoint, "https://seller.example.net:443");
+    }
+
+    #[tokio::test]
+    async fn shared_gateway_isolates_two_authenticated_tc_routes_and_cleanup() {
+        let seller = start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let buyer_a = LocalNote::generate();
+        let buyer_b = LocalNote::generate();
+        let tc_a = "tc-route-a";
+        let tc_b = "tc-route-b";
+        seller.state.route_stream(
+            tc_a,
+            UpstreamConfig::MockWithClaimedModel("model-a".to_string()),
+        );
+        seller.state.route_stream(
+            tc_b,
+            UpstreamConfig::MockWithClaimedModel("model-b".to_string()),
+        );
+        seller
+            .state
+            .register_stream(tc_a, buyer_a.pubkey(), 2, 2, 1);
+        seller
+            .state
+            .register_stream(tc_b, buyer_b.pubkey(), 2, 2, 1);
+
+        let endpoint = format!("https://{}", seller.listen_addr);
+        let channel = crate::buyer::tls::connect_pinned(&endpoint, &seller.tls_fingerprint)
+            .await
+            .unwrap();
+        let mut client = GatewayClient::new(channel);
+        let request_a = gateway_request(&mut client, &buyer_a, tc_a).await;
+        let mut stream_a = client.open_stream(request_a).await.unwrap().into_inner();
+        let chunk_a = stream_a.message().await.unwrap().unwrap();
+        assert_eq!(chunk_a.manifest.unwrap().claimed_model, "model-a");
+        drop(stream_a);
+        seller.state.unregister_stream(tc_a);
+
+        let cleaned_a = gateway_request(&mut client, &buyer_a, tc_a).await;
+        let rejected = client
+            .open_stream(cleaned_a)
+            .await
+            .expect_err("cleaned deal A must no longer authorize");
+        assert_eq!(rejected.code(), tonic::Code::Unauthenticated);
+
+        let request_b = gateway_request(&mut client, &buyer_b, tc_b).await;
+        let mut stream_b = client.open_stream(request_b).await.unwrap().into_inner();
+        let chunk_b = stream_b.message().await.unwrap().unwrap();
+        assert_eq!(chunk_b.manifest.unwrap().claimed_model, "model-b");
+        assert!(!seller.server_task.is_finished());
+        seller.server_task.abort();
     }
 }

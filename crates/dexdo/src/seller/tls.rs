@@ -4,10 +4,12 @@
 //! Here -- only cert+key generation and fingerprint computation. The server side mounts
 //! `Identity` into `ServerTlsConfig`; pinning on the buyer's side is in `buyer`(custom verifier).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 /// The gateway's self-signed certificate + its fingerprint for the handover.
+#[derive(Clone)]
 pub struct GatewayTls {
     /// Certificate in PEM(for `tonic::Identity`).
     pub cert_pem: String,
@@ -28,6 +30,22 @@ impl GatewayTls {
             key_pem: ck.signing_key.serialize_pem(),
             fingerprint,
         })
+    }
+
+    pub fn from_pem_bundle(bundle: String) -> Result<Self> {
+        let certificate = CertificateDer::from_pem_slice(bundle.as_bytes())
+            .context("gateway TLS bundle has no valid certificate")?;
+        PrivateKeyDer::from_pem_slice(bundle.as_bytes())
+            .context("gateway TLS bundle has no valid private key")?;
+        Ok(Self {
+            fingerprint: fingerprint_der(certificate.as_ref()),
+            cert_pem: bundle.clone(),
+            key_pem: bundle,
+        })
+    }
+
+    pub fn pem_bundle(&self) -> String {
+        format!("{}{}", self.cert_pem, self.key_pem)
     }
 }
 

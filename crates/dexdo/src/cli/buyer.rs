@@ -1516,6 +1516,7 @@ async fn place_quote_bound_buy_with_journal(
     note_addr: &str,
     cursor: &mut dexdo_core::MatchWatchCursor,
     journal_path: &std::path::Path,
+    human_model: Option<&str>,
 ) -> Result<()> {
     let order_book = chain.model_buy_order_book_identity().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1554,7 +1555,28 @@ async fn place_quote_bound_buy_with_journal(
         resolved_match: None,
         resolved_matches: Vec::new(),
     };
-    let mut before_post = |submit_identity: String, final_cursor: dexdo_core::MatchWatchCursor| {
+    let mut before_post = |submit_identity: String,
+                           final_cursor: dexdo_core::MatchWatchCursor,
+                           note_shell_balance: u128| {
+        if let Some(frame_model) = human_model {
+            println!(
+                "{}",
+                render_buyer_human_preflight(
+                    frame_model,
+                    selection,
+                    ticks,
+                    max_price_per_tick,
+                    escrow,
+                    note_shell_balance,
+                )
+            );
+        }
+        if note_shell_balance < escrow {
+            return Err(ChainError::Chain(format!(
+                "buyer preflight failed: insufficient Note SHELL balance required={escrow} \
+                 available={note_shell_balance}; no escrow was sent"
+            )));
+        }
         let mut journal = template.clone();
         journal.submit_identity = submit_identity;
         journal.cursor = final_cursor;
@@ -1930,6 +1952,7 @@ async fn raise_pending_buyer_money_before_fresh_reads(
         escrow,
         &journal_note,
         &journal_path,
+        None,
     )
     .await?
     {
@@ -2040,6 +2063,33 @@ fn ensure_pending_buyer_submit_matches_invocation(
 }
 
 #[cfg(feature = "shellnet")]
+fn render_buyer_human_preflight(
+    frame_model: &str,
+    selection: &BuyerQuoteSelection,
+    ticks: u128,
+    max_price_per_tick: u128,
+    escrow: u128,
+    note_shell_balance: u128,
+) -> String {
+    let fill = &selection.quote.fills[0];
+    let fee = fill
+        .cost_with_fee
+        .saturating_sub(fill.ticks.saturating_mul(fill.price_per_tick));
+    format!(
+        "BUYER_PREFLIGHT model={frame_model} requested_ticks={ticks} \
+         minimum_ticks={} best_ask={} \
+         max_price_per_tick={max_price_per_tick} escrow={escrow} fee={fee} \
+         note_shell_balance={note_shell_balance} order_id={} token_contract={} \
+         matchable=true balance_sufficient={}",
+        dexdo_core::params::MIN_STREAM_BUY_TICKS,
+        fill.price_per_tick,
+        fill.order_id,
+        fill.token_contract,
+        note_shell_balance >= escrow
+    )
+}
+
+#[cfg(feature = "shellnet")]
 #[allow(dead_code, clippy::too_many_arguments)]
 async fn start_durable_buyer_submit(
     chain: &dyn ChainBackend,
@@ -2052,6 +2102,7 @@ async fn start_durable_buyer_submit(
     escrow: u128,
     note_addr: &str,
     journal_path: &std::path::Path,
+    human_model: Option<&str>,
 ) -> Result<DurableBuyerSubmitStart> {
     intent.validate()?;
     if let Some(pending) = load_buyer_submit_journal(journal_path, note_addr)? {
@@ -2108,6 +2159,7 @@ async fn start_durable_buyer_submit(
         note_addr,
         &mut cursor,
         journal_path,
+        human_model,
     )
     .await;
     Ok(DurableBuyerSubmitStart::Submitted { result })
@@ -2125,6 +2177,7 @@ async fn execute_buyer_quote_submit<F, Fut>(
     ticks: u128,
     max_price_per_tick: u128,
     escrow: u128,
+    human_model: Option<&str>,
     mut on_submit_observed: F,
 ) -> Result<BuyerQuoteSubmitOutcome>
 where
@@ -2132,7 +2185,7 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     #[cfg(not(feature = "shellnet"))]
-    let _ = (intent, expected_token_contract);
+    let _ = (intent, expected_token_contract, human_model);
 
     #[cfg(feature = "shellnet")]
     if !mock_chain {
@@ -2152,6 +2205,7 @@ where
             escrow,
             &journal_note,
             &journal_path,
+            human_model,
         )
         .await?
         {
@@ -2490,6 +2544,69 @@ struct BuyerQuoteSelection {
     quoted_order: Option<OrderBookOrder>,
 }
 
+fn shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn buyer_read_only_quote_command(
+    args: &BuyerArgs,
+    frame_model: &str,
+    ticks: u128,
+    max_price_per_tick: u128,
+) -> String {
+    let source = if let Some(market) = args.market.as_deref() {
+        format!(" --market {}", shell_arg(&market.to_string_lossy()))
+    } else if let Some(note_addr) = args.identity.note_addr.as_deref() {
+        format!(" --note-addr {}", shell_arg(note_addr))
+    } else {
+        String::new()
+    };
+    let mut command = format!(
+        "dexdo executable-book {} --ticks {ticks} --max-price-per-tick {max_price_per_tick}{source} \
+         --models {} --contracts {}",
+        shell_arg(frame_model),
+        shell_arg(&args.models.to_string_lossy()),
+        shell_arg(&args.contracts.to_string_lossy())
+    );
+    if let Some(path) = args.registry.model_registry_validation.as_deref() {
+        command.push_str(&format!(
+            " --model-registry-validation {}",
+            shell_arg(&path.to_string_lossy())
+        ));
+    }
+    if let Some(address) = args.registry.model_registry_address.as_deref() {
+        command.push_str(&format!(" --model-registry-address {}", shell_arg(address)));
+    }
+    command
+}
+
+fn human_buyer_quote_error(error: anyhow::Error, next_command: &str) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    let lower = detail.to_ascii_lowercase();
+    let reason = if (lower.contains("best ask price")
+        && lower.contains("above buyer max_price_per_tick"))
+        || (lower.contains("the expected ask exists but is not matchable by this buy:")
+            && lower.contains(", price ")
+            && lower.contains("buyer max_price_per_tick"))
+    {
+        "ceiling_below_best_ask"
+    } else if lower.contains("the shared model book would match")
+        && lower.contains("refusing to send escrow into the wrong deal")
+    {
+        "wrong_target"
+    } else if lower.contains("no_executable_ask")
+        || lower.contains("no executable matching ask")
+        || lower.contains("no matchable ask")
+    {
+        "no_executable_ask"
+    } else {
+        return error;
+    };
+    anyhow!(
+        "BUYER_PREFLIGHT matchable=false reason={reason} detail={detail}\nnext_command={next_command}"
+    )
+}
+
 #[cfg(feature = "shellnet")]
 #[allow(dead_code, clippy::too_many_arguments)]
 fn pending_buyer_submit_selection(
@@ -2542,6 +2659,7 @@ async fn buyer_quote_selection_for_submit(
     ticks: u128,
     max_price_per_tick: u128,
     escrow: Option<u128>,
+    human_context: Option<(&BuyerArgs, &str)>,
 ) -> Result<BuyerQuoteSelection> {
     #[cfg(feature = "shellnet")]
     if !mock_chain {
@@ -2566,7 +2684,16 @@ async fn buyer_quote_selection_for_submit(
     #[cfg(not(feature = "shellnet"))]
     let _ = (mock_chain, note_addr, intent);
 
-    buyer_quote_selection(chain, explicit_tc, ticks, max_price_per_tick, escrow).await
+    buyer_quote_selection(chain, explicit_tc, ticks, max_price_per_tick, escrow)
+        .await
+        .map_err(|error| {
+            let Some((args, frame_model)) = human_context else {
+                return error;
+            };
+            let next_command =
+                buyer_read_only_quote_command(args, frame_model, ticks, max_price_per_tick);
+            human_buyer_quote_error(error, &next_command)
+        })
 }
 
 async fn buyer_quote_selection(
@@ -4943,14 +5070,14 @@ fn require_complete_buyer_quote(selection: &BuyerQuoteSelection) -> Result<()> {
 }
 
 fn require_stream_buy_ticks(ticks: u128) -> Result<()> {
-    const MIN_STREAM_BUY_TICKS: u128 = 2;
-    if ticks >= MIN_STREAM_BUY_TICKS {
+    if ticks >= dexdo_core::params::MIN_STREAM_BUY_TICKS {
         return Ok(());
     }
+    let minimum_ticks = dexdo_core::params::MIN_STREAM_BUY_TICKS;
     bail!(
-        "invalid buy ticks: --ticks {ticks} is below the {MIN_STREAM_BUY_TICKS}-tick stream minimum; \
+        "invalid buy ticks: --ticks {ticks} is below the {minimum_ticks}-tick stream minimum; \
          TokenContract funding needs the probe tick plus at least one streaming tick. \
-         Buy at least {MIN_STREAM_BUY_TICKS} ticks or wait for an ask with >= {MIN_STREAM_BUY_TICKS} ticks"
+         Buy at least {minimum_ticks} ticks or wait for an ask with >= {minimum_ticks} ticks"
     );
 }
 
@@ -5172,6 +5299,9 @@ async fn prepare_lazy_buyer_api_deal_once(
                         args.ticks,
                         args.max_price_per_tick,
                         args.escrow,
+                        events
+                            .is_none()
+                            .then_some((args.as_ref(), frame_model.as_str())),
                     )
                     .await?;
                     require_complete_buyer_quote(&selection)?;
@@ -5200,6 +5330,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                         args.ticks,
                         args.max_price_per_tick,
                         selection.escrow,
+                        events.is_none().then_some(frame_model.as_str()),
                         |progress| {
                             emit_shared_buyer_event(
                                 &events,
@@ -5288,6 +5419,9 @@ async fn prepare_lazy_buyer_api_deal_once(
                     ticks,
                     max_price,
                     Some(escrow),
+                    events
+                        .is_none()
+                        .then_some((args.as_ref(), frame_model.as_str())),
                 )
                 .await?;
                 require_complete_buyer_quote(&selection)?;
@@ -5311,6 +5445,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                     ticks,
                     max_price,
                     escrow,
+                    events.is_none().then_some(frame_model.as_str()),
                     |progress| {
                         emit_shared_buyer_event(
                             &events,
@@ -5464,6 +5599,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             token_contract: &token_contract,
             note_addr,
             frame_model: &frame_model,
+            market: None,
             market_path: args.market.as_deref(),
             contracts: &args.contracts,
             endpoint,
@@ -5595,6 +5731,30 @@ fn model_only_on_demand_recovery_enabled(
     has_market_manifest: bool,
 ) -> bool {
     !has_explicit_token_contract && !has_market_manifest
+}
+
+fn render_local_openai_handoff(
+    addr: std::net::SocketAddr,
+    frame_model: &str,
+    continuity_mode: ContinuityModeArg,
+) -> Option<String> {
+    if !addr.ip().is_loopback() {
+        return None;
+    }
+    let continuity = match continuity_mode {
+        ContinuityModeArg::Proactive => {
+            "proactive: may keep a warm deal and spend while idle"
+        }
+        ContinuityModeArg::OnDemand => {
+            "on-demand: does not spend while idle, but the first request after idle waits for purchase/handover"
+        }
+    };
+    Some(format!(
+        "OPENAI_BASE_URL=http://{addr}/v1\n\
+         OPENAI_MODEL={frame_model}\n\
+         OPENAI_API_KEY=dexdo-local\n\
+         CONTINUITY_MODE={continuity}"
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5801,6 +5961,12 @@ async fn run_buyer_on_demand_local_api(
         }),
     )
     .await?;
+    if events.is_none() {
+        if let Some(handoff) = render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
+        {
+            println!("{handoff}");
+        }
+    }
     tracing::info!(
         %addr,
         anthropic_compat = args.anthropic_compat,
@@ -5886,6 +6052,7 @@ async fn run_buyer_inner(
     // whole multiple of PRICE_STEP(1 SHELL), rejected before any submit/escrow. The contract's
     // separate FLAG_MARKET path is the sole price-less exception; this command does not claim it.
     super::support::validate_price_step(args.max_price_per_tick)?;
+    preflight_buyer_pool_for_money_move(&args)?;
     // Issue: token_contract + frame_model come from `--market`(a provision manifest) or the flags.
     // The buyer ignores the deal nonce: it places a buy, it does not post the offer.
     // Model-only buy: with neither
@@ -6200,6 +6367,9 @@ async fn run_buyer_inner(
                         args.ticks,
                         args.max_price_per_tick,
                         args.escrow,
+                        machine_events
+                            .is_none()
+                            .then_some((&args, frame_model.as_str())),
                     )
                     .await?;
                     if let Some(events) = machine_events.as_mut() {
@@ -6244,6 +6414,7 @@ async fn run_buyer_inner(
                         args.ticks,
                         args.max_price_per_tick,
                         submitted_escrow,
+                        machine_events.is_none().then_some(frame_model.as_str()),
                         |progress| {
                             let result = match machine_events.as_mut() {
                                 Some(events) => events.event(
@@ -6373,6 +6544,9 @@ async fn run_buyer_inner(
                     ticks,
                     max_price,
                     Some(escrow),
+                    machine_events
+                        .is_none()
+                        .then_some((&args, frame_model.as_str())),
                 )
                 .await?;
                 if let Some(events) = machine_events.as_mut() {
@@ -6409,6 +6583,7 @@ async fn run_buyer_inner(
                     ticks,
                     max_price,
                     escrow,
+                    machine_events.is_none().then_some(frame_model.as_str()),
                     |progress| {
                         let result = match machine_events.as_mut() {
                             Some(events) => events.event(
@@ -6582,6 +6757,7 @@ async fn run_buyer_inner(
             token_contract: &token_contract,
             note_addr,
             frame_model: &frame_model,
+            market: None,
             market_path: args.market.as_deref(),
             contracts: &args.contracts,
             endpoint,
@@ -6677,24 +6853,24 @@ async fn run_buyer_inner(
         .await?;
         let base_url = format!("http://{addr}/v1");
         let models_url = format!("{base_url}/models");
+        let models: serde_json::Value = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?
+            .get(&models_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let ready = models["data"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["id"].as_str() == Some(frame_model.as_str()))
+        });
+        if !ready {
+            anyhow::bail!("endpoint readiness /v1/models did not include the selected model");
+        }
         if let Some(events) = machine_events.as_mut() {
-            let models: serde_json::Value = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()?
-                .get(&models_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let ready = models["data"].as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["id"].as_str() == Some(frame_model.as_str()))
-            });
-            if !ready {
-                anyhow::bail!("endpoint readiness /v1/models did not include the selected model");
-            }
             events.event(
                 "endpoint_ready",
                 machine::OP_BUYER_RUNTIME,
@@ -6708,6 +6884,10 @@ async fn run_buyer_inner(
                     "anthropic_compat": args.anthropic_compat
                 }),
             )?;
+        } else if let Some(handoff) =
+            render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
+        {
+            println!("{handoff}");
         }
         tracing::info!(%addr, anthropic_compat = args.anthropic_compat, "consumer API listening (loopback)");
         task.await?;
@@ -7072,6 +7252,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_openai_handoff_uses_actual_loopback_port_and_literal_fake_key() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a dynamic loopback port");
+        let addr = listener.local_addr().expect("read bound loopback address");
+        assert_ne!(addr.port(), 0);
+        for (mode, continuity) in [
+            (
+                super::ContinuityModeArg::Proactive,
+                "proactive: may keep a warm deal and spend while idle",
+            ),
+            (
+                super::ContinuityModeArg::OnDemand,
+                "on-demand: does not spend while idle, but the first request after idle waits for purchase/handover",
+            ),
+        ] {
+            let output = super::render_local_openai_handoff(addr, "qwen--qwen3--32b", mode)
+                .expect("loopback handoff");
+            assert_eq!(
+                output,
+                format!(
+                    "OPENAI_BASE_URL=http://{addr}/v1\nOPENAI_MODEL=qwen--qwen3--32b\n\
+                     OPENAI_API_KEY=dexdo-local\nCONTINUITY_MODE={continuity}"
+                )
+            );
+            for secret in ["sk-live-provider-secret", "owner_secret_key_hex"] {
+                assert!(!output.contains(secret), "{output}");
+            }
+        }
+        assert!(
+            super::render_local_openai_handoff(
+                "192.0.2.1:8080".parse().unwrap(),
+                "qwen--qwen3--32b",
+                super::ContinuityModeArg::Proactive,
+            )
+            .is_none(),
+            "the local placeholder block must not invent an external endpoint"
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum QuotePreflightFailure {
         Transport,
@@ -7093,10 +7313,12 @@ mod tests {
         model_presubmit_preflight_calls: std::sync::atomic::AtomicUsize,
         model_submit_calls: std::sync::atomic::AtomicUsize,
         explicit_preflight_error: Option<String>,
+        explicit_money_submit_calls: std::sync::atomic::AtomicUsize,
         explicit_submit_safe_order: Option<dexdo_core::OrderBookOrder>,
         sell_offer_terms: Option<(u64, u64)>,
         sell_offer_terms_calls: std::sync::atomic::AtomicUsize,
         submit_safe_single_ask_quote: bool,
+        note_shell_balance: Option<u128>,
     }
 
     impl QuotePreflightChain {
@@ -7227,6 +7449,7 @@ mod tests {
             before_post: &mut (dyn FnMut(
                 String,
                 dexdo_core::MatchWatchCursor,
+                u128,
             ) -> Result<(), dexdo_core::ChainError>
                       + Send),
         ) -> Result<(), dexdo_core::ChainError> {
@@ -7240,7 +7463,11 @@ mod tests {
             *cursor = dexdo_core::MatchWatchCursor::new(67);
             self.model_before_post_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            before_post(format!("boc-sha256:{}", "a".repeat(64)), cursor.clone())?;
+            before_post(
+                format!("boc-sha256:{}", "a".repeat(64)),
+                cursor.clone(),
+                self.note_shell_balance.unwrap_or(u128::MAX),
+            )?;
             self.model_money_submit_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -7276,7 +7503,9 @@ mod tests {
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
         ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by quote preflight tests")
+            self.explicit_money_submit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
 
         async fn place_buy_by_model(
@@ -7399,6 +7628,138 @@ mod tests {
             1,
             "the canonical assertion must perform exactly one row-returning real-shellnet quote read"
         );
+    }
+
+    #[test]
+    fn buyer_preflight_rejects_below_canonical_tick_minimum_before_chain_work() {
+        let minimum_ticks = dexdo_core::params::MIN_STREAM_BUY_TICKS;
+        let error = super::require_stream_buy_ticks(minimum_ticks - 1)
+            .expect_err("one tick must fail before buyer chain work");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("below the {minimum_ticks}-tick stream minimum")),
+            "{error:#}"
+        );
+        super::require_stream_buy_ticks(minimum_ticks).expect("the canonical minimum is accepted");
+    }
+
+    #[tokio::test]
+    async fn buyer_quote_failures_show_safe_exact_command_and_zero_money_posts() {
+        use clap::Parser;
+        use std::sync::atomic::Ordering;
+
+        let note_addr = format!("0:{}", "1".repeat(64));
+        let secret_key_path = "/tmp/owner-secret-do-not-print.key";
+        let provider_secret_path = "/tmp/provider-secret-do-not-print.json";
+        let argv = format!(
+            "dexdo buyer --note-key {secret_key_path} --note-addr {note_addr} \
+             --endpoints-file {provider_secret_path} --models /tmp/models.json \
+             --contracts /tmp/contracts.json"
+        );
+        let cli = crate::Cli::try_parse_from(argv.split_whitespace()).expect("parse buyer fixture");
+        let crate::Command::Buyer(args) = cli.command else {
+            panic!("buyer command");
+        };
+        let command = super::buyer_read_only_quote_command(&args, "qwen--qwen3--32b", 2, 10);
+
+        assert_eq!(
+            command,
+            format!(
+                "dexdo executable-book 'qwen--qwen3--32b' --ticks 2 \
+                 --max-price-per-tick 10 --note-addr '{note_addr}' \
+                 --models '/tmp/models.json' --contracts '/tmp/contracts.json'"
+            )
+        );
+        for secret in [secret_key_path, provider_secret_path] {
+            assert!(!command.contains(secret), "{command}");
+        }
+
+        for (detail, reason) in [
+            (
+                "best ask price 11 is above buyer max_price_per_tick 10",
+                "ceiling_below_best_ask",
+            ),
+            (
+                "no_executable_ask: no executable matching ask for InferenceOrderBook 0:book",
+                "no_executable_ask",
+            ),
+        ] {
+            let chain = QuotePreflightChain {
+                model_preflight_error: Some(detail.to_string()),
+                ..Default::default()
+            };
+            let error = super::buyer_quote_selection_for_submit(
+                &chain,
+                true,
+                None,
+                &super::BuyerSubmitIntent::foreground(),
+                None,
+                2,
+                10,
+                None,
+                Some((&args, "qwen--qwen3--32b")),
+            )
+            .await
+            .expect_err("non-matchable quote must fail before submit");
+            let rendered = format!("{error:#}");
+            let state = format!("BUYER_PREFLIGHT matchable=false reason={reason}");
+            assert!(
+                rendered.contains(&state)
+                    && rendered.contains(detail)
+                    && rendered.contains(&format!("next_command={command}"))
+                    && !rendered.contains("handover_timeout")
+                    && !rendered.contains("owner-secret"),
+                "{rendered}"
+            );
+            assert_eq!(chain.model_before_post_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 0);
+        }
+
+        for (detail, reason) in [
+            (
+                "the expected ask exists but is not matchable by this buy: tokenContract \
+                 0:expected, price 11, ticks 2, buyer max_price_per_tick 10, requested ticks 2",
+                "ceiling_below_best_ask",
+            ),
+            (
+                "no resting ask for expected tokenContract 0:expected; the shared model book would \
+                 match order  tokenContract 0:other (price 9, ticks 2) instead. Refusing to send \
+                 escrow into the wrong deal",
+                "wrong_target",
+            ),
+        ] {
+            let chain = QuotePreflightChain {
+                explicit_preflight_error: Some(detail.to_string()),
+                ..Default::default()
+            };
+            let error = super::buyer_quote_selection_for_submit(
+                &chain,
+                true,
+                None,
+                &super::BuyerSubmitIntent::foreground(),
+                Some("0:expected"),
+                2,
+                10,
+                None,
+                Some((&args, "qwen--qwen3--32b")),
+            )
+            .await
+            .expect_err("explicit non-matchable quote must fail before submit");
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "BUYER_PREFLIGHT matchable=false reason={reason} \
+                     detail=buyer explicit-token quote preflight: shellnet: {detail}\n\
+                     next_command={command}"
+                )
+            );
+            assert_eq!(
+                chain.explicit_money_submit_calls.load(Ordering::SeqCst),
+                0
+            );
+            assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
@@ -8624,7 +8985,7 @@ mod tests {
             crate::cli::note::OnboardPnState {
                 endpoint: "shellnet.ackinacki.org".into(),
                 nominal: "N100".into(),
-                token_type: 1,
+                token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
                 ecc_shell_deposit: 100_000_000_000,
                 pn_address: Some(format!("0:{}", address_byte.to_string().repeat(64))),
@@ -8815,6 +9176,7 @@ mod tests {
         std::fs::write(
             &pool,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": stale_note,
                     "owner_secret_key_hex": "00"
@@ -8847,6 +9209,131 @@ mod tests {
             0,
             "stale pool must fail before place_buy_by_model moves escrow"
         );
+    }
+
+    /// Owner currency regression: the real command entry must reject stale pool metadata before chain use.
+    #[cfg(feature = "shellnet")]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn real_buyer_entry_rejects_bad_pool_currency_before_chain_or_post() {
+        use std::sync::atomic::Ordering;
+
+        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-non-shell-pool-preflight-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let buyer_note = format!("0:{}", "2".repeat(64));
+        for (case, pool) in [
+            (
+                "missing",
+                serde_json::json!({
+                    "notes": [{"address": buyer_note, "owner_secret_key_hex": "00"}]
+                }),
+            ),
+            (
+                "malformed",
+                serde_json::json!({
+                    "token_type": "2",
+                    "notes": [{"address": buyer_note, "owner_secret_key_hex": "00"}]
+                }),
+            ),
+            (
+                "non-shell",
+                serde_json::json!({
+                    "token_type": 1,
+                    "notes": [{"address": buyer_note, "owner_secret_key_hex": "00"}]
+                }),
+            ),
+        ] {
+            let pool_path = dir.join(format!("{case}.pool.json"));
+            std::fs::write(&pool_path, serde_json::to_vec_pretty(&pool).unwrap()).unwrap();
+            let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
+            let recording = std::sync::Arc::new(QuotePreflightChain::default());
+            let backend: std::sync::Arc<dyn dexdo_core::ChainBackend> = recording.clone();
+            let note: std::sync::Arc<dyn dexdo_core::Note> =
+                std::sync::Arc::new(dexdo_core::LocalNote::generate());
+            let mut machine_events = None;
+            let mut machine_context = super::BuyerMachineErrorContext::default();
+
+            let error = super::run_buyer_inner(
+                super::BuyerArgs {
+                    mock: super::MockFlags {
+                        mock_model: false,
+                        mock_chain: false,
+                    },
+                    identity: super::IdentityArgs {
+                        note_key: None,
+                        note_index: 0,
+                        note_addr: Some(buyer_note.clone()),
+                    },
+                    registry: super::ModelRegistryValidationArgs::default(),
+                    endpoints_file: None,
+                    deals_dir: Some(dir.join("deals")),
+                    token_contract: Some(format!("0:{}", "3".repeat(64))),
+                    resume: false,
+                    market: None,
+                    max_tokens: 1,
+                    local_listen: None,
+                    continuity_mode: super::ContinuityModeArg::Proactive,
+                    json: false,
+                    anthropic_compat: false,
+                    frame_model: Some("qwen--qwen3--32b".to_string()),
+                    allow_unverified_model: true,
+                    models: dir.join("models.json"),
+                    ticks: 1,
+                    max_price_per_tick: dexdo_core::PRICE_STEP,
+                    escrow: None,
+                    contracts: dir.join("must-not-read-contracts.json"),
+                    policy: None,
+                },
+                &mut machine_events,
+                &mut machine_context,
+                super::BuyerCommandRuntime {
+                    backend: Some((backend, note)),
+                    shellnet_preflight: super::BuyerShellnetPreflight::Production,
+                    shutdown: Box::pin(std::future::pending()),
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                error.contains("DEXDO_PN_POOL token_type"),
+                "{case}: {error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "SHELL currency id {}",
+                    dexdo_core::params::SHELL_CURRENCY_ID
+                )),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                recording.discover_calls.load(Ordering::SeqCst)
+                    + recording.model_preflight_calls.load(Ordering::SeqCst)
+                    + recording
+                        .model_presubmit_preflight_calls
+                        .load(Ordering::SeqCst)
+                    + recording.sell_offer_terms_calls.load(Ordering::SeqCst),
+                0,
+                "{case}: bad pool currency must produce zero chain reads"
+            );
+            assert_eq!(
+                recording.model_before_post_calls.load(Ordering::SeqCst)
+                    + recording.model_money_submit_calls.load(Ordering::SeqCst)
+                    + recording.model_submit_calls.load(Ordering::SeqCst),
+                0,
+                "{case}: bad pool currency must produce zero POSTs"
+            );
+        }
     }
 
     /// regression: a direct note identity without DEXDO_PN_POOL must fail before escrow moves.
@@ -8949,6 +9436,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": note_addr,
                     "owner_secret_key_hex": secret,
@@ -9009,6 +9497,7 @@ mod tests {
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
         let pool_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
             "notes": [{
                 "address": note_addr,
                 "owner_secret_key_hex": secret,
@@ -9070,6 +9559,7 @@ mod tests {
         let note_addr = format!("0:{}", "1".repeat(64));
         let token_contract = format!("0:{}", "2".repeat(64));
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
             "notes": [{
                 "address": note_addr,
                 "owner_secret_key_hex": "3b".repeat(32),
@@ -9127,6 +9617,7 @@ mod tests {
             std::fs::write(
                 &pool_path,
                 serde_json::to_vec_pretty(&serde_json::json!({
+                    "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                     "notes": [
                         {
                             "address": note_addr,
@@ -9176,6 +9667,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [
                     {
                         "address": format!("0:{}", "1".repeat(64)),
@@ -9264,8 +9756,9 @@ mod tests {
             multisig_key,
             multisig_seed_file,
             nominal: "N100".into(),
-            token_type: "nackl".into(),
+            token_type: "shell".into(),
             endpoint: "shellnet.ackinacki.org".into(),
+            contracts: std::path::PathBuf::from("contracts/deployed.shellnet.json"),
             pool: std::path::PathBuf::from("pn_pool.json"),
             recovery: None,
             simulate_interrupt_after_spend_before_pool: false,
@@ -11337,6 +11830,7 @@ mod tests {
         std::fs::write(
             &pool,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": buyer_note,
                     "owner_secret_key_hex": "00"
@@ -12051,6 +12545,7 @@ mod tests {
     async fn issue67_select_and_submit(
         chain: &QuotePreflightChain,
         journal_path: &std::path::Path,
+        human_model: Option<&str>,
     ) -> anyhow::Result<super::BuyerQuoteSelection> {
         let ticks = 2;
         let max_price_per_tick = chain
@@ -12076,6 +12571,7 @@ mod tests {
             &format!("0:{}", "1".repeat(64)),
             &mut cursor,
             journal_path,
+            human_model,
         )
         .await?;
         Ok(selection)
@@ -12089,13 +12585,40 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let order = issue67_real_like_order();
-        let chain = issue67_pipeline_chain(&order, Some(order.clone()));
+        let mut chain = issue67_pipeline_chain(&order, Some(order.clone()));
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-67-unchanged");
         let journal_path = dir.join("submit.json");
+        let note_shell_balance = dexdo_core::required_escrow_for_buy(2, order.price_per_tick) + 7;
+        chain.note_shell_balance = Some(note_shell_balance);
 
-        let selection = issue67_select_and_submit(&chain, &journal_path)
+        let selection = issue67_select_and_submit(&chain, &journal_path, Some("qwen--qwen3--32b"))
             .await
             .expect("unchanged real matcher row submits");
+        let line = super::render_buyer_human_preflight(
+            "qwen--qwen3--32b",
+            &selection,
+            2,
+            order.price_per_tick,
+            selection.escrow,
+            note_shell_balance,
+        );
+        let fee = selection.quote.fills[0].cost_with_fee
+            - selection.quote.fills[0].ticks * selection.quote.fills[0].price_per_tick;
+        assert_eq!(
+            line,
+            format!(
+                "BUYER_PREFLIGHT model=qwen--qwen3--32b requested_ticks=2 minimum_ticks={} \
+                 best_ask={} max_price_per_tick={} escrow={} fee={fee} \
+                 note_shell_balance={note_shell_balance} order_id={} token_contract={} \
+                 matchable=true balance_sufficient=true",
+                dexdo_core::params::MIN_STREAM_BUY_TICKS,
+                order.price_per_tick,
+                order.price_per_tick,
+                selection.escrow,
+                order.order_id,
+                order.token_contract.as_deref().unwrap()
+            )
+        );
         assert_eq!(selection.quoted_order.as_ref(), Some(&order));
         assert_eq!(selection.quote.fills[0].order_id, order.order_id);
         assert_eq!(
@@ -12109,6 +12632,33 @@ mod tests {
         assert_eq!(chain.discover_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.model_before_post_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 1);
+        let available = selection.escrow - 1;
+        let mut insufficient = issue67_pipeline_chain(&order, Some(order.clone()));
+        insufficient.note_shell_balance = Some(available);
+        let insufficient_journal = dir.join("insufficient.json");
+        let error = issue67_select_and_submit(
+            &insufficient,
+            &insufficient_journal,
+            Some("qwen--qwen3--32b"),
+        )
+        .await
+        .expect_err("insufficient live Note balance must block escrow POST");
+        assert!(
+            error.to_string().contains(&format!(
+                "required={} available={available}",
+                selection.escrow
+            )),
+            "{error:#}"
+        );
+        assert!(!insufficient_journal.exists());
+        assert_eq!(
+            insufficient.model_before_post_calls.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            insufficient.model_money_submit_calls.load(Ordering::SeqCst),
+            0
+        );
     }
 
     /// a benign metadata difference on the fresh non-atomic book read preserves the quoted
@@ -12142,7 +12692,7 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-95-benign-reread");
         let journal_path = dir.join("submit.json");
 
-        let selection = issue67_select_and_submit(&chain, &journal_path)
+        let selection = issue67_select_and_submit(&chain, &journal_path, None)
             .await
             .expect("the new identity-and-terms guard accepts the benign reread");
         assert_eq!(selection.quoted_order.as_ref(), Some(&quoted));
@@ -12178,7 +12728,7 @@ mod tests {
             let (dir, _cleanup) =
                 buyer_journal_test_dir(&format!("buyer-issue-67-changed-{label}"));
             let journal_path = dir.join("submit.json");
-            let error = issue67_select_and_submit(&chain, &journal_path)
+            let error = issue67_select_and_submit(&chain, &journal_path, None)
                 .await
                 .expect_err("changed matcher head must fail before escrow");
             assert!(
@@ -12216,7 +12766,7 @@ mod tests {
         let chain = issue67_pipeline_chain(&quoted, None);
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-67-disappeared");
         let journal_path = dir.join("submit.json");
-        let error = issue67_select_and_submit(&chain, &journal_path)
+        let error = issue67_select_and_submit(&chain, &journal_path, None)
             .await
             .expect_err("disappeared ask must fail before escrow");
 
@@ -12302,11 +12852,16 @@ mod tests {
             before_post: &mut (dyn FnMut(
                 String,
                 dexdo_core::MatchWatchCursor,
+                u128,
             ) -> Result<(), dexdo_core::ChainError>
                       + Send),
         ) -> Result<(), dexdo_core::ChainError> {
             *cursor = dexdo_core::MatchWatchCursor::new(77);
-            before_post(format!("boc-sha256:{}", "a".repeat(64)), cursor.clone())?;
+            before_post(
+                format!("boc-sha256:{}", "a".repeat(64)),
+                cursor.clone(),
+                u128::MAX,
+            )?;
             assert!(
                 self.expected_journal_path.exists(),
                 "journal callback must finish before the POST seam"
@@ -12466,6 +13021,7 @@ mod tests {
             _before_post: &mut (dyn FnMut(
                 String,
                 dexdo_core::MatchWatchCursor,
+                u128,
             ) -> Result<(), dexdo_core::ChainError>
                       + Send),
         ) -> Result<(), dexdo_core::ChainError> {
@@ -12603,6 +13159,7 @@ mod tests {
             &note_addr,
             &mut cursor,
             journal_path,
+            None,
         )
         .await;
         (note_addr, selection, result)
@@ -12663,6 +13220,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -12894,6 +13452,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -12926,6 +13485,7 @@ mod tests {
             fixture.ticks,
             fixture.max_price_per_tick,
             fixture.escrow,
+            None,
             |_| std::future::ready(Ok(())),
         )
         .await
@@ -13338,6 +13898,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -13391,6 +13952,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -13534,6 +14096,7 @@ mod tests {
             fixture.escrow,
             &fixture.note_addr,
             &money_lock.journal_path,
+            None,
         )
         .await
         .err()
@@ -13552,6 +14115,7 @@ mod tests {
             fixture.escrow,
             &fixture.note_addr,
             &money_lock.journal_path,
+            None,
         )
         .await
         .err()
@@ -13585,6 +14149,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": base.note_addr,
                     "owner_secret_key_hex": "00"
@@ -13695,6 +14260,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -13815,6 +14381,7 @@ mod tests {
         std::fs::write(
             &pool_path,
             serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
                     "owner_secret_key_hex": "00"
@@ -13870,6 +14437,7 @@ mod tests {
             fixture.escrow,
             &fixture.note_addr,
             &journal_path,
+            None,
         )
         .await
         .err()
@@ -13928,6 +14496,7 @@ mod tests {
             fixture.escrow,
             &fixture.note_addr,
             &journal_path,
+            None,
         )
         .await
         .err()
@@ -13980,6 +14549,7 @@ mod tests {
             fixture.escrow,
             &fixture.note_addr,
             &journal_path,
+            None,
         )
         .await
         .err()

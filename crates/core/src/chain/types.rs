@@ -134,7 +134,8 @@ pub struct QuoteFill {
 /// Buyer-visible fill details returned after a model-only buy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchedFill {
-    /// The buyer's authoritative order-book id from `InferenceFilledConfirmed`.
+    /// The receiving owner's authoritative order id from `InferenceFilledConfirmed`:
+    /// `buyerOrderId` for the buyer event and `sellerOrderId` for the seller event.
     pub order_id: u128,
     pub token_contract: TokenContract,
     pub ticks: u128,

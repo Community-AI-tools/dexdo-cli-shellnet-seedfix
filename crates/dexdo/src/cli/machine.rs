@@ -20,6 +20,10 @@ pub(crate) const OP_BUYER_SHUTDOWN: &str = "buyer_shutdown";
 pub(crate) const OP_STATUS: &str = "status";
 pub(crate) const OP_CLOSE: &str = "close";
 pub(crate) const OP_NOTE_DEPLOY: &str = "note_deploy";
+pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MARKER: &str = "NETWORK_GENERATION_MISMATCH";
+pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE: &str =
+    "NETWORK_GENERATION_MISMATCH: upgrade dexdo or use a matching --contracts manifest, then retry; \
+     no wallet transaction was signed or submitted, no voucher was generated, and no funds were spent";
 
 #[derive(Debug)]
 pub(crate) struct MachineErrorPrinted;
@@ -44,6 +48,7 @@ pub(crate) fn is_printed_error(err: &anyhow::Error) -> bool {
 pub(crate) enum ErrorCode {
     InvalidArgument,
     FeatureUnavailable,
+    StaleClient,
     #[allow(dead_code)]
     MarketNotFound,
     #[allow(dead_code)]
@@ -73,6 +78,7 @@ impl ErrorCode {
         match self {
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::FeatureUnavailable => "FEATURE_UNAVAILABLE",
+            Self::StaleClient => "STALE_CLIENT",
             Self::MarketNotFound => "MARKET_NOT_FOUND",
             Self::MarketInactive => "MARKET_INACTIVE",
             Self::NoLiquidity => "NO_LIQUIDITY",
@@ -116,6 +122,7 @@ impl ErrorCode {
         match self {
             Self::InvalidArgument => "invalid or missing command input",
             Self::FeatureUnavailable => "requested feature is unavailable in this binary",
+            Self::StaleClient => NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE,
             Self::MarketNotFound => "market was not found",
             Self::MarketInactive => "market is inactive",
             Self::NoLiquidity => "no executable liquidity is available",
@@ -158,6 +165,9 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
         {
             return ErrorCode::ChainTransport;
         }
+    }
+    if operation == OP_NOTE_DEPLOY && msg.contains("network_generation_mismatch") {
+        return ErrorCode::StaleClient;
     }
     if msg.contains("unavailable: build with") {
         return ErrorCode::FeatureUnavailable;
@@ -686,6 +696,7 @@ mod tests {
     #[test]
     fn required_runtime_error_codes_are_stable_and_structured() {
         let cases = [
+            (ErrorCode::StaleClient, "STALE_CLIENT", false),
             (ErrorCode::NoLiquidity, "NO_LIQUIDITY", true),
             (ErrorCode::IncompleteQuote, "INCOMPLETE_QUOTE", true),
             (
