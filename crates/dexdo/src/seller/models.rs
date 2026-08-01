@@ -12,7 +12,8 @@ use std::path::Path;
 
 /// Model capabilities -- what the endpoint actually supports. Consumed by
 /// (capability-aware request: don't send `logprobs` to strict endpoints that respond `400`).
-/// The default is **conservative**(`logprobs=false`): an unknown/undescribed endpoint does not break.
+/// The default is **conservative**(`logprobs=false`): an unknown/undescribed endpoint is not eligible for
+/// monetized serving or readiness until an authoritative usage source is configured.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -22,6 +23,14 @@ pub struct Capabilities {
     /// How many top alternatives to request when `logprobs=true`. `None` -> don't send `top_logprobs`.
     #[serde(default)]
     pub top_logprobs: Option<u32>,
+    /// The model's **own** maximum output length(completion tokens) at this endpoint. The outbound
+    /// generation limit is clamped to it in addition to the deal budget: a deal budget is
+    /// `ticks * TICK_SIZE` tokens, which every real provider rejects with `400` (Groq answers
+    /// `` `max_tokens` must be less than or equal to `40960` ``), so a deal-only clamp made every
+    /// delivery fail. `None` = **unknown** -> serving that model fails closed with an explicit
+    /// error BEFORE the provider is contacted, rather than sending an unbounded value.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// One behavioral-probe fingerprint declared for a model in config: a deterministic
@@ -192,7 +201,7 @@ mod tests {
           "api_key_env": "GROQ_API_KEY",
           "tokenizer_family": "qwen",
           "price_per_tick": 1000000000,
-          "capabilities": { "logprobs": true, "top_logprobs": 5 }
+          "capabilities": { "logprobs": true, "top_logprobs": 5, "max_output_tokens": 40960 }
         }
       }
     }"#;
@@ -207,6 +216,7 @@ mod tests {
         assert_eq!(by_key.tokenizer_family, "qwen");
         assert!(by_key.capabilities.logprobs);
         assert_eq!(by_key.capabilities.top_logprobs, Some(5));
+        assert_eq!(by_key.capabilities.max_output_tokens, Some(40_960));
         // By the canonical frame_model.
         let by_frame = cfg.get("qwen--qwen3--32b").expect("by frame");
         assert_eq!(by_frame.frame_model, by_key.frame_model);
@@ -242,6 +252,29 @@ mod tests {
         let m = cfg.get("m").unwrap();
         assert!(!m.capabilities.logprobs, "default capability -- off");
         assert_eq!(m.capabilities.top_logprobs, None);
+        // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
+        assert_eq!(m.capabilities.max_output_tokens, None);
+    }
+
+    #[test]
+    fn the_shipped_models_config_declares_an_output_cap_for_every_model() {
+        // a model whose `capabilities.max_output_tokens` is undeclared has an UNKNOWN output cap, and the
+        // seller refuses to serve it BEFORE the provider is contacted. A shipped config entry without the cap is
+        // therefore a model that cannot deliver a single token -- guard the repo's own deployment artifact so a
+        // release can never ship one, the way the live fixtures shipped one.
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models.json"));
+        let cfg = ModelsConfig::load(path).expect("the repo's models.json loads");
+        for (name, model) in &cfg.models {
+            assert!(
+                model
+                    .capabilities
+                    .max_output_tokens
+                    .is_some_and(|cap| cap > 0),
+                "shipped model \"{name}\" ({}) declares no capabilities.max_output_tokens: the seller fails \
+                 closed on an unknown output cap and never serves it",
+                model.frame_model
+            );
+        }
     }
 
     #[test]

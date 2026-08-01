@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Json;
+use dexdo_core::params::DASHBOARD_REFRESH_INTERVAL_MS;
 #[cfg(test)]
 use dexdo_core::ChainBackend;
 use serde::Serialize;
@@ -53,7 +54,6 @@ pub(crate) struct DashboardFacts {
     pub(crate) buyer_note: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) model_hash: Option<String>,
-    pub(crate) price_per_tick: Option<u128>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,11 +67,14 @@ pub(crate) struct DashboardLifecycle {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DashboardByFact {
-    pub(crate) seller_locked: Option<u64>,
-    pub(crate) buyer_locked: Option<u64>,
-    pub(crate) seller_received: Option<u64>,
-    pub(crate) buyer_refunded: Option<u64>,
-    pub(crate) burned: Option<u64>,
+    pub(crate) seller_locked: Option<u128>,
+    pub(crate) buyer_locked: Option<u128>,
+    pub(crate) buyer_bond: Option<u128>,
+    pub(crate) buyer_bond_required: Option<u128>,
+    pub(crate) tokens_final: Option<u128>,
+    pub(crate) seller_received: Option<u128>,
+    pub(crate) buyer_refunded: Option<u128>,
+    pub(crate) burned: Option<u128>,
     pub(crate) closed: Option<bool>,
 }
 
@@ -123,7 +126,6 @@ where
             buyer_note: None,
             model: None,
             model_hash: None,
-            price_per_tick: None,
         })
     }
 }
@@ -140,20 +142,17 @@ impl DashboardBackend for ShellnetDashboardBackend {
         let chain = RealChainBackend::connect(&handle.contracts)?;
         let tc = Address::parse(&handle.token_contract)
             .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", handle.token_contract))?;
-        let state = chain.token_contract_state(&tc).await?;
-        let lifecycle = state
+        let snapshot = chain.token_contract_deal_snapshot(&tc).await?;
+        let lifecycle = snapshot
             .as_ref()
-            .map(dashboard_lifecycle_from_shellnet_state)
+            .map(|snapshot| lifecycle_from_chain_state(snapshot.state))
             .unwrap_or_else(|| DashboardLifecycle {
                 state: Some("terminal".to_string()),
                 terminal: Some(true),
                 ..DashboardLifecycle::default()
             });
-        let byfact = match state.as_ref() {
-            Some(st) => {
-                let bond = chain.token_contract_seller_bond(&tc).await?;
-                dashboard_byfact_from_shellnet_state(st, bond.as_ref())
-            }
+        let byfact = match snapshot {
+            Some(snapshot) => dashboard_byfact_from_shellnet_state(snapshot)?,
             None => DashboardByFact {
                 closed: Some(true),
                 ..DashboardByFact::default()
@@ -163,127 +162,71 @@ impl DashboardBackend for ShellnetDashboardBackend {
             .token_contract_buyer_note(&tc)
             .await?
             .map(|a| a.with_workchain());
-        let terms = chain.token_contract_deal_terms(&tc).await?;
         Ok(DashboardFacts {
             lifecycle,
             byfact,
             buyer_note,
             model: chain.token_contract_model_name(&tc).await?,
             model_hash: chain.token_contract_model_hash(&tc).await?,
-            price_per_tick: terms.map(|(_, price, _)| price),
         })
     }
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "shellnet", test))]
 fn lifecycle_from_chain_state(state: dexdo_core::DealChainState) -> DashboardLifecycle {
+    let terminal = state.is_stopped();
+    let state_name = if state.disputed {
+        "disputed"
+    } else if state.opened {
+        "opened"
+    } else if terminal {
+        "terminal"
+    } else if state.funded {
+        "funded"
+    } else {
+        "placed"
+    };
     DashboardLifecycle {
-        state: Some(state_name_from_flags(
-            Some(state.funded),
-            Some(state.opened),
-            Some(state.disputed),
-        )),
+        state: Some(state_name.to_string()),
         funded: Some(state.funded),
         opened: Some(state.opened),
         disputed: Some(state.disputed),
-        terminal: Some(!state.funded && !state.opened && !state.disputed),
+        terminal: Some(terminal),
     }
 }
 
 #[cfg(test)]
 fn byfact_from_chain_snapshot(snapshot: dexdo_core::StreamSnapshot) -> DashboardByFact {
     DashboardByFact {
-        seller_locked: Some(u64::try_from(snapshot.seller_locked).unwrap_or(u64::MAX)),
-        buyer_locked: Some(u64::try_from(snapshot.buyer_locked).unwrap_or(u64::MAX)),
-        seller_received: Some(u64::try_from(snapshot.seller_received).unwrap_or(u64::MAX)),
-        buyer_refunded: Some(u64::try_from(snapshot.buyer_refunded).unwrap_or(u64::MAX)),
-        burned: Some(u64::try_from(snapshot.burned).unwrap_or(u64::MAX)),
+        seller_locked: Some(snapshot.seller_locked),
+        buyer_locked: Some(snapshot.buyer_locked),
+        buyer_bond: None,
+        buyer_bond_required: None,
+        tokens_final: Some(snapshot.tokens_final),
+        seller_received: Some(snapshot.seller_received),
+        buyer_refunded: Some(snapshot.buyer_refunded),
+        burned: Some(snapshot.burned),
         closed: Some(snapshot.closed),
     }
 }
 
 #[cfg(any(feature = "shellnet", test))]
-fn dashboard_lifecycle_from_shellnet_state(st: &serde_json::Value) -> DashboardLifecycle {
-    let funded = st.get("funded").and_then(serde_json::Value::as_bool);
-    let opened = st.get("opened").and_then(serde_json::Value::as_bool);
-    let disputed = st.get("disputed").and_then(serde_json::Value::as_bool);
-    let state = state_name_from_known_flags(funded, opened, disputed);
-    DashboardLifecycle {
-        state: state.clone(),
-        funded,
-        opened,
-        disputed,
-        terminal: state.map(|s| s == "terminal"),
-    }
-}
-
-#[cfg(any(feature = "shellnet", test))]
-fn state_name_from_known_flags(
-    funded: Option<bool>,
-    opened: Option<bool>,
-    disputed: Option<bool>,
-) -> Option<String> {
-    if disputed == Some(true) {
-        Some("disputed".to_string())
-    } else if opened == Some(true) {
-        Some("opened".to_string())
-    } else if funded == Some(true) {
-        Some("funded".to_string())
-    } else if funded == Some(false) && opened == Some(false) && disputed == Some(false) {
-        Some("terminal".to_string())
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-fn state_name_from_flags(
-    funded: Option<bool>,
-    opened: Option<bool>,
-    disputed: Option<bool>,
-) -> String {
-    state_name_from_known_flags(funded, opened, disputed).unwrap_or_else(|| "unknown".to_string())
-}
-
-#[cfg(any(feature = "shellnet", test))]
 fn dashboard_byfact_from_shellnet_state(
-    st: &serde_json::Value,
-    probe: Option<&serde_json::Value>,
-) -> DashboardByFact {
-    let prepaid = u64_json_field(st, "prepaid");
-    let frozen = u64_json_field(st, "frozen");
-    let deposit = u64_json_field(st, "deposit");
-    DashboardByFact {
-        seller_locked: probe.and_then(|p| u64_json_field(p, "bondHeld")),
-        buyer_locked: sum_u64_options([prepaid, frozen, deposit]),
-        seller_received: u64_json_field(st, "finalizedOwed"),
+    snapshot: dexdo_core::DealChainSnapshot,
+) -> Result<DashboardByFact> {
+    let state = snapshot.state;
+    let buyer_locked = snapshot.buyer_locked().map_err(anyhow::Error::msg)?;
+    Ok(DashboardByFact {
+        seller_locked: Some(snapshot.seller_bond.bond_held),
+        buyer_locked: Some(buyer_locked),
+        buyer_bond: Some(snapshot.buyer_bond.bond_held),
+        buyer_bond_required: Some(snapshot.buyer_bond.bond_required),
+        tokens_final: Some(state.tokens_final),
+        seller_received: Some(state.finalized_owed),
         buyer_refunded: None,
         burned: None,
-        closed: state_name_from_known_flags(
-            st.get("funded").and_then(serde_json::Value::as_bool),
-            st.get("opened").and_then(serde_json::Value::as_bool),
-            st.get("disputed").and_then(serde_json::Value::as_bool),
-        )
-        .map(|state| state == "terminal"),
-    }
-}
-
-#[cfg(any(feature = "shellnet", test))]
-fn u64_json_field(value: &serde_json::Value, key: &str) -> Option<u64> {
-    let raw = value.get(key)?;
-    raw.as_str()
-        .and_then(|s| s.parse::<u128>().ok())
-        .or_else(|| raw.as_u64().map(u128::from))
-        .and_then(|v| (v <= u64::MAX as u128).then_some(v as u64))
-}
-
-#[cfg(any(feature = "shellnet", test))]
-fn sum_u64_options<const N: usize>(values: [Option<u64>; N]) -> Option<u64> {
-    let mut total = 0u64;
-    for value in values {
-        total = total.checked_add(value?)?;
-    }
-    Some(total)
+        closed: Some(state.is_stopped()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +268,8 @@ pub(crate) struct DashboardDeal {
 pub(crate) struct DashboardAccounting {
     pub(crate) shell_paid: Option<String>,
     pub(crate) shell_locked: Option<String>,
+    pub(crate) buyer_bond: Option<String>,
+    pub(crate) buyer_bond_required: Option<String>,
     pub(crate) shell_refunded: Option<String>,
     pub(crate) shell_burned: Option<String>,
     pub(crate) finalized_owed: Option<String>,
@@ -405,8 +350,14 @@ pub(crate) async fn dashboard_from_handles(
     let mut buyer = Vec::new();
     let mut seller = Vec::new();
     for (_path, handle) in handles {
-        let facts = backend.facts(&handle).await?;
-        let deal = dashboard_deal(&handle, facts);
+        let deal = match backend.facts(&handle).await {
+            Ok(facts) => dashboard_deal(&handle, facts),
+            Err(error) => {
+                let mut deal = dashboard_deal(&handle, DashboardFacts::default());
+                deal.state = format!("error: {error}");
+                deal
+            }
+        };
         match handle.role {
             DealHandleRole::Buyer => buyer.push(deal),
             DealHandleRole::Seller => seller.push(deal),
@@ -443,10 +394,7 @@ fn dashboard_deal(handle: &DealHandle, facts: DashboardFacts) -> DashboardDeal {
             .closed
             .and_then(|closed| closed.then_some(true))
     });
-    let price = facts
-        .price_per_tick
-        .or_else(|| handle.market.as_ref().map(|m| m.price_per_tick));
-    let accounting = accounting_for(handle.role, &facts.byfact, price);
+    let accounting = accounting_for(handle.role, &facts.byfact);
     let counterparty_note = match handle.role {
         DealHandleRole::Buyer => handle.market.as_ref().map(|m| m.seller_note.clone()),
         DealHandleRole::Seller => facts.buyer_note.clone(),
@@ -472,22 +420,15 @@ fn dashboard_deal(handle: &DealHandle, facts: DashboardFacts) -> DashboardDeal {
     }
 }
 
-fn accounting_for(
-    role: DealHandleRole,
-    byfact: &DashboardByFact,
-    price_per_tick: Option<u128>,
-) -> DashboardAccounting {
-    let ticks = byfact.seller_received.and_then(|seller_received| {
-        price_per_tick
-            .filter(|p| *p != 0)
-            .map(|p| u128::from(seller_received) / p)
-    });
-    let tokens =
-        ticks.map(|t| t.saturating_mul(dexdo_core::DobParams::canonical().tick_size as u128));
+fn accounting_for(role: DealHandleRole, byfact: &DashboardByFact) -> DashboardAccounting {
+    let tokens = byfact.tokens_final;
+    let ticks = tokens.map(|tokens| tokens / dexdo_core::TICK_SIZE);
     match role {
         DealHandleRole::Buyer => DashboardAccounting {
             shell_paid: byfact.seller_received.map(|v| v.to_string()),
             shell_locked: byfact.buyer_locked.map(|v| v.to_string()),
+            buyer_bond: byfact.buyer_bond.map(|v| v.to_string()),
+            buyer_bond_required: byfact.buyer_bond_required.map(|v| v.to_string()),
             shell_refunded: byfact.buyer_refunded.map(|v| v.to_string()),
             shell_burned: byfact.burned.map(|v| v.to_string()),
             ticks_spent: ticks.map(|v| v.to_string()),
@@ -530,13 +471,14 @@ pub(crate) fn render_html(snapshot: &DashboardSnapshot) -> String {
     ));
     render_section(&mut out, "Buyer Streams", "buyer-rows", &snapshot.buyer);
     render_section(&mut out, "Seller Streams", "seller-rows", &snapshot.seller);
-    out.push_str(dashboard_script());
+    out.push_str(&dashboard_script());
     out.push_str("</main></body></html>");
     out
 }
 
-fn dashboard_script() -> &'static str {
-    r#"<script>
+fn dashboard_script() -> String {
+    let mut script = String::from(
+        r#"<script>
 function dashEscape(value){
   return String(value).replace(/[&<>"']/g,function(ch){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&;'}[ch];
@@ -553,6 +495,8 @@ function dashAccounting(a){
   const rows = [
     ['paid', a.shell_paid],
     ['locked', a.shell_locked],
+    ['buyer bond', a.buyer_bond],
+    ['buyer bond required', a.buyer_bond_required],
     ['refunded', a.shell_refunded],
     ['burned', a.shell_burned],
     ['owed', a.finalized_owed],
@@ -590,9 +534,15 @@ async function refreshDashboard(){
     renderDashboard(data);
   }
 }
-setInterval(refreshDashboard,5000);
+setInterval(refreshDashboard,"#,
+    );
+    script.push_str(&DASHBOARD_REFRESH_INTERVAL_MS.to_string());
+    script.push_str(
+        r#");
 refreshDashboard();
-</script>"#
+</script>"#,
+    );
+    script
 }
 
 fn render_section(out: &mut String, title: &str, tbody_id: &str, deals: &[DashboardDeal]) {
@@ -635,6 +585,8 @@ fn render_accounting(out: &mut String, a: &DashboardAccounting) {
     for (label, value) in [
         ("paid", a.shell_paid.as_deref()),
         ("locked", a.shell_locked.as_deref()),
+        ("buyer bond", a.buyer_bond.as_deref()),
+        ("buyer bond required", a.buyer_bond_required.as_deref()),
         ("refunded", a.shell_refunded.as_deref()),
         ("burned", a.shell_burned.as_deref()),
         ("owed", a.finalized_owed.as_deref()),
@@ -750,6 +702,18 @@ mod tests {
         }
     }
 
+    struct MiddleRowFails;
+
+    #[async_trait]
+    impl DashboardBackend for MiddleRowFails {
+        async fn facts(&self, handle: &DealHandle) -> Result<DashboardFacts> {
+            if handle.handle == "buyer-malformed" {
+                return Err(anyhow::anyhow!("deal snapshot unavailable"));
+            }
+            Ok(open_facts())
+        }
+    }
+
     fn open_facts() -> DashboardFacts {
         DashboardFacts {
             lifecycle: DashboardLifecycle {
@@ -762,6 +726,9 @@ mod tests {
             byfact: DashboardByFact {
                 seller_locked: Some(25),
                 buyer_locked: Some(2050),
+                buyer_bond: Some(50),
+                buyer_bond_required: Some(50),
+                tokens_final: Some(2 * dexdo_core::TICK_SIZE),
                 seller_received: Some(2000),
                 buyer_refunded: Some(50),
                 burned: Some(5),
@@ -770,7 +737,6 @@ mod tests {
             buyer_note: Some("0:buyer".into()),
             model: Some("qwen/qwen3-32b".into()),
             model_hash: Some("hash-qwen".into()),
-            price_per_tick: Some(1000),
         }
     }
 
@@ -846,6 +812,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failing_deal_is_an_attributable_row_and_later_rows_still_render() {
+        let mut first = sample_handle(DealHandleRole::Buyer);
+        first.handle = "buyer-first".into();
+        first.token_contract = "0:first".into();
+        let mut malformed = sample_handle(DealHandleRole::Buyer);
+        malformed.handle = "buyer-malformed".into();
+        malformed.token_contract = "0:malformed".into();
+        let mut last = sample_handle(DealHandleRole::Buyer);
+        last.handle = "buyer-last".into();
+        last.token_contract = "0:last".into();
+
+        let snapshot = dashboard_from_handles(
+            vec![
+                (PathBuf::from("first.json"), first),
+                (PathBuf::from("malformed.json"), malformed),
+                (PathBuf::from("last.json"), last),
+            ],
+            &MiddleRowFails,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.source.handle_count, 3);
+        assert_eq!(snapshot.buyer.len(), 3);
+        assert_eq!(snapshot.buyer[0].handle, "buyer-first");
+        assert_eq!(snapshot.buyer[0].state, "opened");
+        assert_eq!(
+            snapshot.buyer[0].accounting.shell_paid.as_deref(),
+            Some("2000")
+        );
+        assert_eq!(snapshot.buyer[1].handle, "buyer-malformed");
+        assert_eq!(snapshot.buyer[1].token_contract, "0:malformed");
+        assert_eq!(snapshot.buyer[1].state, "error: deal snapshot unavailable");
+        assert_eq!(snapshot.buyer[1].accounting.shell_paid, None);
+        assert_eq!(snapshot.buyer[2].handle, "buyer-last");
+        assert_eq!(snapshot.buyer[2].state, "opened");
+        assert_eq!(
+            snapshot.buyer[2].accounting.shell_paid.as_deref(),
+            Some("2000")
+        );
+    }
+
+    #[tokio::test]
     async fn html_polling_rerenders_visible_rows_from_json() {
         let snapshot = dashboard_from_handles(
             vec![
@@ -879,7 +888,9 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("setInterval(refreshDashboard,5000)"),
+            html.contains(&format!(
+                "setInterval(refreshDashboard,{DASHBOARD_REFRESH_INTERVAL_MS})"
+            )),
             "{html}"
         );
     }
@@ -908,27 +919,179 @@ mod tests {
         assert!(!html.contains(">0</code>"), "{html}");
     }
 
+    #[test]
+    fn returned_two_p_bond_with_zero_tokens_cannot_invent_dashboard_volume() {
+        let byfact = DashboardByFact {
+            seller_received: Some(200),
+            tokens_final: Some(0),
+            ..DashboardByFact::default()
+        };
+
+        let seller = accounting_for(DealHandleRole::Seller, &byfact);
+        assert_eq!(seller.finalized_owed.as_deref(), Some("200"));
+        assert_eq!(seller.delivered_ticks.as_deref(), Some("0"));
+        assert_eq!(seller.delivered_tokens.as_deref(), Some("0"));
+
+        let buyer = accounting_for(DealHandleRole::Buyer, &byfact);
+        assert_eq!(buyer.shell_paid.as_deref(), Some("200"));
+        assert_eq!(buyer.ticks_spent.as_deref(), Some("0"));
+        assert_eq!(buyer.tokens_spent.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn withdrawal_cannot_reduce_authoritative_dashboard_token_volume() {
+        let before = DashboardByFact {
+            seller_received: Some(200),
+            tokens_final: Some(2 * dexdo_core::TICK_SIZE),
+            ..DashboardByFact::default()
+        };
+        let after = DashboardByFact {
+            seller_received: Some(0),
+            ..before.clone()
+        };
+
+        let seller_before = accounting_for(DealHandleRole::Seller, &before);
+        let seller_after = accounting_for(DealHandleRole::Seller, &after);
+        assert_eq!(seller_before.delivered_ticks.as_deref(), Some("2"));
+        assert_eq!(seller_after.delivered_ticks, seller_before.delivered_ticks);
+        assert_eq!(
+            seller_after.delivered_tokens,
+            seller_before.delivered_tokens
+        );
+        assert_ne!(seller_after.finalized_owed, seller_before.finalized_owed);
+
+        let buyer_before = accounting_for(DealHandleRole::Buyer, &before);
+        let buyer_after = accounting_for(DealHandleRole::Buyer, &after);
+        assert_eq!(buyer_after.ticks_spent, buyer_before.ticks_spent);
+        assert_eq!(buyer_after.tokens_spent, buyer_before.tokens_spent);
+        assert_ne!(buyer_after.shell_paid, buyer_before.shell_paid);
+    }
+
+    #[test]
+    fn dashboard_preserves_money_above_uint64_as_decimal_strings() {
+        let above_u64 = u128::from(u64::MAX) + 1;
+        let state = dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: true,
+            disputed: false,
+            deposit: above_u64,
+            finalized_owed: above_u64 + 1,
+            tokens_final: dexdo_core::TICK_SIZE,
+            tokens_superseded: dexdo_core::TICK_SIZE,
+            tokens_pending: dexdo_core::TICK_SIZE,
+            probe_tick: 0,
+            funded_time: None,
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        };
+        let byfact = dashboard_byfact_from_shellnet_state(dexdo_core::DealChainSnapshot {
+            account_code_hash: "code".to_string(),
+            account_boc_hash: "boc".to_string(),
+            state,
+            subscription: dexdo_core::DealSubscription {
+                deal_flags: 0,
+                sub_weeks: 0,
+                week_index: 0,
+                tokens_per_week: dexdo_core::TICK_SIZE,
+                funded_tokens: dexdo_core::TICK_SIZE,
+                tokens_paid: dexdo_core::TICK_SIZE,
+                period_start: 0,
+                week_base_tokens: 0,
+            },
+            seller_bond: dexdo_core::DealSellerBond {
+                bond_funded: true,
+                bond_held: above_u64 + 2,
+                bond_required: above_u64 + 2,
+            },
+            buyer_bond: dexdo_core::DealBuyerBond {
+                bond_held: above_u64 + 3,
+                bond_required: above_u64 + 4,
+            },
+        })
+        .expect("uint128 dashboard facts");
+
+        assert_eq!(byfact.seller_received, Some(above_u64 + 1));
+        assert_eq!(byfact.seller_locked, Some(above_u64 + 2));
+        assert_eq!(byfact.buyer_bond, Some(above_u64 + 3));
+        assert_eq!(byfact.buyer_bond_required, Some(above_u64 + 4));
+        assert_eq!(byfact.buyer_locked, Some(2 * above_u64 + 3));
+
+        let buyer = accounting_for(DealHandleRole::Buyer, &byfact);
+        let seller = accounting_for(DealHandleRole::Seller, &byfact);
+        assert_eq!(buyer.shell_paid, Some((above_u64 + 1).to_string()));
+        assert_eq!(buyer.shell_locked, Some((2 * above_u64 + 3).to_string()));
+        assert_eq!(buyer.buyer_bond, Some((above_u64 + 3).to_string()));
+        assert_eq!(seller.shell_locked, Some((above_u64 + 2).to_string()));
+        assert_eq!(seller.finalized_owed, Some((above_u64 + 1).to_string()));
+    }
+
     #[tokio::test]
-    async fn shellnet_parser_keeps_missing_live_fields_unknown() {
-        let st = serde_json::json!({
+    async fn shellnet_parser_rejects_missing_live_fields() {
+        let incomplete = serde_json::json!({
             "finalizedOwed": "2000",
             "funded": false,
             "opened": false
         });
-        let lifecycle = dashboard_lifecycle_from_shellnet_state(&st);
-        assert_eq!(lifecycle.state, None);
-        assert_eq!(lifecycle.funded, Some(false));
-        assert_eq!(lifecycle.opened, Some(false));
-        assert_eq!(lifecycle.disputed, None);
-        assert_eq!(lifecycle.terminal, None);
+        assert!(dexdo_core::DealChainState::decode_getter(&incomplete).is_err());
 
-        let byfact = dashboard_byfact_from_shellnet_state(&st, None);
+        let state = dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: true,
+            disputed: false,
+            deposit: 1000,
+            finalized_owed: 2000,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            probe_tick: 50,
+            funded_time: None,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: 0,
+            dispute_time: 0,
+        };
+        let lifecycle = lifecycle_from_chain_state(state);
+        assert_eq!(lifecycle.state.as_deref(), Some("opened"));
+        assert_eq!(lifecycle.terminal, Some(false));
+
+        let byfact = dashboard_byfact_from_shellnet_state(dexdo_core::DealChainSnapshot {
+            account_code_hash: "code".to_string(),
+            account_boc_hash: "boc".to_string(),
+            state,
+            subscription: dexdo_core::DealSubscription {
+                deal_flags: dexdo_core::order_flags::SUBSCRIPTION,
+                sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+                week_index: 0,
+                tokens_per_week: 100,
+                funded_tokens: 400,
+                tokens_paid: 0,
+                period_start: 0,
+                week_base_tokens: 0,
+            },
+            seller_bond: dexdo_core::DealSellerBond {
+                bond_funded: true,
+                bond_held: 0,
+                bond_required: 0,
+            },
+            buyer_bond: dexdo_core::DealBuyerBond {
+                bond_held: 200,
+                bond_required: 200,
+            },
+        })
+        .unwrap();
         assert_eq!(byfact.seller_received, Some(2000));
-        assert_eq!(byfact.buyer_locked, None);
-        assert_eq!(byfact.seller_locked, None);
+        assert_eq!(byfact.buyer_locked, Some(1250));
+        assert_eq!(byfact.buyer_bond, Some(200));
+        assert_eq!(byfact.buyer_bond_required, Some(200));
+        assert_eq!(byfact.tokens_final, Some(0));
+        assert_eq!(byfact.seller_locked, Some(0));
         assert_eq!(byfact.buyer_refunded, None);
         assert_eq!(byfact.burned, None);
-        assert_eq!(byfact.closed, None);
+        assert_eq!(byfact.closed, Some(false));
 
         let snapshot = dashboard_from_handles(
             vec![(
@@ -939,7 +1102,6 @@ mod tests {
                 facts: DashboardFacts {
                     lifecycle,
                     byfact,
-                    price_per_tick: Some(1000),
                     ..DashboardFacts::default()
                 },
             },
@@ -947,22 +1109,25 @@ mod tests {
         .await
         .unwrap();
         let deal = &snapshot.buyer[0];
-        assert_eq!(deal.state, "unknown");
-        assert_eq!(deal.funded, Some(false));
-        assert_eq!(deal.opened, Some(false));
-        assert_eq!(deal.terminal, None);
+        assert_eq!(deal.state, "opened");
+        assert_eq!(deal.funded, Some(true));
+        assert_eq!(deal.opened, Some(true));
+        assert_eq!(deal.terminal, Some(false));
         assert_eq!(deal.accounting.shell_paid.as_deref(), Some("2000"));
-        assert_eq!(deal.accounting.shell_locked, None);
+        assert_eq!(deal.accounting.shell_locked.as_deref(), Some("1250"));
+        assert_eq!(deal.accounting.buyer_bond.as_deref(), Some("200"));
+        assert_eq!(deal.accounting.buyer_bond_required.as_deref(), Some("200"));
         assert_eq!(deal.accounting.shell_refunded, None);
         assert_eq!(deal.accounting.shell_burned, None);
         let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json["buyer"][0]["opened"], false);
-        assert!(json["buyer"][0]["terminal"].is_null());
-        assert!(json["buyer"][0]["accounting"]["shell_locked"].is_null());
+        assert_eq!(json["buyer"][0]["opened"], true);
+        assert_eq!(json["buyer"][0]["terminal"], false);
+        assert_eq!(json["buyer"][0]["accounting"]["shell_locked"], "1250");
+        assert_eq!(json["buyer"][0]["accounting"]["buyer_bond"], "200");
         assert!(json["buyer"][0]["accounting"]["shell_burned"].is_null());
         let body = serde_json::to_string(&json).unwrap();
         assert!(!body.contains("\"shell_locked\":\"0\""), "{body}");
-        assert!(!body.contains("\"terminal\":false"), "{body}");
+        assert!(body.contains("\"terminal\":false"), "{body}");
     }
 
     struct WriteBombChain {
@@ -1027,16 +1192,13 @@ mod tests {
             Ok(None)
         }
 
-        async fn advance_tick(
+        async fn claim_tokens(
             &self,
             _token_contract: &TokenContract,
             _note: &dyn Note,
+            _cumulative_tokens: u128,
         ) -> Result<(), ChainError> {
-            self.fail_write("advance_tick")
-        }
-
-        async fn accept_probe(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
-            self.fail_write("accept_probe")
+            self.fail_write("claim_tokens")
         }
 
         async fn stop(
@@ -1062,13 +1224,6 @@ mod tests {
             self.fail_write("release_dispute")
         }
 
-        async fn seller_timeout(
-            &self,
-            _token_contract: &TokenContract,
-        ) -> Result<Settlement, ChainError> {
-            self.fail_write("seller_timeout")
-        }
-
         async fn cleanup_unopened(
             &self,
             _token_contract: &TokenContract,
@@ -1083,10 +1238,19 @@ mod tests {
             Ok(Some(DealChainState {
                 funded: true,
                 opened: true,
-                disputed: false,
                 probe_accepted: true,
+                disputed: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: 2,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 2,
+                dispute_time: 0,
             }))
         }
 
@@ -1095,6 +1259,7 @@ mod tests {
                 seller_locked: 25,
                 buyer_locked: 2050,
                 buyer_lead: 1000,
+                tokens_final: 0,
                 seller_received: 1000,
                 buyer_refunded: 0,
                 burned: 0,

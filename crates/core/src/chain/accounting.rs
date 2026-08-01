@@ -1,7 +1,7 @@
 //! `chain` pure accounting/escrow helpers -- fee-inclusive escrow, tree aggregation, per-model breakdown,
 //! deal anomalies, recoverability(PR4 move-only). No I/O.
 use super::types::*;
-use crate::params::Shell;
+use crate::params::{Shell, PLATFORM_FEE_BPS, SUBSCRIPTION_BUYER_BOND_TICKS, TICK_SIZE};
 use std::collections::BTreeMap;
 
 /// Order book platform fee(`InferenceOrderBook._tickFee`), bps: **250 = 2.5 %**,
@@ -10,15 +10,13 @@ use std::collections::BTreeMap;
 /// does not cover the fee, the order is rejected with `ERR_INSUFFICIENT_DEPOSIT`, but the SHELL has
 /// already gone into the book: no match, no resting bid, no refund (orphaned escrow -- the "fourth
 /// state", a track-2 contract bug). The client must check the invariant BEFORE `placeInferenceBuy`(track-1).
-pub const ORDERBOOK_FEE_BPS: u128 = 250;
-
 /// Fee-inclusive required escrow for `(ticks, max_price_per_tick)`, computed with **checked** arithmetic.
 /// Returns `None` if ANY step overflows `u128` -- including the *intermediate* `p x FEE_BPS` fee product,
 /// which can overflow and then be divided(`/ 10000`) back below `u128::MAX`, yielding a truncated value a
 /// final `== u128::MAX` check would miss. This is the single source of truth for the escrow amount; the guard
 /// rejects on `None`(fail-closed), not merely on a saturated final result.
 fn checked_required_escrow_for_buy(ticks: u128, max_price_per_tick: u128) -> Option<u128> {
-    let fee = max_price_per_tick.checked_mul(ORDERBOOK_FEE_BPS)? / 10_000;
+    let fee = max_price_per_tick.checked_mul(u128::from(PLATFORM_FEE_BPS))? / 10_000;
     let unit = max_price_per_tick.checked_add(fee)?;
     ticks.checked_mul(unit)
 }
@@ -30,6 +28,96 @@ fn checked_required_escrow_for_buy(ticks: u128, max_price_per_tick: u128) -> Opt
 /// the configuration(**fail-closed**). For real values(`<< u128::MAX`) the result exactly equals the contract's.
 pub fn required_escrow_for_buy(ticks: u128, max_price_per_tick: u128) -> u128 {
     checked_required_escrow_for_buy(ticks, max_price_per_tick).unwrap_or(u128::MAX)
+}
+
+/// Exact subscription BUY money split at one price.
+/// `deposit` buys the requested ticks including the platform fee. `buyer_bond` is a separate,
+/// refundable `2P` reserve. `total_escrow` is the amount moved from the buyer note into the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionBuyReserve {
+    pub deposit: u128,
+    pub buyer_bond: u128,
+    pub total_escrow: u128,
+}
+
+/// Checked subscription reserve at `price_per_tick`.
+/// Every multiplication and addition is checked independently so an intermediate overflow cannot
+/// be hidden by later division or truncation.
+pub fn subscription_buy_reserve(
+    ticks: u128,
+    price_per_tick: u128,
+) -> Result<SubscriptionBuyReserve, String> {
+    let deposit = checked_required_escrow_for_buy(ticks, price_per_tick).ok_or_else(|| {
+        format!(
+            "subscription reserve: ticks {ticks} x pricePerTick {price_per_tick} x \
+             (1 + {PLATFORM_FEE_BPS}bps fee) overflows u128"
+        )
+    })?;
+    let buyer_bond = price_per_tick
+        .checked_mul(SUBSCRIPTION_BUYER_BOND_TICKS)
+        .ok_or_else(|| {
+            format!(
+                "subscription reserve: buyer bond {SUBSCRIPTION_BUYER_BOND_TICKS} x \
+                 pricePerTick {price_per_tick} overflows u128"
+            )
+        })?;
+    let total_escrow = deposit.checked_add(buyer_bond).ok_or_else(|| {
+        format!("subscription reserve: deposit {deposit} + buyer bond {buyer_bond} overflows u128")
+    })?;
+    Ok(SubscriptionBuyReserve {
+        deposit,
+        buyer_bond,
+        total_escrow,
+    })
+}
+
+/// Require the exact subscription reserve before a money submit.
+/// Both underfunding and overfunding are rejected: a subscription message carries precisely the
+/// fee-inclusive service deposit plus its separate limit-priced buyer bond.
+pub fn check_subscription_buy_reserve(
+    escrow: u128,
+    ticks: u128,
+    max_price_per_tick: u128,
+) -> Result<SubscriptionBuyReserve, String> {
+    let required = subscription_buy_reserve(ticks, max_price_per_tick)?;
+    if escrow < required.total_escrow {
+        return Err(format!(
+            "subscription escrow {escrow} < required {} (= deposit {} + buyer bond {} at limit \
+             price {max_price_per_tick})",
+            required.total_escrow, required.deposit, required.buyer_bond
+        ));
+    }
+    if escrow > required.total_escrow {
+        return Err(format!(
+            "subscription escrow {escrow} > exact required {} (= deposit {} + buyer bond {} at \
+             limit price {max_price_per_tick}); do not overfund the order",
+            required.total_escrow, required.deposit, required.buyer_bond
+        ));
+    }
+    Ok(required)
+}
+
+/// Exact book refund when a subscription clears below its BUY limit.
+/// The deal receives only the fee-inclusive deposit plus `2P` bond at the clearing price; the
+/// difference from the limit-priced reserve remains in the book's leftover escrow and returns to
+/// the buyer.
+pub fn subscription_buy_clearing_refund(
+    ticks: u128,
+    limit_price_per_tick: u128,
+    clearing_price_per_tick: u128,
+) -> Result<u128, String> {
+    if clearing_price_per_tick > limit_price_per_tick {
+        return Err(format!(
+            "subscription clearing price {clearing_price_per_tick} exceeds BUY limit \
+             {limit_price_per_tick}"
+        ));
+    }
+    let reserved = subscription_buy_reserve(ticks, limit_price_per_tick)?;
+    let forwarded = subscription_buy_reserve(ticks, clearing_price_per_tick)?;
+    reserved
+        .total_escrow
+        .checked_sub(forwarded.total_escrow)
+        .ok_or_else(|| "subscription clearing refund underflows u128".to_string())
 }
 
 /// Compute the executable quote over current resting asks in price/time order.
@@ -157,6 +245,27 @@ fn equivalent_resting_ask(a: &OrderBookOrder, b: &OrderBookOrder) -> bool {
         && a.flags == b.flags
 }
 
+/// Return the funding timestamp only for the exact state written by the contract at match time,
+/// before the seller has ever opened the deal.
+fn exact_never_opened_funded_time(state: DealChainState) -> Option<u64> {
+    let funded_time = state.funded_time.filter(|value| *value > 0)?;
+    (state.funded
+        && !state.opened
+        && !state.probe_accepted
+        && !state.disputed
+        && state.deposit > 0
+        && state.probe_tick == 0
+        && state.finalized_owed == 0
+        && state.tokens_final == 0
+        && state.tokens_superseded == 0
+        && state.tokens_pending == 0
+        && state.probe_time == 0
+        && state.prev_claim_time == funded_time
+        && state.last_claim_time == funded_time
+        && state.dispute_time == 0)
+        .then_some(funded_time)
+}
+
 pub fn check_matched_token_contract_state(
     token_contract: &str,
     state: DealChainState,
@@ -166,41 +275,54 @@ pub fn check_matched_token_contract_state(
     if state.disputed {
         return Err(format!(
             "reported match {token_contract} is disputed immediately after fill: funded={} opened={} \
-             probeAccepted={} fundedTime={:?} lastAdvance={}. Refusing to wait for handover.",
+             deposit={} tokensFinal={} fundedTime={:?} lastClaimTime={}. Refusing to wait for handover.",
             state.funded,
             state.opened,
-            state.probe_accepted,
+            state.deposit,
+            state.tokens_final,
             state.funded_time,
-            state.last_advance
+            state.last_claim_time
         ));
     }
     if !state.funded {
         return Err(format!(
             "reported match {token_contract} is not funded after the fill event: funded=false opened={} \
-             probeAccepted={} fundedTime={:?} lastAdvance={}. The book/fill event and TokenContract state \
+             deposit={} fundedTime={:?} lastClaimTime={}. The book/fill event and TokenContract state \
              disagree; refusing to wait for handover or treat this as recoverable.",
-            state.opened, state.probe_accepted, state.funded_time, state.last_advance
+            state.opened, state.deposit, state.funded_time, state.last_claim_time
         ));
     }
     if state.opened {
         return Ok(MatchedTokenContractStatus::Opened);
     }
-    if state.probe_accepted {
-        return Err(format!(
-            "reported match {token_contract} has funded=true/opened=false/probeAccepted=true. That is not the \
-             funded-never-opened recovery state; refusing to wait for handover."
-        ));
-    }
-    let cleanup_after_unix = state
-        .funded_time
-        .map(|t| t.saturating_add(match_open_timeout_secs));
-    let cleanup_ready = cleanup_after_unix.is_some_and(|deadline| now_secs >= deadline);
-    let remaining_secs = cleanup_after_unix.map(|deadline| deadline.saturating_sub(now_secs));
+    let funded_time = exact_never_opened_funded_time(state).ok_or_else(|| {
+        format!(
+            "reported match {token_contract} is not the authoritative funded-never-opened shape: \
+             probeAccepted={} deposit={} probeTick={} finalizedOwed={} tokensFinal={} \
+             tokensSuperseded={} tokensPending={} probeTime={} prevClaimTime={} lastClaimTime={} \
+             fundedTime={:?} disputeTime={}. Refusing to wait for handover or offer cleanup.",
+            state.probe_accepted,
+            state.deposit,
+            state.probe_tick,
+            state.finalized_owed,
+            state.tokens_final,
+            state.tokens_superseded,
+            state.tokens_pending,
+            state.probe_time,
+            state.prev_claim_time,
+            state.last_claim_time,
+            state.funded_time,
+            state.dispute_time,
+        )
+    })?;
+    let cleanup_after_unix = funded_time.saturating_add(match_open_timeout_secs);
+    let cleanup_ready = now_secs >= cleanup_after_unix;
+    let remaining_secs = cleanup_after_unix.saturating_sub(now_secs);
     Ok(MatchedTokenContractStatus::FundedNeverOpened {
-        funded_time: state.funded_time,
-        cleanup_after_unix,
+        funded_time: Some(funded_time),
+        cleanup_after_unix: Some(cleanup_after_unix),
         cleanup_ready,
-        remaining_secs,
+        remaining_secs: Some(remaining_secs),
     })
 }
 
@@ -220,13 +342,13 @@ pub fn check_buy_deposit_headroom(
     // value), which a saturated-final check would miss -- letting `escrow == required`(the garbage) slip
     // through. Covers the omitted-`--escrow` default path too(it computes the same required).
     let required = checked_required_escrow_for_buy(ticks, max_price_per_tick).ok_or_else(|| format!(
-        "escrow check: ticks {ticks} x maxPricePerTick {max_price_per_tick} x (1 + {ORDERBOOK_FEE_BPS}bps fee) \
+        "escrow check: ticks {ticks} x maxPricePerTick {max_price_per_tick} x (1 + {PLATFORM_FEE_BPS}bps fee) \
          overflows u128 -- absurd configuration, rejected fail-closed ()."
     ))?;
     if escrow < required {
         return Err(format!(
             "escrow {escrow} < minimum {required} (= ticks {ticks} x maxPricePerTick \
-             {max_price_per_tick} x (1 + {ORDERBOOK_FEE_BPS}bps book fee)): \
+             {max_price_per_tick} x (1 + {PLATFORM_FEE_BPS}bps book fee)): \
              placeInferenceBuy will be rejected with ERR_INSUFFICIENT_DEPOSIT, and the escrow will orphan in \
              the book (). Raise --escrow to >={required} or lower --ticks/--max-price-per-tick."
         ));
@@ -234,7 +356,7 @@ pub fn check_buy_deposit_headroom(
     if escrow > required {
         return Err(format!(
             "escrow {escrow} > required {required} (= ticks {ticks} x maxPricePerTick {max_price_per_tick} \
-             x (1 + {ORDERBOOK_FEE_BPS}bps fee)): the surplus ({}) is debited but is NOT refunded when the buy \
+             x (1 + {PLATFORM_FEE_BPS}bps fee)): the surplus ({}) is debited but is NOT refunded when the buy \
              rests and is filled as a maker () -- it strands. Set --escrow to exactly {required}, or \
              omit --escrow to use the computed default.",
             escrow - required
@@ -264,14 +386,11 @@ pub fn aggregate_tree(snaps: Vec<NoteSnapshot>) -> TreeSnapshot {
     }
 }
 
-/// Finalized ticks(tokens) of a deal: `seller_received / price_per_tick` -- each finalized tick pays the
-/// seller exactly `price_per_tick` SHELL. Zero when the price is zero(no division by zero) or the
-/// stream never opened.
-fn finalized_ticks(snapshot: Option<&StreamSnapshot>, price_per_tick: Shell) -> u64 {
-    match snapshot {
-        Some(s) if price_per_tick > 0 => summary_shell(s.seller_received) / price_per_tick,
-        _ => 0,
-    }
+/// Finalized ticks of a deal come solely from the contract's immutable delivered-token counter.
+fn finalized_ticks(snapshot: Option<&StreamSnapshot>) -> u64 {
+    snapshot
+        .map(|s| u64::try_from(s.tokens_final / TICK_SIZE).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Keep the existing `u64` saturation boundary for cross-deal monitor summaries.
@@ -288,7 +407,7 @@ pub fn per_model_breakdown(deals: &[DealView], role: DealRole) -> Vec<ModelBreak
     let mut models: Vec<ModelBreakdown> = Vec::new();
     for d in deals.iter().filter(|d| d.role == role) {
         let model_id = d.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-        let tokens = finalized_ticks(d.snapshot.as_ref(), d.price_per_tick);
+        let tokens = finalized_ticks(d.snapshot.as_ref());
         let (money, locked, burned) = match &d.snapshot {
             Some(s) => {
                 let locked = match role {
@@ -502,46 +621,34 @@ pub fn check_disputable(
     )
 }
 
-/// Contract fixed constant for the funded-but-never-opened cleanup path
-/// (`contracts/airegistry/modifiers/modifiers.sol::MATCH_OPEN_TIMEOUT`).
-pub const MATCH_OPEN_TIMEOUT_SECS: u64 = 600;
-
 /// The single contract write selected by a successful `dexdo reclaim` pre-flight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReclaimAction {
-    StreamReclaim,
+    /// `PrivateNote.streamCleanup` -> `TC.cleanupUnopened()`: recover a deal the seller never opened.
     StreamCleanup,
 }
 
-/// `dexdo reclaim` pre-flight -- the pure timer gate behind the buyer-side timeout reclaim:
-/// `streamReclaim` for opened-abandoned deals, `streamCleanup` for funded-but-never-opened deals. Fails LOUD
-/// before sending rather than letting the contract revert:
+/// `dexdo reclaim` pre-flight -- which single write recovers this deal, and whether it is
+/// admissible at all. Fails LOUD before sending rather than letting the contract revert:
 /// - not disputed, matched, owned by THIS buyer(else reject);
 /// - funded(else nothing to reclaim);
-/// - OPENED + `now >= last_advance + stream_timeout` -> `StreamReclaim`(`TC.sol:597`);
-/// - OPENED but before the timeout -> reject(too early);
-/// - funded, closed, and non-zero `last_advance` -> reject(the deal was previously opened);
-/// - funded but never opened + `now >= funded_time + match_open_timeout` -> `StreamCleanup`;
+/// - OPENED -> reject: explicit STOP is selected by `close`/`recover`, never rewritten from `reclaim`;
+/// - funded, closed, and the exact never-opened state produced at funding +
+/// `now >= funded_time + match_open_timeout` -> `StreamCleanup`;
 /// - funded but never opened before `MATCH_OPEN_TIMEOUT` -> reject(too early).
-/// Times are seconds(client `SystemTime` vs on-chain `lastAdvance`/`fundedTime` + contract timeouts).
+/// Times are seconds(client `SystemTime` vs on-chain `lastClaimTime`/`fundedTime` + contract timeouts).
 /// Offline-regression-tested.
-#[allow(clippy::too_many_arguments)]
 pub fn check_reclaimable(
-    funded: bool,
-    opened: bool,
-    disputed: bool,
+    state: DealChainState,
     buyer_note: Option<&str>,
     note_addr: &str,
     buyer_pubkey: Option<&[u8; 32]>,
     note_ed_pubkey: &[u8; 32],
     now: u64,
-    last_advance: u64,
-    stream_timeout: Option<u64>,
-    funded_time: Option<u64>,
     match_open_timeout: u64,
 ) -> Result<ReclaimAction, String> {
-    if disputed {
-        return Err("reclaim: deal is DISPUTED -- resolve via the dispute path (releaseDispute/arbitration), not reclaim".into());
+    if state.disputed {
+        return Err("reclaim: deal is DISPUTED -- resolve via the dispute path (releaseDispute/resolveDisputeTimeout), not reclaim".into());
     }
     check_buyer_owns(
         "reclaim",
@@ -550,55 +657,52 @@ pub fn check_reclaimable(
         buyer_pubkey,
         note_ed_pubkey,
     )?;
-    if !funded {
+    if !state.funded {
         return Err("reclaim: deal is not funded (not matched) -- nothing to reclaim".into());
     }
-    let funded_time = funded_time
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "reclaim: getState exposes no valid fundedTime".to_string())?;
-    if !opened {
-        if last_advance != 0 {
-            return Err(format!(
-                "reclaim: deal is CLOSED but lastAdvance {last_advance} proves it was previously OPENED; \
-                 refusing streamCleanup before submit"
-            ));
-        }
-        let deadline = funded_time.saturating_add(match_open_timeout);
-        if now < deadline {
-            return Err(format!(
-                "reclaim: too early -- the NEVER-OPENED deal's MATCH_OPEN_TIMEOUT is not reached: fundedTime \
-                 {funded_time} + matchOpenTimeout {match_open_timeout} = {deadline} > now {now} ({} s \
-                 remaining). The seller can still open; cleanup only after the timeout.",
-                deadline.saturating_sub(now)
-            ));
-        }
-        return Ok(ReclaimAction::StreamCleanup);
-    }
-    if last_advance == 0 {
+    if state.opened {
         return Err(
-            "reclaim: OPEN deal has no valid open-time lastAdvance; refusing to submit".into(),
+            "reclaim: deal is OPEN -- use explicit `dexdo close` or `dexdo recover` to STOP it"
+                .into(),
         );
     }
-    if last_advance < funded_time {
-        return Err(format!(
-            "reclaim: contradictory timestamps: OPEN deal lastAdvance {last_advance} precedes fundedTime \
-             {funded_time}; refusing to submit"
-        ));
+
+    if state.is_stopped() {
+        return Err(
+            "reclaim: deal is already terminal/drained; refusing streamCleanup before submit"
+                .into(),
+        );
     }
-    let stream_timeout = stream_timeout.ok_or_else(|| {
-        "reclaim: getConfig exposes no streamTimeout; cannot preflight the OPEN deal timeout"
-            .to_string()
+    let funded_time = exact_never_opened_funded_time(state).ok_or_else(|| {
+        format!(
+            "reclaim: CLOSED deal is not the authoritative never-opened shape; refusing \
+             streamCleanup before submit (probeAccepted={} deposit={} probeTick={} \
+             finalizedOwed={} tokensFinal={} tokensSuperseded={} tokensPending={} probeTime={} \
+             prevClaimTime={} lastClaimTime={} fundedTime={:?} disputeTime={})",
+            state.probe_accepted,
+            state.deposit,
+            state.probe_tick,
+            state.finalized_owed,
+            state.tokens_final,
+            state.tokens_superseded,
+            state.tokens_pending,
+            state.probe_time,
+            state.prev_claim_time,
+            state.last_claim_time,
+            state.funded_time,
+            state.dispute_time,
+        )
     })?;
-    let deadline = last_advance.saturating_add(stream_timeout);
+    let deadline = funded_time.saturating_add(match_open_timeout);
     if now < deadline {
         return Err(format!(
-            "reclaim: too early -- the OPEN deal's STREAM_TIMEOUT is not reached: lastAdvance {last_advance} + \
-             streamTimeout {stream_timeout} = {deadline} > now {now} ({} s remaining). The seller can still \
-             advance; reclaim only after the timeout.",
+            "reclaim: too early -- the NEVER-OPENED deal's MATCH_OPEN_TIMEOUT is not reached: fundedTime \
+             {funded_time} + matchOpenTimeout {match_open_timeout} = {deadline} > now {now} ({} s \
+             remaining). The seller can still open; cleanup only after the timeout.",
             deadline.saturating_sub(now)
         ));
     }
-    Ok(ReclaimAction::StreamReclaim)
+    Ok(ReclaimAction::StreamCleanup)
 }
 
 /// `dexdo release-dispute` pre-flight -- the seller can concede only an actually disputed deal.

@@ -3,7 +3,7 @@ use super::contracts_provision::*;
 use super::*;
 use crate::canonical_multisig;
 use crate::manifest::model_hash_for;
-use crate::params::{Shell, PRICE_STEP};
+use crate::params::{default_buy_deadline, Shell, MAX_SELL_TTL, PRICE_STEP, TICK_SIZE};
 use anyhow::{anyhow, Result};
 use gosh_ackinacki::airegistry::calls::{encode_external_call, encode_internal_payload};
 use gosh_ackinacki::airegistry::deploy::local_context;
@@ -289,7 +289,7 @@ async fn live_minted_note_deploys_inference_orderbook() {
     // Book parameters: a per-model name (4.0.6: the book verifies sha256(modelName)==modelHash) + tickSize.
     let frame_model = format!("dexdo-d-{}--book-derivation", std::process::id());
     let model_hash = model_hash_for(&frame_model);
-    let tick_size: u128 = MODEL_TICK_SIZE;
+    let tick_size: u128 = TICK_SIZE;
 
     // (1) Proof of the inference variant: the getter getInferenceOrderBookAddress exists and
     // returns a deterministic book address(a non-inference note lacks the method -> it would fail).
@@ -880,7 +880,7 @@ async fn live_seller_posts_offer() {
     // The book(per-model) -- a deterministic address; we deploy it if it is not yet active.
     let frame_model = format!("dexdo-d-{}--book-redeploy", std::process::id());
     let model_hash = model_hash_for(&frame_model);
-    let ob_tick_size: u128 = MODEL_TICK_SIZE;
+    let ob_tick_size: u128 = TICK_SIZE;
     let ob = be
         .inference_orderbook_address(&note_addr, &model_hash, ob_tick_size)
         .await
@@ -993,7 +993,7 @@ async fn live_seller_posts_offer() {
 
     // The seller posts the offer into the book(a note write via submit).
     let resp = be
-        .post_sell_offer(&note_addr, &owner, 0, nonce)
+        .post_sell_offer(&note_addr, &owner, 0, nonce, MAX_SELL_TTL.as_secs())
         .await
         .expect("post sell offer");
     println!("=== postSellOffer resp = {resp} ===");
@@ -1047,7 +1047,7 @@ async fn live_offer_cannot_submit_fake_tc_4_0_26() {
     let frame = format!("dexdo-fake-tc-{}", std::process::id());
     let model_hash = model_hash_for(&frame);
     let ob = be
-        .inference_orderbook_address(&note_addr, &model_hash, MODEL_TICK_SIZE)
+        .inference_orderbook_address(&note_addr, &model_hash, TICK_SIZE)
         .await
         .expect("ob addr");
     if !be
@@ -1058,7 +1058,7 @@ async fn live_offer_cannot_submit_fake_tc_4_0_26() {
         .map(|a| a.is_active())
         .unwrap_or(false)
     {
-        be.deploy_inference_orderbook(&note_addr, &owner, &model_hash, &frame, MODEL_TICK_SIZE)
+        be.deploy_inference_orderbook(&note_addr, &owner, &model_hash, &frame, TICK_SIZE)
             .await
             .expect("deploy ob");
         for _ in 0..40 {
@@ -1117,7 +1117,9 @@ async fn live_offer_cannot_submit_fake_tc_4_0_26() {
     );
     println!("=== fake TokenContract {fake_tc}; note-derived canonical TC {canonical_tc} ===");
 
-    let resp = be.post_sell_offer(&note_addr, &owner, 0, nonce).await;
+    let resp = be
+        .post_sell_offer(&note_addr, &owner, 0, nonce, MAX_SELL_TTL.as_secs())
+        .await;
     println!("=== note.postSellOffer(flags, nonce) result = {resp:?} ===");
 
     // Does the fake-tc offer rest in the book?
@@ -1213,7 +1215,7 @@ async fn live_provision_wallet_funded_market() {
 
     // 1) OB(note-funded, no giver) -- deploy-if-absent(note-funded deploy does not wait).
     let ob = be
-        .inference_orderbook_address(&note_addr, &model_hash, MODEL_TICK_SIZE)
+        .inference_orderbook_address(&note_addr, &model_hash, TICK_SIZE)
         .await
         .expect("ob addr");
     if !be
@@ -1224,15 +1226,9 @@ async fn live_provision_wallet_funded_market() {
         .map(|a| a.is_active())
         .unwrap_or(false)
     {
-        be.deploy_inference_orderbook(
-            &note_addr,
-            &owner,
-            &model_hash,
-            &frame_model,
-            MODEL_TICK_SIZE,
-        )
-        .await
-        .expect("deploy OB");
+        be.deploy_inference_orderbook(&note_addr, &owner, &model_hash, &frame_model, TICK_SIZE)
+            .await
+            .expect("deploy OB");
         let mut active = false;
         for _ in 0..40 {
             if be
@@ -1367,7 +1363,7 @@ async fn live_buyer_matches_offer() {
         .as_secs();
     let frame_model = format!("dexdo-d-stream--{nonce:016x}");
     let model_hash = model_hash_for(&frame_model);
-    let ob_tick_size: u128 = MODEL_TICK_SIZE;
+    let ob_tick_size: u128 = TICK_SIZE;
     let price: u128 = PRICE_STEP;
     let max_ticks: u128 = 2;
 
@@ -1432,7 +1428,7 @@ async fn live_buyer_matches_offer() {
     println!("=== seller TC {tc} active ===");
 
     // The seller posts the offer; we wait until it lands in the book as an ask.
-    be.post_sell_offer(&seller_addr, &seller, 0, nonce)
+    be.post_sell_offer(&seller_addr, &seller, 0, nonce, MAX_SELL_TTL.as_secs())
         .await
         .expect("offer");
     let mut rested = false;
@@ -1456,7 +1452,16 @@ async fn live_buyer_matches_offer() {
     let ticks: u128 = max_ticks;
     let escrow = crate::chain::required_escrow_for_buy(ticks, price);
     let resp = be
-        .place_inference_buy(&buyer_addr, &buyer, &model_hash, price, ticks, escrow, 0, 0)
+        .place_inference_buy(
+            &buyer_addr,
+            &buyer,
+            &model_hash,
+            price,
+            ticks,
+            escrow,
+            0,
+            live_buy_deadline(),
+        )
         .await
         .expect("buy");
     println!("=== placeInferenceBuy resp = {resp} ===");
@@ -1532,7 +1537,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     let tc = Address::parse(&market.token_contract).expect("tc addr");
     println!("===  fresh market via note-funded provision_market: OB {ob} TC {tc} ===");
 
-    be.post_sell_offer(&seller_addr, &seller, 0, nonce)
+    be.post_sell_offer(&seller_addr, &seller, 0, nonce, MAX_SELL_TTL.as_secs())
         .await
         .expect("offer");
     let mut rested = false;
@@ -1556,7 +1561,16 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     let ticks: u128 = 2;
     let escrow = crate::chain::required_escrow_for_buy(ticks, price);
     let resp = be
-        .place_inference_buy(&buyer_addr, &buyer, &model_hash, price, ticks, escrow, 0, 0)
+        .place_inference_buy(
+            &buyer_addr,
+            &buyer,
+            &model_hash,
+            price,
+            ticks,
+            escrow,
+            0,
+            live_buy_deadline(),
+        )
         .await
         .expect("buy");
     println!("===  placeInferenceBuy resp = {resp} ===");
@@ -1582,7 +1596,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     let funded_time = funded_time.expect("match funded the TC and getState exposed fundedTime");
-    let cleanup_at = funded_time.saturating_add(crate::chain::MATCH_OPEN_TIMEOUT_SECS);
+    let cleanup_at = funded_time.saturating_add(crate::params::MATCH_OPEN_TIMEOUT_SECS);
     let now = now_secs();
     if now < cleanup_at {
         let wait = cleanup_at - now + 3;
@@ -1622,6 +1636,11 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn live_buy_deadline() -> u64 {
+    default_buy_deadline(now_secs())
+        .expect("current unix time plus the canonical BUY lifetime must fit u64")
 }
 
 async fn is_active(be: &RealChainBackend, addr: &Address) -> bool {
@@ -1686,7 +1705,7 @@ async fn setup_funded_deal(
         )
         .await
         .expect("deploy tc");
-    be.post_sell_offer(seller_addr, seller, 0, nonce)
+    be.post_sell_offer(seller_addr, seller, 0, nonce, MAX_SELL_TTL.as_secs())
         .await
         .expect("offer");
     let mut rested = false;
@@ -1706,9 +1725,18 @@ async fn setup_funded_deal(
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
     assert!(rested, "the offer landed in the book");
-    be.place_inference_buy(buyer_addr, buyer, &model_hash, price, ticks, escrow, 0, 0)
-        .await
-        .expect("buy");
+    be.place_inference_buy(
+        buyer_addr,
+        buyer,
+        &model_hash,
+        price,
+        ticks,
+        escrow,
+        0,
+        live_buy_deadline(),
+    )
+    .await
+    .expect("buy");
     let mut funded = false;
     for _ in 0..30 {
         if be
@@ -1899,316 +1927,6 @@ async fn live_stream_open_and_probe_burn() {
     );
 }
 
-/// Helper: the seller posts the exact `2P` bond(a fresh operational wallet + ECC[2] from the giver) and
-/// opens the stream with the handover cipher of the endpoint to the buyer. On exit: TC `opened`, `bondFunded`.
-async fn open_stream_with_seller_bond(
-    be: &RealChainBackend,
-    tc: &Address,
-    seller: &KeyPair,
-    s_sec: &str,
-    b_sec: &str,
-) {
-    use crate::note::Note;
-    let wallet_keys = KeyPair::generate();
-    let wallet = be
-        .deploy_multisig(&wallet_keys)
-        .await
-        .expect("deploy wallet");
-    let bond_required = be
-        .token_contract_seller_bond(tc)
-        .await
-        .expect("getSellerBond")
-        .and_then(|bond| {
-            bond["bondRequired"]
-                .as_str()
-                .and_then(|raw| raw.parse().ok())
-        })
-        .expect("getSellerBond().bondRequired");
-    be.giver_send_shell(&wallet.with_workchain(), bond_required)
-        .await
-        .expect("send exact seller bond");
-    for _ in 0..20 {
-        if be
-            .client()
-            .get_account(&wallet)
-            .await
-            .expect("w")
-            .map(|a| a.shell())
-            .unwrap_or(0)
-            >= bond_required
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    be.fund_seller_bond(&wallet, &wallet_keys, tc, bond_required)
-        .await
-        .expect("fund seller bond");
-    for _ in 0..20 {
-        if be
-            .token_contract_seller_bond(tc)
-            .await
-            .expect("p")
-            .and_then(|x| x["bondFunded"].as_bool())
-            .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    let buyer_rn = RealNote::from_keypair(KeyPair::from_secret_hex(b_sec).expect("brn"))
-        .expect("buyer real note");
-    let seller_rn = RealNote::from_keypair(KeyPair::from_secret_hex(s_sec).expect("srn"))
-        .expect("seller real note");
-    let cipher = seller_rn.encrypt_to(&buyer_rn.pubkey(), b"https://seller.example/v1|fp");
-    be.open_stream(tc, seller, &cipher).await.expect("open");
-    for _ in 0..20 {
-        if be
-            .token_contract_state(tc)
-            .await
-            .expect("s")
-            .and_then(|s| s["opened"].as_bool())
-            .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-}
-
-fn u128_field(v: &Option<Value>, key: &str) -> u128 {
-    v.as_ref()
-        .and_then(|s| s[key].as_str())
-        .and_then(|x| x.parse::<u128>().ok())
-        .unwrap_or(0)
-}
-
-/// A LIVE deal test, step 4b(accept path + two-tick invariant + clean stop): from an open
-/// stream the seller waits for `SETTLE_WINDOW` and `advance` -- the probe is accepted (probe-tick -> seller,
-/// while the `2P` bond remains held), and the **two-tick invariant** is established(`prepaid==P && frozen==P`);
-/// then the buyer `stop` -- a standard split, the stream is closed. Slow(~5 min due to 180s).
-#[tokio::test]
-#[ignore = "live: stream advance(accept) + two-tick invariant + stop on shellnet (~5min: 180s settle)"]
-async fn live_stream_advance_and_stop() {
-    let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
-        return;
-    };
-    let pool: Value =
-        serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool")).expect("parse pool");
-    let notes = pool["notes"].as_array().expect("notes");
-    let s_sec = notes[0]["owner_secret_key_hex"].as_str().expect("s0");
-    let b_sec = notes[1]["owner_secret_key_hex"].as_str().expect("s1");
-    let seller_addr = Address::parse(notes[0]["address"].as_str().expect("a0")).expect("a0");
-    let seller = KeyPair::from_secret_hex(s_sec).expect("k0");
-    let buyer_addr = Address::parse(notes[1]["address"].as_str().expect("a1")).expect("a1");
-    let buyer = KeyPair::from_secret_hex(b_sec).expect("k1");
-
-    let manifest = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../contracts/deployed.shellnet.json"
-    );
-    let be = RealChainBackend::connect(manifest).expect("connect");
-
-    // ticks=4 gives enough escrow for the probe tick plus the two-tick invariant.
-    let price: u128 = PRICE_STEP;
-    let (_ob, tc) = setup_funded_deal(
-        &be,
-        &seller_addr,
-        &seller,
-        &buyer_addr,
-        &buyer,
-        price,
-        5,
-        4,
-        crate::chain::required_escrow_for_buy(4, price),
-    )
-    .await;
-    println!(
-        "=== funded TC {tc} deposit={} (price={price}) ===",
-        u128_field(&be.token_contract_state(&tc).await.expect("st"), "deposit")
-    );
-
-    open_stream_with_seller_bond(&be, &tc, &seller, s_sec, b_sec).await;
-    let st = be.token_contract_state(&tc).await.expect("st");
-    println!(
-        "=== opened: opened={:?} frozen={} deposit={} ===",
-        st.as_ref().and_then(|s| s["opened"].as_bool()),
-        u128_field(&st, "frozen"),
-        u128_field(&st, "deposit")
-    );
-
-    // advance requires block.timestamp >= _prepaidTime + SETTLE_WINDOW(180s).
-    println!("=== waiting for SETTLE_WINDOW (185s) ===");
-    tokio::time::sleep(std::time::Duration::from_secs(185)).await;
-    be.advance_stream(&tc, &seller).await.expect("advance");
-
-    let mut accepted = false;
-    let (mut prepaid, mut frozen) = (0u128, 0u128);
-    for _ in 0..20 {
-        let st = be.token_contract_state(&tc).await.expect("st");
-        println!(
-            "after advance: probeAccepted={:?} prepaid={} frozen={} deposit={} ticksFinalized={}",
-            st.as_ref().and_then(|s| s["probeAccepted"].as_bool()),
-            u128_field(&st, "prepaid"),
-            u128_field(&st, "frozen"),
-            u128_field(&st, "deposit"),
-            u128_field(&st, "finalizedOwed"),
-        );
-        if st
-            .as_ref()
-            .and_then(|s| s["probeAccepted"].as_bool())
-            .unwrap_or(false)
-        {
-            accepted = true;
-            prepaid = u128_field(&st, "prepaid");
-            frozen = u128_field(&st, "frozen");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(accepted, "the probe is accepted (probeAccepted==true)");
-    assert_eq!(prepaid, price, "two-tick invariant: prepaid == P");
-    assert_eq!(frozen, price, "two-tick invariant: frozen == P");
-    println!(
-        "=== two-tick invariant established: prepaid={prepaid} frozen={frozen} (P={price}) ==="
-    );
-
-    // The buyer closes the stream -- a standard split: the delivered tick to the seller, the remainder to the buyer.
-    be.stream_stop(&buyer_addr, &buyer, &tc)
-        .await
-        .expect("stop");
-    let mut closed = false;
-    for _ in 0..20 {
-        let st = be.token_contract_state(&tc).await.expect("st");
-        println!(
-            "after stop: opened={:?} prepaid={} frozen={} deposit={}",
-            st.as_ref().and_then(|s| s["opened"].as_bool()),
-            u128_field(&st, "prepaid"),
-            u128_field(&st, "frozen"),
-            u128_field(&st, "deposit"),
-        );
-        if st
-            .as_ref()
-            .and_then(|s| s["opened"].as_bool())
-            .map(|o| !o)
-            .unwrap_or(false)
-        {
-            closed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(
-        closed,
-        "the stream is closed by a standard split (opened==false)"
-    );
-}
-
-/// A LIVE test, the **seller no-show** scenario: the deal is open, but the seller does NOT advance
-/// the ticks; after `STREAM_TIMEOUT` the buyer reclaims. Expectation: the stream is closed, the probe is **not accepted**,
-/// the full seller bond `2P` returns via `finalizedOwed`, probe+deposit -> the buyer, **no burn** (a no-show is not
-/// slashed). Slow(~12 min due to 600s). Requires `DEXDO_PN_POOL`.
-#[tokio::test]
-#[ignore = "live: seller no-show reclaim on shellnet (~12min: 600s STREAM_TIMEOUT)"]
-async fn live_stream_seller_no_show() {
-    let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
-        return;
-    };
-    let pool: Value =
-        serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool")).expect("parse pool");
-    let notes = pool["notes"].as_array().expect("notes");
-    let s_sec = notes[0]["owner_secret_key_hex"].as_str().expect("s0");
-    let b_sec = notes[1]["owner_secret_key_hex"].as_str().expect("s1");
-    let seller_addr = Address::parse(notes[0]["address"].as_str().expect("a0")).expect("a0");
-    let seller = KeyPair::from_secret_hex(s_sec).expect("k0");
-    let buyer_addr = Address::parse(notes[1]["address"].as_str().expect("a1")).expect("a1");
-    let buyer = KeyPair::from_secret_hex(b_sec).expect("k1");
-
-    let manifest = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../contracts/deployed.shellnet.json"
-    );
-    let be = RealChainBackend::connect(manifest).expect("connect");
-
-    let price: u128 = PRICE_STEP;
-    let (_ob, tc) = setup_funded_deal(
-        &be,
-        &seller_addr,
-        &seller,
-        &buyer_addr,
-        &buyer,
-        price,
-        5,
-        4,
-        crate::chain::required_escrow_for_buy(4, price),
-    )
-    .await;
-    open_stream_with_seller_bond(&be, &tc, &seller, s_sec, b_sec).await;
-    println!(
-        "=== opened (seller will STAY SILENT): probeAccepted={:?} frozen={} deposit={} ===",
-        be.token_contract_state(&tc)
-            .await
-            .expect("st")
-            .as_ref()
-            .and_then(|s| s["probeAccepted"].as_bool()),
-        u128_field(&be.token_contract_state(&tc).await.expect("st"), "frozen"),
-        u128_field(&be.token_contract_state(&tc).await.expect("st"), "deposit"),
-    );
-
-    // The seller stays silent for exactly STREAM_TIMEOUT(600s) -- then the buyer reclaims.
-    println!("=== waiting for STREAM_TIMEOUT (605s), the seller does not advance the ticks ===");
-    tokio::time::sleep(std::time::Duration::from_secs(605)).await;
-    be.reclaim_on_timeout(&buyer_addr, &buyer, &tc)
-        .await
-        .expect("reclaim");
-
-    let mut closed = false;
-    let (mut accepted_after, mut finalized) = (None, 0u128);
-    for _ in 0..20 {
-        let st = be.token_contract_state(&tc).await.expect("st");
-        println!(
-            "after reclaim: opened={:?} probeAccepted={:?} finalizedOwed={} frozen={} deposit={}",
-            st.as_ref().and_then(|s| s["opened"].as_bool()),
-            st.as_ref().and_then(|s| s["probeAccepted"].as_bool()),
-            u128_field(&st, "finalizedOwed"),
-            u128_field(&st, "frozen"),
-            u128_field(&st, "deposit"),
-        );
-        if st
-            .as_ref()
-            .and_then(|s| s["opened"].as_bool())
-            .map(|o| !o)
-            .unwrap_or(false)
-        {
-            closed = true;
-            accepted_after = st.as_ref().and_then(|s| s["probeAccepted"].as_bool());
-            finalized = u128_field(&st, "finalizedOwed");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-    assert!(
-        closed,
-        "no-show: the stream is closed by the reclaim (opened==false)"
-    );
-    assert_eq!(
-        accepted_after,
-        Some(false),
-        "the probe is NOT accepted (the seller did not show up)"
-    );
-    // the exact `2P` seller bond returns; probe+deposit goes to the buyer; no burn.
-    assert_eq!(
-        finalized,
-        2 * price,
-        "no-show: finalizedOwed carries only the returned 2P seller bond; the tick did NOT go to the seller"
-    );
-    println!(
-        "=== seller no-show: reclaimed, no burn, seller bond 2P->seller, probe+deposit->buyer ==="
-    );
-}
-
 /// **LEGACY.** Its deal SETUP routes through the OLD operator-wallet/giver path
 /// (`deploy_multisig`), kept as `test-giver` regression coverage -- **NOT** the canonical proof (though
 /// `RealDealBackend::open_stream` itself posts the exact `2P` seller bond note-funded). The canonical note-funded
@@ -2336,6 +2054,7 @@ async fn live_real_deal_backend_trait() {
                 price_per_tick: price as u64,
                 max_ticks: max_ticks as u64,
                 token_contract: tc_s.clone(),
+                flags: 0,
             },
             &seller_rn,
         )
@@ -2391,8 +2110,15 @@ async fn live_real_deal_backend_trait() {
     let settlement = backend.stop(&tc_s, &buyer_rn).await.expect("stop");
     println!("=== Settlement via trait = {settlement:?} ===");
     assert!(
-        matches!(settlement, Settlement::AmicableSplit { .. }),
-        "a clean stop after accept -> AmicableSplit"
+        matches!(
+            settlement,
+            Settlement::AuthoritativeReceipt(receipt)
+                if matches!(
+                    receipt.event,
+                    crate::SettlementActionEvent::StreamStopped { .. }
+                )
+        ),
+        "a clean stop after accept must return the exact StreamStopped receipt"
     );
     let snap = backend.snapshot(&tc_s).await.expect("snapshot");
     assert!(snap.closed, "snapshot.closed after stop via the trait");
@@ -2525,6 +2251,7 @@ async fn live_recover_stops_orphaned_open_deal() {
                 price_per_tick: price as u64,
                 max_ticks: max_ticks as u64,
                 token_contract: tc_s.clone(),
+                flags: 0,
             },
             &seller_rn,
         )
@@ -2600,8 +2327,13 @@ async fn live_recover_stops_orphaned_open_deal() {
     }
     let post = post.expect("recover: the deal STOPped (opened=false) within the deadline");
     println!(
-        "post-recover getState: opened={:?} disputed={:?} finalizedOwed={:?} frozen={:?} deposit={:?}",
-        post["opened"], post["disputed"], post["finalizedOwed"], post["frozen"], post["deposit"]
+        "post-recover getState: opened={:?} disputed={:?} finalizedOwed={:?} tokensFinal={:?} tokensPending={:?} deposit={:?}",
+        post["opened"],
+        post["disputed"],
+        post["finalizedOwed"],
+        post["tokensFinal"],
+        post["tokensPending"],
+        post["deposit"]
     );
     assert_eq!(
         post["opened"].as_bool(),

@@ -1,12 +1,13 @@
 //! On-chain abstraction and the mock implementation for.
-//! brings up **only what e2e needs**: offer/match, `open_stream`
-//! (freezing the probe tick + holding the exact `2P` seller bond + writing the enc-endpoint to
-//! the endpoints file), `advance_tick`, `read_handover`, `stop`(incl. `BurnBoth` on the probe),
-//! `seller_timeout`/settle. No networked on-chain.
+//! brings up **only what e2e needs**: offer/match, `open_stream` (holding the exact `2P`
+//! seller bond + writing the enc-endpoint to the endpoints file), `claim_tokens`/`finalize`,
+//! `read_handover`, `stop`, and dispute settlement. No networked on-chain.
+//! Opening a stream pays no one: it freezes one probe tick inside the buyer's escrow, and the seller earns
+//! that tick only after probe acceptance. Later output is paid only through promoted consumption claims.
 
 use crate::machine::Settlement;
 use crate::note::{Note, NotePubkey};
-use crate::params::Shell;
+use crate::params::{ProtocolConsts, Shell};
 use async_trait::async_trait;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -43,35 +44,33 @@ impl HeartbeatGuard {
 /// Validate the exact on-chain state and deal price used by seller resume before any write.
 pub fn validate_seller_resume_state(
     token_contract: &TokenContract,
-    state: &serde_json::Value,
+    state: DealChainState,
     price_per_tick: Shell,
 ) -> Result<(), ChainError> {
-    let flag = |key: &str| state[key].as_bool().unwrap_or(false);
-    let amount = |key: &str| {
-        state[key]
-            .as_str()
-            .and_then(|value| value.parse::<u128>().ok())
-            .unwrap_or(0)
-    };
     let mut blockers = Vec::new();
-    if !flag("funded") {
+    if !state.funded {
         blockers.push("funded=false".to_string());
     }
-    if flag("disputed") {
+    if state.disputed {
         blockers.push("disputed".to_string());
     }
-    if flag("probeAccepted") && !flag("opened") {
+    if state.probe_accepted && !state.opened {
         blockers.push("probeAccepted without opened".to_string());
     }
-    if !flag("opened") {
-        let deposit = amount("deposit");
-        if deposit < u128::from(price_per_tick) {
+    if !state.opened {
+        if state.deposit < u128::from(price_per_tick) {
             blockers.push(format!(
-                "deposit={deposit}, price_per_tick={price_per_tick}: TokenContract cannot be opened"
+                "deposit={}, price_per_tick={price_per_tick}: TokenContract cannot be opened",
+                state.deposit
             ));
         }
-        for key in ["prepaid", "frozen", "finalizedOwed"] {
-            let value = amount(key);
+        for (key, value) in [
+            ("probeTick", state.probe_tick),
+            ("finalizedOwed", state.finalized_owed),
+            ("tokensFinal", state.tokens_final),
+            ("tokensSuperseded", state.tokens_superseded),
+            ("tokensPending", state.tokens_pending),
+        ] {
             if value > 0 {
                 blockers.push(format!("{key}={value}"));
             }
@@ -114,7 +113,7 @@ pub trait ChainBackend: Send + Sync {
     }
     /// ensure the per-deal `TokenContract` being advertised is FRESH(deployed but unused) before resting
     /// an ask on it. A deterministic `(sellerPubkey, nonce)` TC is a single-use per-deal resource -- if a prior
-    /// deal already `opened`/`funded`/`disputed` it(or left residual deposit/prepaid/frozen/finalized), the
+    /// deal already `opened`/`funded`/`disputed` it(or left residual deposit/probe/finalized accounting), the
     /// seller's pre-stream steps(`fundSellerBond`/`open`) revert with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN`
     /// 321 and kin). Default `Ok(())`(mock/buyer/deal backends are not gated); the real seller backend overrides
     /// with the on-chain `getState` check, failing closed with an actionable "use a fresh nonce / recover+destroy".
@@ -171,12 +170,19 @@ pub trait ChainBackend: Send + Sync {
     /// `max_price_per_tick`, funded by `escrow`. `placeInferenceBuy` is model-book-wide, so the buyer
     /// does not name a target -- it learns the matched TC afterwards from its OWN note's fill event
     /// ([`Self::wait_matched_token_contract`]). Default: unsupported; the real shellnet buyer backend overrides it.
+    /// `deadline` is MANDATORY on-chain(absolute unix seconds): an order with no deadline is rejected, and
+    /// once past it anyone may expire the order permissionlessly, returning the escrow.
+    /// A subscription is selected by `flags` alone(`flags::AON | flags::SUBSCRIPTION`) -- the term is not a
+    /// parameter, since every subscription is one month protocol-wide. The book then also requires a volume
+    /// that divides evenly by [`SUBSCRIPTION_WEEKS`] and does not exceed [`SUBSCRIPTION_MAX_TICKS`].
     async fn place_buy_by_model(
         &self,
         _note: &dyn Note,
         _ticks: u128,
         _max_price_per_tick: u128,
         _escrow: u128,
+        _flags: u8,
+        _deadline: u64,
     ) -> Result<(), ChainError> {
         Err(ChainError::Chain(
             "place_buy_by_model: model-only buy is only supported on the real shellnet buyer backend".into(),
@@ -225,6 +231,8 @@ pub trait ChainBackend: Send + Sync {
         ))
     }
     /// Accepted subscription placements at or above a pre-POST order-id floor.
+    /// Reconciled from the ordinary `InferenceOrderPlaced` fact -- a subscription is a flagged BUY order,
+    /// not a separate book primitive -- so the match criteria are the order's own terms plus its term length.
     #[allow(clippy::too_many_arguments)]
     async fn subscription_placements_since(
         &self,
@@ -233,8 +241,6 @@ pub trait ChainBackend: Send + Sync {
         _order_id_floor: u128,
         _max_price_per_tick: u128,
         _ticks: u128,
-        _cycle_budget: u128,
-        _auto_renew: bool,
     ) -> Result<Vec<InferenceSubscriptionPlacement>, ChainError> {
         Err(ChainError::Chain(
             "subscription placement reconciliation is not supported by this backend".to_string(),
@@ -349,8 +355,9 @@ pub trait ChainBackend: Send + Sync {
     }
     /// The seller waits for/reads the match on its own `token_contract`.
     async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError>;
-    /// The seller opens a stream: freezes the probe tick, holds the exact `2P`
-    /// seller bond, and writes `encrypt_to(buyer_pubkey, endpoint)` to the endpoints file.
+    /// The seller opens a stream: holds the exact `2P` seller bond and writes
+    /// `encrypt_to(buyer_pubkey, endpoint)` to the endpoints file. Moves no money -- the escrow stays whole
+    /// and is earned only through promoted claims.
     async fn open_stream(
         &self,
         token_contract: &TokenContract,
@@ -362,20 +369,79 @@ pub trait ChainBackend: Send + Sync {
         &self,
         token_contract: &TokenContract,
     ) -> Result<Option<Vec<u8>>, ChainError>;
-    /// The seller advances a tick on cadence.
-    async fn advance_tick(
+    /// Seller-only: accept the probe tick after `PROBE_WINDOW` of buyer silence.
+    /// This is the gate on the whole deal: before it the trial tick is owed to nobody and `claim_tokens` is
+    /// rejected outright, so a deal whose probe is never accepted can never pay the seller anything. Silence
+    /// on a live endpoint is consent; a buyer who finds nothing there stops instead, and the trial tick burns
+    /// on both sides. Default: unsupported.
+    async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
+        Err(ChainError::Chain(format!(
+            "accept_probe not supported for {token_contract}"
+        )))
+    }
+    /// The seller claims CUMULATIVE consumption in tokens.
+    /// `cumulative_tokens` is an absolute running total, never a delta: the contract rejects any value
+    /// below the previous claim. It must also respect two bounds the caller is responsible for honouring,
+    /// because the contract REJECTS rather than trims an out-of-bounds claim:
+    /// - the claim ceiling([`DealSubscription::claim_cap`]) -- the whole funded volume for an ordinary
+    /// deal, one weekly quota per started week for a subscription;
+    /// - the combined bound([`ProtocolConsts::max_claim_delta`]) -- no more output than the elapsed time
+    /// could physically have produced and never more than hard per-call `MAX_CLAIM_DELTA`, plus
+    /// `MIN_CLAIM_INTERVAL` spacing between claims.
+    /// Landing a claim advances the contract's three-stage final/superseded/pending pipeline, so the two
+    /// newest cumulative claims retain their independent contest windows.
+    async fn claim_tokens(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
+        cumulative_tokens: u128,
     ) -> Result<(), ChainError>;
-    /// Acceptance of the probe tick: `Probe` -> `Streaming`.
-    async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError>;
-    /// Buyer STOP; on the probe -> `BurnBoth`.
+    /// Permissionless promotion of the pending claims after `CLAIM_PROMOTE_WINDOW` of buyer silence.
+    /// This is what makes the LAST claim of a deal payable at all: nothing supersedes it, so without this
+    /// call it would stay contestable forever. For an ordinary deal it also settles and closes once the
+    /// funded volume is exhausted. Default: unsupported.
+    async fn finalize(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
+        Err(ChainError::Chain(format!(
+            "finalize not supported for {token_contract}"
+        )))
+    }
+    /// Permissionless take-or-pay settlement of one crossed subscription week.
+    /// The seller is credited the WHOLE weekly quota regardless of consumption -- a subscription buys
+    /// reserved availability, not delivered volume. Idempotent per boundary; settling the final week closes
+    /// the deal. Default: unsupported.
+    async fn settle_week(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
+        Err(ChainError::Chain(format!(
+            "settle_week not supported for {token_contract}"
+        )))
+    }
+    /// Buyer ends the deal.
+    /// This is also the buyer's remedy for an unresponsive seller: there is no inactivity gate, so a buyer
+    /// facing silence stops immediately and keeps everything except the trusted consumption -- strictly
+    /// better than waiting out any timeout. An ordinary deal settles by fact; a subscription pays the week
+    /// already in progress in full and refunds only whole unstarted weeks. The contested tail is never
+    /// paid on this path -- walking away IS the statement that it is disputed.
     async fn stop(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<Settlement, ChainError>;
+    /// Observe an exact buyer-owned `StreamStopped` settlement, when the backend can read immutable
+    /// contract events. Seller recovery uses this only as read-only attribution; it never submits STOP.
+    async fn buyer_stop_settlement(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        Ok(None)
+    }
+    /// The seller abandons the deal(hardware died, model pulled). Pays by FACT on every deal shape --
+    /// a seller who walks out mid-week stopped reserving capacity, so take-or-pay does not apply to him.
+    /// He forfeits the pending tail exactly as the buyer would, so quitting never pays better than
+    /// delivering. Default: unsupported.
+    async fn seller_stop(&self, token_contract: &TokenContract) -> Result<Settlement, ChainError> {
+        Err(ChainError::Chain(format!(
+            "seller_stop not supported for {token_contract}"
+        )))
+    }
     /// The buyer opens a dispute on the stream: this TC freezes
     /// the contested buyer amount and seller bond until resolution; other deals and both whole notes
     /// remain independent. Default implementation: STOP(lower bound -- scam revenue=0); backends with
@@ -398,23 +464,33 @@ pub trait ChainBackend: Send + Sync {
             "release_dispute not supported for {token_contract}"
         )))
     }
-    /// The seller is gone: no-show/inactivity timeout -> refund to the buyer, without burn.
-    async fn seller_timeout(
+    /// Permissionless terminal resolution after the persisted dispute window. Nobody conceded,
+    /// so the same bounded dispute stake is burned on both sides and only the surviving balances
+    /// are returned. Default: unsupported; the mock overrides this for offline lifecycle parity.
+    async fn resolve_dispute_timeout(
         &self,
         token_contract: &TokenContract,
-    ) -> Result<Settlement, ChainError>;
-    /// Submit inactivity reclaim only if accepted output has not advanced since the caller planned it.
-    /// Real backends override this to place the comparison after transaction preflight and immediately
-    /// before the reclaim send.
-    async fn seller_timeout_if_heartbeat(
+    ) -> Result<Settlement, ChainError> {
+        Err(ChainError::Chain(format!(
+            "resolve_dispute_timeout not supported for {token_contract}"
+        )))
+    }
+    /// Submit an automatic/inactivity-policy buyer exit only if accepted output has not advanced since the
+    /// policy planned it.
+    /// This guard is deliberately NOT used for an explicit operator/user STOP: a fresh output chunk must not
+    /// silently veto a direct request to close the deal. It only keeps an automatic failure-policy decision
+    /// honest when output resumes between that decision and the money POST. Real backends override this to
+    /// place the comparison after transaction preflight and immediately before the send.
+    async fn stop_if_heartbeat(
         &self,
         token_contract: &TokenContract,
+        note: &dyn Note,
         heartbeat: &HeartbeatGuard,
     ) -> Result<Option<Settlement>, ChainError> {
         if !heartbeat.unchanged() {
             return Ok(None);
         }
-        self.seller_timeout(token_contract).await.map(Some)
+        self.stop(token_contract, note).await.map(Some)
     }
     /// The seller never opened a funded match: after MATCH_OPEN_TIMEOUT the buyer can clean up the unopened
     /// deal(`streamCleanup` -> `TC.cleanupUnopened`) and recover escrow. Default unsupported; real buyer
@@ -427,28 +503,33 @@ pub trait ChainBackend: Send + Sync {
             "cleanup_unopened not supported for {token_contract}"
         )))
     }
-    /// Exact buyer-owned STOP receipt. Generic closed/stopped state is not enough to
-    /// distinguish STOP from reclaim, dispute resolution, or another terminal path.
-    async fn buyer_stop_settlement(
+    /// Read one coherent strict lifecycle/accounting view. Real backends read
+    /// one complete getter set bracketed by the exact account BOC revision per
+    /// bounded attempt; mock/unsupported backends have no such live view.
+    async fn deal_snapshot(
         &self,
         _token_contract: &TokenContract,
-    ) -> Result<Option<(u128, u128)>, ChainError> {
+    ) -> Result<Option<DealChainSnapshot>, ChainError> {
         Ok(None)
     }
     /// Read by-fact per-deal lifecycle flags and timeout anchors from the chain. Default `None` keeps mock and
     /// unsupported backends on their local/session fallback; real shellnet buyer/deal backends override this so
-    /// the long-running buyer monitor can derive cleanup/reclaim decisions from `TokenContract.getState`.
+    /// the long-running buyer monitor can derive cleanup and buyer-exit decisions from
+    /// `TokenContract.getState`.
     async fn deal_state(
         &self,
         _token_contract: &TokenContract,
     ) -> Result<Option<DealChainState>, ChainError> {
         Ok(None)
     }
-    /// Authoritative per-deal `getConfig().streamTimeout`. Unsupported/unreadable backends fail closed.
-    async fn deal_stream_timeout(&self, token_contract: &TokenContract) -> Result<u64, ChainError> {
-        Err(ChainError::Chain(format!(
-            "getConfig().streamTimeout unavailable for {token_contract}"
-        )))
+    /// Read the deal SHAPE(`getSubscription`): subscription term, weekly quota, weeks already settled.
+    /// Required to claim correctly -- the claim ceiling of a subscription is a per-week allowance, not the
+    /// whole funded volume. Default `None` keeps mock/unsupported backends on their local model.
+    async fn deal_subscription(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Option<DealSubscription>, ChainError> {
+        Ok(None)
     }
     /// Snapshot of locks and burned SHELL for the contract -- for e2e checks.
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot>;
@@ -473,14 +554,67 @@ pub trait ChainBackend: Send + Sync {
         })
     }
 
-    /// Per-deal stream-phase cadence (`getConfig().settleWindow`,, dynamic since 4.0.5) for the
-    /// seller-driven advance loop. Default zero(mock/fast paths + the buyer/deal backends); the real
-    /// **seller** backend overrides it to read the deal's on-chain `getConfig`.
-    async fn deal_settle_window(
+    /// Per-deal claim bounds read from the deal's on-chain `getConfig()`, for the seller-driven claim loop
+    /// . Default: the canonical values(mock/fast paths and the buyer/deal backends); the real
+    /// **seller** backend overrides it so a redeployed contract with different bounds cannot desync the
+    /// driver from what the chain will actually accept.
+    async fn deal_claim_bounds(
         &self,
         _token_contract: &TokenContract,
-    ) -> Result<std::time::Duration, ChainError> {
-        Ok(std::time::Duration::ZERO)
+    ) -> Result<ClaimBounds, ChainError> {
+        Ok(ClaimBounds::canonical())
+    }
+}
+
+/// Per-deal bounds on the consumption-claim loop, mirrored from `TokenContract.getConfig()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimBounds {
+    /// Minimum spacing between accepted claims(`minClaimInterval`).
+    pub min_claim_interval: std::time::Duration,
+    /// Physical generation floor per tick(`minSecondsPerTick`); bounds the claimable delta.
+    pub min_seconds_per_tick: std::time::Duration,
+    /// Window after which a pending claim is promotable by anyone(`finalize`).
+    pub promote_window: std::time::Duration,
+    /// Buyer silence after which the seller may accept the probe. A FIXED protocol constant, deliberately
+    /// absent from `getConfig()`.
+    pub probe_window: std::time::Duration,
+    /// Window after which an unresolved dispute is settleable by anyone(`disputeWindow`).
+    pub dispute_window: std::time::Duration,
+}
+
+impl ClaimBounds {
+    pub fn canonical() -> Self {
+        let c = ProtocolConsts::canonical();
+        Self {
+            min_claim_interval: c.min_claim_interval,
+            min_seconds_per_tick: c.min_seconds_per_tick,
+            promote_window: c.claim_promote_window,
+            probe_window: c.probe_window,
+            dispute_window: c.dispute_window,
+        }
+    }
+
+    /// Build from the deal's `getConfig()` result. `CLAIM_PROMOTE_WINDOW` is NOT part of that getter -- the
+    /// contract defines it as `2 * MIN_SECONDS_PER_TICK`, so it is derived here rather than guessed, and
+    /// stays correct if a deployment changes the underlying rate floor.
+    pub fn from_config(
+        min_claim_interval: u64,
+        min_seconds_per_tick: u64,
+        dispute_window: u64,
+    ) -> Self {
+        Self {
+            min_claim_interval: std::time::Duration::from_secs(min_claim_interval),
+            min_seconds_per_tick: std::time::Duration::from_secs(min_seconds_per_tick),
+            promote_window: std::time::Duration::from_secs(min_seconds_per_tick.saturating_mul(2)),
+            probe_window: crate::params::PROBE_WINDOW,
+            dispute_window: std::time::Duration::from_secs(dispute_window),
+        }
+    }
+
+    /// Largest cumulative increment claimable after `elapsed`, mirroring both the on-chain rate bound and
+    /// the independent hard per-call `MAX_CLAIM_DELTA`.
+    pub fn max_claim_delta(&self, elapsed: std::time::Duration) -> u128 {
+        crate::params::claim_delta_limit(elapsed, self.min_seconds_per_tick)
     }
 }
 
@@ -493,7 +627,7 @@ pub(crate) fn note_id_hex(pk: &NotePubkey) -> String {
 mod tests {
     use super::*;
     use crate::note::LocalNote;
-    use crate::params::{DobParams, ProtocolConsts, Shell};
+    use crate::params::{DobParams, ProtocolConsts, Shell, MATCH_OPEN_TIMEOUT_SECS};
 
     /// regression: after dropping the buyer-side shared-book scan, canonical-TC safety must remain at the
     /// order-book entry point. The buyer cannot derive per-ask `(sellerPubkey, nonce)` from `getOrder`, so the
@@ -513,14 +647,21 @@ mod tests {
     }
 
     /// regression: one active/resting sell order per TokenContract, with the reservation cleared when
-    /// the order leaves the book. In 4.0.21 the deal TokenContract posts its own offer, so this is enforced
-    /// TC-side(the IOB `_sellTcInUse` map was dropped): `placeSellOffer` refuses to re-register while an
-    /// offer is live(`_offerPosted`), and `onSellClosed` releases the reservation when the offer is off the book.
+    /// the order leaves the book. In 4.0.31 the note-driven `postFromNote` path treats an already-posted or
+    /// funded TC as a duplicate no-op, and `onSellClosed` releases the reservation when the offer is off the
+    /// book.
+    /// The guard is now an idempotent early RETURN rather than a revert: a re-post while an offer is already
+    /// live -- or after the deal is funded -- is a no-op. That still prevents a second resting ask per TC, which
+    /// is the property this test exists for, and it makes a retried post harmless instead of a hard failure.
     #[test]
-    fn orderbook_source_rejects_duplicate_active_sell_tc() {
+    fn orderbook_source_prevents_duplicate_active_sell_tc() {
         let source = include_str!("../../../../contracts/airegistry/TokenContract.sol");
-        // Reserve: cannot post a second offer while one is already live on the book.
-        assert!(source.contains("require(!_offerPosted, ERR_ALREADY_REGISTERED)"));
+        // Reserve: no second offer while one is live, and none at all once the deal is funded.
+        assert!(
+            source.contains("if (_offerPosted || _funded) { return; }"),
+            "TokenContract must refuse to post a second resting ask for the same deal"
+        );
+        assert!(source.contains("_offerPosted = true;"));
         // Release: the reservation is cleared when the offer leaves the book.
         assert!(source.contains("_offerPosted = false;"));
     }
@@ -577,6 +718,61 @@ mod tests {
         assert!(err.contains(""), "{err}");
         // The old over-funded control(110M, ticks=2, maxPrice=50M; required 102.5M) is now rejected.
         assert!(check_buy_deposit_headroom(110_000_000, 2, 50_000_000).is_err());
+    }
+
+    #[test]
+    fn subscription_reserve_is_exact_deposit_plus_separate_two_p_bond() {
+        let price = 1_000_000_000;
+        let ticks = 8;
+        let reserve = subscription_buy_reserve(ticks, price).expect("checked subscription reserve");
+
+        assert_eq!(reserve.deposit, required_escrow_for_buy(ticks, price));
+        assert_eq!(reserve.deposit, 8_200_000_000);
+        assert_eq!(reserve.buyer_bond, 2_000_000_000);
+        assert_eq!(reserve.total_escrow, 10_200_000_000);
+        assert_eq!(
+            reserve.total_escrow - required_escrow_for_buy(ticks, price),
+            reserve.buyer_bond,
+            "ordinary BUY accounting remains bond-free"
+        );
+        assert!(check_subscription_buy_reserve(reserve.total_escrow, ticks, price).is_ok());
+        assert!(check_subscription_buy_reserve(reserve.total_escrow - 1, ticks, price).is_err());
+        assert!(check_subscription_buy_reserve(reserve.total_escrow + 1, ticks, price).is_err());
+    }
+
+    #[test]
+    fn subscription_reserve_overflow_fails_closed_at_every_checked_step() {
+        let largest_step = u128::MAX - (u128::MAX % crate::PRICE_STEP);
+        assert!(subscription_buy_reserve(4, largest_step).is_err());
+        assert!(check_subscription_buy_reserve(u128::MAX, 4, largest_step).is_err());
+
+        let bond_overflow = u128::MAX / crate::SUBSCRIPTION_BUYER_BOND_TICKS + 1;
+        assert!(subscription_buy_reserve(0, bond_overflow).is_err());
+
+        let price = 10_000;
+        let unit = required_escrow_for_buy(1, price);
+        let ticks = (u128::MAX - 2 * price) / unit + 1;
+        assert!(
+            subscription_buy_reserve(ticks, price).is_err(),
+            "deposit plus bond overflow must not wrap"
+        );
+    }
+
+    #[test]
+    fn subscription_lower_clearing_forwards_clearing_money_and_refunds_limit_remainder() {
+        let ticks = 8;
+        let limit = 2_000_000_000;
+        let clearing = 1_000_000_000;
+        let reserved = subscription_buy_reserve(ticks, limit).unwrap();
+        let forwarded = subscription_buy_reserve(ticks, clearing).unwrap();
+        let refund = subscription_buy_clearing_refund(ticks, limit, clearing).unwrap();
+
+        assert_eq!(forwarded.deposit, 8_200_000_000);
+        assert_eq!(forwarded.buyer_bond, 2_000_000_000);
+        assert_eq!(refund, reserved.total_escrow - forwarded.total_escrow);
+        assert_eq!(reserved.total_escrow, forwarded.total_escrow + refund);
+        assert_eq!(subscription_buy_clearing_refund(ticks, limit, limit), Ok(0));
+        assert!(subscription_buy_clearing_refund(ticks, clearing, limit).is_err());
     }
 
     fn ask(order_id: u128, tc: &str, price: u128, ticks: u128) -> OrderBookOrder {
@@ -725,10 +921,19 @@ mod tests {
             DealChainState {
                 funded: false,
                 opened: false,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: None,
-                last_advance: 0,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
             },
             1000,
             MATCH_OPEN_TIMEOUT_SECS,
@@ -738,19 +943,32 @@ mod tests {
         assert!(err.contains("refusing to wait for handover"), "{err}");
     }
 
+    fn matched_never_opened_state() -> DealChainState {
+        DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(100),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 100,
+            last_claim_time: 100,
+            dispute_time: 0,
+        }
+    }
+
     /// funded-but-never-opened is recognized as cleanup-eligible only after MATCH_OPEN_TIMEOUT.
     #[test]
     fn funded_never_opened_cleanup_readiness_is_timeout_gated() {
         let early = check_matched_token_contract_state(
             "0:tc",
-            DealChainState {
-                funded: true,
-                opened: false,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(100),
-                last_advance: 0,
-            },
+            matched_never_opened_state(),
             699,
             MATCH_OPEN_TIMEOUT_SECS,
         )
@@ -767,14 +985,7 @@ mod tests {
 
         let ready = check_matched_token_contract_state(
             "0:tc",
-            DealChainState {
-                funded: true,
-                opened: false,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(100),
-                last_advance: 0,
-            },
+            matched_never_opened_state(),
             700,
             MATCH_OPEN_TIMEOUT_SECS,
         )
@@ -788,6 +999,52 @@ mod tests {
                 remaining_secs: Some(0),
             }
         );
+    }
+
+    #[test]
+    fn matched_classifier_rejects_every_mutated_never_opened_shape() {
+        type StateMutation = (&'static str, fn(&mut DealChainState));
+
+        let valid = matched_never_opened_state();
+        let malformed = "not the authoritative funded-never-opened shape";
+
+        let mut disputed = valid;
+        disputed.disputed = true;
+        let error =
+            check_matched_token_contract_state("0:tc", disputed, 700, MATCH_OPEN_TIMEOUT_SECS)
+                .unwrap_err();
+        assert!(error.contains("disputed immediately"), "{error}");
+
+        let mutations: &[StateMutation] = &[
+            ("accepted probe", |state| state.probe_accepted = true),
+            ("drained deposit", |state| state.deposit = 0),
+            ("probe money", |state| state.probe_tick = 1),
+            ("seller money", |state| state.finalized_owed = 1),
+            ("final tokens", |state| state.tokens_final = 1),
+            ("superseded tokens", |state| state.tokens_superseded = 1),
+            ("pending tokens", |state| state.tokens_pending = 1),
+            ("probe time", |state| state.probe_time = 1),
+            ("previous claim time", |state| state.prev_claim_time = 101),
+            ("last claim time", |state| state.last_claim_time = 101),
+            ("missing funded time", |state| state.funded_time = None),
+            ("zero funded time", |state| {
+                state.funded_time = Some(0);
+                state.prev_claim_time = 0;
+                state.last_claim_time = 0;
+            }),
+            ("mismatched funded time", |state| {
+                state.funded_time = Some(101)
+            }),
+            ("stale dispute time", |state| state.dispute_time = 1),
+        ];
+        for (name, mutate) in mutations {
+            let mut state = valid;
+            mutate(&mut state);
+            let error =
+                check_matched_token_contract_state("0:tc", state, 700, MATCH_OPEN_TIMEOUT_SECS)
+                    .unwrap_err();
+            assert!(error.contains(malformed), "{name}: {error}");
+        }
     }
 
     /// negative: insufficient depth returns an incomplete quote instead of inventing liquidity.
@@ -934,9 +1191,10 @@ mod tests {
         chain
             .post_offer(
                 SellOffer {
-                    price_per_tick: 1200,
+                    price_per_tick: 2 * u64::try_from(crate::PRICE_STEP).unwrap(),
                     max_ticks: 8,
                     token_contract: foreign_tc,
+                    flags: 0,
                 },
                 &foreign_seller,
             )
@@ -945,9 +1203,10 @@ mod tests {
         chain
             .post_offer(
                 SellOffer {
-                    price_per_tick: 1000,
+                    price_per_tick: u64::try_from(crate::PRICE_STEP).unwrap(),
                     max_ticks: 8,
                     token_contract: intended_tc.clone(),
+                    flags: 0,
                 },
                 &intended_seller,
             )
@@ -957,16 +1216,16 @@ mod tests {
         chain.place_buy(&intended_tc, &buyer).await.unwrap();
         let m = chain.read_match(&intended_tc).await.unwrap();
         assert_eq!(m.token_contract, intended_tc);
-        assert_eq!(m.price_per_tick, 1000);
+        assert_eq!(m.price_per_tick, u64::try_from(crate::PRICE_STEP).unwrap());
         assert_eq!(m.buyer_pubkey, buyer.pubkey());
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// duplicate active sell posts for the same TC fail, but once a fill consumes the old active ask,
-    /// a fresh post is allowed by the book-level guard.
+    /// duplicate active sell posts for the same TC fail. A fill consumes the active ask but also
+    /// permanently binds that TC to its first seller/buyer pair, so it cannot be posted again.
     #[tokio::test]
-    async fn mock_duplicate_sell_post_fails_until_fill_removes_old_order() {
+    async fn mock_duplicate_sell_post_and_filled_tc_repost_both_fail() {
         let base = std::env::temp_dir().join(format!(
             "dexdo-dup-post-{}-{}",
             std::process::id(),
@@ -983,9 +1242,10 @@ mod tests {
         let buyer = LocalNote::from_seed(&[12u8; 32]);
         let tc = "tc-dup".to_string();
         let offer = SellOffer {
-            price_per_tick: 1000,
+            price_per_tick: u64::try_from(crate::PRICE_STEP).unwrap(),
             max_ticks: 8,
             token_contract: tc.clone(),
+            flags: 0,
         };
 
         chain.post_offer(offer.clone(), &seller).await.unwrap();
@@ -998,8 +1258,58 @@ mod tests {
             chain.discover_offers().await.unwrap().is_empty(),
             "fill removes the active ask from the book"
         );
-        chain.post_offer(offer, &seller).await.unwrap();
-        assert_eq!(chain.discover_offers().await.unwrap().len(), 1);
+        let err = chain.post_offer(offer, &seller).await.unwrap_err();
+        assert!(err.to_string().contains("was already filled/matched"));
+        assert!(chain.discover_offers().await.unwrap().is_empty());
+        assert_eq!(
+            chain.read_match(&tc).await.unwrap().buyer_pubkey,
+            buyer.pubkey()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn mock_sell_post_preserves_subscription_flag() {
+        let base = std::env::temp_dir().join(format!(
+            "dexdo-seller-subscription-flag-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let chain = MockChainBackend::new(
+            base.join("eps.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let seller = LocalNote::from_seed(&[21u8; 32]);
+
+        for (token_contract, flags) in [
+            ("tc-ordinary", 0),
+            ("tc-subscription", flags::AON | flags::SUBSCRIPTION),
+        ] {
+            chain
+                .post_offer(
+                    SellOffer {
+                        price_per_tick: u64::try_from(crate::PRICE_STEP).unwrap(),
+                        max_ticks: 8,
+                        token_contract: token_contract.to_string(),
+                        flags,
+                    },
+                    &seller,
+                )
+                .await
+                .unwrap();
+            let raw = chain
+                .raw_resting_sell_orders_for_tc(&token_contract.to_string())
+                .await
+                .unwrap();
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].flags, flags);
+            if token_contract == "tc-subscription" {
+                assert_eq!(raw[0].flags, 0x60);
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1010,7 +1320,14 @@ mod tests {
             std::env::temp_dir().join(format!("dexdo-high-price-stop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let consts = ProtocolConsts::canonical();
+        // This regression isolates u128 money accounting; claim-clock parity is covered by the
+        // dedicated mock tests, so this fixture explicitly removes both timing bounds.
+        let consts = ProtocolConsts {
+            min_claim_interval: std::time::Duration::ZERO,
+            min_seconds_per_tick: std::time::Duration::ZERO,
+            probe_window: std::time::Duration::ZERO,
+            ..ProtocolConsts::canonical()
+        };
         let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
         let seller = LocalNote::from_seed(&[13u8; 32]);
         let buyer = LocalNote::from_seed(&[14u8; 32]);
@@ -1019,6 +1336,12 @@ mod tests {
         let price = u64::MAX - (u64::MAX % step);
         let p = u128::from(price);
         let two_p = 2 * p;
+        let notional = 3 * p;
+        let full_fee = u128::from(crate::settle::fee(3, price, &consts));
+        let probe_fee = u128::from(crate::settle::fee(1, price, &consts));
+        let rebate = u128::from(crate::settle::rebate(1, price, &consts));
+        // The funded buyer lock carries the full by-fact fee budget in addition to deal notional.
+        let escrow = notional + full_fee;
 
         chain
             .post_offer(
@@ -1026,6 +1349,7 @@ mod tests {
                     price_per_tick: price,
                     max_ticks: 3,
                     token_contract: tc.clone(),
+                    flags: 0,
                 },
                 &seller,
             )
@@ -1037,38 +1361,84 @@ mod tests {
             .await
             .unwrap();
 
+        // Opening pays nobody: it marks one probe tick while the buyer's whole escrow remains locked.
         let opened = chain.snapshot(&tc).await.unwrap();
-        assert_eq!(opened.seller_locked, two_p);
-        assert_eq!(opened.buyer_locked, p);
+        assert_eq!(opened.seller_locked, two_p, "the seller's 2P bond is held");
+        assert_eq!(
+            opened.buyer_locked, escrow,
+            "the whole escrow is still the buyer's"
+        );
+        assert_eq!(
+            opened.seller_received, 0,
+            "opening earns the seller nothing"
+        );
 
+        // The trial tick is accepted first -- nothing is claimable before that. It is credited to the seller
+        // out of the buyer's escrow and seeds the cumulative claim pipeline as its first trusted tick.
         chain.accept_probe(&tc).await.unwrap();
+        let after_probe = chain.snapshot(&tc).await.unwrap();
+        assert_eq!(
+            after_probe.seller_received, p,
+            "the accepted probe is one delivered tick"
+        );
+
+        // Re-stating the probe is idempotent; the next cumulative claim is still contestable.
+        chain
+            .claim_tokens(&tc, &seller, crate::params::TICK_SIZE)
+            .await
+            .unwrap();
+        let after_first = chain.snapshot(&tc).await.unwrap();
+        assert_eq!(
+            after_first.seller_received, p,
+            "only the probe is earned; the newest claim is still contestable"
+        );
+
+        chain
+            .claim_tokens(&tc, &seller, 2 * crate::params::TICK_SIZE)
+            .await
+            .unwrap();
         let streaming = chain.snapshot(&tc).await.unwrap();
         assert_eq!(streaming.seller_locked, two_p);
-        assert_eq!(streaming.buyer_locked, two_p);
-        assert_eq!(streaming.seller_received, p);
-        assert_eq!(streaming.buyer_locked + streaming.seller_received, 3 * p);
+        assert_eq!(
+            streaming.seller_received, p,
+            "only the accepted probe is trusted; the next cumulative tick is still contestable"
+        );
+        assert_eq!(
+            streaming.buyer_locked + streaming.seller_received + probe_fee,
+            escrow,
+            "escrow is conserved across buyer lock, seller proceeds and accrued fee"
+        );
 
+        // The buyer stops: the trusted probe stays paid and the contested next tick is dropped.
         assert_eq!(
             chain.stop(&tc, &buyer).await.unwrap(),
             Settlement::AmicableSplit {
                 to_seller_ticks: 1,
-                to_buyer_refund: p,
+                to_buyer_refund: escrow - p - probe_fee,
             }
         );
         let stopped = chain.snapshot(&tc).await.unwrap();
         assert!(stopped.closed);
-        assert_eq!(stopped.seller_locked, 0);
+        assert_eq!(
+            stopped.seller_locked, 0,
+            "the bond returns on a clean close"
+        );
         assert_eq!(stopped.buyer_locked, 0);
-        assert_eq!(stopped.seller_received, two_p);
-        assert_eq!(stopped.buyer_refunded, p);
+        assert_eq!(
+            stopped.seller_received,
+            p + rebate + two_p,
+            "finalizedOwed includes probe proceeds, clean rebate and returned seller bond"
+        );
+        assert_eq!(stopped.buyer_refunded, escrow - p - probe_fee);
         assert_eq!(
             stopped.burned,
-            u128::from(crate::settle::net_burn(2, price, &consts))
+            u128::from(crate::settle::net_burn(1, price, &consts)),
+            "the net fee is burned over the one trusted probe tick"
         );
         assert_eq!(
-            stopped.seller_received + stopped.buyer_refunded,
-            3 * p,
-            "the buyer's probe plus two-tick window must be conserved"
+            stopped.seller_received + stopped.buyer_refunded + stopped.burned,
+            escrow + two_p,
+            "buyer escrow plus seller bond must be conserved across the settlement"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -1092,9 +1462,10 @@ mod tests {
         chain
             .post_offer(
                 SellOffer {
-                    price_per_tick: 1000,
+                    price_per_tick: u64::try_from(crate::PRICE_STEP).unwrap(),
                     max_ticks: 8,
                     token_contract: tc.clone(),
+                    flags: 0,
                 },
                 &seller,
             )
@@ -1147,11 +1518,24 @@ mod tests {
             seller_locked: u128::from(seller_locked),
             buyer_locked: u128::from(buyer_locked),
             buyer_lead: u128::from(buyer_locked), // test helper: treat the lock as the at-risk lead(the two-tick tests)
+            tokens_final: 0,
             seller_received: u128::from(received),
             buyer_refunded: 0,
             burned: u128::from(burned),
             closed: false,
         }
+    }
+
+    fn snap_with_ticks(
+        received: Shell,
+        finalized_ticks: u128,
+        seller_locked: Shell,
+        buyer_locked: Shell,
+        burned: Shell,
+    ) -> StreamSnapshot {
+        let mut snapshot = snap(received, seller_locked, buyer_locked, burned);
+        snapshot.tokens_final = finalized_ticks * crate::params::TICK_SIZE;
+        snapshot
     }
 
     fn deal(
@@ -1172,7 +1556,7 @@ mod tests {
     }
 
     /// The seller view groups deals by served model, then by anonymous counterparty, summing the by-fact
-    /// figures; the per-model roll-up is the sum across its counterparties(tokens = `received / price`).
+    /// figures; the per-model roll-up is the sum across its counterparties.
     #[test]
     fn breakdown_groups_by_model_then_counterparty_with_rollup() {
         let deals = vec![
@@ -1181,21 +1565,21 @@ mod tests {
                 Some("qwen"),
                 Some("aa"),
                 100,
-                Some(snap(500, 200, 0, 50)),
+                Some(snap_with_ticks(500, 5, 200, 0, 50)),
             ),
             deal(
                 DealRole::Seller,
                 Some("qwen"),
                 Some("bb"),
                 100,
-                Some(snap(300, 100, 0, 30)),
+                Some(snap_with_ticks(300, 3, 100, 0, 30)),
             ),
             deal(
                 DealRole::Seller,
                 Some("llama"),
                 Some("cc"),
                 100,
-                Some(snap(200, 0, 0, 20)),
+                Some(snap_with_ticks(200, 2, 0, 0, 20)),
             ),
         ];
         let b = per_model_breakdown(&deals, DealRole::Seller);
@@ -1219,10 +1603,10 @@ mod tests {
     }
 
     /// `locked` is role-specific: the seller view shows `seller_locked`, the buyer view shows `buyer_locked`,
-    /// from the SAME deal snapshot. `money`/`tokens` are the settled `seller_received` for both roles.
+    /// from the SAME deal snapshot. Money comes from `seller_received`; volume comes from `tokens_final`.
     #[test]
     fn breakdown_locked_is_role_specific() {
-        let s = snap(400, 200, 700, 10);
+        let s = snap_with_ticks(400, 4, 200, 700, 10);
         let deals = vec![
             deal(DealRole::Seller, Some("m"), Some("x"), 100, Some(s.clone())),
             deal(DealRole::Buyer, Some("m"), Some("y"), 100, Some(s)),
@@ -1237,30 +1621,47 @@ mod tests {
         assert_eq!(buyer[0].tokens, 4, "buyer's spent ticks = settled ticks");
     }
 
-    /// Finalized ticks = `received / price`. A zero price(a malformed/uninitialised deal) yields zero ticks
-    /// rather than dividing by zero.
+    /// A returned seller bond changes money but cannot invent delivered volume when `tokens_final` is zero.
     #[test]
-    fn breakdown_ticks_from_price_and_zero_price_guard() {
-        let ok = vec![deal(
+    fn breakdown_returned_two_p_bond_with_zero_tokens_reports_zero_volume() {
+        let deals = vec![deal(
             DealRole::Seller,
             Some("m"),
             Some("x"),
             100,
-            Some(snap(1000, 0, 0, 0)),
+            Some(snap(200, 0, 0, 0)),
         )];
-        assert_eq!(per_model_breakdown(&ok, DealRole::Seller)[0].tokens, 10);
-        let zero = vec![deal(
+        let breakdown = per_model_breakdown(&deals, DealRole::Seller);
+        assert_eq!(breakdown[0].money, 200, "the returned 2P remains money");
+        assert_eq!(
+            breakdown[0].tokens, 0,
+            "zero authoritative tokens cannot become ticks"
+        );
+    }
+
+    /// Withdrawing accrued money may reduce `finalized_owed`, but the immutable token counter preserves volume.
+    #[test]
+    fn breakdown_withdrawal_cannot_reduce_authoritative_token_volume() {
+        let before = vec![deal(
             DealRole::Seller,
             Some("m"),
             Some("x"),
-            0,
-            Some(snap(1000, 0, 0, 0)),
+            100,
+            Some(snap_with_ticks(200, 2, 0, 0, 0)),
         )];
-        assert_eq!(
-            per_model_breakdown(&zero, DealRole::Seller)[0].tokens,
-            0,
-            "no div-by-zero"
-        );
+        let after = vec![deal(
+            DealRole::Seller,
+            Some("m"),
+            Some("x"),
+            100,
+            Some(snap_with_ticks(0, 2, 0, 0, 0)),
+        )];
+        let before = per_model_breakdown(&before, DealRole::Seller);
+        let after = per_model_breakdown(&after, DealRole::Seller);
+        assert_eq!(before[0].tokens, 2);
+        assert_eq!(after[0].tokens, 2);
+        assert_eq!(before[0].money, 200);
+        assert_eq!(after[0].money, 0);
     }
 
     /// A deal whose model the source cannot name buckets under `(unknown)` (the mock book has no per-deal
@@ -1272,7 +1673,7 @@ mod tests {
             None,
             Some("x"),
             100,
-            Some(snap(200, 0, 0, 0)),
+            Some(snap_with_ticks(200, 2, 0, 0, 0)),
         )];
         let b = per_model_breakdown(&deals, DealRole::Seller);
         assert_eq!(b[0].model, UNKNOWN_MODEL);
@@ -1336,14 +1737,14 @@ mod tests {
                 Some("m"),
                 Some("x"),
                 100,
-                Some(snap(200, 50, 0, 10)),
+                Some(snap_with_ticks(200, 2, 50, 0, 10)),
             ),
             deal(
                 DealRole::Seller,
                 Some("m"),
                 Some("x"),
                 100,
-                Some(snap(300, 70, 0, 20)),
+                Some(snap_with_ticks(300, 3, 70, 0, 20)),
             ),
         ];
         let b = per_model_breakdown(&deals, DealRole::Seller);
@@ -1432,6 +1833,7 @@ mod tests {
             seller_locked: 0,
             buyer_locked: u128::from(buyer_locked),
             buyer_lead: u128::from(buyer_lead),
+            tokens_final: 0,
             seller_received: 0,
             buyer_refunded: 0,
             burned: 0,
@@ -1552,8 +1954,9 @@ mod recover_tests {
 mod dispute_reclaim_tests {
     use super::{
         check_disputable, check_reclaimable, check_release_disputable, check_seller_pubkey,
-        check_withdrawable_shell, ReclaimAction, MATCH_OPEN_TIMEOUT_SECS,
+        check_withdrawable_shell, DealChainState, ReclaimAction,
     };
+    use crate::params::MATCH_OPEN_TIMEOUT_SECS;
 
     /// -- `check_disputable`: an OPEN, undisputed deal owned by THIS buyer is disputable; each
     /// precondition fails closed BEFORE any on-chain `streamDispute`.
@@ -1584,242 +1987,185 @@ mod dispute_reclaim_tests {
         );
     }
 
-    /// -- `check_reclaimable` is a fail-loud timer gate:
-    /// opened+past-timeout -> ok; opened+too-early -> reject; funded-never-opened before
-    /// MATCH_OPEN_TIMEOUT -> reject; funded-never-opened after MATCH_OPEN_TIMEOUT -> ok; not-funded /
-    /// disputed / foreign-note / wrong-key / unmatched -> reject.
-    #[test]
-    fn reclaimable_gates() {
-        let me = [7u8; 32];
-        let other = [9u8; 32];
-        // opened + past STREAM_TIMEOUT(now 1000 >= lastAdvance 100 + streamTimeout 600), owned -> ok
-        assert_eq!(
-            check_reclaimable(
-                true,
-                true,
-                false,
-                Some("0:buyer"),
-                "0:buyer",
-                Some(&me),
-                &me,
-                1000,
-                100,
-                Some(600),
-                Some(50),
-                MATCH_OPEN_TIMEOUT_SECS
-            )
-            .unwrap(),
-            ReclaimAction::StreamReclaim
-        );
-        // opened, before STREAM_TIMEOUT(now 500 < 700) -> reject
-        assert!(check_reclaimable(
-            true,
-            true,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            500,
-            100,
-            Some(600),
-            Some(50),
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("too early"));
-        // funded but never opened before MATCH_OPEN_TIMEOUT -> reject.
-        assert!(check_reclaimable(
-            true,
-            false,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            1099,
-            0,
-            None,
-            Some(500),
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("MATCH_OPEN_TIMEOUT"));
-        // funded but never opened after MATCH_OPEN_TIMEOUT -> ok(streamCleanup path).
-        assert_eq!(
-            check_reclaimable(
-                true,
-                false,
-                false,
-                Some("0:buyer"),
-                "0:buyer",
-                Some(&me),
-                &me,
-                1100,
-                0,
-                None,
-                Some(500),
-                MATCH_OPEN_TIMEOUT_SECS
-            )
-            .unwrap(),
-            ReclaimAction::StreamCleanup
-        );
-        // not funded -> reject
-        assert!(check_reclaimable(
-            false,
-            true,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            9999,
-            0,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("not funded"));
-        // disputed -> reject
-        assert!(check_reclaimable(
-            true,
-            true,
-            true,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            9999,
-            0,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("DISPUTED"));
-        // foreign note -> reject
-        assert!(check_reclaimable(
-            true,
-            true,
-            false,
-            Some("0:other"),
-            "0:buyer",
-            Some(&me),
-            &me,
-            9999,
-            0,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("not the deal's buyer note"));
-        // wrong key -> reject
-        assert!(check_reclaimable(
-            true,
-            true,
-            false,
-            Some("0:buyer"),
-            "0:buyer",
-            Some(&other),
-            &me,
-            9999,
-            0,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("not the deal's buyer key"));
-        // unmatched -> reject
-        assert!(check_reclaimable(
-            true,
-            true,
-            false,
-            None,
-            "0:buyer",
-            Some(&me),
-            &me,
-            9999,
-            0,
-            Some(600),
-            None,
-            MATCH_OPEN_TIMEOUT_SECS
-        )
-        .unwrap_err()
-        .contains("no recorded buyer note"));
+    fn never_opened_state() -> DealChainState {
+        DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit: 2_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            probe_tick: 0,
+            funded_time: Some(500),
+            probe_time: 0,
+            prev_claim_time: 500,
+            last_claim_time: 500,
+            dispute_time: 0,
+        }
     }
 
-    fn owned_reclaim(
-        opened: bool,
-        now: u64,
-        last_advance: u64,
-        stream_timeout: Option<u64>,
-        funded_time: Option<u64>,
-    ) -> Result<ReclaimAction, String> {
+    fn owned_reclaim(state: DealChainState, now: u64) -> Result<ReclaimAction, String> {
         let me = [7u8; 32];
         check_reclaimable(
-            true,
-            opened,
-            false,
+            state,
             Some("0:buyer"),
             "0:buyer",
             Some(&me),
             &me,
             now,
-            last_advance,
-            stream_timeout,
-            funded_time,
             MATCH_OPEN_TIMEOUT_SECS,
         )
     }
 
-    /// each valid branch permits one write, while a retained non-zero `lastAdvance`
-    /// after opened reclaim permits no repeat POST.
+    /// Reclaim is only the exact never-opened cleanup. Explicit buyer STOP is tested separately through
+    /// `check_recoverable` and is never rewritten from this legacy command name.
     #[test]
-    fn reclaim_selection_rejects_repeat_after_opened_timeout() {
-        let first = owned_reclaim(true, 1000, 100, Some(600), Some(50));
-        assert_eq!(usize::from(first.is_ok()), 1, "opened POST count");
-        assert_eq!(first.unwrap(), ReclaimAction::StreamReclaim);
+    fn reclaimable_gates() {
+        let me = [7u8; 32];
+        let other = [9u8; 32];
+        let mut opened = never_opened_state();
+        opened.opened = true;
+        opened.probe_time = 501;
+        opened.last_claim_time = 501;
+        let opened_reclaim = owned_reclaim(opened, 500);
+        assert_eq!(
+            usize::from(opened_reclaim.is_ok()),
+            0,
+            "OPEN reclaim POST count"
+        );
+        assert!(opened_reclaim
+            .unwrap_err()
+            .contains("explicit `dexdo close`"));
 
-        let repeat = owned_reclaim(false, 1001, 100, None, Some(50));
-        assert_eq!(usize::from(repeat.is_ok()), 0, "repeat POST count");
-        assert!(repeat.unwrap_err().contains("previously OPENED"));
+        let never_opened = never_opened_state();
+        assert!(owned_reclaim(never_opened, 1_099)
+            .unwrap_err()
+            .contains("MATCH_OPEN_TIMEOUT"));
+        assert_eq!(
+            owned_reclaim(never_opened, 1_100).unwrap(),
+            ReclaimAction::StreamCleanup
+        );
 
-        let cleanup = owned_reclaim(false, 650, 0, None, Some(50));
-        assert_eq!(usize::from(cleanup.is_ok()), 1, "cleanup POST count");
-        assert_eq!(cleanup.unwrap(), ReclaimAction::StreamCleanup);
+        let mut not_funded = never_opened;
+        not_funded.funded = false;
+        assert!(owned_reclaim(not_funded, 9_999)
+            .unwrap_err()
+            .contains("not funded"));
+
+        let mut disputed = opened;
+        disputed.disputed = true;
+        assert!(owned_reclaim(disputed, 9_999)
+            .unwrap_err()
+            .contains("DISPUTED"));
+
+        assert!(check_reclaimable(
+            opened,
+            Some("0:other"),
+            "0:buyer",
+            Some(&me),
+            &me,
+            9_999,
+            MATCH_OPEN_TIMEOUT_SECS,
+        )
+        .unwrap_err()
+        .contains("not the deal's buyer note"));
+        assert!(check_reclaimable(
+            opened,
+            Some("0:buyer"),
+            "0:buyer",
+            Some(&other),
+            &me,
+            9_999,
+            MATCH_OPEN_TIMEOUT_SECS,
+        )
+        .unwrap_err()
+        .contains("not the deal's buyer key"));
+        assert!(check_reclaimable(
+            opened,
+            None,
+            "0:buyer",
+            Some(&me),
+            &me,
+            9_999,
+            MATCH_OPEN_TIMEOUT_SECS,
+        )
+        .unwrap_err()
+        .contains("no recorded buyer note"));
     }
 
-    /// missing and internally contradictory getter timestamps remain fail-closed.
     #[test]
-    fn reclaim_timestamps_fail_closed() {
-        let failures = [
-            (
-                "opened missing lastAdvance",
-                owned_reclaim(true, 1000, 0, Some(600), Some(50)),
-                "lastAdvance",
-            ),
-            (
-                "closed missing fundedTime",
-                owned_reclaim(false, 1000, 0, None, None),
-                "fundedTime",
-            ),
-            (
-                "opened timestamps reversed",
-                owned_reclaim(true, 1000, 40, Some(600), Some(50)),
-                "contradictory timestamps",
-            ),
-            (
-                "opened missing streamTimeout",
-                owned_reclaim(true, 1000, 100, None, Some(50)),
-                "streamTimeout",
-            ),
-        ];
-        for (name, result, expected) in failures {
+    fn cleanup_rejects_terminal_and_every_mutated_never_opened_shape() {
+        let valid = never_opened_state();
+        let mut cases = Vec::new();
+
+        let mut state = valid;
+        state.opened = true;
+        cases.push(("opened deal", state, "dexdo close"));
+
+        let mut state = valid;
+        state.deposit = 0;
+        cases.push(("terminal drained", state, "terminal/drained"));
+
+        let mut state = valid;
+        state.probe_accepted = true;
+        cases.push(("accepted probe", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.probe_tick = 1;
+        cases.push(("probe money", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.finalized_owed = 1;
+        cases.push(("seller money", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.tokens_final = 1;
+        cases.push(("final tokens", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.tokens_superseded = 1;
+        cases.push(("superseded tokens", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.tokens_pending = 1;
+        cases.push(("pending tokens", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.probe_time = 501;
+        cases.push(("probe time", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.prev_claim_time = 501;
+        cases.push(("previous claim time", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.last_claim_time = 501;
+        cases.push(("last claim time", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.dispute_time = 501;
+        cases.push(("stale dispute time", state, "never-opened shape"));
+
+        let mut state = valid;
+        state.funded_time = None;
+        cases.push(("missing funded time", state, "fundedTime"));
+
+        let mut state = valid;
+        state.funded_time = Some(0);
+        state.prev_claim_time = 0;
+        state.last_claim_time = 0;
+        cases.push(("zero funded time", state, "fundedTime"));
+
+        for (name, state, expected) in cases {
+            let result = owned_reclaim(state, 1_100);
             assert_eq!(usize::from(result.is_ok()), 0, "{name} POST count");
-            assert!(result.unwrap_err().contains(expected), "{name}");
+            assert!(
+                result.unwrap_err().contains(expected),
+                "{name} must fail with {expected}"
+            );
         }
     }
 

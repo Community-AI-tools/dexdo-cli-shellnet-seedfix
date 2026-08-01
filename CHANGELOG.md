@@ -1,3 +1,13 @@
+## v0.0.20
+
+- fix(tests): keep the models-fixture guard compiling without test-giver
+- fix: do not count the probe seed as an unbacked delivery advance
+- fix: declare model output caps in live fixtures ( follow-up)
+- fix: clamp upstream max_tokens to the model output cap
+- fix: emit seller_offer_outcome RESTED on every resting path
+- fix: integrate complete v0.0.20 client for contracts 4.0.32
+- contracts: integrate live shellnet 4.0.31 from PR713
+
 ## v0.0.19
 
 - fix(release): omit internal agent docs from notes

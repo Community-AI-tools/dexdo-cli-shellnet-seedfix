@@ -109,11 +109,16 @@ the deal deploys (Phase 5, whole SHELL) plus runtime gas. If it is short, deploy
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
       "price_per_tick": 1000000000,
-      "capabilities": { "logprobs": true, "top_logprobs": 5 }
+      "capabilities": { "logprobs": true, "top_logprobs": 5, "max_output_tokens": 40960 }
     }
   }
 }
 ```
+
+`capabilities.max_output_tokens` is the model's own maximum completion length at that provider (Groq
+answers `400` above `40960` for `qwen/qwen3-32b`). The seller clamps every outbound request to it, so the
+field is REQUIRED: a model entry without it is refused before the provider is contacted rather than served
+with an unbounded limit. Take the number from your provider's model card.
 
 The `price_per_tick` here is decorative metadata -- it does NOT set the live deal price. The price
 buyers pay is whatever you set at `dexdo provision --price-per-tick` (Phase 5); editing this field
@@ -138,7 +143,7 @@ or OpenAI logprobs, so keep `logprobs` off and omit `top_logprobs`:
       "api_key_env": "ANTHROPIC_API_KEY",
       "tokenizer_family": "claude",
       "price_per_tick": 1000000000,
-      "capabilities": { "logprobs": false }
+      "capabilities": { "logprobs": false, "max_output_tokens": 64000 }
     }
   }
 }

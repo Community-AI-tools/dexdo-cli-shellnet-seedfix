@@ -10,7 +10,10 @@ pub mod verify;
 
 use crate::seller::auth::challenge_bytes;
 use anyhow::{anyhow, Result};
-use dexdo_core::{ChainBackend, Handover, LocalNote, Note, TokenContract};
+use dexdo_core::{
+    params::{DEFAULT_SPOTCHECK_PROBE, DEFAULT_SPOTCHECK_THRESHOLD},
+    ChainBackend, Handover, LocalNote, Note, TokenContract,
+};
 use dexdo_proto::{
     CanonChunk, CanonRequest, ChallengeRequest, ChatMessage, GatewayClient, SamplingParams,
     StreamRequest,
@@ -142,8 +145,9 @@ impl Buyer {
                 reasoning.push(chunk.reasoning);
             }
             received += 1;
-            // Tick accounting is done on-chain via advance_tick(called by the orchestrator);
-            // here the buyer keeps a count of received tokens and may break off(STOP).
+            // The seller accounts cumulatively on-chain via claimTokens after acceptProbe, and
+            // mature claims are promoted by finalize; here the buyer only counts received tokens
+            // and may break off(STOP).
             if received >= max_tokens {
                 break; // buyer stops receiving -> STOP is submitted as a separate on-chain action
             }
@@ -231,7 +235,6 @@ impl Buyer {
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify::{
             self, prefix_agreement, reference_endpoint_for, spotcheck_verdict,
-            DEFAULT_SPOTCHECK_THRESHOLD,
         };
         let Some(endpoint) = reference_endpoint_for(model_id, models) else {
             return Ok(verify::Verdict::Pass); // no exact-model reference -> degradation(R3)
@@ -242,7 +245,7 @@ impl Buyer {
         };
 
         // Deterministic probe: the claimed model's greedy output is characteristic and reproducible.
-        let probe = SPOTCHECK_PROBE;
+        let probe = DEFAULT_SPOTCHECK_PROBE;
         let request = CanonRequest {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -303,10 +306,6 @@ impl Buyer {
         })
     }
 }
-
-/// Deterministic B7 spot-check probe: a reasoning prompt yields, under greedy, a reproducible
-/// model-characteristic output(a different model diverges in the prefix early).
-const SPOTCHECK_PROBE: &str = "What is 17 times 23? Show your step-by-step reasoning.";
 
 /// Greedy(temp=0) request to the official reference endpoint:
 /// non-streaming `chat/completions`, return the comparable text. Some reasoning models return provider-side

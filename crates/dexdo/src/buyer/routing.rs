@@ -9,7 +9,14 @@ use super::verify::{reference_endpoint_for, StreamVerifier, Verdict};
 use super::Buyer;
 use crate::seller::ModelsConfig;
 use async_trait::async_trait;
-use dexdo_core::{ChainBackend, Note, OfferListing};
+pub use dexdo_core::params::DEFAULT_SPOT_CHECK_RATE;
+use dexdo_core::{
+    params::{
+        SELLER_SCORE_BAIL_DELTA, SELLER_SCORE_PASS_DELTA, SPOT_CHECK_POSITIVE_SCORE_DECAY,
+        SPOT_CHECK_UNKNOWN_SCORE_MULTIPLIER,
+    },
+    ChainBackend, Note, OfferListing,
+};
 use dexdo_proto::CanonRequest;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -45,10 +52,6 @@ pub struct CappedBuy {
     pub spot_check_rate: f64,
 }
 
-/// Default base rate of the B7-full spot-check / B8 sampling: Bernoulli per request,
-/// ~3%(the 1-5% range). `spotcheck_rate_for` scales it per-seller(unknown/low score -> more often).
-pub const DEFAULT_SPOT_CHECK_RATE: f64 = 0.03;
-
 impl CappedBuy {
     /// **Production** constructor for a buy frame: the frame carries the safe **default**
     /// B7-full/B8 sampling rate([`DEFAULT_SPOT_CHECK_RATE`]), so a production buy ALWAYS samples -- the
@@ -81,9 +84,9 @@ impl CappedBuy {
 /// is always "unknown" -> always under maximum scrutiny. Clamped to [0, 1].
 pub fn spotcheck_rate_for(base_rate: f64, score: i64) -> f64 {
     let factor = if score <= 0 {
-        4.0 // unfamiliar/caught -- elevated rate(safe default)
+        SPOT_CHECK_UNKNOWN_SCORE_MULTIPLIER // unfamiliar/caught -- elevated rate(safe default)
     } else {
-        1.0 / (1.0 + score as f64 * 0.5) // the more stable the LOCAL history, the rarer
+        1.0 / (1.0 + score as f64 * SPOT_CHECK_POSITIVE_SCORE_DECAY) // the more stable the LOCAL history, the rarer
     };
     (base_rate * factor).clamp(0.0, 1.0)
 }
@@ -141,11 +144,11 @@ impl SellerScores {
     }
     /// Successful verification(D4 `Pass` / delivery) -- the seller is more reliable.
     pub fn record_pass(&mut self, seller_id: &str) {
-        *self.scores.entry(seller_id.to_string()).or_insert(0) += 1;
+        *self.scores.entry(seller_id.to_string()).or_insert(0) += SELLER_SCORE_PASS_DELTA;
     }
     /// Bail/no-show(D4 `Bail` / no-show) -- the seller is worse for the frame.
     pub fn record_bail(&mut self, seller_id: &str) {
-        *self.scores.entry(seller_id.to_string()).or_insert(0) -= 1;
+        *self.scores.entry(seller_id.to_string()).or_insert(0) += SELLER_SCORE_BAIL_DELTA;
     }
     /// Current score of a seller(`0` -- unfamiliar).
     pub fn score_of(&self, seller_id: &str) -> i64 {
@@ -332,8 +335,11 @@ pub async fn route_capped_buy(
                 }
             }
             DealOutcome::NoShow => {
-                // The seller vanished: refund of the frozen tick without burn.
-                let _ = chain.seller_timeout(&c.token_contract).await;
+                // The seller vanished. There is no inactivity timeout to wait out: STOP is available at any
+                // moment and returns the escrow minus only the consumption already promoted -- which on a
+                // no-show is nothing. Ignoring the result is deliberate; the routing decision (blacklist,
+                // next candidate) does not depend on the recovery landing.
+                let _ = chain.stop(&c.token_contract, note).await;
                 blacklist.mark(&c.seller_id);
                 scores.record_bail(&c.seller_id);
                 attempts.push(Attempt {
@@ -684,9 +690,13 @@ mod tests {
         s.record_pass("a");
         s.record_pass("a");
         s.record_bail("a");
-        assert_eq!(s.score_of("a"), 1, "2 pass - 1 bail = 1");
+        assert_eq!(
+            s.score_of("a"),
+            SELLER_SCORE_PASS_DELTA * 2 + SELLER_SCORE_BAIL_DELTA,
+            "score uses the canonical pass and bail deltas"
+        );
         s.record_bail("b");
-        assert_eq!(s.score_of("b"), -1);
+        assert_eq!(s.score_of("b"), SELLER_SCORE_BAIL_DELTA);
     }
 
     #[test]
@@ -724,15 +734,16 @@ mod tests {
     #[test]
     fn spotcheck_rate_scales_with_score() {
         // Lead's decision: unfamiliar/low score -> more often(x4); stable history -> rarer; clamp [0,1].
-        let base = 0.03;
+        let base = DEFAULT_SPOT_CHECK_RATE;
+        let unknown_rate = base * SPOT_CHECK_UNKNOWN_SCORE_MULTIPLIER;
         // Unfamiliar(score 0) and caught(score < 0) -- elevated rate.
         assert!(
-            (spotcheck_rate_for(base, 0) - 0.12).abs() < 1e-9,
-            "score 0 -> basex4"
+            (spotcheck_rate_for(base, 0) - unknown_rate).abs() < f64::EPSILON,
+            "score 0 uses the canonical unknown-score multiplier"
         );
         assert!(
-            (spotcheck_rate_for(base, -2) - 0.12).abs() < 1e-9,
-            "score<0 -> basex4"
+            (spotcheck_rate_for(base, -2) - unknown_rate).abs() < f64::EPSILON,
+            "score<0 uses the canonical unknown-score multiplier"
         );
         // Stable history -- rarer than base.
         assert!(
@@ -757,7 +768,7 @@ mod tests {
         // Directive @43057bd: safe default -- an unknown note(score 0) is checked NO LESS OFTEN than
         // any note with local history. A scammer rotating notes is always "unknown" -> always
         // under maximum scrutiny; relaxation only for a note that has been clean many times.
-        let base = 0.03;
+        let base = DEFAULT_SPOT_CHECK_RATE;
         let unknown = spotcheck_rate_for(base, 0);
         for score in 1..=50 {
             assert!(

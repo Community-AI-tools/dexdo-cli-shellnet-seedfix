@@ -10,6 +10,8 @@
 
 use crate::registry::model_id_alias;
 use crate::seller::{ModelConfig, ModelsConfig};
+pub use dexdo_core::params::DEFAULT_SPOTCHECK_THRESHOLD;
+use dexdo_core::params::LOGPROB_VALIDATION_EPSILON;
 use dexdo_proto::{CanonChunk, SignalManifest, TokenLogprobs};
 use std::sync::Arc;
 
@@ -81,7 +83,6 @@ fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig
 /// Comparing entropy/shape against a **specific model's profile**(an equivalent-but-different model) is,
 /// horizon(needs a per-model profile); here -- a cheap universal consistency cross-check.
 fn logprob_shape_check(logprobs: &[TokenLogprobs]) -> Verdict {
-    const EPS: f64 = 1e-6;
     for (i, tl) in logprobs.iter().enumerate() {
         // A real model's log-probability is always FINITE and <= 0. NaN/+/-inf is a "broken" signal
         // (corruption/fabrication); catch it explicitly, otherwise NaN comparisons(always false) silently bypass B6.
@@ -91,7 +92,7 @@ fn logprob_shape_check(logprobs: &[TokenLogprobs]) -> Verdict {
                 tl.logprob
             ));
         }
-        if tl.logprob > EPS {
+        if tl.logprob > LOGPROB_VALIDATION_EPSILON {
             return Verdict::Bail(format!(
                 "logprob-shape: token {i} logprob {:.4} > 0 -- invalid log-probability (fabrication)",
                 tl.logprob
@@ -104,10 +105,10 @@ fn logprob_shape_check(logprobs: &[TokenLogprobs]) -> Verdict {
                     "logprob-shape: token {i} top[{j}] logprob is not finite -- invalid log-probability"
                 ));
             }
-            if t.logprob > EPS {
+            if t.logprob > LOGPROB_VALIDATION_EPSILON {
                 return Verdict::Bail(format!("logprob-shape: token {i} top[{j}] logprob > 0"));
             }
-            if t.logprob > prev + EPS {
+            if t.logprob > prev + LOGPROB_VALIDATION_EPSILON {
                 return Verdict::Bail(format!(
                     "logprob-shape: token {i} top is not descending -- distribution fabrication"
                 ));
@@ -115,7 +116,7 @@ fn logprob_shape_check(logprobs: &[TokenLogprobs]) -> Verdict {
             prev = t.logprob;
         }
         if let Some(top0) = tl.top.first() {
-            if tl.logprob > top0.logprob + EPS {
+            if tl.logprob > top0.logprob + LOGPROB_VALIDATION_EPSILON {
                 return Verdict::Bail(format!(
                     "logprob-shape: token {i} chosen logprob > top maximum -- inconsistent"
                 ));
@@ -354,10 +355,6 @@ pub fn behavioral_check_with_reasoning(
 
 // ---- B7 full spot-check: greedy comparison against the declared model's official endpoint ----
 
-/// The default B7 spot-check agreement threshold is **high**: greedy(temp=0) of the same model
-/// yields an almost identical leading prefix, while a different model diverges early. Tuned by the caller.
-pub const DEFAULT_SPOTCHECK_THRESHOLD: f64 = 0.7;
-
 /// The declared model's **official** reference endpoint: the buyer compares the
 /// seller's greedy output against it. **Data-driven**(owned `String`) -- built from a model's configured
 /// upstream. The key is read from env at runtime(`api_key_env`) and is NOT stored here(masked in logs).
@@ -569,6 +566,23 @@ mod tests {
             matches!(v.verify(&c), Verdict::Bail(_)),
             "logprob > 0 -> Bail"
         );
+    }
+
+    #[test]
+    fn logprob_epsilon_boundary_uses_canonical_parameter() {
+        let mut at_boundary = StreamVerifier::new();
+        let accepted = chunk_lp(
+            vec![lp(LOGPROB_VALIDATION_EPSILON, vec![])],
+            Some(manifest_lp(true)),
+        );
+        assert_eq!(at_boundary.verify(&accepted), Verdict::Pass);
+
+        let mut over_boundary = StreamVerifier::new();
+        let rejected = chunk_lp(
+            vec![lp(LOGPROB_VALIDATION_EPSILON * 2.0, vec![])],
+            Some(manifest_lp(true)),
+        );
+        assert!(matches!(over_boundary.verify(&rejected), Verdict::Bail(_)));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use dexdo_core::params::BUYER_UPSTREAM_OPEN_RETRIES;
 use dexdo_proto::CanonChunk;
 use futures::Stream;
 use http::StatusCode;
@@ -71,48 +72,48 @@ pub async fn messages(
     let reclaim_heartbeat = deal.accepted_output_guard();
     request_guard.arm_upstream_failure();
 
-    let upstream = match state
-        .buyer
-        .open_canon_stream(
-            &deal.route.handover,
-            &deal.route.token_contract,
-            canon.clone(),
-        )
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            if deal.session.dead_gateway_action() == DeadGatewayAction::RetryThenReclaim {
+    let retry_limit = if deal.session.dead_gateway_action() == DeadGatewayAction::RetryThenReclaim {
+        BUYER_UPSTREAM_OPEN_RETRIES
+    } else {
+        0
+    };
+    let mut retries = 0usize;
+    let upstream = loop {
+        match state
+            .buyer
+            .open_canon_stream(
+                &deal.route.handover,
+                &deal.route.token_contract,
+                canon.clone(),
+            )
+            .await
+        {
+            Ok(stream) => break Ok(stream),
+            Err(error) if retries < retry_limit => {
+                retries += 1;
                 tracing::warn!(
-                    error = %e,
+                    error = %error,
                     token_contract = %deal.route.token_contract,
                     "consumer API: upstream open failed; retrying once per dead_gateway=retry_then_reclaim"
                 );
-                match state
-                    .buyer
-                    .open_canon_stream(&deal.route.handover, &deal.route.token_contract, canon)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(second) => {
-                        deal.session
-                            .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
-                            .await;
-                        return reject(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("upstream open failed after retry: {second}"),
-                        );
-                    }
-                }
-            } else {
-                deal.session
-                    .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
-                    .await;
-                return reject(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream open failed: {e}"),
-                );
             }
+            Err(error) => break Err(error),
+        }
+    };
+    let upstream = match upstream {
+        Ok(stream) => stream,
+        Err(error) => {
+            deal.session
+                .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
+                .await;
+            let reason = if retries == 0 {
+                format!("upstream open failed: {error}")
+            } else if retries == 1 {
+                format!("upstream open failed after retry: {error}")
+            } else {
+                format!("upstream open failed after {retries} retries: {error}")
+            };
+            return reject(StatusCode::BAD_GATEWAY, &reason);
         }
     };
 

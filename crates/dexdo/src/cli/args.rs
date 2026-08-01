@@ -2,9 +2,22 @@
 //! for `seller`/`buyer`/`monitor`/`provision`/`destroy`/`recover`. Behavior-identical to the pre-split defs.
 
 use anyhow::{bail, Result};
-use clap::{ArgGroup, Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use dexdo_core::{
-    params::{SHELL_CURRENCY_ID, SHELL_CURRENCY_LABEL},
+    params::{
+        CLI_POSITIVE_U64_MIN, DEFAULT_BUYER_MAX_TOKENS, DEFAULT_BUYER_TICKS,
+        DEFAULT_CHAIN_READ_TIMEOUT_SECS, DEFAULT_CONTINUITY_MODE, DEFAULT_CONTRACTS_PATH,
+        DEFAULT_DASHBOARD_LISTEN, DEFAULT_DOCTOR_NETWORK, DEFAULT_EXECUTABLE_BOOK_TICKS,
+        DEFAULT_EXPORT_FORMAT, DEFAULT_MARKETS_FRAME_MODEL, DEFAULT_MARKET_DATA_OUTPUT,
+        DEFAULT_MARKET_DATA_TIMEOUT_MS, DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH,
+        DEFAULT_MONITOR_TREE_WIDTH, DEFAULT_NOTE_DEPLOY_ENDPOINT, DEFAULT_NOTE_DEPLOY_NOMINAL,
+        DEFAULT_NOTE_INDEX, DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION, DEFAULT_ORACLE_EVENT_LIST_INDEX,
+        DEFAULT_ORACLE_FEE, DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_ORACLE_PMP_DESCRIPTION,
+        DEFAULT_POLICY_ROLE, DEFAULT_PROVISION_MAX_TICKS, DEFAULT_SELLER_GATEWAY_LISTEN,
+        DEFAULT_SELLER_MOCK_TOKEN_COUNT, MARKET_DATA_DEPTH_LIMIT_MAX, MARKET_DATA_DEPTH_LIMIT_MIN,
+        MARKET_DATA_LIST_LIMIT_MAX, MARKET_DATA_LIST_LIMIT_MIN, SHELL_CURRENCY_ID,
+        SHELL_CURRENCY_LABEL,
+    },
     PRICE_STEP,
 };
 use http::uri::Authority;
@@ -14,18 +27,28 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 fn parse_market_data_limit(s: &str) -> Result<u32, String> {
-    parse_bounded_u32(s, 1, 200, "--limit")
+    parse_bounded_u32(
+        s,
+        MARKET_DATA_LIST_LIMIT_MIN,
+        MARKET_DATA_LIST_LIMIT_MAX,
+        "--limit",
+    )
 }
 
 fn parse_market_data_depth_limit(s: &str) -> Result<u32, String> {
-    parse_bounded_u32(s, 1, 1000, "--limit")
+    parse_bounded_u32(
+        s,
+        MARKET_DATA_DEPTH_LIMIT_MIN,
+        MARKET_DATA_DEPTH_LIMIT_MAX,
+        "--limit",
+    )
 }
 
 fn parse_positive_u64(s: &str) -> Result<u64, String> {
     let value = s
         .parse::<u64>()
         .map_err(|e| format!("expected positive integer: {e}"))?;
-    if value == 0 {
+    if value < CLI_POSITIVE_U64_MIN {
         return Err("expected positive integer, got 0".to_string());
     }
     Ok(value)
@@ -54,8 +77,6 @@ fn parse_bounded_u32(s: &str, min: u32, max: u32, name: &str) -> Result<u32, Str
     }
     Ok(value)
 }
-
-pub(crate) const DEFAULT_CHAIN_READ_TIMEOUT_SECS: u64 = 30;
 
 /// Bounded timeout for direct shellnet getter reads. This is intentionally separate from market-data's
 /// indexer HTTP timeout: `market-data` is the fast indexer path and must not be wrapped here.
@@ -108,7 +129,7 @@ pub(crate) struct IdentityArgs {
     /// Index of the tree(sub)note this subcommand operates on: one root
     /// key -> many notes, a specific deal/order lives on a specific sub-note. Reproducible
     /// (same key+index -> same note). The monitor aggregates over the whole tree(`--tree-width`).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_NOTE_INDEX)]
     pub(crate) note_index: u32,
     /// **Real shellnet:** on-chain address of the actor's already **provisioned** `PrivateNote` (minted by
     /// `mint_pn_pool`). dexdo does NOT create the note -- it only reads/signs it
@@ -170,7 +191,7 @@ pub(crate) struct SellerArgs {
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
     /// Local bind/listen address for accepting buyer connections; seller-side equivalent of buyer --local-listen.
-    #[arg(long, default_value = "127.0.0.1:8443")]
+    #[arg(long, default_value = DEFAULT_SELLER_GATEWAY_LISTEN)]
     pub(crate) gateway_listen: SocketAddr,
     /// Public gateway host:port written to the buyer handover. Defaults to --gateway-listen.
     #[arg(long, value_name = "HOST:PORT")]
@@ -196,12 +217,15 @@ pub(crate) struct SellerArgs {
     /// the manifest, so do not pass both.
     #[arg(long)]
     pub(crate) nonce: Option<u64>,
+    /// Offer this seller only to subscription BUYs. Ordinary sellers leave this off.
+    #[arg(long)]
+    pub(crate) subscription: bool,
     /// Tick price P in raw ECC[2] units; must be a positive multiple of PRICE_STEP(1 SHELL).
     #[arg(long, default_value_t = PRICE_STEP as u64)]
     pub(crate) price_per_tick: u64,
     /// How many fake tokens to serve in `--mock-model` mode. Real upstreams follow the request's
     /// `max_tokens`, capped by the market's `max_ticks * TICK_SIZE`.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_SELLER_MOCK_TOKEN_COUNT)]
     pub(crate) mock_token_count: u64,
     /// Model name from the config: a key or `frame_model`. Required on real shellnet
     /// even with `--mock-model`, because it selects the on-chain `modelHash`; optional only for the
@@ -209,12 +233,12 @@ pub(crate) struct SellerArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
     /// Path to the models config. Defaults to `models.json` in the working directory.
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// **Real shellnet:** manifest of the deployed contracts(SuperRoot/DappConfig addresses). The release
     /// places it next to the binary; default -- `contracts/deployed.shellnet.json` in the working directory. The
     /// exact seller bond `2P` is posted by the note itself -- no operator wallet.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Persistent failure policy JSON. Defaults to XDG config (`~/.config/dexdo/policy.json`, Windows
     /// `%APPDATA%\dexdo\policy.json`). Real seller startup fails closed if missing or incomplete.
@@ -262,7 +286,7 @@ pub(crate) struct BuyerArgs {
     pub(crate) market: Option<PathBuf>,
     /// One-shot buyer receive cap. In local consumer-API mode, per-request `max_tokens` is honored and capped by
     /// the purchased deal budget(`--ticks x TICK_SIZE`) instead of this debug/one-shot cap.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_BUYER_MAX_TOKENS)]
     pub(crate) max_tokens: u64,
     /// Local bind/listen address for the OpenAI-compatible consumer endpoint; buyer-side equivalent of seller --gateway-listen.
     /// If set -- the client brings up an HTTP interface instead of a one-shot stream+STOP.
@@ -272,7 +296,7 @@ pub(crate) struct BuyerArgs {
     /// low remaining budget, or no current deal; it may pre-buy while idle and spend the documented probe/idle
     /// cost. on-demand buys only after active/recent consumer traffic; it avoids idle spend, but the first
     /// request after idle may wait for a fresh deal.
-    #[arg(long, value_enum, default_value_t = ContinuityModeArg::Proactive, value_name = "MODE")]
+    #[arg(long, value_enum, default_value = DEFAULT_CONTINUITY_MODE, value_name = "MODE")]
     pub(crate) continuity_mode: ContinuityModeArg,
     /// Emit machine-readable JSONL lifecycle events on stdout.
     #[arg(long)]
@@ -296,10 +320,10 @@ pub(crate) struct BuyerArgs {
     /// fingerprints, B7-full reference via base_url/served_model/api_key_env). Defaults to `models.json` in the
     /// working directory. A model absent from this config has no verification data -> the buyer fails closed
     /// (unless `--allow-unverified-model`).
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// How many ticks the buyer purchases. Not used on the mock path.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_BUYER_TICKS)]
     pub(crate) ticks: u128,
     /// **Real shellnet:** the per-tick price LIMIT(`maxPricePerTick`) in raw ECC[2]
     /// (`PRICE_STEP = 1000000000` raw = 1 SHELL) -- crosses with ask <= limit.
@@ -315,7 +339,7 @@ pub(crate) struct BuyerArgs {
     #[arg(long)]
     pub(crate) escrow: Option<u128>,
     /// **Real shellnet:** manifest of the deployed contracts(see `seller --contracts`).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Persistent failure policy JSON. Defaults to XDG config (`~/.config/dexdo/policy.json`, Windows
     /// `%APPDATA%\dexdo\policy.json`). Real buyer startup fails closed if missing or incomplete.
@@ -358,7 +382,7 @@ pub(crate) struct MonitorArgs {
     /// How many tree(sub)notes to poll (, R14: the monitor aggregates over ALL notes under
     /// the key, not just the root). The window `index = 0..width` is reproducible from the key. `--note-index`
     /// is ignored by the monitor(it sees the whole tree, not a single sub-note).
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_MONITOR_TREE_WIDTH)]
     pub(crate) tree_width: u32,
     /// **Real shellnet:** the operator's market manifest(s) from `dexdo provision` -- the monitor
     /// reads each market's `TokenContract` by-fact state on-chain (a `RealNote` is a single key, not an HD tree,
@@ -366,7 +390,7 @@ pub(crate) struct MonitorArgs {
     #[arg(long)]
     pub(crate) market: Vec<PathBuf>,
     /// Deployed-contracts manifest(SuperRoot/DappConfig) for the real-chain connection.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -374,13 +398,13 @@ pub(crate) struct MonitorArgs {
 #[derive(Args)]
 pub(crate) struct DoctorArgs {
     /// Network name or Block Manager endpoint. `shellnet` uses the manifest/default endpoint.
-    #[arg(long, default_value = "shellnet")]
+    #[arg(long, default_value = DEFAULT_DOCTOR_NETWORK)]
     pub(crate) network: String,
     /// Block Manager host or URL. Overrides the manifest and `--network` endpoint.
     #[arg(long, alias = "graphql")]
     pub(crate) endpoint: Option<String>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Optional `dexdo provision` market manifest. When supplied, doctor also verifies the market IOB/TC are
     /// active and carry the expected code hash.
@@ -412,7 +436,7 @@ pub(crate) enum PolicyCommand {
 #[derive(Args)]
 pub(crate) struct PolicyInitArgs {
     /// Which role section to scaffold.
-    #[arg(long, value_enum, default_value_t = PolicyRoleArg::Both)]
+    #[arg(long, value_enum, default_value = DEFAULT_POLICY_ROLE)]
     pub(crate) role: PolicyRoleArg,
     /// Policy file path. Defaults to the platform config path.
     #[arg(long)]
@@ -459,7 +483,7 @@ pub(crate) struct ProvisionArgs {
     #[arg(long)]
     pub(crate) frame_model: String,
     /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Deal nonce -- disambiguates multiple `TokenContract`s under one `RootModel`.: REQUIRED and must be
     /// UNIQUE per deal -- the per-deal `TokenContract` derives from `(sellerPubkey, nonce)`, so a reused/default
@@ -470,7 +494,7 @@ pub(crate) struct ProvisionArgs {
     #[arg(long, default_value_t = PRICE_STEP)]
     pub(crate) price_per_tick: u128,
     /// Max ticks the deal `TokenContract` bounds to.
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = DEFAULT_PROVISION_MAX_TICKS)]
     pub(crate) max_ticks: u128,
     /// Note ECC[2] allocation in whole SHELL, not raw nano/vmshell(1 SHELL = 1e9 raw).
     /// Split about `deposit/2` per deploy after `fundDeployShell`(RootModel + TokenContract).
@@ -480,7 +504,7 @@ pub(crate) struct ProvisionArgs {
     pub(crate) deposit_shells: Option<u128>,
     /// Output path for the produced market manifest(OB/RootModel + the deployed TC address). `dexdo
     /// seller`/`buyer` load it via `--market`.
-    #[arg(long, default_value = "market.json")]
+    #[arg(long, default_value = DEFAULT_MARKET_MANIFEST_OUTPUT_PATH)]
     pub(crate) output: PathBuf,
     /// Persistent seller failure policy JSON. Defaults to the same platform path as `dexdo seller`.
     /// Provisioning fails locally before reading secrets or connecting to shellnet if it is unsupported.
@@ -506,7 +530,7 @@ pub(crate) struct DestroyArgs {
     #[arg(long)]
     pub(crate) acknowledge_burn: bool,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -526,7 +550,7 @@ pub(crate) struct RecoverArgs {
     #[arg(long)]
     pub(crate) pool: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -547,13 +571,13 @@ pub(crate) struct DisputeArgs {
     #[arg(long)]
     pub(crate) pool: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo reclaim`: the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
-/// `streamReclaim` -> `TC.reclaimOnTimeout()` after `STREAM_TIMEOUT`; funded-but-never-opened deals use
-/// `streamCleanup` -> `TC.cleanupUnopened()` after `MATCH_OPEN_TIMEOUT`. Fails closed locally on ownership + timer.
+/// Args for `dexdo reclaim`: the BUYER reclaims escrow on seller no-show. OPEN deals use
+/// the explicit `close`/`recover` STOP path; funded-but-never-opened deals use `streamCleanup`
+/// after `MATCH_OPEN_TIMEOUT`. Fails closed locally on ownership, state, and the cleanup timer.
 #[derive(Args)]
 pub(crate) struct ReclaimArgs {
     #[command(flatten)]
@@ -568,7 +592,7 @@ pub(crate) struct ReclaimArgs {
     #[arg(long)]
     pub(crate) pool: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -585,7 +609,7 @@ pub(crate) struct ReleaseDisputeArgs {
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -599,7 +623,7 @@ pub(crate) struct ResolveDisputeTimeoutArgs {
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -621,7 +645,7 @@ pub(crate) struct WithdrawShellArgs {
     #[arg(long)]
     pub(crate) recipient: Option<String>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -638,7 +662,7 @@ pub(crate) struct MarketDeployArgs {
     #[arg(long)]
     pub(crate) frame_model: String,
     /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -657,7 +681,7 @@ pub(crate) struct MarketsArgs {
     #[arg(long)]
     pub(crate) endpoints_file: Option<PathBuf>,
     /// Frame model id for mock-chain discovery output.
-    #[arg(long, default_value = "dexdo-mock")]
+    #[arg(long, default_value = DEFAULT_MARKETS_FRAME_MODEL)]
     pub(crate) frame_model: String,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
@@ -665,13 +689,13 @@ pub(crate) struct MarketsArgs {
     #[arg(long)]
     pub(crate) market: Vec<PathBuf>,
     /// Models config used when --market is absent.
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// Any active inference PrivateNote address used to derive per-model order-book addresses when --market is absent.
     #[arg(long)]
     pub(crate) note_addr: Option<String>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -692,10 +716,10 @@ pub(crate) struct MarketArgs {
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Models config(used to accept a model KEY as well as a raw canonical frame_model).
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -715,16 +739,16 @@ pub(crate) struct ExecutableBookArgs {
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Models config(used to accept a model KEY as well as a raw canonical frame_model).
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// Desired buyer ticks for the executable row filter.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_EXECUTABLE_BOOK_TICKS)]
     pub(crate) ticks: u128,
     /// Buyer price ceiling in raw ECC[2] used by `dexdo buyer --max-price-per-tick`.
     #[arg(long, default_value_t = PRICE_STEP)]
     pub(crate) max_price_per_tick: u128,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -751,7 +775,7 @@ pub(crate) struct QuoteArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
     /// Models config used with --model.
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// Any active inference PrivateNote address used to derive the order-book address when --market is absent.
     #[arg(long)]
@@ -763,7 +787,7 @@ pub(crate) struct QuoteArgs {
     #[arg(long)]
     pub(crate) budget: Option<u128>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -780,10 +804,10 @@ pub(crate) struct MarketDataArgs {
     #[arg(long, global = true)]
     pub(crate) indexer_url: Option<String>,
     /// Output format for scripts/operators.
-    #[arg(long, value_enum, default_value_t = MarketDataOutput::Table, global = true)]
+    #[arg(long, value_enum, default_value = DEFAULT_MARKET_DATA_OUTPUT, global = true)]
     pub(crate) output: MarketDataOutput,
     /// HTTP request timeout in milliseconds.
-    #[arg(long, default_value_t = 10_000, global = true)]
+    #[arg(long, default_value_t = DEFAULT_MARKET_DATA_TIMEOUT_MS, global = true)]
     pub(crate) timeout_ms: u64,
     #[command(subcommand)]
     pub(crate) command: MarketDataCommand,
@@ -841,10 +865,10 @@ pub(crate) struct OrdersArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
     /// Models config used with --model.
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     #[command(subcommand)]
     pub(crate) command: OrdersCommand,
@@ -868,11 +892,17 @@ pub(crate) enum OrdersCommand {
     CancelAll,
 }
 
-/// Inference subscription lifecycle: recurring buy orders in one model book.
+/// Pre-match lifecycle for one single-seller take-or-pay subscription BUY.
 #[derive(Args)]
 pub(crate) struct SubscriptionArgs {
     #[command(flatten)]
+    pub(crate) mock: MockFlags,
+    #[command(flatten)]
     pub(crate) identity: IdentityArgs,
+    /// Local deal-handle directory. The matched subscription is persisted here before its fill
+    /// cursor advances, so `dexdo buyer --resume` can reuse the same deterministic buyer handle.
+    #[arg(long)]
+    pub(crate) deals_dir: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
     #[command(flatten)]
@@ -884,10 +914,13 @@ pub(crate) struct SubscriptionArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
     /// Models config used with --model.
-    #[arg(long, default_value = "models.json")]
+    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
+    /// Endpoints/mock-chain-state file used by the explicit mock path.
+    #[arg(long)]
+    pub(crate) endpoints_file: Option<PathBuf>,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     #[command(subcommand)]
     pub(crate) command: SubscriptionCommand,
@@ -895,49 +928,31 @@ pub(crate) struct SubscriptionArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum SubscriptionCommand {
-    /// Place a recurring inference buy subscription from this note.
+    /// Place one ordinary AON+SUBSCRIPTION BUY with a finite deadline and exact escrow.
     Place(SubscriptionPlaceArgs),
-    /// Show one subscription's current on-chain state.
+    /// Show one owned subscription BUY while it rests, or its durable matched TC fact.
     Status {
-        /// Resting subscription order id.
+        /// Ordinary InferenceOrderBook order id.
         order_id: u128,
     },
-    /// Cancel a live subscription order owned by this note.
+    /// Cancel one owned subscription BUY only while it is still resting.
     Cancel {
-        /// Resting subscription order id.
-        order_id: u128,
-    },
-    /// Apply an already-expired subscription cycle and print the resulting on-chain state.
-    Poke {
-        /// Resting subscription order id.
+        /// Ordinary InferenceOrderBook order id.
         order_id: u128,
     },
 }
 
 #[derive(Args)]
-#[command(group(
-    ArgGroup::new("subscription_size")
-        .required(true)
-        .multiple(false)
-        .args(["ticks", "budget"])
-))]
 pub(crate) struct SubscriptionPlaceArgs {
     /// Actor PrivateNote owner key. May be passed before `place` or here after `place`.
     #[arg(long)]
     pub(crate) note_key: Option<PathBuf>,
-    /// Per-tick ceiling in raw ECC[2]; must be a positive multiple of PRICE_STEP(1 SHELL).
-    /// Required because this command moves SHELL.
+    /// Per-tick ceiling in raw ECC[2]; a positive multiple of PRICE_STEP(1 SHELL).
     #[arg(long)]
     pub(crate) max_price_per_tick: u128,
-    /// Desired subscription ticks. Mutually exclusive with --budget.
+    /// Whole 28-day volume. Must be within the protocol bound and divisible by four weeks.
     #[arg(long)]
-    pub(crate) ticks: Option<u128>,
-    /// Fee-inclusive SHELL budget. The CLI converts it to whole ticks and sends exact escrow only.
-    #[arg(long)]
-    pub(crate) budget: Option<u128>,
-    /// Client renewal hint stored by the book. Renewal still requires a future re-place.
-    #[arg(long)]
-    pub(crate) auto_renew: bool,
+    pub(crate) ticks: u128,
 }
 
 /// Role override for raw token-contract status/close when no local deal handle exists.
@@ -973,7 +988,7 @@ pub(crate) struct HistoryArgs {
 #[derive(Args)]
 pub(crate) struct DashboardArgs {
     /// Loopback HTTP listen address.
-    #[arg(long, default_value = "127.0.0.1:8765")]
+    #[arg(long, default_value = DEFAULT_DASHBOARD_LISTEN)]
     pub(crate) listen: SocketAddr,
     /// Directory containing local deal handle JSON files. Defaults to the platform app data directory.
     #[arg(long)]
@@ -983,7 +998,7 @@ pub(crate) struct DashboardArgs {
 /// Read current on-chain state for a local deal handle or a raw TokenContract address.
 #[derive(Args)]
 pub(crate) struct StatusArgs {
-    /// Emit the stable `dexdo.status.v1` JSON object.
+    /// Emit the stable `dexdo.status.v2` JSON object.
     #[arg(long)]
     pub(crate) json: bool,
     /// Use the local mock chain state next to --endpoints-file.
@@ -1003,6 +1018,7 @@ pub(crate) struct StatusArgs {
 }
 
 /// Role-aware close/recovery wrapper for a local deal handle or raw TokenContract address.
+/// An OPEN seller deal submits `sellerStop`; an already STOPped seller deal submits `destroy`.
 #[derive(Args)]
 pub(crate) struct CloseArgs {
     /// Emit the stable `dexdo.close.v1` JSON object.
@@ -1040,7 +1056,7 @@ pub(crate) struct ExportArgs {
     #[arg(long)]
     pub(crate) deal: String,
     /// Output format.
-    #[arg(long, value_enum, default_value_t = ExportFormatArg::Json)]
+    #[arg(long, value_enum, default_value = DEFAULT_EXPORT_FORMAT)]
     pub(crate) format: ExportFormatArg,
     /// Directory containing local deal handle JSON files. Defaults to the platform app data directory.
     #[arg(long)]
@@ -1085,7 +1101,7 @@ pub(crate) struct NoteBalanceArgs {
     #[arg(long)]
     pub(crate) note_addr: String,
     /// Deployed-contracts manifest(keeps shellnet connection behavior aligned with the other note commands).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Block Manager host or URL. Overrides the endpoint in `--contracts`.
     #[arg(long, alias = "graphql")]
@@ -1102,7 +1118,7 @@ pub(crate) struct NoteWithdrawArgs {
     #[arg(long)]
     pub(crate) to: String,
     /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -1133,7 +1149,7 @@ pub(crate) struct NoteDeployArgs {
     )]
     pub(crate) multisig_seed_file: Option<PathBuf>,
     /// PN deposit nominal.
-    #[arg(long, default_value = "N100")]
+    #[arg(long, default_value = DEFAULT_NOTE_DEPLOY_NOMINAL)]
     pub(crate) nominal: String,
     /// Deposit currency. Dexdo markets use SHELL only.
     #[arg(
@@ -1143,10 +1159,10 @@ pub(crate) struct NoteDeployArgs {
     )]
     pub(crate) token_type: String,
     /// Shellnet endpoint.
-    #[arg(long, default_value = "shellnet.ackinacki.org")]
+    #[arg(long, default_value = DEFAULT_NOTE_DEPLOY_ENDPOINT)]
     pub(crate) endpoint: String,
     /// Deployed shellnet contracts manifest used for the pre-spend generation check.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// The `DEXDO_PN_POOL` JSON to append the deployed note to(created if absent).
     #[arg(long)]
@@ -1219,10 +1235,10 @@ pub(crate) struct OracleProvisionArgs {
     #[arg(long)]
     pub(crate) oracle_name: String,
     /// OracleEventList index under the Oracle.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_ORACLE_EVENT_LIST_INDEX)]
     pub(crate) event_list_index: u128,
     /// Human-readable OracleEventList description, used only when the list needs deployment.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION)]
     pub(crate) event_list_description: String,
     /// Existing `dexdo provision` market manifest; its InferenceOrderBook is the range-event price source.
     #[arg(long)]
@@ -1234,7 +1250,7 @@ pub(crate) struct OracleProvisionArgs {
     #[arg(long)]
     pub(crate) deadline: u64,
     /// Event description passed into PMP approval.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = DEFAULT_ORACLE_PMP_DESCRIPTION)]
     pub(crate) describe: String,
     /// Range upper bound as uint256 decimal. Repeat once per boundary; outcomes must be bounds+1.
     #[arg(long = "bound")]
@@ -1253,13 +1269,13 @@ pub(crate) struct OracleProvisionArgs {
     )]
     pub(crate) token_type: u32,
     /// Oracle fee paid by the PMP deployer note to this OracleEventList.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = DEFAULT_ORACLE_FEE)]
     pub(crate) oracle_fee: u128,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Output path for the oracle-market manifest.
-    #[arg(long, default_value = "oracle-market.json")]
+    #[arg(long, default_value = DEFAULT_ORACLE_MARKET_OUTPUT_PATH)]
     pub(crate) output: PathBuf,
 }
 
@@ -1269,7 +1285,7 @@ pub(crate) struct OracleStateArgs {
     #[arg(long)]
     pub(crate) manifest: PathBuf,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
@@ -1282,12 +1298,82 @@ pub(crate) struct OracleResolveArgs {
     #[arg(long)]
     pub(crate) oracle_key: PathBuf,
     /// Deployed-contracts manifest.
-    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migrated_cli_consumers_do_not_redeclare_canonical_parameters() {
+        let args_source = include_str!("args.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("args unit-test module boundary")
+            .0;
+        let consumers = [
+            ("args.rs", args_source),
+            ("admin.rs", include_str!("admin.rs")),
+            ("commands.rs", include_str!("commands.rs")),
+            ("indexer.rs", include_str!("indexer.rs")),
+            ("oracle.rs", include_str!("oracle.rs")),
+        ];
+        let canonical_names = [
+            "CLI_POSITIVE_U64_MIN",
+            "DEFAULT_BUYER_MAX_TOKENS",
+            "DEFAULT_BUYER_TICKS",
+            "DEFAULT_CHAIN_READ_TIMEOUT_SECS",
+            "DEFAULT_CONTRACTS_PATH",
+            "DEFAULT_CONTINUITY_MODE",
+            "DEFAULT_DASHBOARD_LISTEN",
+            "DEFAULT_DEPOSIT_SHELLS",
+            "DEFAULT_DOCTOR_NETWORK",
+            "DEFAULT_EXECUTABLE_BOOK_TICKS",
+            "DEFAULT_EXPORT_FORMAT",
+            "DEFAULT_INDEXER_URL",
+            "DEFAULT_MARKET_DATA_OUTPUT",
+            "DEFAULT_MARKET_DATA_TIMEOUT_MS",
+            "DEFAULT_MARKETS_FRAME_MODEL",
+            "DEFAULT_MARKET_MANIFEST_OUTPUT_PATH",
+            "DEFAULT_MODELS_PATH",
+            "DEFAULT_MONITOR_TREE_WIDTH",
+            "DEFAULT_NOTE_DEPLOY_ENDPOINT",
+            "DEFAULT_NOTE_DEPLOY_NOMINAL",
+            "DEFAULT_NOTE_INDEX",
+            "DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION",
+            "DEFAULT_ORACLE_EVENT_LIST_INDEX",
+            "DEFAULT_ORACLE_FEE",
+            "DEFAULT_ORACLE_MARKET_OUTPUT_PATH",
+            "DEFAULT_ORACLE_PMP_DESCRIPTION",
+            "DEFAULT_POLICY_ROLE",
+            "DEFAULT_PROVISION_MAX_TICKS",
+            "DEFAULT_SELLER_GATEWAY_LISTEN",
+            "DEFAULT_SELLER_MOCK_TOKEN_COUNT",
+            "INDEXER_ERROR_BODY_MAX_BYTES",
+            "MARKET_DATA_DEPTH_LIMIT_MAX",
+            "MARKET_DATA_DEPTH_LIMIT_MIN",
+            "MARKET_DATA_LIST_LIMIT_MAX",
+            "MARKET_DATA_LIST_LIMIT_MIN",
+            "MARKET_DEPLOY_ACTIVATION_MAX_READS",
+            "MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL",
+            "ORACLE_RESOLUTION_MAX_READS",
+            "ORACLE_RESOLUTION_POLL_INTERVAL",
+        ];
+
+        for name in canonical_names {
+            assert!(
+                consumers.iter().any(|(_, source)| source.contains(name)),
+                "a migrated CLI consumer must use params::{name}"
+            );
+            let declaration = format!("const {name}");
+            for (path, source) in consumers {
+                assert!(
+                    !source.contains(&declaration),
+                    "{path} must consume params::{name} directly instead of redeclaring it"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pmp_token_type_accepts_only_shell() {
         assert_eq!(

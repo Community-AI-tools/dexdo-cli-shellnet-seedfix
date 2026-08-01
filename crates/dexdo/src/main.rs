@@ -52,18 +52,16 @@ enum Command {
     /// Recover: the BUYER signs **STOP** on an orphaned OPEN deal (its buyer process died, but the
     /// note/key are intact) -- the normal buyer-STOP split, **without** placing a new buy -- so a stuck
     /// deal can be closed and the seller can then `destroy` it. Buyer-signed; fails closed if the deal is
-    /// not OPEN / is disputed / the note is not the deal's buyer. (Seller-vanished mid-stream is instead the
-    /// contract's `reclaimOnTimeout`/`STREAM_TIMEOUT`.)
+    /// not OPEN / is disputed / the note is not the deal's buyer.
     Recover(RecoverArgs),
     /// Dispute: the BUYER opens an on-chain dispute on an OPEN deal -- `streamDispute` -> `TC.dispute()`
     /// freezes this TC's contested amount and seller bond until resolution. The anti-scam lever for an observed
     /// substitution/fraud -- strictly stronger than `recover`'s STOP (which still pays for delivered
     /// ticks). Buyer-signed; fails closed if the deal is not OPEN / already disputed / the note isn't the buyer.
     Dispute(DisputeArgs),
-    /// Reclaim: the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
-    /// `streamReclaim` -> `TC.reclaimOnTimeout()` after `STREAM_TIMEOUT`; funded-but-never-opened deals use
-    /// `streamCleanup` -> `TC.cleanupUnopened()` after `MATCH_OPEN_TIMEOUT`. Buyer-signed; fails closed locally
-    /// on ownership + the timer.
+    /// Reclaim: recover buyer escrow after seller no-show. OPEN deals use the explicit
+    /// `close`/`recover` STOP path; funded-but-never-opened deals use `streamCleanup` after
+    /// `MATCH_OPEN_TIMEOUT`. Buyer-signed; fails closed locally on state, ownership, and the cleanup timer.
     Reclaim(ReclaimArgs),
     /// ReleaseDispute: the SELLER concedes a disputed deal -- `TokenContract.releaseDispute()` returns
     /// this TC's contested amount to the buyer and the seller bond. Seller-signed; fails closed if the deal
@@ -90,7 +88,7 @@ enum Command {
     MarketData(MarketDataArgs),
     /// Orders: list/show/cancel this note's resting inference orders.
     Orders(OrdersArgs),
-    /// Subscription: place/status/cancel recurring inference buy subscriptions.
+    /// Place, inspect, or cancel one pre-match single-seller subscription BUY.
     Subscription(SubscriptionArgs),
     /// Deals: list durable local deal handles saved by seller/buyer flows.
     Deals(DealsArgs),
@@ -101,6 +99,7 @@ enum Command {
     /// Status: read current state for a local deal handle or raw TokenContract.
     Status(StatusArgs),
     /// Close: role-aware close/recovery action for a local deal handle or raw TokenContract.
+    /// Seller closes an OPEN deal with `sellerStop`; a STOPped seller deal proceeds to `destroy`.
     Close(CloseArgs),
     /// Export: secret-free JSON/Markdown evidence for one local deal handle or raw TokenContract.
     Export(ExportArgs),
@@ -684,9 +683,9 @@ mod market_orders_cli_tests {
     use super::{Cli, Command};
     use crate::cli::args::{
         MarketDataCommand, MarketDataOutput, OrdersCommand, SubscriptionCommand,
-        DEFAULT_CHAIN_READ_TIMEOUT_SECS,
     };
     use clap::Parser;
+    use dexdo_core::params::DEFAULT_CHAIN_READ_TIMEOUT_SECS;
     use std::path::PathBuf;
 
     /// market discovery and executable quote commands parse the intended read-only surfaces.
@@ -1049,7 +1048,6 @@ mod market_orders_cli_tests {
             "1000000000",
             "--ticks",
             "4",
-            "--auto-renew",
         ])
         .expect("subscription place parses");
         let Command::Subscription(s) = c.command else {
@@ -1064,9 +1062,7 @@ mod market_orders_cli_tests {
             DEFAULT_CHAIN_READ_TIMEOUT_SECS
         );
         assert_eq!(p.max_price_per_tick, dexdo_core::PRICE_STEP);
-        assert_eq!(p.ticks, Some(4));
-        assert_eq!(p.budget, None);
-        assert!(p.auto_renew);
+        assert_eq!(p.ticks, 4);
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -1138,15 +1134,28 @@ mod market_orders_cli_tests {
             })
         ));
 
-        let c = Cli::try_parse_from(["dexdo", "subscription", "--market", "m.json", "poke", "7"])
-            .expect("permissionless subscription poke parses");
-        assert!(matches!(
-            c.command,
-            Command::Subscription(crate::cli::args::SubscriptionArgs {
-                command: SubscriptionCommand::Poke { order_id: 7 },
-                ..
-            })
-        ));
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--mock-model",
+            "--mock-chain",
+            "--endpoints-file",
+            "mock-endpoints.json",
+            "--model",
+            "qwen--qwen3--32b",
+            "status",
+            "7",
+        ])
+        .expect("explicit mock subscription flags parse");
+        let Command::Subscription(s) = c.command else {
+            panic!("expected mock subscription");
+        };
+        assert!(s.mock.mock_model);
+        assert!(s.mock.mock_chain);
+        assert_eq!(
+            s.endpoints_file,
+            Some(std::path::PathBuf::from("mock-endpoints.json"))
+        );
 
         assert!(Cli::try_parse_from([
             "dexdo",
@@ -1408,6 +1417,25 @@ mod deal_handle_cli_tests {
         };
         assert_eq!(seller.gateway_listen.to_string(), "0.0.0.0:8443");
         assert_eq!(seller.gateway_advertise_addr(), "0.0.0.0:8443");
+    }
+
+    #[test]
+    fn seller_subscription_mode_is_explicit_and_off_by_default() {
+        let ordinary = Cli::try_parse_from(["dexdo", "seller"]).expect("ordinary seller parses");
+        let Command::Seller(ordinary) = ordinary.command else {
+            panic!("expected Command::Seller");
+        };
+        assert!(
+            !ordinary.subscription,
+            "ordinary seller must not set the subscription flag"
+        );
+
+        let subscription = Cli::try_parse_from(["dexdo", "seller", "--subscription"])
+            .expect("subscription seller parses");
+        let Command::Seller(subscription) = subscription.command else {
+            panic!("expected Command::Seller");
+        };
+        assert!(subscription.subscription);
     }
 
     #[test]
@@ -1687,7 +1715,7 @@ mod tests {
         check_market_model_match, consumer_api_token_budget, default_endpoints_path,
         resolve_endpoints_file, resolve_market_fields,
     };
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, ValueEnum};
 
     fn subcommand_long_help(name: &str) -> String {
         let mut command = Cli::command();
@@ -1716,6 +1744,177 @@ mod tests {
             .expect_err("--version should render the package version");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn cli_defaults_parse_from_canonical_params() {
+        use dexdo_core::params as p;
+        use std::path::Path;
+
+        let seller = Cli::try_parse_from(["dexdo", "seller"]).expect("seller defaults parse");
+        let Command::Seller(seller) = seller.command else {
+            panic!("seller command")
+        };
+        assert_eq!(seller.identity.note_index, p::DEFAULT_NOTE_INDEX);
+        assert_eq!(
+            seller.gateway_listen.to_string(),
+            p::DEFAULT_SELLER_GATEWAY_LISTEN
+        );
+        assert_eq!(seller.mock_token_count, p::DEFAULT_SELLER_MOCK_TOKEN_COUNT);
+        assert_eq!(seller.models, Path::new(p::DEFAULT_MODELS_PATH));
+        assert_eq!(seller.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+
+        let buyer = Cli::try_parse_from(["dexdo", "buyer"]).expect("buyer defaults parse");
+        let Command::Buyer(buyer) = buyer.command else {
+            panic!("buyer command")
+        };
+        assert_eq!(buyer.max_tokens, p::DEFAULT_BUYER_MAX_TOKENS);
+        assert_eq!(buyer.continuity_mode.as_str(), p::DEFAULT_CONTINUITY_MODE);
+        assert_eq!(buyer.ticks, p::DEFAULT_BUYER_TICKS);
+        assert_eq!(buyer.models, Path::new(p::DEFAULT_MODELS_PATH));
+        assert_eq!(buyer.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+
+        let monitor = Cli::try_parse_from(["dexdo", "monitor"]).expect("monitor defaults parse");
+        let Command::Monitor(monitor) = monitor.command else {
+            panic!("monitor command")
+        };
+        assert_eq!(monitor.tree_width, p::DEFAULT_MONITOR_TREE_WIDTH);
+        assert_eq!(monitor.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+
+        let doctor = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor defaults parse");
+        let Command::Doctor(doctor) = doctor.command else {
+            panic!("doctor command")
+        };
+        assert_eq!(doctor.network, p::DEFAULT_DOCTOR_NETWORK);
+        assert_eq!(doctor.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+
+        let policy =
+            Cli::try_parse_from(["dexdo", "policy", "init"]).expect("policy defaults parse");
+        let Command::Policy(policy) = policy.command else {
+            panic!("policy command")
+        };
+        let PolicyCommand::Init(policy) = policy.command else {
+            panic!("policy init")
+        };
+        assert_eq!(
+            policy.role.to_possible_value().unwrap().get_name(),
+            p::DEFAULT_POLICY_ROLE
+        );
+
+        let provision =
+            Cli::try_parse_from(["dexdo", "provision", "--frame-model", "qwen--qwen3--32b"])
+                .expect("provision defaults parse");
+        let Command::Provision(provision) = provision.command else {
+            panic!("provision command")
+        };
+        assert_eq!(provision.max_ticks, p::DEFAULT_PROVISION_MAX_TICKS);
+        assert_eq!(
+            provision.output,
+            Path::new(p::DEFAULT_MARKET_MANIFEST_OUTPUT_PATH)
+        );
+
+        let markets = Cli::try_parse_from(["dexdo", "markets"]).expect("markets defaults parse");
+        let Command::Markets(markets) = markets.command else {
+            panic!("markets command")
+        };
+        assert_eq!(markets.frame_model, p::DEFAULT_MARKETS_FRAME_MODEL);
+        assert_eq!(markets.models, Path::new(p::DEFAULT_MODELS_PATH));
+        assert_eq!(
+            markets.read_timeout.read_timeout_secs,
+            p::DEFAULT_CHAIN_READ_TIMEOUT_SECS
+        );
+
+        let executable = Cli::try_parse_from(["dexdo", "executable-book", "qwen--qwen3--32b"])
+            .expect("executable-book defaults parse");
+        let Command::ExecutableBook(executable) = executable.command else {
+            panic!("executable-book command")
+        };
+        assert_eq!(executable.ticks, p::DEFAULT_EXECUTABLE_BOOK_TICKS);
+        assert_eq!(executable.models, Path::new(p::DEFAULT_MODELS_PATH));
+
+        let market_data =
+            Cli::try_parse_from(["dexdo", "market-data", "list"]).expect("market-data defaults");
+        let Command::MarketData(market_data) = market_data.command else {
+            panic!("market-data command")
+        };
+        assert_eq!(
+            market_data.output.to_possible_value().unwrap().get_name(),
+            p::DEFAULT_MARKET_DATA_OUTPUT
+        );
+        assert_eq!(market_data.timeout_ms, p::DEFAULT_MARKET_DATA_TIMEOUT_MS);
+
+        let dashboard =
+            Cli::try_parse_from(["dexdo", "dashboard"]).expect("dashboard defaults parse");
+        let Command::Dashboard(dashboard) = dashboard.command else {
+            panic!("dashboard command")
+        };
+        assert_eq!(dashboard.listen.to_string(), p::DEFAULT_DASHBOARD_LISTEN);
+
+        let export = Cli::try_parse_from(["dexdo", "export", "--deal", "deal-1"])
+            .expect("export defaults parse");
+        let Command::Export(export) = export.command else {
+            panic!("export command")
+        };
+        assert_eq!(
+            export.format.to_possible_value().unwrap().get_name(),
+            p::DEFAULT_EXPORT_FORMAT
+        );
+
+        let note = Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "deploy",
+            "--multisig-address",
+            "0:wallet",
+            "--multisig-key",
+            "wallet.key",
+            "--pool",
+            "pn_pool.json",
+        ])
+        .expect("note deploy defaults parse");
+        let Command::Note(note) = note.command else {
+            panic!("note command")
+        };
+        let NoteCommand::Deploy(note) = note.command else {
+            panic!("note deploy")
+        };
+        assert_eq!(note.nominal, p::DEFAULT_NOTE_DEPLOY_NOMINAL);
+        assert_eq!(note.endpoint, p::DEFAULT_NOTE_DEPLOY_ENDPOINT);
+        assert_eq!(note.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+
+        let oracle = Cli::try_parse_from([
+            "dexdo",
+            "oracle",
+            "provision",
+            "--oracle-key",
+            "oracle.key",
+            "--oracle-name",
+            "weekly-qwen",
+            "--market",
+            "market.json",
+            "--event-name",
+            "weekly-price",
+            "--deadline",
+            "1900000000",
+        ])
+        .expect("oracle defaults parse");
+        let Command::Oracle(oracle) = oracle.command else {
+            panic!("oracle command")
+        };
+        let OracleCommand::Provision(oracle) = oracle.command else {
+            panic!("oracle provision")
+        };
+        assert_eq!(oracle.event_list_index, p::DEFAULT_ORACLE_EVENT_LIST_INDEX);
+        assert_eq!(
+            oracle.event_list_description,
+            p::DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION
+        );
+        assert_eq!(oracle.describe, p::DEFAULT_ORACLE_PMP_DESCRIPTION);
+        assert_eq!(oracle.oracle_fee, p::DEFAULT_ORACLE_FEE);
+        assert_eq!(
+            oracle.output,
+            Path::new(p::DEFAULT_ORACLE_MARKET_OUTPUT_PATH)
+        );
     }
 
     #[test]
@@ -1750,6 +1949,148 @@ mod tests {
             panic!("executable-book command")
         };
         assert_eq!(book.max_price_per_tick, dexdo_core::PRICE_STEP);
+    }
+
+    #[test]
+    fn subscription_surface_is_only_place_status_cancel() {
+        let price = dexdo_core::PRICE_STEP.to_string();
+        let placed = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--note-addr",
+            "0:1111111111111111111111111111111111111111111111111111111111111111",
+            "--model",
+            "qwen--qwen3--32b",
+            "place",
+            "--note-key",
+            "buyer.key",
+            "--max-price-per-tick",
+            &price,
+            "--ticks",
+            "4",
+        ])
+        .expect("subscription place parses");
+        let Command::Subscription(args) = placed.command else {
+            panic!("subscription command")
+        };
+        let SubscriptionCommand::Place(place) = args.command else {
+            panic!("subscription place")
+        };
+        assert_eq!(place.max_price_per_tick, dexdo_core::PRICE_STEP);
+        assert_eq!(place.ticks, u128::from(dexdo_core::SUBSCRIPTION_WEEKS));
+
+        for command in ["status", "cancel"] {
+            assert!(
+                Cli::try_parse_from([
+                    "dexdo",
+                    "subscription",
+                    "--note-addr",
+                    "0:1111111111111111111111111111111111111111111111111111111111111111",
+                    "--model",
+                    "qwen--qwen3--32b",
+                    command,
+                    "7",
+                ])
+                .is_ok(),
+                "{command} must parse"
+            );
+        }
+        for obsolete in ["poke", "auto-renew", "advance-tick", "place-dedicated"] {
+            assert!(
+                Cli::try_parse_from(["dexdo", "subscription", obsolete]).is_err(),
+                "legacy subscription surface {obsolete} must stay absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_mock_cli_roundtrip_uses_persisted_note_and_chain_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-subscription-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let endpoints = dir.join("endpoints.json");
+        let note_key = dir.join("buyer.key");
+        std::fs::write(&note_key, "11".repeat(32)).unwrap();
+        let endpoints_arg = endpoints.to_str().unwrap();
+        let note_key_arg = note_key.to_str().unwrap();
+        let price = dexdo_core::PRICE_STEP.to_string();
+
+        let place = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--mock-model",
+            "--mock-chain",
+            "--endpoints-file",
+            endpoints_arg,
+            "--model",
+            "qwen--qwen3--32b",
+            "place",
+            "--note-key",
+            note_key_arg,
+            "--max-price-per-tick",
+            &price,
+            "--ticks",
+            "4",
+        ])
+        .unwrap();
+        let Command::Subscription(place) = place.command else {
+            panic!("subscription place")
+        };
+        run_subscription(place).await.unwrap();
+
+        for command in ["status", "cancel"] {
+            let parsed = Cli::try_parse_from([
+                "dexdo",
+                "subscription",
+                "--mock-model",
+                "--mock-chain",
+                "--note-key",
+                note_key_arg,
+                "--endpoints-file",
+                endpoints_arg,
+                "--model",
+                "qwen--qwen3--32b",
+                command,
+                "1",
+            ])
+            .unwrap();
+            let Command::Subscription(args) = parsed.command else {
+                panic!("subscription {command}")
+            };
+            run_subscription(args).await.unwrap();
+        }
+
+        let status_after_cancel = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--mock-model",
+            "--mock-chain",
+            "--note-key",
+            note_key_arg,
+            "--endpoints-file",
+            endpoints_arg,
+            "--model",
+            "qwen--qwen3--32b",
+            "status",
+            "1",
+        ])
+        .unwrap();
+        let Command::Subscription(status_after_cancel) = status_after_cancel.command else {
+            panic!("subscription status")
+        };
+        let error = run_subscription(status_after_cancel)
+            .await
+            .expect_err("cancelled mock subscription must no longer be resting")
+            .to_string();
+        assert!(error.contains("absent"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1800,30 +2141,6 @@ mod tests {
             .expect_err("this flags=0 CLI path is a limit BUY and must reject zero")
             .to_string();
         assert!(error.contains("PRICE_STEP"), "{error}");
-
-        let subscription = Cli::try_parse_from([
-            "dexdo",
-            "subscription",
-            "--contracts",
-            "must-not-be-read.json",
-            "--model",
-            "qwen",
-            "place",
-            "--max-price-per-tick",
-            invalid.as_str(),
-            "--ticks",
-            "2",
-        ])
-        .expect("subscription parses");
-        let Command::Subscription(subscription) = subscription.command else {
-            panic!("subscription command")
-        };
-        let error = run_subscription(subscription)
-            .await
-            .expect_err("subscription must reject before backend construction")
-            .to_string();
-        assert!(error.contains("PRICE_STEP"), "{error}");
-        assert!(!error.contains("must-not-be-read"), "{error}");
     }
 
     #[test]

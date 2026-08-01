@@ -39,6 +39,11 @@ use dexdo::registry::{
     RegistryValidationPolicy,
 };
 #[cfg(feature = "shellnet")]
+use dexdo_core::params::{
+    DEFAULT_CONTRACTS_PATH, EXECUTABLE_READ_BACKOFF, POOL_LOCK_POLL_INTERVAL,
+    POOL_LOCK_TIMEOUT_SECS,
+};
+#[cfg(feature = "shellnet")]
 use dexdo_core::shellnet::LiveBookOrder;
 #[cfg(feature = "shellnet")]
 use dexdo_core::OrderBookSnapshot;
@@ -52,27 +57,6 @@ use std::future::Future;
 use std::io::Write as _;
 #[cfg(feature = "shellnet")]
 use zeroize::Zeroizing;
-
-/// Deadline for awaiting match/handover: fail-closed, so `seller`/`buyer` don't hang
-/// forever if the match didn't go through. Backstop, not SLA -- a real on-chain match completes in ~1-2 min.
-pub(crate) const DEAL_WAIT_SECS: u64 = 300;
-/// Lookback window for a model-only `--resume`: how far back to scan THIS note's own
-/// `InferenceFilledConfirmed` events for the freshly matched deal (the buyer learns its deal from its own
-/// note, never a hand-pasted address). Wide enough to survive a process restart / slow match, short enough
-/// to skip earlier, already closed deals on the same book. The reader returns the MOST RECENT match in-window.
-pub(crate) const RESUME_LOOKBACK_SECS: i64 = 1800;
-pub(crate) const TRANSIENT_QUOTE_ATTEMPTS: usize = 3;
-pub(crate) const TRANSIENT_QUOTE_INITIAL_BACKOFF: std::time::Duration =
-    std::time::Duration::from_millis(250);
-#[cfg(feature = "shellnet")]
-pub(crate) const EXECUTABLE_READ_BACKOFF: [std::time::Duration; 2] = [
-    std::time::Duration::from_millis(250),
-    std::time::Duration::from_millis(500),
-];
-#[cfg(feature = "shellnet")]
-const DEFAULT_CONTRACTS_PATH: &str = "contracts/deployed.shellnet.json";
-#[cfg(feature = "shellnet")]
-const POOL_LOCK_TIMEOUT_SECS: u64 = 30;
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) async fn direct_chain_read_with_timeout<T>(
@@ -264,7 +248,7 @@ fn acquire_pool_write_lock_inner(pool_path: &std::path::Path, wait: bool) -> Res
                         lock_path.display()
                     );
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(POOL_LOCK_POLL_INTERVAL);
             }
             Err(e) => bail!("create pool lock {}: {e}", lock_path.display()),
         }
@@ -1077,7 +1061,7 @@ pub(crate) async fn read_book_target(
             &note,
             &target.frame_model,
             &target.model_hash,
-            dexdo_core::MODEL_TICK_SIZE,
+            dexdo_core::TICK_SIZE,
         )
         .await
 }
@@ -1109,7 +1093,7 @@ pub(crate) async fn resolve_order_book_target(
     let note = dexdo_core::Address::parse(note_addr)
         .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))?;
     chain
-        .inference_orderbook_address(&note, &target.model_hash, dexdo_core::MODEL_TICK_SIZE)
+        .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
         .await
         .map_err(|error| market_note_getter_error(note_addr, chain.client().endpoint(), error))
         .map(|address| address.with_workchain())
@@ -1243,7 +1227,7 @@ pub(crate) async fn expected_order_book_for_note(
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let model_hash = model_hash_for(frame_model);
     let ob = chain
-        .inference_orderbook_address(&note, &model_hash, dexdo_core::MODEL_TICK_SIZE)
+        .inference_orderbook_address(&note, &model_hash, dexdo_core::TICK_SIZE)
         .await?;
     Ok(ob.with_workchain())
 }
@@ -1384,12 +1368,12 @@ pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> St
         }
         Some(deals::DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
             format!(
-                "next=seller_wait_delivery_then_advance_after_window command=`keep dexdo seller running for {deal}; it waits for the first delivered canonical tick, then calls TokenContract.advance() only after PROBE_WINDOW` reason=awaiting_delivery_then_probe_window"
+                "next=seller_wait_delivery_then_accept_probe command=`keep dexdo seller running for {deal}; it waits for the first delivered canonical tick, then calls TokenContract.acceptProbe() after PROBE_WINDOW; use dexdo close {deal} --note-key <seller-key> to call TokenContract.sellerStop() if the seller must stop` reason=awaiting_delivery_then_probe_window"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.opened => {
             format!(
-                "next=seller_advance_or_wait_buyer_stop command=`keep dexdo seller running for {deal}`; buyer may STOP when done"
+                "next=seller_claim_finalize_or_settle_week_or_seller_stop command=`keep dexdo seller running for {deal}; it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims, while the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries; use dexdo close {deal} --note-key <seller-key> to call TokenContract.sellerStop() if the seller must stop`; buyer may STOP when done"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.funded && !s.probe_accepted => {
@@ -1403,7 +1387,7 @@ pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> St
             "next=none reason=deal_already_terminal".to_string()
         }
         Some(deals::DealHandleRole::Buyer) if s.opened => format!(
-            "next=stream_stop_or_reclaim_after_timeout command=`dexdo close {deal} --note-key <buyer-key>`"
+            "next=stream_stop command=`dexdo close {deal} --note-key <buyer-key>`"
         ),
         Some(deals::DealHandleRole::Buyer) if s.funded && !s.probe_accepted => {
             format!("next=cleanup_unopened_after_timeout command=`dexdo close {deal} --note-key <buyer-key>`")

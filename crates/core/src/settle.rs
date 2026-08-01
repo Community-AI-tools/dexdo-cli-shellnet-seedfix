@@ -32,38 +32,64 @@ pub fn net_burn(n_clean_ticks: u64, p: Shell, c: &ProtocolConsts) -> Shell {
     mul_bps(rate, n_clean_ticks, p)
 }
 
-/// Resolution of an early stop at the probe tick:
-/// the buyer burns `P`, the seller burns `P`, the remaining seller-bond `P` is refunded, and any
-/// unspent buyer deposit is refunded.
+/// Resolution of an unresolved dispute: the seller's whole bond burns and an equal amount of
+/// the buyer's escrow with it, while everything already trusted and the remaining deposit are paid out
+/// normally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeBurn {
-    /// The buyer's probe tick -- burned.
+pub struct ContestedBurn {
+    /// The buyer's mirrored slice of the escrow -- burned.
     pub buyer: Shell,
     /// The buyer's remaining, unspent deposit -- refunded.
     pub buyer_refund: u128,
-    /// The slashed half of the seller's `2P` bond -- burned.
+    /// The seller's bond -- burned in full.
     pub seller: Shell,
-    /// The unslashed half of the seller's `2P` bond -- refunded to the seller.
+    /// Remainder of the seller's bond returned to him. Always zero on this path: nobody conceded, so the
+    /// whole collateral is destroyed.
     pub seller_refund: Shell,
 }
 
-impl ProbeBurn {
+impl ContestedBurn {
     /// Total SHELL burned.
     pub fn total(&self) -> u128 {
         u128::from(self.buyer) + u128::from(self.seller)
     }
 }
 
-/// `probe_burn`: on a probe STOP the buyer's probe tick `p` burns AND a
-/// mirror `p` from the seller's `2P` bond burns(symmetric `P` vs `P`); the remaining bond
-/// (`p`) is returned to the seller separately. The pure stream machine has no extra buyer
-/// deposit; real adapters fill `buyer_refund` from the pre-STOP contract state.
-pub fn probe_burn(p: Shell) -> ProbeBurn {
-    ProbeBurn {
-        buyer: p,
+/// `contested_burn`: when `DISPUTE_WINDOW` passes with nobody conceding, the seller's WHOLE bond is
+/// destroyed and an equal amount of the buyer's escrow with it.
+/// The burn is deliberately FIXED at the bond rather than scaled to the disputed amount. Scaling it broke
+/// symmetry: the rate allowance lets a single claim assert far more than the bond covers, so a claim-sized
+/// burn would take a large slice of the buyer's escrow against a bond-sized slice of the seller's -- the
+/// buyer would pay more than the seller for refusing to settle. At bond size, refusing costs exactly the
+/// same on either side of the argument, which is what makes an unresolved dispute nobody's win.
+/// The buyer's side is still clamped to what he actually holds, so a deposit smaller than the bond cannot
+/// make the settlement underflow and brick the escrow. The pure stream machine has no separate deposit, so
+/// real adapters fill `buyer_refund` from the pre-settlement contract state.
+pub fn contested_burn(deposit: Shell, seller_bond: Shell) -> ContestedBurn {
+    ContestedBurn {
+        buyer: seller_bond.min(deposit),
         buyer_refund: 0,
-        seller: p,
-        seller_refund: p,
+        seller: seller_bond,
+        seller_refund: 0,
+    }
+}
+
+/// `probe_burn`: a buyer who walks away from the TRIAL tick destroys it, and a mirror tick of the
+/// seller's bond with it. Neither side keeps it.
+/// This is a different shape from [`contested_burn`], and deliberately so. Here the argument is about one
+/// trial tick, so the stake is one tick on each side and the REST of the bond goes back -- a seller who set
+/// out to take the first tick and vanish collects nothing and pays a tick for the attempt, but a seller whose
+/// endpoint merely went down briefly is not wiped out. A dispute, by contrast, is about the deal as a whole,
+/// and there the whole bond is at stake.
+/// The seller's side is clamped to the bond he holds. The pure stream machine has no separate deposit, so
+/// real adapters fill `buyer_refund` from the pre-settlement contract state.
+pub fn probe_burn(probe_tick: Shell, seller_bond: Shell) -> ContestedBurn {
+    let seller = probe_tick.min(seller_bond);
+    ContestedBurn {
+        buyer: probe_tick,
+        buyer_refund: 0,
+        seller,
+        seller_refund: seller_bond - seller,
     }
 }
 
@@ -132,15 +158,59 @@ mod tests {
         );
     }
 
+    /// an unresolved dispute costs each side the SAME -- the seller's whole bond, mirrored out of the
+    /// buyer's escrow. Equal cost is what stops either party from preferring deadlock.
     #[test]
-    fn probe_stop_burns_p_per_side_and_refunds_remaining_seller_bond() {
-        // symmetric P vs P burn; the other P of the seller's 2P bond returns.
-        let b = probe_burn(P);
-        assert_eq!(b.buyer, P);
-        assert_eq!(b.buyer_refund, 0);
-        assert_eq!(b.seller, P);
-        assert_eq!(b.seller_refund, P);
+    fn dispute_timeout_burn_is_bond_sized_and_symmetric() {
+        let bond = 2 * P;
+        let b = contested_burn(10 * P, bond);
+        assert_eq!(b.seller, bond, "the whole bond is destroyed");
+        assert_eq!(b.seller_refund, 0, "nobody conceded, so none of it returns");
+        assert_eq!(b.buyer, bond, "an equal amount of the buyer's escrow burns");
+        assert_eq!(b.total(), u128::from(bond) * 2);
+    }
+
+    /// The burn does not scale with what was claimed -- the claim is not even an input here. Whatever the
+    /// seller asserted, refusing to settle costs him the bond and the buyer the same amount, so the size of
+    /// the disputed figure cannot shift the balance of the argument.
+    #[test]
+    fn dispute_timeout_burn_does_not_depend_on_the_claim() {
+        let bond = 2 * P;
+        // Same deposit, any claim history: one and only one outcome.
+        assert_eq!(contested_burn(10 * P, bond), contested_burn(10 * P, bond));
+        // And it is bond-sized on both sides whenever the buyer can cover it.
+        let b = contested_burn(10 * P, bond);
+        assert_eq!(u128::from(b.buyer), u128::from(b.seller));
+    }
+
+    /// A buyer holding less than the bond burns only what he has, so the settlement cannot underflow and
+    /// permanently brick the escrow.
+    #[test]
+    fn dispute_timeout_burn_clamps_to_the_buyers_deposit() {
+        let b = contested_burn(P / 2, 2 * P);
+        assert_eq!(b.buyer, P / 2, "clamped to what the buyer actually holds");
+        assert_eq!(b.seller, 2 * P, "the seller still loses the whole bond");
+    }
+
+    /// walking away from the TRIAL tick stakes one tick per side -- not the whole bond. The rest of
+    /// the collateral returns, so a brief outage is not punished like a scam.
+    #[test]
+    fn probe_burn_stakes_one_tick_per_side_and_returns_the_rest() {
+        let b = probe_burn(P, 2 * P);
+        assert_eq!(b.buyer, P, "the trial tick is destroyed");
+        assert_eq!(b.seller, P, "a mirror tick of the bond goes with it");
+        assert_eq!(
+            b.seller_refund, P,
+            "the remaining bond returns to the seller"
+        );
         assert_eq!(b.total(), u128::from(P) * 2);
-        assert_eq!(b.seller + b.seller_refund, 2 * P);
+    }
+
+    /// A probe burn is strictly cheaper for the seller than a lost dispute -- otherwise the cheap resolution
+    /// would not be the attractive one.
+    #[test]
+    fn probe_burn_costs_the_seller_less_than_a_lost_dispute() {
+        let bond = 2 * P;
+        assert!(probe_burn(P, bond).seller < contested_burn(10 * P, bond).seller);
     }
 }

@@ -1,9 +1,9 @@
 //! Buyer continuity planner for the long-running local API mode.
 //! The planner is deliberately side-effect free: callers read chain facts, pass them in, and execute the
 //! returned action through existing primitives (`place_buy`, handover resolution, `streamCleanup`,
-//! `streamReclaim`, `SessionSettle`). This keeps duplicate monitor ticks and process restarts idempotent.
+//! `SessionSettle`). This keeps duplicate monitor ticks and process restarts idempotent.
 
-use dexdo_core::{TokenContract, MATCH_OPEN_TIMEOUT_SECS};
+use dexdo_core::{params::BUYER_RENEWAL_THRESHOLD_TOKENS, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +116,6 @@ pub enum BuyerAction {
     CleanupUnopened {
         token_contract: TokenContract,
     },
-    ReclaimOpened {
-        token_contract: TokenContract,
-    },
     PlaceNextDeal {
         reason: &'static str,
     },
@@ -166,15 +163,13 @@ impl ContinuityMode {
 pub struct ContinuityConfig {
     pub renewal_threshold_tokens: u64,
     pub match_open_timeout_secs: u64,
-    pub stream_timeout_secs: u64,
 }
 
 impl Default for ContinuityConfig {
     fn default() -> Self {
         Self {
-            renewal_threshold_tokens: 64,
+            renewal_threshold_tokens: BUYER_RENEWAL_THRESHOLD_TOKENS,
             match_open_timeout_secs: MATCH_OPEN_TIMEOUT_SECS,
-            stream_timeout_secs: 600,
         }
     }
 }
@@ -289,12 +284,6 @@ impl BuyerContinuity {
             DealPhase::FundedNeverOpened { .. } => BuyerAction::Noop {
                 reason: "waiting-for-handover",
             },
-            DealPhase::Opened { idle_secs } if idle_secs >= cfg.stream_timeout_secs => {
-                self.stale.insert(current.token_contract.clone());
-                BuyerAction::ReclaimOpened {
-                    token_contract: current.token_contract,
-                }
-            }
             DealPhase::Opened { .. } | DealPhase::HandoverReady => {
                 if current
                     .remaining_tokens
@@ -378,11 +367,18 @@ pub fn seller_market_action(
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_renewal_threshold_uses_canonical_parameter() {
+        assert_eq!(
+            ContinuityConfig::default().renewal_threshold_tokens,
+            BUYER_RENEWAL_THRESHOLD_TOKENS
+        );
+    }
+
     fn cfg() -> ContinuityConfig {
         ContinuityConfig {
             renewal_threshold_tokens: 10,
             match_open_timeout_secs: 600,
-            stream_timeout_secs: 600,
         }
     }
 
@@ -447,20 +443,24 @@ mod tests {
     }
 
     #[test]
-    fn opened_idle_reclaims_and_does_not_reuse_failed_stream() {
-        let mut c = BuyerContinuity::default();
-        assert_eq!(
-            c.tick(Some(DealFacts::opened_idle("tc-idle", 600)), None, cfg()),
-            BuyerAction::ReclaimOpened {
-                token_contract: "tc-idle".to_string()
-            }
-        );
-        assert_eq!(
-            c.tick(Some(DealFacts::opened_idle("tc-idle", 700)), None, cfg()),
-            BuyerAction::IgnoreStale {
-                token_contract: "tc-idle".to_string()
-            }
-        );
+    fn opened_idle_never_authorizes_stop_or_replacement_buy() {
+        for idle_secs in [600, 700, u64::MAX] {
+            let mut c = BuyerContinuity::default();
+            assert_eq!(
+                c.tick(
+                    Some(DealFacts::opened_idle("tc-idle", idle_secs)),
+                    None,
+                    cfg()
+                ),
+                BuyerAction::ServeCurrent {
+                    token_contract: "tc-idle".to_string()
+                }
+            );
+            assert!(
+                !c.stale_token_contracts().contains("tc-idle"),
+                "idle alone must not retire an OPEN deal"
+            );
+        }
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
                 ContinuityMode::OnDemand,
                 ConsumerDemand::Idle
             ),
-            BuyerAction::ReclaimOpened {
+            BuyerAction::ServeCurrent {
                 token_contract: "tc-idle".to_string()
             }
         );
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_fact_recovery_actions_ignore_continuity_mode_and_demand() {
+    fn unopened_cleanup_ignores_mode_while_opened_idle_never_moves_money() {
         for (mode, demand) in [
             (ContinuityMode::Proactive, ConsumerDemand::Idle),
             (ContinuityMode::Proactive, ConsumerDemand::ActiveOrRecent),
@@ -675,16 +675,17 @@ mod tests {
             let mut c = BuyerContinuity::default();
             assert_eq!(
                 c.tick_with_mode(
-                    Some(DealFacts::opened_idle("tc-reclaim", 600)),
+                    Some(DealFacts::opened_idle("tc-open", u64::MAX)),
                     None,
                     cfg(),
                     mode,
                     demand
                 ),
-                BuyerAction::ReclaimOpened {
-                    token_contract: "tc-reclaim".to_string()
+                BuyerAction::ServeCurrent {
+                    token_contract: "tc-open".to_string()
                 }
             );
+            assert!(c.stale_token_contracts().is_empty());
         }
     }
 

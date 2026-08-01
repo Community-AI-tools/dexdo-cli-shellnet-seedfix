@@ -2,7 +2,7 @@
 //! `deals`/`status`/`close` without reassembling low-level addresses.
 
 use anyhow::{bail, Result};
-use dexdo_core::MarketManifest;
+use dexdo_core::{DealBuyerBond, DealChainState, MarketManifest};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -84,65 +84,101 @@ pub(crate) struct DealStateSummary {
     pub(crate) disputed: bool,
     pub(crate) probe_accepted: bool,
     pub(crate) deposit: u128,
-    pub(crate) prepaid: u128,
-    pub(crate) frozen: u128,
+    pub(crate) probe_tick: u128,
+    pub(crate) buyer_bond: u128,
+    pub(crate) buyer_bond_required: u128,
     pub(crate) finalized_owed: u128,
+    pub(crate) tokens_final: u128,
+    pub(crate) tokens_superseded: u128,
+    pub(crate) tokens_pending: u128,
     pub(crate) funded_time: Option<u64>,
-    pub(crate) last_advance: u64,
+    pub(crate) probe_time: u64,
+    pub(crate) prev_claim_time: u64,
+    pub(crate) last_claim_time: u64,
+    pub(crate) dispute_time: u64,
 }
 
 impl DealStateSummary {
     #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-    pub(crate) fn buyer_locked(&self) -> u128 {
+    pub(crate) fn buyer_locked(&self) -> Result<u128> {
         self.deposit
-            .saturating_add(self.prepaid)
-            .saturating_add(self.frozen)
+            .checked_add(self.probe_tick)
+            .and_then(|total| total.checked_add(self.buyer_bond))
+            .ok_or_else(|| anyhow::anyhow!("buyer locked amount overflows uint128"))
     }
 }
 
+#[cfg(test)]
+pub(crate) fn classify_deal_state(
+    state: &serde_json::Value,
+    buyer_bond: DealBuyerBond,
+) -> Result<DealStateSummary> {
+    let state = DealChainState::decode_getter(state).map_err(anyhow::Error::msg)?;
+    Ok(summarize_chain_state(state, buyer_bond))
+}
+
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn classify_deal_state(state: &serde_json::Value) -> DealStateSummary {
-    let funded = state["funded"].as_bool().unwrap_or(false);
-    let opened = state["opened"].as_bool().unwrap_or(false);
-    let disputed = state["disputed"].as_bool().unwrap_or(false);
-    let probe_accepted = state["probeAccepted"].as_bool().unwrap_or(false);
-    let deposit = u128_field(state, "deposit");
-    let prepaid = u128_field(state, "prepaid");
-    let frozen = u128_field(state, "frozen");
-    let finalized_owed = u128_field(state, "finalizedOwed");
-    let settled = funded
-        && !opened
-        && !disputed
-        && deposit == 0
-        && prepaid == 0
-        && frozen == 0
-        && finalized_owed == 0;
-    let kind = if disputed {
+pub(crate) fn summarize_deal_snapshot(
+    snapshot: &dexdo_core::DealChainSnapshot,
+) -> DealStateSummary {
+    summarize_chain_state(snapshot.state, snapshot.buyer_bond)
+}
+
+fn summarize_chain_state(state: DealChainState, buyer_bond: DealBuyerBond) -> DealStateSummary {
+    let kind = if state.disputed {
         DealStateKind::Disputed
-    } else if opened && probe_accepted {
+    } else if state.opened && state.probe_accepted {
         DealStateKind::Streaming
-    } else if opened {
+    } else if state.opened {
         DealStateKind::Probe
-    } else if settled || funded && probe_accepted {
+    } else if state.is_stopped() {
         DealStateKind::Stopped
-    } else if funded {
+    } else if state.funded {
         DealStateKind::FundedButNeverOpened
     } else {
         DealStateKind::Placed
     };
     DealStateSummary {
         kind,
-        funded,
-        opened,
-        disputed,
-        probe_accepted,
-        deposit,
-        prepaid,
-        frozen,
-        finalized_owed,
-        funded_time: u64_opt_field(state, "fundedTime"),
-        last_advance: u64_opt_field(state, "lastAdvance").unwrap_or(0),
+        funded: state.funded,
+        opened: state.opened,
+        disputed: state.disputed,
+        probe_accepted: state.probe_accepted,
+        deposit: state.deposit,
+        probe_tick: state.probe_tick,
+        buyer_bond: buyer_bond.bond_held,
+        buyer_bond_required: buyer_bond.bond_required,
+        finalized_owed: state.finalized_owed,
+        tokens_final: state.tokens_final,
+        tokens_superseded: state.tokens_superseded,
+        tokens_pending: state.tokens_pending,
+        funded_time: state.funded_time,
+        probe_time: state.probe_time,
+        prev_claim_time: state.prev_claim_time,
+        last_claim_time: state.last_claim_time,
+        dispute_time: state.dispute_time,
     }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn deal_state_getter_json(state: DealChainState) -> serde_json::Value {
+    serde_json::json!({
+        "funded": state.funded,
+        "opened": state.opened,
+        "probeAccepted": state.probe_accepted,
+        "disputed": state.disputed,
+        "deposit": state.deposit.to_string(),
+        "probeTick": state.probe_tick.to_string(),
+        "finalizedOwed": state.finalized_owed.to_string(),
+        "tokensFinal": state.tokens_final.to_string(),
+        "tokensSuperseded": state.tokens_superseded.to_string(),
+        "tokensPending": state.tokens_pending.to_string(),
+        "probeTime": state.probe_time.to_string(),
+        "prevClaimTime": state.prev_claim_time.to_string(),
+        "lastClaimTime": state.last_claim_time.to_string(),
+        "disputeTime": state.dispute_time.to_string(),
+        "fundedTime": state.funded_time.unwrap_or(0).to_string(),
+    })
 }
 
 pub(crate) fn default_deals_dir() -> Result<PathBuf> {
@@ -450,23 +486,6 @@ fn is_secret_field_name(key: &str) -> bool {
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-fn u128_field(v: &serde_json::Value, key: &str) -> u128 {
-    v[key]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| v[key].as_u64().map(u128::from))
-        .unwrap_or(0)
-}
-
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-fn u64_opt_field(v: &serde_json::Value, key: &str) -> Option<u64> {
-    v[key]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| v[key].as_u64())
-}
-
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
@@ -604,37 +623,95 @@ mod tests {
 
     #[test]
     fn deal_state_classification_distinguishes_lifecycle_states() {
-        let st = serde_json::json!({"funded": false, "opened": false, "disputed": false});
-        assert_eq!(classify_deal_state(&st).kind, DealStateKind::Placed);
-        let st = serde_json::json!({
-            "funded": true, "opened": false, "probeAccepted": false, "deposit": "10"
-        });
+        let ordinary_bond = dexdo_core::DealBuyerBond {
+            bond_held: 0,
+            bond_required: 0,
+        };
+        fn state(
+            funded: bool,
+            opened: bool,
+            probe_accepted: bool,
+            disputed: bool,
+            deposit: u128,
+            probe_tick: u128,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "funded": funded,
+                "opened": opened,
+                "probeAccepted": probe_accepted,
+                "disputed": disputed,
+                "deposit": deposit.to_string(),
+                "probeTick": probe_tick.to_string(),
+                "finalizedOwed": "0",
+                "tokensFinal": "0",
+                "tokensSuperseded": "0",
+                "tokensPending": "0",
+                "probeTime": "0",
+                "prevClaimTime": "0",
+                "lastClaimTime": "0",
+                "disputeTime": "0",
+                "fundedTime": "0"
+            })
+        }
+
+        let st = state(false, false, false, false, 0, 0);
         assert_eq!(
-            classify_deal_state(&st).kind,
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
+            DealStateKind::Placed
+        );
+        let st = state(true, false, false, false, 10, 0);
+        assert_eq!(
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
             DealStateKind::FundedButNeverOpened
         );
-        let st = serde_json::json!({"funded": true, "opened": true, "probeAccepted": false});
-        assert_eq!(classify_deal_state(&st).kind, DealStateKind::Probe);
-        let st = serde_json::json!({"funded": true, "opened": true, "probeAccepted": true});
-        assert_eq!(classify_deal_state(&st).kind, DealStateKind::Streaming);
-        let st = serde_json::json!({"funded": true, "opened": false, "probeAccepted": true});
-        assert_eq!(classify_deal_state(&st).kind, DealStateKind::Stopped);
-        let st = serde_json::json!({
-            "funded": true,
-            "opened": false,
-            "probeAccepted": false,
-            "deposit": "0",
-            "prepaid": "0",
-            "frozen": "0",
-            "finalizedOwed": "0"
-        });
+        let st = state(true, true, false, false, 10, 1);
         assert_eq!(
-            classify_deal_state(&st).kind,
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
+            DealStateKind::Probe
+        );
+        let st = state(true, true, true, false, 10, 0);
+        assert_eq!(
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
+            DealStateKind::Streaming
+        );
+        let st = state(true, false, true, false, 0, 0);
+        assert_eq!(
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
             DealStateKind::Stopped,
             "a post-STOP deal with returned escrow is terminal, not never-opened"
         );
-        let st = serde_json::json!({"disputed": true});
-        assert_eq!(classify_deal_state(&st).kind, DealStateKind::Disputed);
+        let st = state(true, false, true, true, 10, 0);
+        assert_eq!(
+            classify_deal_state(&st, ordinary_bond).unwrap().kind,
+            DealStateKind::Disputed
+        );
+
+        let mut incomplete = state(true, true, true, false, 10, 0);
+        incomplete
+            .as_object_mut()
+            .unwrap()
+            .remove("tokensSuperseded");
+        assert!(
+            classify_deal_state(&incomplete, ordinary_bond)
+                .unwrap_err()
+                .to_string()
+                .contains("tokensSuperseded"),
+            "incomplete 4.0.31 state must fail closed"
+        );
+
+        let overflow = state(true, true, true, false, u128::MAX, 1);
+        let summary = classify_deal_state(
+            &overflow,
+            dexdo_core::DealBuyerBond {
+                bond_held: 1,
+                bond_required: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            summary.buyer_locked().is_err(),
+            "deposit + probeTick + buyerBond must use checked uint128 arithmetic"
+        );
     }
 
     #[test]

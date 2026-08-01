@@ -5,21 +5,12 @@ use base64::Engine as _;
 use gosh_ackinacki::wallet::query::fetch_dapp_id;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::time::Duration;
 use tvm_abi::token::TokenValue;
 use tvm_abi::{Contract, Event};
 use tvm_types::SliceData;
 
 use super::client::{fetch_ext_out_page, ExtOutPage};
 use super::contracts_provision::INFERENCE_ORDERBOOK_ABI;
-
-const PAGE_SIZE: u32 = 50;
-const READ_BACKOFF: [Duration; 4] = [
-    Duration::from_millis(250),
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
 
 /// One still-live order reconstructed from the book event stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,13 +165,13 @@ pub(super) async fn read_book_event_fold(
     fold_book_event_pages(fold, |before| {
         let dapp_id = dapp_id.clone();
         async move {
-            for delay in READ_BACKOFF {
+            for delay in crate::params::BOOK_EVENT_READ_BACKOFFS {
                 match fetch_ext_out_page(
                     http,
                     endpoint,
                     account_id,
                     &dapp_id,
-                    PAGE_SIZE,
+                    crate::params::BOOK_EVENT_PAGE_SIZE,
                     before.as_deref(),
                 )
                 .await
@@ -197,7 +188,7 @@ pub(super) async fn read_book_event_fold(
                 endpoint,
                 account_id,
                 &dapp_id,
-                PAGE_SIZE,
+                crate::params::BOOK_EVENT_PAGE_SIZE,
                 before.as_deref(),
             )
             .await

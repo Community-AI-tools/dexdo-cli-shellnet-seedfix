@@ -3,21 +3,29 @@
 
 pub mod advance;
 pub mod auth;
+pub mod capacity;
 pub mod gateway;
+pub mod keeper;
 pub mod liveness;
 pub mod models;
 pub mod tls;
 pub mod upstream;
 
-pub use advance::{drive_advance, AdvanceWindows};
+pub use advance::{drive_advance, drive_advance_with_observer, AdvanceWindows, ClaimStateObserver};
+pub use keeper::{
+    drive_subscription_keeper, drive_subscription_keeper_with_observer, SubscriptionKeeperObserver,
+};
 pub use models::{Capabilities, ModelConfig, ModelsConfig};
 pub use upstream::{anthropic::AnthropicConfig, openai::OpenAiConfig, UpstreamConfig};
 
 use anyhow::{anyhow, bail, Result};
+use dexdo_core::params::{
+    MIN_STREAM_BUY_TICKS, SELLER_OPEN_STATE_INITIAL_BACKOFF, SELLER_OPEN_STATE_READ_ATTEMPTS,
+};
 use dexdo_core::{
-    normalize_wallet_address, ChainBackend, DobParams, Handover, LocalNote, Match,
-    MatchWatchCursor, MatchedFill, Note, OrderBookOrder, SellOffer, SellOfferOutcome,
-    TokenContract,
+    normalize_wallet_address, order_flags, ChainBackend, DealChainState, DealSubscription,
+    Handover, LocalNote, Match, MatchWatchCursor, MatchedFill, Note, OrderBookOrder, SellOffer,
+    SellOfferOutcome, TokenContract, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
 };
 use gateway::{GatewayService, GatewayState};
 use std::net::SocketAddr;
@@ -28,10 +36,8 @@ use tls::GatewayTls;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-pub const DEFAULT_MATCH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const SUBSCRIPTION_SELL_FLAGS: u8 = order_flags::AON | order_flags::SUBSCRIPTION;
 const SELLER_MATCH_WATCH_CURSOR_VERSION: u32 = 1;
-const SELLER_OPEN_STATE_READ_ATTEMPTS: usize = 3;
-const SELLER_OPEN_STATE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Seller configuration for one stream.
 #[derive(Debug, Clone)]
@@ -42,11 +48,13 @@ pub struct SellerConfig {
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,
+    /// Whether this SELL accepts only subscription BUYs.
+    pub subscription: bool,
     /// Public gateway host:port that will be encrypted to the buyer(R15).
     pub gateway_advertise: String,
     /// How many fake tokens to yield(mock model). `0` = a deliberate seller no-show.
-    /// Real upstreams are limited by the buyer request's `max_tokens` and the market cap
-    /// (`max_ticks * TICK_SIZE`), not by this debug fixture.
+    /// Real upstreams are limited by the buyer request's `max_tokens` and the matched TC's strict
+    /// `fundedTokens`/weekly cap, not by this debug fixture or the seller's advertised maximum.
     pub mock_token_count: u64,
 }
 
@@ -112,13 +120,13 @@ pub struct SellerFillLineage {
 
 impl SellerFillLineage {
     fn validate(&self) -> Result<()> {
-        if self.offered_ticks < 2
+        if u128::from(self.offered_ticks) < MIN_STREAM_BUY_TICKS
             || self.matched_ticks == 0
             || self.matched_ticks > self.offered_ticks
             || self.residual_ticks != self.offered_ticks - self.matched_ticks
         {
             bail!(
-                "invalid seller fill lineage: N={} K={} R={}; expected N>=2, 1<=K<=N and R=N-K",
+                "invalid seller fill lineage: N={} K={} R={}; expected N>={MIN_STREAM_BUY_TICKS}, 1<=K<=N and R=N-K",
                 self.offered_ticks,
                 self.matched_ticks,
                 self.residual_ticks
@@ -172,9 +180,12 @@ impl SellerMatchWatchCursor {
                 cfg.token_contract
             );
         }
-        if authoritative_ticks < 2 || matched_ticks == 0 || matched_ticks > authoritative_ticks {
+        if u128::from(authoritative_ticks) < MIN_STREAM_BUY_TICKS
+            || matched_ticks == 0
+            || matched_ticks > authoritative_ticks
+        {
             bail!(
-                "seller fill ticks must be within 1..={} for offer size >=2, got {}",
+                "seller fill ticks must be within 1..={} for offer size >={MIN_STREAM_BUY_TICKS}, got {}",
                 authoritative_ticks,
                 matched_ticks
             );
@@ -356,7 +367,48 @@ pub async fn start_gateway_with_note_tls(
     note: Arc<dyn Note>,
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
-    let state = Arc::new(GatewayState::with_upstream(upstream));
+    start_gateway_with_note_and_capacity_dir(addr, upstream, note, None, gw_tls).await
+}
+
+/// Production seller gateway with crash-safe subscription capacity stored beside deal handles.
+pub async fn start_gateway_with_note_and_deals_dir(
+    addr: SocketAddr,
+    upstream: UpstreamConfig,
+    note: Arc<dyn Note>,
+    deals_dir: PathBuf,
+) -> Result<RunningSeller> {
+    start_gateway_with_note_and_capacity_dir(
+        addr,
+        upstream,
+        note,
+        Some(deals_dir),
+        GatewayTls::generate()?,
+    )
+    .await
+}
+
+/// Production seller gateway with both a persistent TLS identity and crash-safe capacity state.
+pub async fn start_gateway_with_note_tls_and_deals_dir(
+    addr: SocketAddr,
+    upstream: UpstreamConfig,
+    note: Arc<dyn Note>,
+    deals_dir: PathBuf,
+    gw_tls: GatewayTls,
+) -> Result<RunningSeller> {
+    start_gateway_with_note_and_capacity_dir(addr, upstream, note, Some(deals_dir), gw_tls).await
+}
+
+async fn start_gateway_with_note_and_capacity_dir(
+    addr: SocketAddr,
+    upstream: UpstreamConfig,
+    note: Arc<dyn Note>,
+    deals_dir: Option<PathBuf>,
+    gw_tls: GatewayTls,
+) -> Result<RunningSeller> {
+    let state = Arc::new(match deals_dir {
+        Some(deals_dir) => GatewayState::with_upstream_and_deals_dir(upstream, deals_dir),
+        None => GatewayState::with_upstream(upstream),
+    });
     let service = GatewayService::new(state.clone()).into_server();
 
     // Both rustls providers(ring/aws-lc-rs) are present in the tree; pin the process
@@ -412,12 +464,36 @@ pub async fn post_offer_with_note(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
 ) -> Result<()> {
+    validate_subscription_offer_volume(cfg)?;
     let offer = SellOffer {
         price_per_tick: cfg.price_per_tick,
         max_ticks: cfg.max_ticks,
         token_contract: cfg.token_contract.clone(),
+        flags: if cfg.subscription {
+            SUBSCRIPTION_SELL_FLAGS
+        } else {
+            0
+        },
     };
     chain.post_offer(offer, note).await?;
+    Ok(())
+}
+
+fn validate_subscription_offer_volume(cfg: &SellerConfig) -> Result<()> {
+    let term = u64::from(SUBSCRIPTION_WEEKS);
+    if cfg.subscription
+        && (cfg.max_ticks == 0
+            || u128::from(cfg.max_ticks) > SUBSCRIPTION_MAX_TICKS
+            || !cfg.max_ticks.is_multiple_of(term))
+    {
+        bail!(
+            "seller subscription offer for TokenContract {} requires non-zero max_ticks no greater \
+             than {SUBSCRIPTION_MAX_TICKS} and divisible by the fixed {SUBSCRIPTION_WEEKS}-week \
+             term, got {}",
+            cfg.token_contract,
+            cfg.max_ticks
+        );
+    }
     Ok(())
 }
 
@@ -521,6 +597,20 @@ fn validate_resting_offer(
             ),
         ));
     }
+    let expected_flags = if cfg.subscription {
+        SUBSCRIPTION_SELL_FLAGS
+    } else {
+        0
+    };
+    if order.flags != expected_flags {
+        return Err(resting_offer_error(
+            &cfg.token_contract,
+            format!(
+                "raw order {} flags 0x{:02x} do not match required seller flags 0x{:02x}",
+                order.order_id, order.flags, expected_flags
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -532,6 +622,7 @@ pub async fn inspect_seller_offer(
     cfg: &SellerConfig,
     expected_owner: Option<&str>,
 ) -> Result<SellerOfferInspection> {
+    validate_subscription_offer_volume(cfg)?;
     match chain.read_openable_match_now(&cfg.token_contract).await {
         Ok(Some(_)) => return Ok(SellerOfferInspection::Funded),
         Ok(None) => {}
@@ -680,13 +771,30 @@ pub async fn provision_match(
     // after reading the on-chain ciphertext(written by `open_stream`), so register-before-open rules out a race. Otherwise on a
     // real(slow) chain the buyer manages to knock in the window between open_stream and register_stream
     // -> the gateway still has no pubkey -> `challenge-response failed`(the mock timing did not expose this).
+    let (state, deal) = read_coherent_deal_capacity(chain, &cfg.token_contract).await?;
+    if cfg.subscription != deal.is_subscription() {
+        let expected = if cfg.subscription {
+            "subscription"
+        } else {
+            "ordinary"
+        };
+        let observed = if deal.is_subscription() {
+            "subscription"
+        } else {
+            "ordinary"
+        };
+        bail!(
+            "TokenContract {}: seller configured {expected} mode but strict deal snapshot is {observed}",
+            cfg.token_contract
+        );
+    }
     seller.state.register_stream(
         &cfg.token_contract,
         m.buyer_pubkey,
         cfg.mock_token_count,
-        cfg.max_ticks,
-        DobParams::canonical().tick_size,
-    );
+        state,
+        deal,
+    )?;
     if !read_opened_with_retry(chain, &cfg.token_contract).await? {
         chain
             .open_stream(&cfg.token_contract, enc, seller.note.as_ref())
@@ -698,6 +806,16 @@ pub async fn provision_match(
         );
     }
     Ok(())
+}
+
+async fn read_coherent_deal_capacity(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+) -> Result<(DealChainState, DealSubscription)> {
+    let snapshot = chain.deal_snapshot(token_contract).await?.ok_or_else(|| {
+        anyhow!("TokenContract {token_contract}: coherent deal snapshot returned no capacity data")
+    })?;
+    Ok((snapshot.state, snapshot.subscription))
 }
 
 /// Perform only the read-only match poll, leaving provisioning to the caller.
@@ -880,8 +998,8 @@ pub async fn watch_and_serve_match(
 mod tests {
     use super::*;
     use dexdo_core::{
-        validate_seller_resume_state, ChainError, DealChainState, LocalNote, NotePubkey,
-        OfferListing, SellOffer, Settlement, StreamSnapshot,
+        validate_seller_resume_state, ChainError, DealBuyerBond, DealChainSnapshot, DealChainState,
+        DealSellerBond, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement, StreamSnapshot,
     };
     use dexdo_proto::{CanonRequest, ChallengeRequest, GatewayClient, StreamRequest};
     use proptest::prelude::*;
@@ -924,6 +1042,7 @@ mod tests {
         polls: AtomicU64,
         state_failures_remaining: AtomicU64,
         state_reads: AtomicU64,
+        subscription: bool,
         expect_last_seen: Option<i64>,
         record_created_at: i64,
         matched_ticks: u128,
@@ -946,6 +1065,7 @@ mod tests {
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
+                subscription: false,
                 expect_last_seen,
                 record_created_at,
                 matched_ticks: 8,
@@ -964,6 +1084,7 @@ mod tests {
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
+                subscription: false,
                 expect_last_seen: None,
                 record_created_at: 1,
                 matched_ticks: 8,
@@ -993,6 +1114,11 @@ mod tests {
 
         fn with_offer_ticks(mut self, ticks: u64) -> Self {
             self.offer_ticks = ticks;
+            self
+        }
+
+        fn with_subscription(mut self) -> Self {
+            self.subscription = true;
             self
         }
     }
@@ -1077,19 +1203,16 @@ mod tests {
             Ok(self.handover.lock().unwrap().clone())
         }
 
-        async fn advance_tick(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
-            unimplemented!()
-        }
-
-        async fn accept_probe(&self, _: &TokenContract) -> Result<(), ChainError> {
+        async fn claim_tokens(
+            &self,
+            _: &TokenContract,
+            _: &dyn Note,
+            _: u128,
+        ) -> Result<(), ChainError> {
             unimplemented!()
         }
 
         async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
-            unimplemented!()
-        }
-
-        async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
             unimplemented!()
         }
 
@@ -1106,10 +1229,112 @@ mod tests {
             Ok(Some(DealChainState {
                 funded: true,
                 opened: self.opened.load(Ordering::Relaxed),
-                disputed: false,
                 probe_accepted: false,
+                disputed: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: 0,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            }))
+        }
+
+        async fn deal_subscription(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealSubscription>, ChainError> {
+            let funded_tokens = 8 * dexdo_core::TICK_SIZE;
+            Ok(Some(if self.subscription {
+                DealSubscription {
+                    deal_flags: order_flags::SUBSCRIPTION,
+                    sub_weeks: 4,
+                    week_index: 0,
+                    tokens_per_week: 2 * dexdo_core::TICK_SIZE,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                }
+            } else {
+                DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: funded_tokens,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                }
+            }))
+        }
+
+        async fn deal_snapshot(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainSnapshot>, ChainError> {
+            self.state_reads.fetch_add(1, Ordering::Relaxed);
+            let state = DealChainState {
+                funded: true,
+                opened: self.opened.load(Ordering::Relaxed),
+                probe_accepted: false,
+                disputed: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
+                funded_time: Some(1),
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            };
+            let funded_tokens = 8 * dexdo_core::TICK_SIZE;
+            let subscription = if self.subscription {
+                DealSubscription {
+                    deal_flags: order_flags::SUBSCRIPTION,
+                    sub_weeks: 4,
+                    week_index: 0,
+                    tokens_per_week: 2 * dexdo_core::TICK_SIZE,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                }
+            } else {
+                DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: funded_tokens,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                }
+            };
+            Ok(Some(DealChainSnapshot {
+                account_code_hash: "test-code".to_string(),
+                account_boc_hash: "test-boc".to_string(),
+                state,
+                subscription,
+                seller_bond: DealSellerBond {
+                    bond_funded: true,
+                    bond_held: 1,
+                    bond_required: 1,
+                },
+                buyer_bond: DealBuyerBond {
+                    bond_held: u128::from(self.subscription),
+                    bond_required: u128::from(self.subscription),
+                },
             }))
         }
 
@@ -1125,18 +1350,39 @@ mod tests {
         TransportFailure,
     }
 
+    fn resume_state(deposit: u128) -> DealChainState {
+        DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            probe_tick: 0,
+            funded_time: Some(1),
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: 0,
+            dispute_time: 0,
+        }
+    }
+
     struct StartupBackend {
         raw: RawStartupRead,
         startup_match: Option<Match>,
         watcher_match: Option<Match>,
         post_calls: AtomicU64,
+        posted_offer: Mutex<Option<SellOffer>>,
         raw_reads: AtomicU64,
         freshness_checks: AtomicU64,
         poll_calls: AtomicU64,
         poll_failures_remaining: AtomicU64,
         open_calls: AtomicU64,
         startup_failure: Option<String>,
-        resume_facts: Option<(serde_json::Value, u64)>,
+        resume_facts: Option<(DealChainState, u64)>,
     }
 
     impl StartupBackend {
@@ -1146,6 +1392,7 @@ mod tests {
                 startup_match,
                 watcher_match: Some(watcher_match),
                 post_calls: AtomicU64::new(0),
+                posted_offer: Mutex::new(None),
                 raw_reads: AtomicU64::new(0),
                 freshness_checks: AtomicU64::new(0),
                 poll_calls: AtomicU64::new(0),
@@ -1162,6 +1409,7 @@ mod tests {
                 startup_match: None,
                 watcher_match: None,
                 post_calls: AtomicU64::new(0),
+                posted_offer: Mutex::new(None),
                 raw_reads: AtomicU64::new(0),
                 freshness_checks: AtomicU64::new(0),
                 poll_calls: AtomicU64::new(0),
@@ -1182,7 +1430,7 @@ mod tests {
             self
         }
 
-        fn with_resume_facts(mut self, state: serde_json::Value, price_per_tick: u64) -> Self {
+        fn with_resume_facts(mut self, state: DealChainState, price_per_tick: u64) -> Self {
             self.resume_facts = Some((state, price_per_tick));
             self
         }
@@ -1215,8 +1463,9 @@ mod tests {
             Ok(())
         }
 
-        async fn post_offer(&self, _: SellOffer, _: &dyn Note) -> Result<(), ChainError> {
+        async fn post_offer(&self, offer: SellOffer, _: &dyn Note) -> Result<(), ChainError> {
             self.post_calls.fetch_add(1, Ordering::Relaxed);
+            self.posted_offer.lock().unwrap().replace(offer);
             Ok(())
         }
 
@@ -1235,7 +1484,7 @@ mod tests {
                 return Err(ChainError::Chain(failure.clone()));
             }
             if let Some((state, price_per_tick)) = &self.resume_facts {
-                validate_seller_resume_state(token_contract, state, *price_per_tick)?;
+                validate_seller_resume_state(token_contract, *state, *price_per_tick)?;
             }
             Ok(self.startup_match.clone())
         }
@@ -1296,19 +1545,16 @@ mod tests {
             Ok(None)
         }
 
-        async fn advance_tick(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
-            unimplemented!()
-        }
-
-        async fn accept_probe(&self, _: &TokenContract) -> Result<(), ChainError> {
+        async fn claim_tokens(
+            &self,
+            _: &TokenContract,
+            _: &dyn Note,
+            _: u128,
+        ) -> Result<(), ChainError> {
             unimplemented!()
         }
 
         async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
-            unimplemented!()
-        }
-
-        async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
             unimplemented!()
         }
 
@@ -1319,10 +1565,71 @@ mod tests {
             Ok(Some(DealChainState {
                 funded: true,
                 opened: false,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: 0,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            }))
+        }
+
+        async fn deal_snapshot(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainSnapshot>, ChainError> {
+            let state = self
+                .resume_facts
+                .as_ref()
+                .map(|(state, _)| *state)
+                .unwrap_or(DealChainState {
+                    funded: true,
+                    opened: false,
+                    probe_accepted: false,
+                    disputed: false,
+                    deposit: 1_000,
+                    finalized_owed: 0,
+                    tokens_final: 0,
+                    tokens_superseded: 0,
+                    tokens_pending: 0,
+                    funded_time: Some(1),
+                    probe_tick: 0,
+                    probe_time: 0,
+                    prev_claim_time: 0,
+                    last_claim_time: 0,
+                    dispute_time: 0,
+                });
+            let funded_tokens = 8 * dexdo_core::TICK_SIZE;
+            Ok(Some(DealChainSnapshot {
+                account_code_hash: "test-code".to_string(),
+                account_boc_hash: "test-boc".to_string(),
+                state,
+                subscription: DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: funded_tokens,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                },
+                seller_bond: DealSellerBond {
+                    bond_funded: true,
+                    bond_held: 1,
+                    bond_required: 1,
+                },
+                buyer_bond: DealBuyerBond {
+                    bond_held: 0,
+                    bond_required: 0,
+                },
             }))
         }
 
@@ -1346,6 +1653,7 @@ mod tests {
             token_contract: token_contract.to_string(),
             price_per_tick: 1000,
             max_ticks: 8,
+            subscription: false,
             gateway_advertise: "127.0.0.1:8443".to_string(),
             mock_token_count: 8,
         }
@@ -1505,9 +1813,198 @@ mod tests {
         assert_eq!(backend.raw_reads.load(Ordering::Relaxed), 1);
         assert_eq!(backend.freshness_checks.load(Ordering::Relaxed), 1);
         assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backend.posted_offer.lock().unwrap().as_ref().unwrap().flags,
+            0,
+            "ordinary seller must keep flags=0"
+        );
         assert_eq!(backend.poll_calls.load(Ordering::Relaxed), 1);
         assert_eq!(backend.open_calls.load(Ordering::Relaxed), 1);
         seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscription_mode_posts_explicit_flag_and_preserves_full_size() {
+        let owner = chain_address('1');
+        let note = LocalNote::generate();
+
+        let ordinary_cfg = test_cfg(&chain_address('2'));
+        let ordinary_backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()));
+        prepare_seller_offer(&note, &ordinary_backend, &ordinary_cfg, Some(&owner))
+            .await
+            .expect("ordinary SELL posts");
+        let ordinary = ordinary_backend
+            .posted_offer
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("ordinary offer captured");
+        assert_eq!(ordinary.flags, 0);
+
+        let mut subscription_cfg = test_cfg(&chain_address('3'));
+        subscription_cfg.subscription = true;
+        let subscription_backend =
+            StartupBackend::without_match(RawStartupRead::Orders(Vec::new()));
+        prepare_seller_offer(
+            &note,
+            &subscription_backend,
+            &subscription_cfg,
+            Some(&owner),
+        )
+        .await
+        .expect("subscription SELL posts");
+        let subscription = subscription_backend
+            .posted_offer
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("subscription offer captured");
+        assert_eq!(
+            subscription.flags,
+            order_flags::AON | order_flags::SUBSCRIPTION
+        );
+        assert_eq!(subscription.flags, 0x60);
+        assert_eq!(subscription.max_ticks, subscription_cfg.max_ticks);
+    }
+
+    #[tokio::test]
+    async fn malformed_subscription_volume_fails_before_post_or_resume() {
+        let owner = chain_address('4');
+        let note = LocalNote::generate();
+        let over_cap =
+            u64::try_from(SUBSCRIPTION_MAX_TICKS).unwrap() + u64::from(SUBSCRIPTION_WEEKS);
+        assert_eq!(over_cap, 40_324);
+
+        for max_ticks in [0, 1023, over_cap] {
+            let tc = chain_address(if max_ticks == 0 { '5' } else { '6' });
+            let mut cfg = test_cfg(&tc);
+            cfg.max_ticks = max_ticks;
+            cfg.subscription = true;
+
+            let post_backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()));
+            let error = post_offer_with_note(&note, &post_backend, &cfg)
+                .await
+                .expect_err("malformed subscription volume must not be posted");
+            assert!(error.to_string().contains("subscription"), "{error}");
+            assert!(
+                error.to_string().contains(&max_ticks.to_string()),
+                "{error}"
+            );
+            assert_eq!(post_backend.post_calls.load(Ordering::Relaxed), 0);
+
+            let mut resting = raw_sell(
+                80 + u128::from(max_ticks),
+                &owner,
+                Some(&tc),
+                1000,
+                u128::from(max_ticks),
+            );
+            resting.flags = SUBSCRIPTION_SELL_FLAGS;
+            let resume_backend =
+                StartupBackend::without_match(RawStartupRead::Orders(vec![resting]));
+            let error = prepare_seller_offer(&note, &resume_backend, &cfg, Some(&owner))
+                .await
+                .expect_err("malformed subscription volume must not resume");
+            assert!(error.to_string().contains("subscription"), "{error}");
+            assert!(
+                error.to_string().contains(&max_ticks.to_string()),
+                "{error}"
+            );
+            assert_eq!(resume_backend.raw_reads.load(Ordering::Relaxed), 0);
+            assert_eq!(resume_backend.freshness_checks.load(Ordering::Relaxed), 0);
+            assert_eq!(resume_backend.post_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(resume_backend.poll_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(resume_backend.open_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_offer_volume_behavior_is_unchanged() {
+        let note = LocalNote::generate();
+        for max_ticks in [0, 1023] {
+            let mut cfg = test_cfg(&chain_address(if max_ticks == 0 { '7' } else { '8' }));
+            cfg.max_ticks = max_ticks;
+            let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()));
+
+            post_offer_with_note(&note, &backend, &cfg)
+                .await
+                .expect("ordinary offer keeps its existing post behavior");
+
+            assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                backend
+                    .posted_offer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .max_ticks,
+                max_ticks
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resting_resume_requires_exact_seller_flag_shape() {
+        let tc = chain_address('4');
+        let owner = chain_address('5');
+        let mut subscription_cfg = test_cfg(&tc);
+        subscription_cfg.subscription = true;
+
+        let mut flagged = raw_sell(71, &owner, Some(&tc), 1000, 8);
+        flagged.flags = order_flags::AON | order_flags::SUBSCRIPTION;
+        let matching = StartupBackend::without_match(RawStartupRead::Orders(vec![flagged]));
+        let startup = prepare_seller_offer(
+            &LocalNote::generate(),
+            &matching,
+            &subscription_cfg,
+            Some(&owner),
+        )
+        .await
+        .expect("same-mode subscription SELL resumes");
+        assert_eq!(startup, SellerOfferStartup::ResumedResting { order_id: 71 });
+        assert_eq!(matching.post_calls.load(Ordering::Relaxed), 0);
+
+        for (order_id, invalid_flags) in [
+            (72, 0),
+            (73, order_flags::SUBSCRIPTION),
+            (74, order_flags::AON),
+            (
+                75,
+                order_flags::TEE | order_flags::AON | order_flags::SUBSCRIPTION,
+            ),
+            (76, 0x80),
+        ] {
+            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 1000, 8);
+            invalid.flags = invalid_flags;
+            let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![invalid]));
+            assert_startup_rejected(
+                &backend,
+                &subscription_cfg,
+                &owner,
+                &format!("flags 0x{invalid_flags:02x} do not match required seller flags 0x60"),
+            )
+            .await;
+        }
+
+        let ordinary_cfg = test_cfg(&tc);
+        for (order_id, invalid_flags) in [
+            (77, order_flags::SUBSCRIPTION),
+            (78, order_flags::AON),
+            (79, order_flags::AON | order_flags::SUBSCRIPTION),
+            (80, 0x80),
+        ] {
+            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 1000, 8);
+            invalid.flags = invalid_flags;
+            let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![invalid]));
+            assert_startup_rejected(
+                &backend,
+                &ordinary_cfg,
+                &owner,
+                &format!("flags 0x{invalid_flags:02x} do not match required seller flags 0x00"),
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -1519,19 +2016,7 @@ mod tests {
         let matched = sample_match(&tc, buyer.pubkey());
         let backend =
             StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
-                .with_resume_facts(
-                    serde_json::json!({
-                        "funded": true,
-                        "opened": false,
-                        "probeAccepted": false,
-                        "disputed": false,
-                        "deposit": "1000",
-                        "prepaid": "0",
-                        "frozen": "0",
-                        "finalizedOwed": "0"
-                    }),
-                    1000,
-                );
+                .with_resume_facts(resume_state(1000), 1000);
 
         let (startup, seller, _) =
             prepare_start_gateway_and_watch(&backend, &cfg, &owner, "funded-resume").await;
@@ -1556,19 +2041,7 @@ mod tests {
             matched.price_per_tick = price_per_tick.into();
             let backend =
                 StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
-                    .with_resume_facts(
-                        serde_json::json!({
-                            "funded": true,
-                            "opened": false,
-                            "probeAccepted": false,
-                            "disputed": false,
-                            "deposit": "0",
-                            "prepaid": "0",
-                            "frozen": "0",
-                            "finalizedOwed": "0"
-                        }),
-                        price_per_tick.into(),
-                    );
+                    .with_resume_facts(resume_state(0), price_per_tick.into());
             let note = LocalNote::generate();
 
             let error = prepare_seller_offer(&note, &backend, &cfg, Some(&owner))
@@ -1600,19 +2073,7 @@ mod tests {
         matched.price_per_tick = 2;
         let backend =
             StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
-                .with_resume_facts(
-                    serde_json::json!({
-                        "funded": true,
-                        "opened": false,
-                        "probeAccepted": false,
-                        "disputed": false,
-                        "deposit": "1",
-                        "prepaid": "0",
-                        "frozen": "0",
-                        "finalizedOwed": "0"
-                    }),
-                    2,
-                );
+                .with_resume_facts(resume_state(1), 2);
         let note = LocalNote::generate();
 
         let error = prepare_seller_offer(&note, &backend, &cfg, Some(&owner))
@@ -1941,7 +2402,8 @@ mod tests {
     proptest! {
         #[test]
         fn seller_fill_lineage_conserves_capacity_and_rejects_invalid_replay(
-            (offered, matched) in (2u64..10_000)
+            (offered, matched) in (u64::try_from(MIN_STREAM_BUY_TICKS)
+                .expect("MIN_STREAM_BUY_TICKS must fit u64")..10_000)
                 .prop_flat_map(|offered| (Just(offered), 1u64..=offered))
         ) {
             let tc = "tc-fill-lineage-property";
@@ -2077,6 +2539,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_provision_registers_coherent_authoritative_capacity_before_open() {
+        let seller = test_seller();
+        let mut cfg = test_cfg("tc-subscription-capacity");
+        cfg.subscription = true;
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(
+            sample_match("tc-subscription-capacity", buyer.pubkey()),
+            false,
+            false,
+        )
+        .with_subscription();
+
+        provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-subscription-capacity", buyer.pubkey()),
+        )
+        .await
+        .unwrap();
+
+        let capacity = seller
+            .state
+            .capacity_snapshot("tc-subscription-capacity")
+            .unwrap()
+            .unwrap();
+        assert_eq!(capacity.funded_tokens, 8 * dexdo_core::TICK_SIZE);
+        assert_eq!(capacity.authoritative_cap, dexdo_core::TICK_SIZE);
+        assert_eq!(
+            backend.state_reads.load(Ordering::Relaxed),
+            2,
+            "one shared snapshot read is followed by the existing opened-state decision read"
+        );
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_provision_uses_coherent_actual_funded_capacity_before_open() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-ordinary-capacity");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(
+            sample_match("tc-ordinary-capacity", buyer.pubkey()),
+            false,
+            false,
+        );
+
+        provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-ordinary-capacity", buyer.pubkey()),
+        )
+        .await
+        .unwrap();
+
+        let capacity = seller
+            .state
+            .capacity_snapshot("tc-ordinary-capacity")
+            .unwrap()
+            .unwrap();
+        assert_eq!(capacity.funded_tokens, 8 * dexdo_core::TICK_SIZE);
+        assert_eq!(
+            capacity.authoritative_cap,
+            dexdo_core::TICK_SIZE,
+            "pre-accept delivery is only the single probe allowance"
+        );
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_provision_rejects_ordinary_shape_before_auth_or_open() {
+        let seller = test_seller();
+        let mut cfg = test_cfg("tc-subscription-missing");
+        cfg.subscription = true;
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(
+            sample_match("tc-subscription-missing", buyer.pubkey()),
+            false,
+            false,
+        );
+
+        let error = provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-subscription-missing", buyer.pubkey()),
+        )
+        .await
+        .expect_err("ordinary strict shape must not satisfy subscription seller mode");
+
+        assert!(
+            error.to_string().contains(
+                "seller configured subscription mode but strict deal snapshot is ordinary"
+            ),
+            "{error:#}"
+        );
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
+        assert!(seller
+            .state
+            .capacity_snapshot("tc-subscription-missing")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn opened_true_skips_duplicate_open_stream_and_restores_auth() {
         let seller = test_seller();
         let cfg = test_cfg("tc-opened");
@@ -2151,7 +2719,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 3);
         assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
     }
 
@@ -2180,7 +2748,7 @@ mod tests {
             .to_string()
             .contains("getState unreadable after 3 attempts"));
         assert!(error.to_string().contains("refusing to skip open_stream"));
-        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 4);
         assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
     }
 
@@ -2233,12 +2801,41 @@ mod tests {
             tc_b,
             UpstreamConfig::MockWithClaimedModel("model-b".to_string()),
         );
+        let state = DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit: 1,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            probe_tick: 1,
+            funded_time: Some(1),
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: 0,
+            dispute_time: 0,
+        };
+        let deal = DealSubscription {
+            deal_flags: 0,
+            sub_weeks: 0,
+            week_index: 0,
+            tokens_per_week: dexdo_core::TICK_SIZE,
+            funded_tokens: dexdo_core::TICK_SIZE,
+            tokens_paid: 0,
+            period_start: 0,
+            week_base_tokens: 0,
+        };
         seller
             .state
-            .register_stream(tc_a, buyer_a.pubkey(), 2, 2, 1);
+            .register_stream(tc_a, buyer_a.pubkey(), 2, state, deal)
+            .unwrap();
         seller
             .state
-            .register_stream(tc_b, buyer_b.pubkey(), 2, 2, 1);
+            .register_stream(tc_b, buyer_b.pubkey(), 2, state, deal)
+            .unwrap();
 
         let endpoint = format!("https://{}", seller.listen_addr);
         let channel = crate::buyer::tls::connect_pinned(&endpoint, &seller.tls_fingerprint)

@@ -113,11 +113,11 @@ fn status_next_for(
     let action = match (role, state, funded, opened, probe_accepted) {
         (_, "closed", _, _, _) => "none",
         (Some("seller"), "stopped", _, _, _) => "destroy",
-        (Some("seller"), _, _, true, false) => "seller_wait_delivery_then_advance_after_window",
-        (Some("seller"), _, _, true, true) => "seller_advance_or_wait_buyer_stop",
+        (Some("seller"), _, _, true, false) => "seller_wait_delivery_then_accept_probe",
+        (Some("seller"), _, _, true, true) => "seller_claim_finalize_or_settle_week_or_seller_stop",
         (Some("seller"), _, true, false, false) => "buyer_cleanup_after_timeout",
         (Some("buyer"), "stopped", _, _, _) => "none",
-        (Some("buyer"), _, _, true, _) => "stream_stop_or_reclaim_after_timeout",
+        (Some("buyer"), _, _, true, _) => "stream_stop",
         (Some("buyer"), _, true, false, false) => "cleanup_unopened_after_timeout",
         (Some("buyer"), _, _, _, _) => "cancel_resting_bid_or_wait_match",
         _ => "unknown_role",
@@ -127,9 +127,11 @@ fn status_next_for(
         retryable_after_unix: None,
         command: if action == "none" {
             "none".to_string()
-        } else if action.starts_with("seller_advance")
-            || action == "seller_wait_delivery_then_advance_after_window"
-        {
+        } else if matches!(
+            action,
+            "seller_wait_delivery_then_accept_probe"
+                | "seller_claim_finalize_or_settle_week_or_seller_stop"
+        ) {
             "seller".to_string()
         } else {
             "close".to_string()
@@ -164,11 +166,18 @@ fn status_response_from_summary(
         probe_accepted: s.probe_accepted,
         accounting: machine::StatusAccounting {
             finalized_owed: machine::amount(s.finalized_owed),
-            buyer_locked: machine::amount(s.buyer_locked()),
+            buyer_locked: machine::amount(s.buyer_locked()?),
             deposit: machine::amount(s.deposit),
-            prepaid: machine::amount(s.prepaid),
-            frozen: machine::amount(s.frozen),
-            last_advance_unix: Some(s.last_advance).filter(|v| *v != 0),
+            probe_tick: machine::amount(s.probe_tick),
+            buyer_bond: machine::amount(s.buyer_bond),
+            buyer_bond_required: machine::amount(s.buyer_bond_required),
+            tokens_final: machine::amount(s.tokens_final),
+            tokens_superseded: machine::amount(s.tokens_superseded),
+            tokens_pending: machine::amount(s.tokens_pending),
+            probe_time_unix: Some(s.probe_time).filter(|v| *v != 0),
+            prev_claim_time_unix: Some(s.prev_claim_time).filter(|v| *v != 0),
+            last_claim_time_unix: Some(s.last_claim_time).filter(|v| *v != 0),
+            dispute_time_unix: Some(s.dispute_time).filter(|v| *v != 0),
             funded_time_unix: s.funded_time,
         },
         next: status_next_for(role.as_deref(), state, s.funded, s.opened, s.probe_accepted),
@@ -189,11 +198,18 @@ fn closed_status_response(
         disputed: false,
         probe_accepted: false,
         deposit: 0,
-        prepaid: 0,
-        frozen: 0,
+        probe_tick: 0,
+        buyer_bond: 0,
+        buyer_bond_required: 0,
         finalized_owed: 0,
+        tokens_final: 0,
+        tokens_superseded: 0,
+        tokens_pending: 0,
         funded_time: None,
-        last_advance: 0,
+        probe_time: 0,
+        prev_claim_time: 0,
+        last_claim_time: 0,
+        dispute_time: 0,
     };
     status_response_from_summary(
         network,
@@ -221,12 +237,19 @@ fn mock_summary_from_snapshot(snapshot: &dexdo_core::StreamSnapshot) -> deals::D
         opened: !snapshot.closed,
         disputed: false,
         probe_accepted: snapshot.seller_received > 0,
-        deposit: 0,
-        prepaid: 0,
-        frozen: snapshot.buyer_locked,
+        deposit: snapshot.buyer_locked,
+        probe_tick: 0,
+        buyer_bond: 0,
+        buyer_bond_required: 0,
         finalized_owed: snapshot.seller_received,
+        tokens_final: 0,
+        tokens_superseded: 0,
+        tokens_pending: 0,
         funded_time: None,
-        last_advance: 0,
+        probe_time: 0,
+        prev_claim_time: 0,
+        last_claim_time: 0,
+        dispute_time: 0,
     }
 }
 
@@ -295,7 +318,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     let chain = RealChainBackend::connect(contracts)?;
     let tc = Address::parse(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
-    let Some(state) = chain.token_contract_state(&tc).await? else {
+    let Some(snapshot) = chain.token_contract_deal_snapshot(&tc).await? else {
         if args.json {
             return machine::print_json(&closed_status_response(
                 "shellnet",
@@ -317,7 +340,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         );
         return Ok(());
     };
-    let s = deals::classify_deal_state(&state);
+    let s = deals::summarize_deal_snapshot(&snapshot);
     if args.json {
         return machine::print_json(&status_response_from_summary(
             "shellnet",
@@ -356,13 +379,23 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         );
     }
     println!(
-        "accounting finalized_owed={} buyer_locked={} deposit={} prepaid={} frozen={} last_advance={} funded_time={}",
+        "accounting finalized_owed={} buyer_locked={} deposit={} probe_tick={} buyer_bond={} \
+         buyer_bond_required={} tokens_final={} \
+         tokens_superseded={} tokens_pending={} probe_time={} prev_claim_time={} last_claim_time={} \
+         dispute_time={} funded_time={}",
         s.finalized_owed,
-        s.buyer_locked(),
+        s.buyer_locked()?,
         s.deposit,
-        s.prepaid,
-        s.frozen,
-        s.last_advance,
+        s.probe_tick,
+        s.buyer_bond,
+        s.buyer_bond_required,
+        s.tokens_final,
+        s.tokens_superseded,
+        s.tokens_pending,
+        s.probe_time,
+        s.prev_claim_time,
+        s.last_claim_time,
+        s.dispute_time,
         s.funded_time
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string())
@@ -391,9 +424,12 @@ pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
     let chain = RealChainBackend::connect(contracts)?;
     let tc = Address::parse(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
-    let state = chain.token_contract_state(&tc).await?;
-    let active = state.is_some();
-    let summary = state.as_ref().map(deals::classify_deal_state);
+    let snapshot = chain.token_contract_deal_snapshot(&tc).await?;
+    let active = snapshot.is_some();
+    let state = snapshot
+        .as_ref()
+        .map(|snapshot| deals::deal_state_getter_json(snapshot.state));
+    let summary = snapshot.as_ref().map(deals::summarize_deal_snapshot);
     let (onchain_model, onchain_model_hash, onchain_buyer_note, deal_terms) = if active {
         let model = chain.token_contract_model_name(&tc).await?;
         let model_hash = chain.token_contract_model_hash(&tc).await?;
@@ -427,7 +463,7 @@ pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
         onchain_model_hash,
         onchain_buyer_note,
         deal_terms,
-    });
+    })?;
     match args.format {
         ExportFormatArg::Json => println!("{}", serde_json::to_string_pretty(&export)?),
         ExportFormatArg::Md => print!("{}", audit::render_markdown(&export)),
@@ -451,11 +487,18 @@ mod tests {
             disputed: false,
             probe_accepted: false,
             deposit: 0,
-            prepaid: 0,
-            frozen: 0,
+            probe_tick: 0,
+            buyer_bond: 0,
+            buyer_bond_required: 0,
             finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: Some(1),
-            last_advance: 1,
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
         };
         let status = super::status_response_from_summary(
             "shellnet",
@@ -469,11 +512,19 @@ mod tests {
         )
         .expect("format seller Probe status");
 
-        assert_eq!(
-            status.next.action,
-            "seller_wait_delivery_then_advance_after_window"
-        );
+        assert_eq!(status.next.action, "seller_wait_delivery_then_accept_probe");
         assert_eq!(status.next.command, "seller");
+    }
+
+    #[test]
+    fn seller_streaming_status_names_current_claim_and_settlement_actions() {
+        let next = super::status_next_for(Some("seller"), "streaming", true, true, true);
+
+        assert_eq!(
+            next.action,
+            "seller_claim_finalize_or_settle_week_or_seller_stop"
+        );
+        assert_eq!(next.command, "seller");
     }
 
     #[test]

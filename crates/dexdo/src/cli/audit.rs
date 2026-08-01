@@ -2,6 +2,7 @@
 #![cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 
 use crate::cli::deals::{DealHandle, DealHandleRole, DealStateKind, DealStateSummary};
+use anyhow::Result;
 use serde::Serialize;
 
 pub(crate) const DEAL_AUDIT_VERSION: u32 = 1;
@@ -75,7 +76,10 @@ pub(crate) struct AuditLifecycle {
     pub(crate) disputed: Option<bool>,
     pub(crate) probe_accepted: Option<bool>,
     pub(crate) funded_at_unix: Option<u64>,
-    pub(crate) last_advance_unix: Option<u64>,
+    pub(crate) probe_time_unix: Option<u64>,
+    pub(crate) prev_claim_time_unix: Option<u64>,
+    pub(crate) last_claim_time_unix: Option<u64>,
+    pub(crate) dispute_time_unix: Option<u64>,
     pub(crate) stopped_at_unix: Option<u64>,
 }
 
@@ -91,8 +95,12 @@ pub(crate) struct AuditAccounting {
     pub(crate) buyer_refund: Option<String>,
     pub(crate) burned_amount: Option<String>,
     pub(crate) deposit: Option<String>,
-    pub(crate) prepaid: Option<String>,
-    pub(crate) frozen: Option<String>,
+    pub(crate) probe_tick: Option<String>,
+    pub(crate) buyer_bond: Option<String>,
+    pub(crate) buyer_bond_required: Option<String>,
+    pub(crate) tokens_final: Option<String>,
+    pub(crate) tokens_superseded: Option<String>,
+    pub(crate) tokens_pending: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,7 +137,7 @@ pub(crate) fn history_handle_matches(
     true
 }
 
-pub(crate) fn build_deal_audit(input: DealAuditBuild) -> DealAuditExport {
+pub(crate) fn build_deal_audit(input: DealAuditBuild) -> Result<DealAuditExport> {
     let handle = input.handle.as_ref();
     let role = input.role.or_else(|| handle.map(|h| h.role));
     let deal_ref = handle
@@ -187,7 +195,7 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> DealAuditExport {
                 "closed".to_string()
             }
         });
-    let accounting = build_accounting(input.summary.as_ref(), input.deal_terms.as_ref());
+    let accounting = build_accounting(input.summary.as_ref(), input.deal_terms.as_ref())?;
     let actions = build_actions(
         role,
         &deal_ref,
@@ -197,7 +205,7 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> DealAuditExport {
         handle.is_some(),
     );
 
-    DealAuditExport {
+    Ok(DealAuditExport {
         version: DEAL_AUDIT_VERSION,
         generated_at_unix: input.generated_at_unix,
         source: AuditSource {
@@ -227,10 +235,22 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> DealAuditExport {
             disputed: input.summary.as_ref().map(|s| s.disputed),
             probe_accepted: input.summary.as_ref().map(|s| s.probe_accepted),
             funded_at_unix: input.summary.as_ref().and_then(|s| s.funded_time),
-            last_advance_unix: input
+            probe_time_unix: input
                 .summary
                 .as_ref()
-                .and_then(|s| (s.last_advance != 0).then_some(s.last_advance)),
+                .and_then(|s| (s.probe_time != 0).then_some(s.probe_time)),
+            prev_claim_time_unix: input
+                .summary
+                .as_ref()
+                .and_then(|s| (s.prev_claim_time != 0).then_some(s.prev_claim_time)),
+            last_claim_time_unix: input
+                .summary
+                .as_ref()
+                .and_then(|s| (s.last_claim_time != 0).then_some(s.last_claim_time)),
+            dispute_time_unix: input
+                .summary
+                .as_ref()
+                .and_then(|s| (s.dispute_time != 0).then_some(s.dispute_time)),
             stopped_at_unix: None,
         },
         accounting,
@@ -240,32 +260,37 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> DealAuditExport {
             finish_reason: None,
         },
         raw_onchain_state: input.state,
-    }
+    })
 }
 
 fn build_accounting(
     summary: Option<&DealStateSummary>,
     terms: Option<&DealTermsAudit>,
-) -> AuditAccounting {
+) -> Result<AuditAccounting> {
     let finalized_owed = summary.map(|s| s.finalized_owed);
-    let finalized_ticks = finalized_owed.and_then(|owed| {
-        let price = terms?.price_per_tick;
-        (price != 0).then(|| (owed / price).to_string())
-    });
-    AuditAccounting {
+    let finalized_ticks =
+        summary.map(|state| (state.tokens_final / dexdo_core::TICK_SIZE).to_string());
+    Ok(AuditAccounting {
         tick_size: terms.map(|t| t.tick_size.to_string()),
         price_per_tick: terms.map(|t| t.price_per_tick.to_string()),
         max_ticks: terms.map(|t| t.max_ticks.to_string()),
         finalized_ticks,
         seller_owed: finalized_owed.map(|v| v.to_string()),
         seller_received: None,
-        buyer_locked: summary.map(|s| s.buyer_locked().to_string()),
+        buyer_locked: summary
+            .map(DealStateSummary::buyer_locked)
+            .transpose()?
+            .map(|value| value.to_string()),
         buyer_refund: None,
         burned_amount: None,
         deposit: summary.map(|s| s.deposit.to_string()),
-        prepaid: summary.map(|s| s.prepaid.to_string()),
-        frozen: summary.map(|s| s.frozen.to_string()),
-    }
+        probe_tick: summary.map(|s| s.probe_tick.to_string()),
+        buyer_bond: summary.map(|s| s.buyer_bond.to_string()),
+        buyer_bond_required: summary.map(|s| s.buyer_bond_required.to_string()),
+        tokens_final: summary.map(|s| s.tokens_final.to_string()),
+        tokens_superseded: summary.map(|s| s.tokens_superseded.to_string()),
+        tokens_pending: summary.map(|s| s.tokens_pending.to_string()),
+    })
 }
 
 fn build_actions(
@@ -324,7 +349,7 @@ fn build_actions(
         }
         Some(DealHandleRole::Buyer) if s.opened => {
             next.push(format!(
-                "`dexdo close {deal_ref} --note-key <buyer-key>` (streamStop/recover, or streamReclaim after timeout)"
+                "`dexdo close {deal_ref} --note-key <buyer-key>` (explicit buyer STOP)"
             ));
             next.push(format!(
                 "`dexdo dispute --token-contract {token_contract} --note-addr <buyer-note> --note-key <buyer-key>` if fraud/substitution evidence exists"
@@ -359,10 +384,23 @@ fn build_actions(
                 "`dexdo close {deal_ref} --note-key <seller-key>` (destroy/selfdestruct stopped TokenContract)"
             ));
         }
+        Some(DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
+            next.push(
+                "keep `dexdo seller` running: after the first delivered canonical tick it calls TokenContract.acceptProbe() after PROBE_WINDOW"
+                    .into(),
+            );
+            next.push(format!(
+                "`dexdo close {deal_ref} --note-key <seller-key>` to call TokenContract.sellerStop() if the seller must stop"
+            ));
+        }
         Some(DealHandleRole::Seller) if s.opened => {
             next.push(
-                "wait for buyer STOP/recover/reclaim; seller cannot destroy an opened deal".into(),
+                "keep `dexdo seller` running: it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims; the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries"
+                    .into(),
             );
+            next.push(format!(
+                "`dexdo close {deal_ref} --note-key <seller-key>` to call TokenContract.sellerStop() if the seller must stop"
+            ));
         }
         Some(DealHandleRole::Seller) => {
             next.push(
@@ -457,10 +495,37 @@ pub(crate) fn render_markdown(export: &DealAuditExport) -> String {
     );
     optional_line(
         &mut out,
-        "last_advance_unix",
+        "probe_time_unix",
         export
             .lifecycle
-            .last_advance_unix
+            .probe_time_unix
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "prev_claim_time_unix",
+        export
+            .lifecycle
+            .prev_claim_time_unix
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "last_claim_time_unix",
+        export
+            .lifecycle
+            .last_claim_time_unix
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "dispute_time_unix",
+        export
+            .lifecycle
+            .dispute_time_unix
             .map(|v| v.to_string())
             .as_deref(),
     );
@@ -521,8 +586,36 @@ pub(crate) fn render_markdown(export: &DealAuditExport) -> String {
         export.accounting.burned_amount.as_deref(),
     );
     optional_line(&mut out, "deposit", export.accounting.deposit.as_deref());
-    optional_line(&mut out, "prepaid", export.accounting.prepaid.as_deref());
-    optional_line(&mut out, "frozen", export.accounting.frozen.as_deref());
+    optional_line(
+        &mut out,
+        "probe_tick",
+        export.accounting.probe_tick.as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "buyer_bond",
+        export.accounting.buyer_bond.as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "buyer_bond_required",
+        export.accounting.buyer_bond_required.as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "tokens_final",
+        export.accounting.tokens_final.as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "tokens_superseded",
+        export.accounting.tokens_superseded.as_deref(),
+    );
+    optional_line(
+        &mut out,
+        "tokens_pending",
+        export.accounting.tokens_pending.as_deref(),
+    );
 
     out.push_str("\n## Actions\n\n");
     for item in &export.actions.observed {
@@ -613,19 +706,32 @@ mod tests {
 
     #[test]
     fn deal_audit_json_and_markdown_are_secret_free_and_compute_ticks() {
+        let three_ticks_tokens = 3 * dexdo_core::TICK_SIZE;
         let state = serde_json::json!({
             "funded": true,
             "opened": false,
             "probeAccepted": true,
             "disputed": false,
             "deposit": "1000",
-            "prepaid": "0",
-            "frozen": "0",
+            "probeTick": "0",
             "finalizedOwed": "3000",
+            "tokensFinal": three_ticks_tokens.to_string(),
+            "tokensSuperseded": three_ticks_tokens.to_string(),
+            "tokensPending": three_ticks_tokens.to_string(),
+            "probeTime": "110",
+            "prevClaimTime": "115",
+            "lastClaimTime": "120",
+            "disputeTime": "0",
             "fundedTime": "100",
-            "lastAdvance": "120"
         });
-        let summary = classify_deal_state(&state);
+        let summary = classify_deal_state(
+            &state,
+            dexdo_core::DealBuyerBond {
+                bond_held: 0,
+                bond_required: 0,
+            },
+        )
+        .unwrap();
         let export = build_deal_audit(DealAuditBuild {
             generated_at_unix: 200,
             handle: Some(sample_handle()),
@@ -640,11 +746,12 @@ mod tests {
             onchain_model_hash: Some(dexdo_core::model_hash_for("qwen/qwen3-32b")),
             onchain_buyer_note: Some("0:buyer".into()),
             deal_terms: Some(DealTermsAudit {
-                tick_size: 1_000_000,
+                tick_size: dexdo_core::TICK_SIZE,
                 price_per_tick: 1000,
                 max_ticks: 8,
             }),
-        });
+        })
+        .unwrap();
         assert_eq!(export.accounting.finalized_ticks.as_deref(), Some("3"));
         assert_eq!(export.deal.buyer_note.as_deref(), Some("0:buyer"));
         let json = serde_json::to_string_pretty(&export).unwrap();
@@ -657,5 +764,106 @@ mod tests {
             assert!(text.contains("qwen/qwen3-32b"), "{text}");
             assert!(text.contains("finalized"), "{text}");
         }
+    }
+
+    #[test]
+    fn returned_two_price_seller_bond_does_not_invent_finalized_ticks() {
+        let state = serde_json::json!({
+            "funded": true,
+            "opened": false,
+            "probeAccepted": false,
+            "disputed": false,
+            "deposit": "0",
+            "probeTick": "0",
+            "finalizedOwed": "2000",
+            "tokensFinal": "0",
+            "tokensSuperseded": "0",
+            "tokensPending": "0",
+            "probeTime": "0",
+            "prevClaimTime": "0",
+            "lastClaimTime": "100",
+            "disputeTime": "0",
+            "fundedTime": "100",
+        });
+        let summary = classify_deal_state(
+            &state,
+            dexdo_core::DealBuyerBond {
+                bond_held: 0,
+                bond_required: 0,
+            },
+        )
+        .unwrap();
+        let accounting = build_accounting(
+            Some(&summary),
+            Some(&DealTermsAudit {
+                tick_size: dexdo_core::TICK_SIZE,
+                price_per_tick: 1000,
+                max_ticks: 2,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(accounting.seller_owed.as_deref(), Some("2000"));
+        assert_eq!(accounting.tokens_final.as_deref(), Some("0"));
+        assert_eq!(accounting.finalized_ticks.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn seller_open_actions_name_only_current_contract_methods() {
+        let mut summary = DealStateSummary {
+            kind: DealStateKind::Probe,
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            deposit: 0,
+            probe_tick: 0,
+            buyer_bond: 0,
+            buyer_bond_required: 0,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        };
+        let probe = build_actions(
+            Some(DealHandleRole::Seller),
+            "deal-seller",
+            "0:tc",
+            true,
+            Some(&summary),
+            true,
+        )
+        .available_next_commands
+        .join("\n");
+        assert!(probe.contains("TokenContract.acceptProbe()"), "{probe}");
+        assert!(probe.contains("TokenContract.sellerStop()"), "{probe}");
+        assert!(!probe.contains("advance"), "{probe}");
+
+        summary.kind = DealStateKind::Streaming;
+        summary.probe_accepted = true;
+        let streaming = build_actions(
+            Some(DealHandleRole::Seller),
+            "deal-seller",
+            "0:tc",
+            true,
+            Some(&summary),
+            true,
+        )
+        .available_next_commands
+        .join("\n");
+        for method in [
+            "TokenContract.claimTokens(cumulativeTokens)",
+            "TokenContract.finalize()",
+            "TokenContract.settleWeek()",
+            "TokenContract.sellerStop()",
+        ] {
+            assert!(streaming.contains(method), "missing {method}: {streaming}");
+        }
+        assert!(!streaming.contains("advance"), "{streaming}");
     }
 }

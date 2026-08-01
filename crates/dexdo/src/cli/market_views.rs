@@ -16,6 +16,8 @@ use crate::cli::machine;
 use anyhow::{bail, Result};
 #[cfg(feature = "shellnet")]
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+#[cfg(feature = "shellnet")]
+use dexdo_core::params::INDEXER_FAST_TIMEOUT;
 use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
 #[cfg(feature = "shellnet")]
 use dexdo_core::{
@@ -26,9 +28,6 @@ use dexdo_core::{
 use serde_json::json;
 #[cfg(feature = "shellnet")]
 use std::future::Future;
-
-#[cfg(feature = "shellnet")]
-const INDEXER_FAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(feature = "shellnet")]
 #[derive(Debug)]

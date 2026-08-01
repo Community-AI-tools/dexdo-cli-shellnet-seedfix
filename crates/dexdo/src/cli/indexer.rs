@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
+use dexdo_core::params::{DEFAULT_INDEXER_URL, INDEXER_ERROR_BODY_MAX_BYTES};
 use reqwest::Url;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
 
-pub(crate) const DEFAULT_INDEXER_URL: &str = "http://dodex-dev.ackinacki.org:8080";
 pub(crate) const INDEXER_URL_ENV: &str = "DEXDO_INDEXER_URL";
 
 #[derive(Clone, Debug)]
@@ -376,12 +376,11 @@ fn non_empty_trimmed<'a>(value: Option<&'a str>, name: &str) -> Result<Option<&'
 }
 
 fn compact_body(body: &str) -> String {
-    const MAX_BODY: usize = 2048;
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= MAX_BODY {
+    if compact.len() <= INDEXER_ERROR_BODY_MAX_BYTES {
         compact
     } else {
-        let mut end = MAX_BODY;
+        let mut end = INDEXER_ERROR_BODY_MAX_BYTES;
         while !compact.is_char_boundary(end) {
             end -= 1;
         }
@@ -524,7 +523,11 @@ mod tests {
 
     #[tokio::test]
     async fn unicode_http_error_body_truncates_without_panicking() {
-        let body = format!("{}\u{00e9}{}", "a".repeat(2047), "b".repeat(16));
+        let body = format!(
+            "{}\u{00e9}{}",
+            "a".repeat(INDEXER_ERROR_BODY_MAX_BYTES - 1),
+            "b".repeat(16)
+        );
         let response = format!(
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()

@@ -3,7 +3,10 @@
 
 use crate::cli::args::OracleArgs;
 use anyhow::{bail, Result};
-use dexdo_core::params::SHELL_CURRENCY_ID;
+#[cfg(feature = "shellnet")]
+use dexdo_core::params::{
+    ORACLE_RESOLUTION_MAX_READS, ORACLE_RESOLUTION_POLL_INTERVAL, SHELL_CURRENCY_ID,
+};
 
 #[cfg(feature = "shellnet")]
 use crate::cli::args::{OracleCommand, OracleProvisionArgs, OracleResolveArgs, OracleStateArgs};
@@ -238,7 +241,7 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
         manifest.event_id, manifest.oracle_list_hash, manifest.pmp
     );
     let mut last_details_error = None;
-    for i in 0..60 {
+    for i in 0..ORACLE_RESOLUTION_MAX_READS {
         match chain.pmp_details(&pmp).await {
             Ok(Some(details)) => {
                 if let Some(outcome) = pmp_resolved_outcome(&details) {
@@ -255,15 +258,17 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
                 last_details_error = Some(e.to_string());
             }
         }
-        if i + 1 < 60 {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if i + 1 < ORACLE_RESOLUTION_MAX_READS {
+            tokio::time::sleep(ORACLE_RESOLUTION_POLL_INTERVAL).await;
         }
     }
+    let resolution_timeout_secs = (ORACLE_RESOLUTION_MAX_READS as u64)
+        .saturating_mul(ORACLE_RESOLUTION_POLL_INTERVAL.as_secs());
     let last_details_error = last_details_error
         .map(|e| format!(" Last transient pmp_details error while polling: {e}."))
         .unwrap_or_default();
     bail!(
-        "resolveRange was submitted but PMP {} did not expose resolvedOutcome within 180s. \
+        "resolveRange was submitted but PMP {} did not expose resolvedOutcome within {resolution_timeout_secs}s. \
          If the bound InferenceOrderBook has no MIN_LIQUIDITY, requestWeeklyMedian reverts under bounce:false \
          and onWeeklyMedian never arrives; this is the  no-liquidity stuck case, not a CLI success.{}",
         manifest.pmp,

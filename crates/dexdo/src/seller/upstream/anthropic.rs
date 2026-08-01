@@ -1,7 +1,10 @@
 //! Native Anthropic Messages API seller upstream.
 
-use super::{UpstreamEvent, UpstreamResult};
+use super::{
+    annotate_seller_config_fault, resolve_model_output_cap, UpstreamEvent, UpstreamResult,
+};
 use crate::seller::models::ModelConfig;
+use dexdo_core::params::UPSTREAM_SSE_FRAME_MAX_BYTES;
 use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -17,6 +20,10 @@ pub struct AnthropicConfig {
     pub frame_model: String,
     pub api_key_env: String,
     pub tokenizer_family: String,
+    /// The model's own maximum output length. `None` = unknown ->
+    /// serving fails closed before the provider is contacted. The Messages API always requires `max_tokens`
+    /// and rejects anything above the model's limit, so a deal-budget-only bound never delivered.
+    pub max_output_tokens: Option<u32>,
 }
 
 impl AnthropicConfig {
@@ -36,6 +43,7 @@ impl AnthropicConfig {
                 .to_string(),
             api_key_env: model.api_key_env.clone(),
             tokenizer_family: model.tokenizer_family.clone(),
+            max_output_tokens: model.capabilities.max_output_tokens,
         }
     }
 }
@@ -64,6 +72,7 @@ fn build_request<'a>(
     cfg: &'a AnthropicConfig,
     req: &CanonRequest,
     count: u64,
+    model_output_cap: u32,
 ) -> MessagesRequest<'a> {
     let mut system = Vec::new();
     let mut messages = Vec::new();
@@ -80,9 +89,14 @@ fn build_request<'a>(
     let requested_max = req
         .params
         .as_ref()
-        .and_then(|p| (p.max_tokens != 0).then_some(p.max_tokens))
-        .unwrap_or_else(|| count.min(u32::MAX as u64) as u32);
-    let max_tokens = requested_max.min(count.min(u32::MAX as u64) as u32).max(1);
+        .and_then(|p| (p.max_tokens != 0).then_some(p.max_tokens));
+    // bounded by ALL THREE of the buyer's request, the deal budget and the model's own output cap.
+    let deal_max_tokens = u32::try_from(count).unwrap_or(u32::MAX);
+    let max_tokens = requested_max
+        .unwrap_or(u32::MAX)
+        .min(deal_max_tokens)
+        .min(model_output_cap)
+        .max(1);
     let (temperature, stop_sequences) = req.params.as_ref().map_or((None, Vec::new()), |p| {
         (
             if p.greedy {
@@ -127,6 +141,15 @@ pub async fn run(
     req: Option<CanonRequest>,
     tx: mpsc::Sender<UpstreamResult>,
 ) {
+    // an unknown model output cap fails closed FIRST, before any provider connection.
+    let model_output_cap =
+        match resolve_model_output_cap(cfg.max_output_tokens, &cfg.frame_model, &cfg.model) {
+            Ok(cap) => cap,
+            Err(status) => {
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
+        };
     let Some(key) = std::env::var(&cfg.api_key_env)
         .ok()
         .filter(|key| !key.is_empty())
@@ -147,7 +170,7 @@ pub async fn run(
             .await;
         return;
     };
-    if let Err(status) = stream_upstream(cfg, &key, count, &req, &tx).await {
+    if let Err(status) = stream_upstream(cfg, &key, count, &req, &tx, model_output_cap).await {
         let _ = tx.send(Err(status)).await;
     }
 }
@@ -158,27 +181,34 @@ async fn stream_upstream(
     count: u64,
     req: &CanonRequest,
     tx: &mpsc::Sender<UpstreamResult>,
+    model_output_cap: u32,
 ) -> Result<(), Status> {
     use futures::StreamExt;
 
     let client = reqwest::Client::new();
-    let body = build_request(cfg, req, count);
+    let body = build_request(cfg, req, count, model_output_cap);
     let response = http_request(&client, cfg, key, &body)
         .send()
         .await
         .map_err(|e| Status::unavailable(format!("upstream connect failed: {e}")))?;
     if !response.status().is_success() {
-        return Err(Status::unavailable(format!(
-            "upstream HTTP {}",
-            response.status()
-        )));
+        // a `4xx` rejects a request the seller built end to end -- name the model and the sent limit.
+        return Err(annotate_seller_config_fault(
+            Status::unavailable(format!("upstream HTTP {}", response.status())),
+            response.status().as_u16(),
+            &cfg.model,
+            body.max_tokens,
+            model_output_cap,
+        ));
     }
 
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut seq = 0_u64;
-    let mut accounted_output = 0_u64;
-    let mut saw_stop = false;
+    // Usage is cumulative and untrusted until the stream terminates consistently. Hold it locally so a
+    // later decrease/malformed terminal event cannot leave a partially advanced monetary high-water.
+    let mut reported_output: Option<u64> = None;
+    let mut post_output_reported: Option<u64> = None;
     while let Some(part) = stream.next().await {
         let bytes = part.map_err(|e| Status::unavailable(format!("upstream read failed: {e}")))?;
         buffer.extend_from_slice(&bytes);
@@ -187,6 +217,7 @@ async fn stream_upstream(
                 ParsedEvent::Delta { text, reasoning }
                     if !text.is_empty() || !reasoning.is_empty() =>
                 {
+                    post_output_reported = None;
                     let chunk = CanonChunk {
                         text,
                         reasoning,
@@ -212,28 +243,66 @@ async fn stream_upstream(
                         return Ok(());
                     }
                 }
-                ParsedEvent::Usage {
+                ParsedEvent::InitialUsage {
                     input_tokens: _,
                     output_tokens,
                 } => {
-                    if output_tokens < accounted_output {
+                    if reported_output.is_some_and(|previous| output_tokens < previous) {
                         return Err(Status::data_loss(
                             "Anthropic cumulative output_tokens decreased",
                         ));
                     }
-                    let capped = output_tokens.min(count);
-                    let delta = capped.saturating_sub(accounted_output);
-                    if delta != 0 {
-                        if tx.send(Ok(UpstreamEvent::Accounted(delta))).await.is_err() {
-                            return Ok(());
-                        }
-                        accounted_output = capped;
+                    if output_tokens > count {
+                        return Err(Status::data_loss(
+                            "Anthropic cumulative output_tokens exceeds the requested token limit",
+                        ));
+                    }
+                    reported_output = Some(output_tokens);
+                }
+                ParsedEvent::CumulativeUsage {
+                    input_tokens: _,
+                    output_tokens,
+                } => {
+                    if reported_output.is_some_and(|previous| output_tokens < previous) {
+                        return Err(Status::data_loss(
+                            "Anthropic cumulative output_tokens decreased",
+                        ));
+                    }
+                    if output_tokens > count {
+                        return Err(Status::data_loss(
+                            "Anthropic cumulative output_tokens exceeds the requested token limit",
+                        ));
+                    }
+                    reported_output = Some(output_tokens);
+                    if seq > 0 {
+                        post_output_reported = Some(output_tokens);
                     }
                 }
                 ParsedEvent::Delta { .. } | ParsedEvent::Other => {}
                 ParsedEvent::Stop => {
-                    saw_stop = true;
-                    break;
+                    if seq == 0 {
+                        if reported_output.unwrap_or(0) != 0 {
+                            return Err(Status::data_loss(
+                                "Anthropic usage reports output tokens without delivered output",
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    let output_tokens = post_output_reported
+                        .filter(|tokens| *tokens > 0)
+                        .ok_or_else(|| {
+                            Status::data_loss(
+                                "Anthropic output ended without positive post-output cumulative output_tokens",
+                            )
+                        })?;
+                    if tx
+                        .send(Ok(UpstreamEvent::Accounted(output_tokens)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    return Ok(());
                 }
                 ParsedEvent::Error(message) => {
                     return Err(Status::unavailable(format!(
@@ -241,9 +310,6 @@ async fn stream_upstream(
                     )));
                 }
             }
-        }
-        if saw_stop {
-            return Ok(());
         }
     }
     if !buffer.is_empty() {
@@ -253,8 +319,6 @@ async fn stream_upstream(
         "Anthropic SSE ended without message_stop",
     ))
 }
-
-const MAX_SSE_FRAME_BYTES: usize = 1 << 20;
 
 #[allow(clippy::result_large_err)]
 fn drain_complete_events(buffer: &mut Vec<u8>) -> Result<Vec<String>, Status> {
@@ -266,7 +330,7 @@ fn drain_complete_events(buffer: &mut Vec<u8>) -> Result<Vec<String>, Status> {
             .map_err(|_| Status::data_loss("Anthropic SSE frame is not valid UTF-8"))?;
         events.push(frame);
     }
-    if buffer.len() > MAX_SSE_FRAME_BYTES {
+    if buffer.len() > UPSTREAM_SSE_FRAME_MAX_BYTES {
         return Err(Status::resource_exhausted(
             "Anthropic SSE frame exceeds buffer cap",
         ));
@@ -324,7 +388,11 @@ enum ParsedEvent {
         text: String,
         reasoning: String,
     },
-    Usage {
+    InitialUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    CumulativeUsage {
         input_tokens: u64,
         output_tokens: u64,
     },
@@ -368,7 +436,7 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
             event
                 .message
                 .and_then(|message| message.usage)
-                .map_or(ParsedEvent::Other, |usage| ParsedEvent::Usage {
+                .map_or(ParsedEvent::Other, |usage| ParsedEvent::InitialUsage {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                 })
@@ -376,7 +444,7 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
         ("message_delta", _) => {
             event
                 .usage
-                .map_or(ParsedEvent::Other, |usage| ParsedEvent::Usage {
+                .map_or(ParsedEvent::Other, |usage| ParsedEvent::CumulativeUsage {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                 })
@@ -392,6 +460,9 @@ mod tests {
     use crate::seller::models::Capabilities;
     use dexdo_proto::{ChatMessage, SamplingParams};
 
+    /// A model output cap high enough that these fixtures are bounded by the request/deal, as before.
+    const TEST_OUTPUT_CAP: u32 = 64_000;
+
     fn config() -> AnthropicConfig {
         AnthropicConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -399,6 +470,7 @@ mod tests {
             frame_model: "anthropic--claude--sonnet-4".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             tokenizer_family: "claude".to_string(),
+            max_output_tokens: Some(TEST_OUTPUT_CAP),
         }
     }
 
@@ -430,7 +502,7 @@ mod tests {
             params: None,
         };
         let (tx, mut rx) = mpsc::channel(16);
-        let result = stream_upstream(&cfg, "secret", 8, &request, &tx).await;
+        let result = stream_upstream(&cfg, "secret", 8, &request, &tx, TEST_OUTPUT_CAP).await;
         drop(tx);
         server.await.unwrap();
         let mut events = Vec::new();
@@ -461,7 +533,7 @@ mod tests {
                 greedy: false,
             }),
         };
-        let body = build_request(&cfg, &request, 32);
+        let body = build_request(&cfg, &request, 32, TEST_OUTPUT_CAP);
         let built = http_request(&reqwest::Client::new(), &cfg, "secret", &body)
             .build()
             .unwrap();
@@ -480,6 +552,131 @@ mod tests {
         assert_eq!(json["max_tokens"], 32);
         assert_eq!(json["stream"], true);
         assert_eq!(json["stop_sequences"][0], "STOP");
+    }
+
+    #[test]
+    fn build_request_clamps_generation_to_request_deal_count_and_model_output_cap() {
+        // the Messages API always requires `max_tokens` and rejects anything above the model's own
+        // limit, so the same three-way clamp applies here.
+        let cfg = config();
+        let with_request_limit = |max_tokens| CanonRequest {
+            messages: vec![],
+            params: Some(SamplingParams {
+                max_tokens,
+                ..Default::default()
+            }),
+        };
+        let no_request_limit = CanonRequest {
+            messages: vec![],
+            params: None,
+        };
+
+        assert_eq!(
+            build_request(&cfg, &with_request_limit(12), 5, TEST_OUTPUT_CAP).max_tokens,
+            5
+        );
+        assert_eq!(
+            build_request(&cfg, &with_request_limit(3), 5, TEST_OUTPUT_CAP).max_tokens,
+            3
+        );
+        assert_eq!(
+            build_request(&cfg, &no_request_limit, 7, TEST_OUTPUT_CAP).max_tokens,
+            7
+        );
+        // No client value and a deal budget of whole ticks -> the model cap, never `u32::MAX`.
+        assert_eq!(
+            build_request(&cfg, &no_request_limit, u64::MAX, TEST_OUTPUT_CAP).max_tokens,
+            TEST_OUTPUT_CAP
+        );
+        assert_eq!(
+            build_request(
+                &cfg,
+                &with_request_limit(100_000),
+                2_000_000,
+                TEST_OUTPUT_CAP
+            )
+            .max_tokens,
+            TEST_OUTPUT_CAP
+        );
+        assert_eq!(
+            build_request(&cfg, &no_request_limit, 0, TEST_OUTPUT_CAP).max_tokens,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_model_output_cap_refuses_before_contacting_the_provider() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cfg = AnthropicConfig {
+            base_url: format!("http://{address}"),
+            // `PATH` is always set, so the key precondition cannot mask the capability refusal.
+            api_key_env: "PATH".to_string(),
+            max_output_tokens: None,
+            ..config()
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        // Bounded: a regression that only refuses AFTER connecting would otherwise block on a listener that
+        // never answers, and a hung test is not a failing test.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run(
+                &cfg,
+                8,
+                Some(CanonRequest {
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "hello".into(),
+                    }],
+                    params: None,
+                }),
+                tx,
+            ),
+        )
+        .await
+        .expect("an unknown output cap must be refused without waiting on the provider");
+
+        let Some(Err(status)) = rx.recv().await else {
+            panic!("an unknown output cap must be reported as a refusal");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("max_output_tokens"),
+            "{}",
+            status.message()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                .await
+                .is_err(),
+            "an unknown output cap must not reach the provider at all"
+        );
+    }
+
+    #[test]
+    fn from_model_carries_the_declared_model_output_cap() {
+        let mut model = ModelConfig {
+            frame_model: "anthropic--claude-sonnet--4".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            served_model: "claude-sonnet-4-5-20250929".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            tokenizer_family: "claude".into(),
+            price_per_tick: 1,
+            capabilities: Capabilities::default(),
+            identity_aliases: vec![],
+            vocab_size: None,
+            fingerprints: vec![],
+        };
+        assert_eq!(
+            AnthropicConfig::from_model(&model, None).max_output_tokens,
+            None,
+            "an undeclared cap stays unknown (fail closed), never a fabricated default"
+        );
+        model.capabilities.max_output_tokens = Some(64_000);
+        assert_eq!(
+            AnthropicConfig::from_model(&model, None).max_output_tokens,
+            Some(64_000)
+        );
     }
 
     #[test]
@@ -511,11 +708,11 @@ mod tests {
     fn handles_message_usage_and_stop_events() {
         assert_eq!(
             parse_event("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}").unwrap(),
-            ParsedEvent::Usage { input_tokens: 12, output_tokens: 1 }
+            ParsedEvent::InitialUsage { input_tokens: 12, output_tokens: 1 }
         );
         assert_eq!(
             parse_event("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}").unwrap(),
-            ParsedEvent::Usage { input_tokens: 0, output_tokens: 7 }
+            ParsedEvent::CumulativeUsage { input_tokens: 0, output_tokens: 7 }
         );
         assert_eq!(
             parse_event("event: message_stop\ndata: {\"type\":\"message_stop\"}").unwrap(),
@@ -531,7 +728,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let sse = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
             "event: content_block_delta\n",
@@ -565,7 +762,7 @@ mod tests {
             params: None,
         };
         let (tx, mut rx) = mpsc::channel(8);
-        stream_upstream(&cfg, "secret", 8, &request, &tx)
+        stream_upstream(&cfg, "secret", 8, &request, &tx, TEST_OUTPUT_CAP)
             .await
             .unwrap();
         drop(tx);
@@ -615,7 +812,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_unterminated_frame_and_malformed_json() {
-        let mut oversized = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
+        let mut oversized = vec![b'x'; UPSTREAM_SSE_FRAME_MAX_BYTES + 1];
         assert_eq!(
             drain_complete_events(&mut oversized).unwrap_err().code(),
             tonic::Code::ResourceExhausted
@@ -676,5 +873,100 @@ mod tests {
             })
             .sum();
         assert_eq!(accounted, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_final_usage_fails_without_accounting_frames() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"uncounted\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                UpstreamEvent::Chunk {
+                    accounted_tokens: 0,
+                    ..
+                }
+            )),
+            "no guessed usage may be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn positive_initial_usage_without_final_usage_fails_without_accounting_frames() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"uncounted\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                UpstreamEvent::Chunk {
+                    accounted_tokens: 0,
+                    ..
+                }
+            )),
+            "initial usage is not final usage and must not advance monetary accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn decreasing_cumulative_usage_fails_without_partial_accounting() {
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"output\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                UpstreamEvent::Chunk {
+                    accounted_tokens: 0,
+                    ..
+                }
+            )),
+            "a contradictory cumulative sequence must not advance monetary usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_usage_value_fails_without_accounting() {
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"output\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":18446744073709551616}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            UpstreamEvent::Chunk {
+                accounted_tokens: 0,
+                ..
+            }
+        )));
     }
 }

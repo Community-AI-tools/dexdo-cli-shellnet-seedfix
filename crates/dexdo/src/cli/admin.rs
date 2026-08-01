@@ -10,14 +10,18 @@ use crate::cli::policy;
 #[cfg(feature = "shellnet")]
 use crate::cli::support::{
     deposit_per_deploy, ensure_provision_deposit_covered, prompt_deposit_shells, read_secret_hex,
-    require_provision_nonce, resolve_market_fields, validate_price_step, DEFAULT_DEPOSIT_SHELLS,
-    SHELL_UNIT,
+    require_provision_nonce, resolve_market_fields, validate_price_step, SHELL_UNIT,
 };
 #[cfg(not(feature = "shellnet"))]
 use anyhow::bail;
 use anyhow::Result;
 #[cfg(feature = "shellnet")]
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+#[cfg(feature = "shellnet")]
+use dexdo_core::params::{
+    DEFAULT_DEPOSIT_SHELLS, MARKET_DEPLOY_ACTIVATION_MAX_READS,
+    MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL,
+};
 
 /// Provision a per-deal market: the seller note brings up the
 /// `InferenceOrderBook`(`deployInferenceOrderBook`) and pre-funds + deploys the `RootModel` + per-deal
@@ -73,7 +77,7 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
         Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     if let Some(policy) = registry_policy.as_ref() {
         let expected_order_book = chain
-            .inference_orderbook_address(&note, &target.model_hash, dexdo_core::MODEL_TICK_SIZE)
+            .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
             .await?
             .with_workchain();
         let order_book_active = order_book_active(&chain, &expected_order_book).await?;
@@ -187,7 +191,7 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
 /// no-op). Same lazy deploy the seller's `post_offer` does, surfaced as a first-class operate command.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
-    use dexdo_core::{model_hash_for, Address, KeyPair, RealChainBackend, MODEL_TICK_SIZE};
+    use dexdo_core::{model_hash_for, Address, KeyPair, RealChainBackend, TICK_SIZE};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr (active inference note) is required")
     })?;
@@ -232,7 +236,7 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note =
         Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    let tick_size = MODEL_TICK_SIZE;
+    let tick_size = TICK_SIZE;
     let ob = chain
         .inference_orderbook_address(&note, &model_hash, tick_size)
         .await?;
@@ -266,11 +270,11 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
         .deploy_inference_orderbook(&note, &keys, &model_hash, &frame_model, tick_size)
         .await?;
     // Wait for activation so a follow-up `post_offer` doesn't race the deploy(the book getter returns once active).
-    for _ in 0..30 {
+    for _ in 0..MARKET_DEPLOY_ACTIVATION_MAX_READS {
         if chain.inference_orderbook_stats(&ob).await?.is_some() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL).await;
     }
     println!(
         "deployed inference market for {} -- order book {}",

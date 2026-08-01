@@ -18,7 +18,8 @@ use crate::cli::support::*;
 use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::params::{
-    SellerLivenessParams, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT,
+    SellerLivenessParams, DEFAULT_MATCH_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+    SELLER_TERMINAL_RECEIPT_TIMEOUT,
 };
 use dexdo_core::{DobParams, MatchWatchCursor, SellOfferOutcome};
 use futures::{stream::FuturesUnordered, FutureExt as _, StreamExt as _};
@@ -31,13 +32,93 @@ use tokio::task::JoinSet;
 
 use crate::operator_shutdown_signal;
 
-#[cfg(test)]
+struct OrdinaryCapacityObserver {
+    gateway: std::sync::Arc<dexdo::seller::gateway::GatewayState>,
+}
+
+impl dexdo::seller::ClaimStateObserver for OrdinaryCapacityObserver {
+    fn observe(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        state: dexdo_core::DealChainState,
+    ) -> std::result::Result<(), dexdo_core::ChainError> {
+        self.gateway
+            .reconcile_ordinary_capacity(token_contract, state)
+            .map(|_| ())
+            .map_err(|error| {
+                dexdo_core::ChainError::Chain(format!(
+                    "TokenContract {token_contract}: persist ordinary delivery capacity from claim state: \
+                     {error}"
+                ))
+            })
+    }
+
+    fn observe_terminal(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+    ) -> std::result::Result<(), dexdo_core::ChainError> {
+        self.gateway
+            .mark_deal_terminal(token_contract)
+            .map_err(|error| {
+                dexdo_core::ChainError::Chain(format!(
+                    "TokenContract {token_contract}: remove terminal ordinary delivery capacity: {error}"
+                ))
+            })
+    }
+}
+
+struct SubscriptionCapacityObserver {
+    gateway: std::sync::Arc<dexdo::seller::gateway::GatewayState>,
+}
+
+#[async_trait::async_trait]
+impl dexdo::seller::SubscriptionKeeperObserver for SubscriptionCapacityObserver {
+    async fn observe(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        snapshot: Option<&dexdo_core::DealChainSnapshot>,
+    ) -> std::result::Result<(), dexdo_core::ChainError> {
+        let result = match snapshot {
+            Some(snapshot) => self
+                .gateway
+                .reconcile_subscription_capacity(
+                    token_contract,
+                    snapshot.state,
+                    snapshot.subscription,
+                )
+                .map(|_| ()),
+            None => self.gateway.mark_subscription_terminal(token_contract),
+        };
+        result.map_err(|error| {
+            dexdo_core::ChainError::Chain(format!(
+                "TokenContract {token_contract}: persist subscription delivery capacity from keeper \
+                 snapshot: {error}"
+            ))
+        })
+    }
+}
+
 fn seller_offer_outcome_line(outcome: &SellOfferOutcome) -> String {
     match outcome {
         SellOfferOutcome::Rested { order_id } => {
             format!("seller_offer_outcome RESTED order_id={order_id}")
         }
         SellOfferOutcome::Matched => "seller_offer_outcome MATCHED".to_string(),
+    }
+}
+
+/// The startup announcement printed before `seller_ready` for one prepared pool deal: a fresh post
+/// reports its authoritative outcome(`seller_offer_outcome`), an adopted raw resting SELL reports
+/// the resume(`seller_offer_resume`), and a startup with no resting or matched fact stays silent.
+fn seller_offer_startup_line(startup: &dexdo::seller::SellerOfferStartup) -> Option<String> {
+    match startup {
+        dexdo::seller::SellerOfferStartup::ResumedResting { order_id } => {
+            Some(format!("seller_offer_resume RESTING order_id={order_id}"))
+        }
+        dexdo::seller::SellerOfferStartup::Posted { outcome } => {
+            outcome.as_ref().map(seller_offer_outcome_line)
+        }
+        dexdo::seller::SellerOfferStartup::ResumedFunded => None,
     }
 }
 
@@ -341,6 +422,7 @@ fn seller_watch_cursor_path(
         )))
 }
 
+#[cfg(any(test, feature = "shellnet"))]
 fn seller_pool_dir(
     deals_dir: Option<&std::path::Path>,
     seller_note: &str,
@@ -352,6 +434,7 @@ fn seller_pool_dir(
         .join(deals::make_token_contract_id(&seller_note)))
 }
 
+#[cfg(any(test, feature = "shellnet"))]
 fn load_or_create_gateway_tls(
     pool_dir: &std::path::Path,
 ) -> Result<dexdo::seller::tls::GatewayTls> {
@@ -507,10 +590,33 @@ async fn record_advance_result(
                 finalized,
                 "seller pool deal reached terminal by-fact state"
             );
-            if let Err(error) =
-                apply_seller_terminal_policy(&token_contract, seller_policy, finalized)
-            {
-                first_error.get_or_insert(error);
+            match chain.deal_state(&token_contract).await {
+                Ok(Some(state)) => {
+                    if let Err(error) = apply_seller_terminal_policy(
+                        &token_contract,
+                        seller_policy,
+                        finalized,
+                        state,
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Ok(None) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "--token-contract {token_contract}: authoritative terminal deal state is unavailable; \
+                             refusing to guess buyer_no_show from finalized={finalized}"
+                        )
+                    });
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "--token-contract {token_contract}: authoritative terminal deal state is unreadable; \
+                             refusing to guess buyer_no_show from finalized={finalized}: {error}"
+                        )
+                    });
+                }
             }
             seller.state.unregister_stream(&token_contract);
             spawn_buyer_stop_receipt_wait(terminal_receipts, token_contract, chain, delivery);
@@ -714,6 +820,7 @@ where
         initial.nonce = initial_market.nonce;
         initial.market = Some(initial_market);
     }
+    let subscription = initial.cfg.subscription;
     let mut pool = vec![initial];
 
     for market in markets.into_values() {
@@ -767,13 +874,14 @@ where
             token_contract: market.token_contract.clone(),
             price_per_tick,
             max_ticks,
+            subscription,
             gateway_advertise: context.gateway_advertise.to_string(),
             mock_token_count,
         };
         pool.push(SellerPoolDeal {
             watch: dexdo::seller::SellerMatchWatchConfig {
                 cursor_path: seller_watch_cursor_path(context.deals_dir, &market.token_contract)?,
-                poll_interval: dexdo::seller::DEFAULT_MATCH_POLL_INTERVAL,
+                poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
             },
             chain,
             cfg,
@@ -853,6 +961,10 @@ where
             };
         }
     };
+    if let Some(announcement) = seller_offer_startup_line(&startup) {
+        println!("{announcement}");
+        let _ = std::io::stdout().flush();
+    }
     let identity = match &startup {
         dexdo::seller::SellerOfferStartup::ResumedResting { order_id }
         | dexdo::seller::SellerOfferStartup::Posted {
@@ -1104,7 +1216,7 @@ where
     let mut gateway_poll =
         tokio::time::interval(SellerLivenessParams::canonical().gateway_task_poll);
     gateway_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut owner_fill_poll = tokio::time::interval(dexdo::seller::DEFAULT_MATCH_POLL_INTERVAL);
+    let mut owner_fill_poll = tokio::time::interval(DEFAULT_MATCH_POLL_INTERVAL);
     owner_fill_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stop_error = None;
     let mut stopped_by_operator = false;
@@ -1259,6 +1371,7 @@ where
                     token_contract: market.token_contract.clone(),
                     price_per_tick: authoritative_price,
                     max_ticks: authoritative_ticks,
+                    subscription: current.cfg.subscription,
                     gateway_advertise: current.cfg.gateway_advertise.clone(),
                     mock_token_count: current.cfg.mock_token_count,
                 };
@@ -1268,7 +1381,7 @@ where
                             context.deals_dir,
                             &cfg.token_contract,
                         )?,
-                        poll_interval: dexdo::seller::DEFAULT_MATCH_POLL_INTERVAL,
+                        poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
                     },
                     chain,
                     cfg,
@@ -1442,43 +1555,104 @@ where
                         ).await {
                             Ok(false) => {
                               let spawn_result: Result<()> = async {
-                                let settle = deal
-                                    .chain
-                                    .deal_settle_window(&deal.cfg.token_contract)
-                                    .await
-                                    .map_err(|error| {
-                                        anyhow::anyhow!(
-                                            "--token-contract {}: getConfig().settleWindow is \
-                                             unreadable, refusing to start by-fact advance on a \
-                                             guessed cadence: {error}",
-                                            deal.cfg.token_contract
-                                        )
-                                    })?;
-                                let windows =
-                                    dexdo::seller::AdvanceWindows::from_settle_window(settle);
-                                let note = seller.note.clone();
-                                let delivery = seller.state.delivery(&deal.cfg.token_contract);
-                                let token_contract = deal.cfg.token_contract.clone();
-                                let chain = deal.chain.clone();
-                                let tick_budget = u128::from(deal.cfg.max_ticks);
-                                let tick_size = dexdo_core::DobParams::canonical().tick_size;
-                                active.spawn(async move {
-                                    let result = dexdo::seller::drive_advance(
-                                        chain.as_ref(),
-                                        &token_contract,
-                                        note.as_ref(),
-                                        windows,
-                                        tick_budget,
-                                        tick_size,
-                                        delivery.count.clone(),
-                                        delivery.done.clone(),
-                                    )
-                                    .await;
-                                    (token_contract, chain, delivery, result)
-                                });
-                                Ok(())
-                            }
-                            .await;
+                                  let bounds = deal
+                                      .chain
+                                      .deal_claim_bounds(&deal.cfg.token_contract)
+                                      .await
+                                      .map_err(|error| {
+                                          anyhow::anyhow!(
+                                              "--token-contract {}: getConfig() claim bounds are \
+                                               unreadable, refusing to start by-fact claiming on a \
+                                               guessed cadence: {error}",
+                                              deal.cfg.token_contract
+                                          )
+                                      })?;
+                                  let snapshot = deal
+                                      .chain
+                                      .deal_snapshot(&deal.cfg.token_contract)
+                                      .await
+                                      .map_err(|error| {
+                                          anyhow::anyhow!(
+                                              "--token-contract {}: strict coherent deal snapshot is \
+                                               unreadable, refusing to choose the settlement driver \
+                                               from guessed deal shape: {error}",
+                                              deal.cfg.token_contract
+                                          )
+                                      })?
+                                      .ok_or_else(|| {
+                                          anyhow::anyhow!(
+                                              "--token-contract {}: strict coherent deal snapshot \
+                                               returned no data after stream open",
+                                              deal.cfg.token_contract
+                                          )
+                                      })?;
+                                  let run_subscription_keeper =
+                                      snapshot.subscription.is_subscription();
+                                  let windows =
+                                      dexdo::seller::AdvanceWindows::from_bounds(bounds);
+                                  let note = seller.note.clone();
+                                  let delivery = seller.state.delivery(&deal.cfg.token_contract);
+                                  let token_contract = deal.cfg.token_contract.clone();
+                                  let chain = deal.chain.clone();
+                                  let gateway = seller.state.clone();
+                                  let tick_budget = u128::from(deal.cfg.max_ticks);
+                                  let tick_size = dexdo_core::DobParams::canonical().tick_size;
+                                  active.spawn(async move {
+                                      let result = if !run_subscription_keeper {
+                                          let observer = OrdinaryCapacityObserver { gateway };
+                                          dexdo::seller::drive_advance_with_observer(
+                                              chain.as_ref(),
+                                              &token_contract,
+                                              note.as_ref(),
+                                              windows,
+                                              tick_budget,
+                                              tick_size,
+                                              true,
+                                              delivery.count.clone(),
+                                              delivery.done.clone(),
+                                              &observer,
+                                          )
+                                          .await
+                                      } else {
+                                          let advance = dexdo::seller::drive_advance(
+                                              chain.as_ref(),
+                                              &token_contract,
+                                              note.as_ref(),
+                                              windows,
+                                              tick_budget,
+                                              tick_size,
+                                              false,
+                                              delivery.count.clone(),
+                                              delivery.done.clone(),
+                                          );
+                                          let observer =
+                                              SubscriptionCapacityObserver { gateway };
+                                          let keeper =
+                                              dexdo::seller::drive_subscription_keeper_with_observer(
+                                                  chain.as_ref(),
+                                                  &token_contract,
+                                                  bounds,
+                                                  &observer,
+                                          );
+                                          tokio::pin!(advance);
+                                          tokio::pin!(keeper);
+                                          async {
+                                              tokio::select! {
+                                                  finalized = &mut keeper => finalized,
+                                                  claimed = &mut advance => {
+                                                      let claimed = claimed?;
+                                                      let finalized = keeper.await?;
+                                                      Ok(claimed.max(finalized))
+                                                  }
+                                              }
+                                          }
+                                          .await
+                                      };
+                                      (token_contract, chain, delivery, result)
+                                  });
+                                  Ok(())
+                              }
+                              .await;
                               if let Err(error) = spawn_result {
                                   seller.state.unregister_stream(&deal.cfg.token_contract);
                                   first_error.get_or_insert(error);
@@ -1836,6 +2010,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         token_contract: token_contract.clone(),
         price_per_tick: offer_price,
         max_ticks: offer_ticks,
+        subscription: args.subscription,
         gateway_advertise: gateway_advertise.clone(),
         mock_token_count: args.mock_token_count,
     };
@@ -2014,6 +2189,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                 .expect("real seller model was resolved"),
         )
     };
+    let seller_deals_dir = deals::resolve_deals_dir(args.deals_dir.as_deref())?;
 
     let seller = match start_seller_gateway_with_liveness(
         async {
@@ -2031,17 +2207,23 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
             chain.assert_note_can_post_sell_offer().await?;
             match persistent_gateway_tls.take() {
                 Some(tls) => {
-                    dexdo::seller::start_gateway_with_note_tls(
+                    dexdo::seller::start_gateway_with_note_tls_and_deals_dir(
                         args.gateway_listen,
                         upstream,
                         note,
+                        seller_deals_dir.clone(),
                         tls,
                     )
                     .await
                 }
                 None => {
-                    dexdo::seller::start_gateway_with_note(args.gateway_listen, upstream, note)
-                        .await
+                    dexdo::seller::start_gateway_with_note_and_deals_dir(
+                        args.gateway_listen,
+                        upstream,
+                        note,
+                        seller_deals_dir.clone(),
+                    )
+                    .await
                 }
             }
         },
@@ -2121,7 +2303,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     };
     let watch = dexdo::seller::SellerMatchWatchConfig {
         cursor_path: seller_watch_cursor_path(args.deals_dir.as_deref(), &token_contract)?,
-        poll_interval: dexdo::seller::DEFAULT_MATCH_POLL_INTERVAL,
+        poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
     };
     let note_addr = args.identity.note_addr.as_deref().unwrap_or(&seller_owner);
     let frame_model = seller_frame_model_for_handle.as_deref().unwrap_or("mock");
@@ -2224,25 +2406,17 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "shellnet")]
-    use super::acquire_seller_pool_lock;
-    use super::{
-        load_or_create_gateway_tls, load_seller_pool_deals, react_to_seller_shutdown_signal,
-        record_advance_result, record_terminal_receipt_result, run_seller_pool,
-        seller_liveness_event, seller_offer_outcome_line, seller_pool_dir, seller_ready_line,
-        start_seller_gateway_with_liveness, upstream_failure_event, SellerGatewayStartup,
-        SellerPoolContext, SellerPoolDeal, SellerTerminalReceiptResult, SELLER_EVENT_SCHEMA,
-    };
-    use crate::cli::{deals, policy};
+    use super::*;
     use dexdo::seller::{
         liveness::RestingOfferIdentity, prepare_seller_offer, SellerConfig, SellerOfferStartup,
     };
     use dexdo_core::{
-        ChainBackend, ChainError, DealChainState, DobParams, LocalNote, Match, MatchWatchCursor,
-        MatchedFill, MockChainBackend, Note, NotePubkey, OfferListing, ProtocolConsts, SellOffer,
+        ChainBackend, ChainError, DealBuyerBond, DealChainSnapshot, DealChainState, DealSellerBond,
+        DealSubscription, DobParams, LocalNote, Match, MatchWatchCursor, MatchedFill,
+        MockChainBackend, Note, NotePubkey, OfferListing, ProtocolConsts, SellOffer,
         SellOfferOutcome, Settlement, StreamSnapshot, TokenContract,
     };
-    use futures::FutureExt as _;
+    #[cfg(feature = "shellnet")]
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2331,6 +2505,7 @@ mod tests {
             token_contract: Some(format!("0:{}", "b".repeat(64))),
             market: None,
             nonce: Some(7),
+            subscription: false,
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 8,
             model: Some("unused".to_string()),
@@ -2349,6 +2524,139 @@ mod tests {
 
     fn signal_test_token_contract() -> String {
         format!("0:{}", "a".repeat(64))
+    }
+
+    #[tokio::test]
+    async fn subscription_keeper_observer_updates_week_cap_and_removes_terminal_record() {
+        let gateway = Arc::new(dexdo::seller::gateway::GatewayState::new());
+        let token_contract = "0:subscription-capacity-observer".to_string();
+        let buyer = LocalNote::generate();
+        let state = dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: true,
+            disputed: false,
+            deposit: 1,
+            finalized_owed: 0,
+            tokens_final: dexdo_core::TICK_SIZE,
+            tokens_superseded: dexdo_core::TICK_SIZE,
+            tokens_pending: dexdo_core::TICK_SIZE,
+            probe_tick: 0,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        };
+        let week_zero = dexdo_core::DealSubscription {
+            deal_flags: dexdo_core::order_flags::SUBSCRIPTION,
+            sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+            week_index: 0,
+            tokens_per_week: 2 * dexdo_core::TICK_SIZE,
+            funded_tokens: u128::from(dexdo_core::SUBSCRIPTION_WEEKS) * 2 * dexdo_core::TICK_SIZE,
+            tokens_paid: 0,
+            period_start: 1,
+            week_base_tokens: 0,
+        };
+        gateway
+            .register_stream(&token_contract, buyer.pubkey(), 100, state, week_zero)
+            .unwrap();
+
+        let week_one = dexdo_core::DealSubscription {
+            week_index: 1,
+            tokens_paid: 2 * dexdo_core::TICK_SIZE,
+            week_base_tokens: dexdo_core::TICK_SIZE,
+            ..week_zero
+        };
+        let snapshot = dexdo_core::DealChainSnapshot {
+            account_code_hash: "test-code".to_string(),
+            account_boc_hash: "test-boc".to_string(),
+            state,
+            subscription: week_one,
+            seller_bond: dexdo_core::DealSellerBond {
+                bond_funded: true,
+                bond_held: 1,
+                bond_required: 1,
+            },
+            buyer_bond: dexdo_core::DealBuyerBond {
+                bond_held: 1,
+                bond_required: 1,
+            },
+        };
+        let observer = SubscriptionCapacityObserver {
+            gateway: gateway.clone(),
+        };
+        dexdo::seller::SubscriptionKeeperObserver::observe(
+            &observer,
+            &token_contract,
+            Some(&snapshot),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            gateway
+                .reconcile_subscription_capacity(&token_contract, state, week_one)
+                .unwrap()
+                .unwrap()
+                .authoritative_cap,
+            3 * dexdo_core::TICK_SIZE
+        );
+
+        let final_week = dexdo_core::DealSubscription {
+            week_index: dexdo_core::SUBSCRIPTION_WEEKS,
+            tokens_paid: week_zero.funded_tokens,
+            week_base_tokens: state.tokens_pending,
+            ..week_zero
+        };
+        let final_snapshot = dexdo_core::DealChainSnapshot {
+            subscription: final_week,
+            ..snapshot.clone()
+        };
+        dexdo::seller::SubscriptionKeeperObserver::observe(
+            &observer,
+            &token_contract,
+            Some(&final_snapshot),
+        )
+        .await
+        .unwrap();
+        let final_capacity = gateway
+            .reconcile_subscription_capacity(&token_contract, state, final_week)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_capacity.authoritative_cap, state.tokens_pending);
+        assert_eq!(final_capacity.available().unwrap(), 0);
+
+        dexdo::seller::SubscriptionKeeperObserver::observe(&observer, &token_contract, None)
+            .await
+            .unwrap();
+
+        let nonce = vec![7; 32];
+        gateway.auth.issue_challenge(&token_contract, nonce.clone());
+        let signature = buyer.sign(&dexdo::seller::auth::challenge_bytes(
+            &token_contract,
+            &nonce,
+        ));
+        let service = dexdo::seller::gateway::GatewayService::new(gateway);
+        let error = dexdo_proto::Gateway::open_stream(
+            &service,
+            tonic::Request::new(dexdo_proto::StreamRequest {
+                token_contract,
+                nonce,
+                signature: signature.0.to_vec(),
+                request: Some(dexdo_proto::CanonRequest {
+                    messages: Vec::new(),
+                    params: Some(dexdo_proto::SamplingParams {
+                        max_tokens: 1,
+                        ..dexdo_proto::SamplingParams::default()
+                    }),
+                }),
+            }),
+        )
+        .await
+        .err()
+        .expect("terminal capacity removal must reject before upstream");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("capacity is not registered"));
     }
 
     async fn existing_resting_offer(
@@ -2381,6 +2689,7 @@ mod tests {
             token_contract: token_contract.clone(),
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 1024,
+            subscription: false,
             gateway_advertise,
             mock_token_count: 8,
         };
@@ -2736,6 +3045,271 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seller_offer_startup_line_covers_every_resting_startup() {
+        assert_eq!(
+            seller_offer_startup_line(&dexdo::seller::SellerOfferStartup::Posted {
+                outcome: Some(SellOfferOutcome::Rested { order_id: 5 }),
+            })
+            .as_deref(),
+            Some("seller_offer_outcome RESTED order_id=5")
+        );
+        assert_eq!(
+            seller_offer_startup_line(&dexdo::seller::SellerOfferStartup::ResumedResting {
+                order_id: 5,
+            })
+            .as_deref(),
+            Some("seller_offer_resume RESTING order_id=5")
+        );
+        assert_eq!(
+            seller_offer_startup_line(&dexdo::seller::SellerOfferStartup::Posted {
+                outcome: Some(SellOfferOutcome::Matched),
+            })
+            .as_deref(),
+            Some("seller_offer_outcome MATCHED")
+        );
+        assert_eq!(
+            seller_offer_startup_line(&dexdo::seller::SellerOfferStartup::ResumedFunded),
+            None
+        );
+        assert_eq!(
+            seller_offer_startup_line(&dexdo::seller::SellerOfferStartup::Posted { outcome: None }),
+            None
+        );
+    }
+
+    const STARTUP_CHILD_CASE: &str = "DEXDO_TEST_798_STARTUP_CASE";
+    const STARTUP_CHILD_DONE: &str = "seller-offer-startup-child-done case=";
+
+    /// regression driver: run the production `prepare_pool_deal` dispatch in a child process so
+    /// the assertions read the bytes the seller actually writes to stdout, not a formatter in isolation
+    /// (the emitted-nowhere formatter is exactly what made the release gate hang).
+    #[tokio::test]
+    #[ignore = "subprocess helper for seller offer startup announcement regressions"]
+    async fn seller_offer_startup_child() {
+        let Some(case) = std::env::var_os(STARTUP_CHILD_CASE) else {
+            return;
+        };
+        use dexdo::seller::{start_gateway_with_note, SellerMatchWatchConfig, UpstreamConfig};
+        use std::time::Duration;
+
+        let case = case.to_string_lossy().into_owned();
+        let note = Arc::new(LocalNote::generate());
+        let seller = start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            note.clone(),
+        )
+        .await
+        .expect("start startup-announcement gateway");
+        let root = std::env::temp_dir().join(format!("dexdo-798-{case}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create seller test directory");
+        let chain = MockChainBackend::new(
+            root.join("endpoints.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let owner = format!(
+            "0:{}",
+            note.pubkey()
+                .ed
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let token_contract = signal_test_token_contract();
+        let gateway_advertise = seller.listen_addr.to_string();
+        let cfg = SellerConfig {
+            token_contract: token_contract.clone(),
+            price_per_tick: dexdo_core::PRICE_STEP as u64,
+            max_ticks: 1024,
+            subscription: false,
+            gateway_advertise: gateway_advertise.clone(),
+            mock_token_count: 8,
+        };
+        // Bring the exact TC into the authoritative startup state under test; "fresh" leaves it vacant
+        // so the pool itself has to post.
+        if case != "fresh" {
+            let seeded = prepare_seller_offer(note.as_ref(), &chain, &cfg, Some(&owner))
+                .await
+                .expect("seed the exact resting SELL");
+            assert!(
+                matches!(
+                    seeded,
+                    SellerOfferStartup::Posted {
+                        outcome: Some(SellOfferOutcome::Rested { .. }),
+                    }
+                ),
+                "seed must leave one exact resting SELL, got {seeded:?}"
+            );
+            if case == "funded" {
+                chain
+                    .place_buy(&token_contract, &LocalNote::generate())
+                    .await
+                    .expect("match the seeded SELL before the pool prepares it");
+            }
+        }
+        let deal = SellerPoolDeal {
+            chain: Arc::new(chain),
+            cfg,
+            watch: SellerMatchWatchConfig {
+                cursor_path: root.join("seller-watch.json"),
+                poll_interval: Duration::from_millis(10),
+            },
+            upstream: UpstreamConfig::Mock,
+            nonce: 1,
+            market: None,
+        };
+        let contracts = root.join("unused-contracts.json");
+        let context = SellerPoolContext {
+            deals_dir: Some(root.as_path()),
+            contracts: &contracts,
+            note_addr: &owner,
+            frame_model: "mock",
+            gateway_advertise: &gateway_advertise,
+        };
+        let shutdown = futures::future::pending::<()>();
+        tokio::pin!(shutdown);
+        let identity = prepare_pool_deal(&seller, &deal, &context, false, shutdown.as_mut())
+            .await
+            .expect("prepare the pool deal under test");
+        match case.as_str() {
+            "fresh" | "resume" => assert!(
+                identity.is_some(),
+                "case {case} must leave one exact resting SELL identity"
+            ),
+            "funded" => assert!(identity.is_none(), "a funded TC has no resting SELL"),
+            other => panic!("unknown startup child case: {other}"),
+        }
+        seller.server_task.abort();
+        println!("{STARTUP_CHILD_DONE}{case}");
+        let _ = std::io::stdout().flush();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn seller_offer_startup_child_output(case: &str) -> String {
+        use std::process::Command;
+
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "cli::seller::tests::seller_offer_startup_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(STARTUP_CHILD_CASE, case)
+            .output()
+            .expect("spawn seller offer startup child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "startup child case {case} failed: {text}"
+        );
+        assert!(
+            text.contains(&format!("{STARTUP_CHILD_DONE}{case}")),
+            "startup child case {case} never reached the assertion point: {text}"
+        );
+        text
+    }
+
+    /// the fresh post that the chain accepts as resting(`readiness=exact_tc_offer_accepted`)
+    /// must print `seller_offer_outcome RESTED order_id=<id>` -- the exact line the two-runner release
+    /// gate waits on -- exactly once, before `seller_ready`.
+    #[test]
+    fn accepted_fresh_offer_prints_seller_offer_outcome_rested_before_ready() {
+        let output = seller_offer_startup_child_output("fresh");
+        assert_eq!(
+            output
+                .matches("seller_offer_outcome RESTED order_id=")
+                .count(),
+            1,
+            "the accepted fresh offer must announce its resting order exactly once: {output}"
+        );
+        let rested = output
+            .lines()
+            .find(|line| line.starts_with("seller_offer_outcome RESTED order_id="))
+            .expect("resting announcement line");
+        let order_id = rested
+            .trim_end()
+            .rsplit_once('=')
+            .expect("order id suffix")
+            .1
+            .to_string();
+        assert!(
+            order_id.chars().all(|c| c.is_ascii_digit()) && !order_id.is_empty(),
+            "the gate parses this order id as decimal digits: {rested}"
+        );
+        let ready = output
+            .lines()
+            .find(|line| line.starts_with("seller_ready token_contract="))
+            .expect("seller_ready line");
+        assert!(
+            ready.contains(&format!(
+                "order_id={order_id} readiness=exact_tc_offer_accepted"
+            )),
+            "the announced order must be the one the seller declares ready: {output}"
+        );
+        assert!(
+            output.find(rested).unwrap() < output.find(ready).unwrap(),
+            "the gate waits for the resting order before readiness: {output}"
+        );
+        assert!(
+            !output.contains("seller_offer_resume RESTING"),
+            "a fresh post is not a resume: {output}"
+        );
+    }
+
+    /// adopting an existing exact raw resting SELL announces that resting order exactly once too
+    /// -- on its own `seller_offer_resume RESTING` contract, which relies on to prove a restart did
+    /// not re-post(`seller_offer_outcome RESTED` stays the fresh-post-only marker).
+    #[test]
+    fn resumed_resting_offer_prints_its_resting_order_exactly_once() {
+        let output = seller_offer_startup_child_output("resume");
+        assert_eq!(
+            output
+                .matches("seller_offer_resume RESTING order_id=")
+                .count(),
+            1,
+            "the adopted resting order must be announced exactly once: {output}"
+        );
+        let resumed = output
+            .lines()
+            .find(|line| line.starts_with("seller_offer_resume RESTING order_id="))
+            .expect("resume announcement line");
+        let order_id = resumed.trim_end().rsplit_once('=').expect("order id").1;
+        let ready = output
+            .lines()
+            .find(|line| line.starts_with("seller_ready token_contract="))
+            .expect("seller_ready line");
+        assert!(
+            ready.contains(&format!(
+                "order_id={order_id} readiness=resumed_resting_offer"
+            )),
+            "the resumed order must be the one the seller declares ready: {output}"
+        );
+        assert!(
+            !output.contains("seller_offer_outcome RESTED"),
+            ": a resume must stay distinguishable from a fresh post: {output}"
+        );
+    }
+
+    /// negative: a TC already funded by a matched buyer has no resting SELL, so the seller must
+    /// announce no offer outcome at all.
+    #[test]
+    fn funded_startup_prints_no_offer_announcement() {
+        let output = seller_offer_startup_child_output("funded");
+        assert!(
+            !output.contains("seller_offer_outcome ")
+                && !output.contains("seller_offer_resume ")
+                && !output.contains("seller_ready "),
+            "nothing rested, so nothing may be announced: {output}"
+        );
+    }
+
     /// regression: `run_seller` delegates every mock/real deal to the shared pool and never restores
     /// the old bounded one-deal match wait.
     #[test]
@@ -2809,6 +3383,7 @@ mod tests {
             token_contract: format!("0:{}", "b".repeat(64)),
             price_per_tick: config.price_per_tick,
             max_ticks: config.max_ticks,
+            subscription: false,
             gateway_advertise: config.gateway_advertise.clone(),
             mock_token_count: config.mock_token_count,
         };
@@ -2838,6 +3413,7 @@ mod tests {
             token_contract: Some(config.token_contract.clone()),
             market: None,
             nonce: None,
+            subscription: false,
             price_per_tick: config.price_per_tick,
             mock_token_count: config.mock_token_count,
             model: Some("restart-model".to_string()),
@@ -3015,11 +3591,13 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "shellnet")]
         fn with_inspection_failure(self) -> Self {
             self.inspection_fail_once.store(true, Ordering::Relaxed);
             self
         }
 
+        #[cfg(feature = "shellnet")]
         fn with_open_failure(self) -> Self {
             self.open_fail_once.store(true, Ordering::Relaxed);
             self
@@ -3141,7 +3719,12 @@ mod tests {
             Ok(self.opened.load(Ordering::Relaxed).then_some(vec![1]))
         }
 
-        async fn advance_tick(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
+        async fn claim_tokens(
+            &self,
+            _: &TokenContract,
+            _: &dyn Note,
+            _: u128,
+        ) -> Result<(), ChainError> {
             Ok(())
         }
 
@@ -3153,10 +3736,6 @@ mod tests {
             unreachable!("the test exits before the fixed probe window")
         }
 
-        async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
-            unreachable!("the test exits before timeout")
-        }
-
         async fn deal_state(
             &self,
             _: &TokenContract,
@@ -3164,10 +3743,58 @@ mod tests {
             Ok(self.exists.load(Ordering::Relaxed).then(|| DealChainState {
                 funded: self.matched.load(Ordering::Relaxed),
                 opened: self.opened.load(Ordering::Relaxed),
-                disputed: false,
                 probe_accepted: false,
+                disputed: false,
+                deposit: if self.matched.load(Ordering::Relaxed) {
+                    u128::from(self.price_per_tick) * u128::from(self.matched_ticks)
+                } else {
+                    0
+                },
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
+                probe_tick: 0,
                 funded_time: self.matched.load(Ordering::Relaxed).then_some(1),
-                last_advance: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            }))
+        }
+
+        async fn deal_snapshot(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainSnapshot>, ChainError> {
+            let Some(state) = self.deal_state(&self.token_contract).await? else {
+                return Ok(None);
+            };
+            let funded_tokens = u128::from(self.matched_ticks) * dexdo_core::TICK_SIZE;
+            let bond_required = u128::from(self.price_per_tick) * 2;
+            Ok(Some(DealChainSnapshot {
+                account_code_hash: "pool-test-code".to_string(),
+                account_boc_hash: format!("pool-test:{}", self.token_contract),
+                state,
+                subscription: DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: funded_tokens,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                },
+                seller_bond: DealSellerBond {
+                    bond_funded: true,
+                    bond_held: bond_required,
+                    bond_required,
+                },
+                buyer_bond: DealBuyerBond {
+                    bond_held: 0,
+                    bond_required: 0,
+                },
             }))
         }
 
@@ -3176,6 +3803,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn seller_fill_poll_returns_whole_owner_batch_once() {
+        let owner_fills = Arc::new(Mutex::new(Vec::new()));
+        let first = PoolTestBackend::new(owner_fills.clone(), "0:first".to_string(), 8, 3, true, 2);
+        let _second = PoolTestBackend::new(owner_fills, "0:second".to_string(), 5, 2, true, 1);
+        let note = LocalNote::generate();
+        let mut cursor = MatchWatchCursor::new(0);
+
+        let batch = first.poll_seller_fills(&note, &mut cursor).await.unwrap();
+        assert_eq!(
+            batch
+                .iter()
+                .map(|fill| fill.token_contract.as_str())
+                .collect::<Vec<_>>(),
+            ["0:second", "0:first"]
+        );
+        assert!(
+            first
+                .poll_seller_fills(&note, &mut cursor)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the owner-wide batch must be consumed exactly once"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
     struct PoolTestProvisioner {
         note_addr: String,
         frame_model: String,
@@ -3183,6 +3837,7 @@ mod tests {
         calls: Arc<Mutex<Vec<(u64, u64, u64)>>>,
     }
 
+    #[cfg(feature = "shellnet")]
     impl PoolTestProvisioner {
         fn provision(
             &mut self,
@@ -3227,6 +3882,21 @@ mod tests {
         }
     }
 
+    fn elapse_mock_probe_window(state_path: &std::path::Path, token_contract: &str) {
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        let opened_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(ProtocolConsts::canonical().probe_window.as_secs());
+        let stream = &mut state["streams"][token_contract];
+        stream["probe_time"] = opened_at.into();
+        stream["prev_claim_time"] = opened_at.into();
+        stream["last_claim_time"] = opened_at.into();
+        std::fs::write(state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
     async fn record_terminal_for_test(
         seller: &dexdo::seller::RunningSeller,
         chain: Arc<dyn ChainBackend>,
@@ -3244,6 +3914,93 @@ mod tests {
             first_error,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_policy_dispatch_uses_authoritative_probe_state_at_zero_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let chain = Arc::new(MockChainBackend::new(
+            root.path().join("endpoints.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        ));
+        let seller_note = Arc::new(LocalNote::generate());
+        let buyer_note = LocalNote::generate();
+        let mut seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            seller_note.clone(),
+        )
+        .await
+        .unwrap();
+        let policy = policy::SellerRuntimePolicy {
+            after_deal_done: policy::SellerAfterDealDoneAction::Retire,
+            buyer_no_show: policy::SellerBuyerNoShowAction::CleanupAndRetire,
+            dispute_against_me: policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+            max_open_deals: 2,
+        };
+        let mut terminal_receipts = tokio::task::JoinSet::new();
+
+        for (token_contract, probe_accepted) in [
+            ("accepted-probe-zero-delivery", true),
+            ("true-buyer-no-show", false),
+        ] {
+            let token_contract = token_contract.to_string();
+            chain
+                .post_offer(
+                    SellOffer {
+                        price_per_tick: dexdo_core::PRICE_STEP as u64,
+                        max_ticks: 4,
+                        token_contract: token_contract.clone(),
+                        flags: 0,
+                    },
+                    seller_note.as_ref(),
+                )
+                .await
+                .unwrap();
+            chain.place_buy(&token_contract, &buyer_note).await.unwrap();
+            chain
+                .open_stream(&token_contract, Vec::new(), seller_note.as_ref())
+                .await
+                .unwrap();
+            if probe_accepted {
+                elapse_mock_probe_window(
+                    &root.path().join("endpoints.chainstate.json"),
+                    &token_contract,
+                );
+                chain.accept_probe(&token_contract).await.unwrap();
+            }
+            chain.stop(&token_contract, &buyer_note).await.unwrap();
+
+            let state = chain.deal_state(&token_contract).await.unwrap().unwrap();
+            assert_eq!(state.probe_accepted, probe_accepted);
+            let delivery = seller.state.delivery(&token_contract);
+            assert_eq!(delivery.count.load(Ordering::Acquire), 0);
+            let backend: Arc<dyn ChainBackend> = chain.clone();
+            let mut first_error = None;
+            record_advance_result(
+                &seller,
+                Ok((token_contract, backend, delivery, Ok(0))),
+                &mut terminal_receipts,
+                &policy,
+                &mut first_error,
+            )
+            .await;
+
+            if probe_accepted {
+                assert!(first_error.is_none(), "{first_error:?}");
+            } else {
+                let error = first_error.expect("true no-show must use buyer_no_show policy");
+                assert!(
+                    error.to_string().contains("failure_class=buyer_no_show"),
+                    "{error:#}"
+                );
+            }
+        }
+
+        terminal_receipts.abort_all();
+        seller.server_task.abort();
+        let _ = (&mut seller.server_task).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3266,9 +4023,10 @@ mod tests {
             chain
                 .post_offer(
                     SellOffer {
-                        price_per_tick: 1_000,
+                        price_per_tick: dexdo_core::PRICE_STEP as u64,
                         max_ticks: 4,
                         token_contract: tc.clone(),
+                        flags: 0,
                     },
                     seller_note.as_ref(),
                 )
@@ -3280,6 +4038,7 @@ mod tests {
                 .await
                 .unwrap();
             if accept_probe {
+                elapse_mock_probe_window(&root.path().join("endpoints.chainstate.json"), &tc);
                 chain.accept_probe(&tc).await.unwrap();
             }
             if tc == "clean-1" {
@@ -3394,7 +4153,7 @@ mod tests {
             "replayed terminal read must not duplicate clean-1"
         );
 
-        for tc in ["probe-stop", "disputed", "unfunded-generic-terminal"] {
+        for tc in ["probe-stop", "disputed"] {
             record_terminal_for_test(
                 &seller,
                 receipt_chain.clone(),
@@ -3407,7 +4166,7 @@ mod tests {
         }
         tokio::task::yield_now().await;
         tokio::time::advance(dexdo_core::params::SELLER_TERMINAL_RECEIPT_TIMEOUT).await;
-        for tc in ["probe-stop", "disputed", "unfunded-generic-terminal"] {
+        for tc in ["probe-stop", "disputed"] {
             let joined = terminal_receipts
                 .join_next()
                 .await
@@ -3418,6 +4177,33 @@ mod tests {
             );
         }
         assert!(first_error.is_none(), "{first_error:?}");
+
+        record_terminal_for_test(
+            &seller,
+            receipt_chain,
+            "unfunded-generic-terminal",
+            seller.state.delivery("unfunded-generic-terminal"),
+            &mut terminal_receipts,
+            &mut first_error,
+        )
+        .await;
+        let error = first_error.expect("missing authoritative state must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to guess buyer_no_show"),
+            "{error:#}"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(dexdo_core::params::SELLER_TERMINAL_RECEIPT_TIMEOUT).await;
+        let joined = terminal_receipts
+            .join_next()
+            .await
+            .expect("missing-state terminal receipt task");
+        assert!(
+            record_terminal_receipt_result(joined, &mut None).is_empty(),
+            "missing authoritative state must not produce a terminal trail"
+        );
         seller.server_task.abort();
         let _ = (&mut seller.server_task).await;
     }
@@ -3515,6 +4301,7 @@ mod tests {
             token_contract: initial.token_contract.clone(),
             price_per_tick: initial.price_per_tick,
             max_ticks: initial.offered_ticks,
+            subscription: false,
             gateway_advertise: gateway.clone(),
             mock_token_count: 8,
         };
@@ -3536,6 +4323,7 @@ mod tests {
                 token_contract: independent.token_contract.clone(),
                 price_per_tick: independent.price_per_tick,
                 max_ticks: independent.offered_ticks,
+                subscription: false,
                 gateway_advertise: gateway.clone(),
                 mock_token_count: 8,
             },
@@ -3892,6 +4680,7 @@ mod tests {
             token_contract: Some(token_contract),
             market: None,
             nonce: Some(nonce),
+            subscription: false,
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 4,
             model: None,
@@ -3935,6 +4724,7 @@ mod tests {
             token_contract: initial_tc.clone(),
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 1024,
+            subscription: false,
             gateway_advertise: gateway.to_string(),
             mock_token_count: 4,
         };
@@ -4063,6 +4853,7 @@ mod tests {
             token_contract: descendant_tc.clone(),
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 2,
+            subscription: false,
             gateway_advertise: gateway.to_string(),
             mock_token_count: 4,
         };

@@ -20,7 +20,8 @@
       ],
       "capabilities": {
         "logprobs": true,
-        "top_logprobs": 5
+        "top_logprobs": 5,
+        "max_output_tokens": 40960
       }
     },
     "claude-sonnet": {
@@ -31,7 +32,8 @@
       "tokenizer_family": "claude",
       "price_per_tick": 1000000000,
       "capabilities": {
-        "logprobs": false
+        "logprobs": false,
+        "max_output_tokens": 64000
       }
     }
   }

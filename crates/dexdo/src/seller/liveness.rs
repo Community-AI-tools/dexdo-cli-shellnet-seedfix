@@ -904,6 +904,7 @@ where
             health_timeout: params.health_check_timeout,
             cycle_timeout: params.health_cycle_timeout,
             cancel_poll: params.cancel_confirmation_poll,
+            abort_gateway_on_stop: true,
         },
     )
     .await
@@ -915,6 +916,7 @@ struct SupervisionTiming {
     health_timeout: Duration,
     cycle_timeout: Duration,
     cancel_poll: Duration,
+    abort_gateway_on_stop: bool,
 }
 
 async fn supervise_with_timing<S>(
@@ -925,7 +927,6 @@ async fn supervise_with_timing<S>(
     identity: &RestingOfferIdentity,
     shutdown: S,
     timing: SupervisionTiming,
-    abort_gateway_on_stop: bool,
 ) -> Result<RestingSellerOutcome>
 where
     S: Future<Output = ()>,
@@ -999,7 +1000,7 @@ where
         }
         disposition => disposition,
     };
-    if abort_gateway_on_stop
+    if timing.abort_gateway_on_stop
         && !matches!(&disposition, CancellationDisposition::UnknownFailure { .. })
     {
         seller.server_task.abort();
@@ -1039,8 +1040,8 @@ where
             health_timeout: params.health_check_timeout,
             cycle_timeout: params.health_cycle_timeout,
             cancel_poll: params.cancel_confirmation_poll,
+            abort_gateway_on_stop,
         },
-        abort_gateway_on_stop,
     )
     .await
 }
@@ -1050,8 +1051,9 @@ mod tests {
     use super::*;
     use crate::seller::{Capabilities, OpenAiConfig, UpstreamConfig};
     use dexdo_core::{
-        ChainError, DealChainState, LocalNote, Note, NotePubkey, OfferListing, OrderBookOrder,
-        SellOffer, SellOfferOutcome, Settlement, StreamSnapshot, TokenContract,
+        ChainError, DealBuyerBond, DealChainSnapshot, DealChainState, DealSellerBond,
+        DealSubscription, LocalNote, Note, NotePubkey, OfferListing, OrderBookOrder, SellOffer,
+        SellOfferOutcome, Settlement, StreamSnapshot, TokenContract,
     };
     use futures::{future::FusedFuture as _, FutureExt as _};
     use proptest::prelude::*;
@@ -1276,7 +1278,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn advance_tick(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
+        async fn claim_tokens(
+            &self,
+            _: &TokenContract,
+            _: &dyn Note,
+            _: u128,
+        ) -> Result<(), ChainError> {
             unimplemented!()
         }
 
@@ -1288,10 +1295,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
-            unimplemented!()
-        }
-
         async fn deal_state(
             &self,
             _: &TokenContract,
@@ -1299,10 +1302,69 @@ mod tests {
             Ok(Some(DealChainState {
                 funded: self.matched.lock().unwrap().is_some(),
                 opened: false,
-                disputed: false,
                 probe_accepted: false,
+                disputed: false,
+                deposit: 0,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
+                probe_tick: 0,
                 funded_time: None,
-                last_advance: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            }))
+        }
+
+        async fn deal_snapshot(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainSnapshot>, ChainError> {
+            if self.matched.lock().unwrap().is_none() {
+                return Ok(None);
+            }
+            let funded_tokens = 8 * dexdo_core::TICK_SIZE;
+            Ok(Some(DealChainSnapshot {
+                account_code_hash: "test-code".to_string(),
+                account_boc_hash: "test-boc".to_string(),
+                state: DealChainState {
+                    funded: true,
+                    opened: false,
+                    probe_accepted: false,
+                    disputed: false,
+                    deposit: 1_000,
+                    finalized_owed: 0,
+                    tokens_final: 0,
+                    tokens_superseded: 0,
+                    tokens_pending: 0,
+                    probe_tick: 0,
+                    funded_time: Some(1),
+                    probe_time: 0,
+                    prev_claim_time: 0,
+                    last_claim_time: 0,
+                    dispute_time: 0,
+                },
+                subscription: DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: funded_tokens,
+                    funded_tokens,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                },
+                seller_bond: DealSellerBond {
+                    bond_funded: true,
+                    bond_held: 1,
+                    bond_required: 1,
+                },
+                buyer_bond: DealBuyerBond {
+                    bond_held: 0,
+                    bond_required: 0,
+                },
             }))
         }
 
@@ -1320,6 +1382,7 @@ mod tests {
             token_contract: token_contract.to_string(),
             price_per_tick: 1000,
             max_ticks: 8,
+            subscription: false,
             gateway_advertise: "127.0.0.1:0".to_string(),
             mock_token_count: 8,
         }
@@ -1373,7 +1436,11 @@ mod tests {
             claimed_model_override: None,
             api_key_env: "PATH".to_string(),
             tokenizer_family: "exact".to_string(),
-            capabilities: Capabilities::default(),
+            capabilities: Capabilities {
+                logprobs: true,
+                top_logprobs: None,
+                max_output_tokens: Some(1024),
+            },
         })
     }
 
@@ -1399,7 +1466,7 @@ mod tests {
     }
 
     fn healthy_sse() -> String {
-        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n".to_string()
+        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"logprobs\":{\"content\":[{\"token\":\"OK\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\ndata: [DONE]\n\n".to_string()
     }
 
     fn watch(name: &str) -> SellerMatchWatchConfig {
@@ -1419,6 +1486,7 @@ mod tests {
             health_timeout: Duration::from_millis(500),
             cycle_timeout: Duration::from_millis(600),
             cancel_poll: Duration::from_millis(1),
+            abort_gateway_on_stop: true,
         }
     }
 
@@ -1680,6 +1748,7 @@ mod tests {
                 health_timeout: Duration::from_millis(100),
                 cycle_timeout: Duration::from_millis(300),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
         )
         .await
@@ -1735,6 +1804,7 @@ mod tests {
                 health_timeout: Duration::from_secs(1),
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
         )
         .await
@@ -1791,6 +1861,7 @@ mod tests {
                 health_timeout: Duration::from_secs(1),
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
         )
         .await
@@ -1844,6 +1915,7 @@ mod tests {
                 health_timeout: Duration::from_millis(100),
                 cycle_timeout: Duration::from_millis(300),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
         )
         .await
@@ -1892,6 +1964,7 @@ mod tests {
                 health_timeout: Duration::from_millis(100),
                 cycle_timeout: Duration::from_millis(150),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
         )
         .await
@@ -1941,7 +2014,6 @@ mod tests {
             &id,
             std::future::pending(),
             fast_timing(),
-            true,
         )
         .await
         .unwrap();
@@ -1993,8 +2065,8 @@ mod tests {
                 health_timeout: Duration::from_millis(10),
                 cycle_timeout: Duration::from_millis(30),
                 cancel_poll: Duration::from_millis(1),
+                abort_gateway_on_stop: true,
             },
-            true,
         )
         .await
         .unwrap();
@@ -2049,7 +2121,6 @@ mod tests {
             &id,
             std::future::pending(),
             fast_timing(),
-            true,
         )
         .await
         .unwrap();
@@ -2149,7 +2220,6 @@ mod tests {
             &id,
             std::future::ready(()),
             fast_timing(),
-            true,
         )
         .await
         .unwrap();
@@ -2194,7 +2264,6 @@ mod tests {
             &id,
             std::future::pending(),
             fast_timing(),
-            true,
         )
         .await
         .unwrap();
@@ -2259,7 +2328,6 @@ mod tests {
             &target,
             shutdown.as_mut(),
             fast_timing(),
-            true,
         )
         .await
         .unwrap();
@@ -2458,7 +2526,6 @@ mod tests {
                     &id,
                     std::future::pending(),
                     fast_timing(),
-                    true,
                 )
                 .await
                 .unwrap()

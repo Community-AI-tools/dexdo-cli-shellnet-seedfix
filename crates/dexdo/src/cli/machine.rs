@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v1";
 pub(crate) const QUOTE_SCHEMA: &str = "dexdo.quote.v1";
 pub(crate) const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v1";
-pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v1";
+pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v2";
 pub(crate) const CLOSE_SCHEMA: &str = "dexdo.close.v1";
 #[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_SCHEMA: &str = "dexdo.note_deploy.v1";
@@ -20,6 +20,7 @@ pub(crate) const OP_BUYER_SHUTDOWN: &str = "buyer_shutdown";
 pub(crate) const OP_STATUS: &str = "status";
 pub(crate) const OP_CLOSE: &str = "close";
 pub(crate) const OP_NOTE_DEPLOY: &str = "note_deploy";
+#[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MARKER: &str = "NETWORK_GENERATION_MISMATCH";
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE: &str =
     "NETWORK_GENERATION_MISMATCH: upgrade dexdo or use a matching --contracts manifest, then retry; \
@@ -495,9 +496,16 @@ pub(crate) struct StatusAccounting {
     pub(crate) finalized_owed: String,
     pub(crate) buyer_locked: String,
     pub(crate) deposit: String,
-    pub(crate) prepaid: String,
-    pub(crate) frozen: String,
-    pub(crate) last_advance_unix: Option<u64>,
+    pub(crate) probe_tick: String,
+    pub(crate) buyer_bond: String,
+    pub(crate) buyer_bond_required: String,
+    pub(crate) tokens_final: String,
+    pub(crate) tokens_superseded: String,
+    pub(crate) tokens_pending: String,
+    pub(crate) probe_time_unix: Option<u64>,
+    pub(crate) prev_claim_time_unix: Option<u64>,
+    pub(crate) last_claim_time_unix: Option<u64>,
+    pub(crate) dispute_time_unix: Option<u64>,
     pub(crate) funded_time_unix: Option<u64>,
 }
 
@@ -672,7 +680,7 @@ mod tests {
         assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v1");
         assert_eq!(QUOTE_SCHEMA, "dexdo.quote.v1");
         assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v1");
-        assert_eq!(STATUS_SCHEMA, "dexdo.status.v1");
+        assert_eq!(STATUS_SCHEMA, "dexdo.status.v2");
         assert_eq!(CLOSE_SCHEMA, "dexdo.close.v1");
         assert_eq!(ERROR_SCHEMA, "dexdo.error.v1");
     }

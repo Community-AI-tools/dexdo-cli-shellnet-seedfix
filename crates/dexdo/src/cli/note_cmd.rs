@@ -14,8 +14,14 @@ use anyhow::bail;
 use anyhow::Result;
 #[cfg(feature = "shellnet")]
 use dexdo_core::params::{
-    HERMEZ_SRS_MAX_ATTEMPTS, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
-    SHELL_CURRENCY_ID,
+    HERMEZ_SRS_HASH_BUFFER_BYTES, HERMEZ_SRS_HTTP_TIMEOUT, HERMEZ_SRS_MAX_ATTEMPTS,
+    HERMEZ_SRS_PROGRESS_STEP_PERCENT, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
+    NOTE_DEPLOY_ACTIVE_POLL_INTERVAL, NOTE_DEPLOY_ACTIVE_TIMEOUT,
+    NOTE_DEPLOY_EXISTING_SHELL_FUNDING_TIMEOUT, NOTE_DEPLOY_LOCK_TIMEOUT_SECS,
+    NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL, NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL,
+    NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT, NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
+    NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT, NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS,
+    NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS, NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL, SHELL_CURRENCY_ID,
 };
 #[cfg(feature = "shellnet")]
 use std::io::{Read as _, Write as _};
@@ -84,9 +90,6 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
 pub(crate) async fn run_note_recover(_args: NoteRecoverArgs) -> Result<()> {
     bail!("note recover unavailable: build with `--features shellnet`")
 }
-
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_LOCK_TIMEOUT_SECS: u64 = 3600;
 
 #[cfg(feature = "shellnet")]
 const HERMEZ_SRS_NAME: &str = "hermez_kzg_srs_k19.bin";
@@ -165,7 +168,7 @@ fn acquire_note_deploy_wallet_lock(funding_multisig_address: &str) -> Result<Not
                     );
                     announced = true;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL);
             }
             Err(e) => bail!("create note deploy wallet lock {}: {e}", path.display()),
         }
@@ -246,7 +249,7 @@ fn acquire_note_deploy_prover_cache_lock_with_timeout(
                     announced = true;
                 }
                 let remaining = timeout.saturating_sub(started.elapsed());
-                std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+                std::thread::sleep(remaining.min(NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL));
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
@@ -309,10 +312,6 @@ impl NoteDeployVoucherFailpoints {
     }
 }
 
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 2_000_000_000;
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
 #[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH: &str =
     "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f";
@@ -940,8 +939,11 @@ where
         match op(attempt).await {
             Ok(value) => return Ok(value),
             Err(error) => {
-                if is_note_deploy_wallet_submit_busy_error(&error) && attempt < 3 {
-                    let backoff_secs = attempt.saturating_mul(10);
+                if is_note_deploy_wallet_submit_busy_error(&error)
+                    && attempt < NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS
+                {
+                    let backoff_secs =
+                        attempt.saturating_mul(NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS);
                     eprintln!(
                         "note deploy: funding wallet {funding_multisig_address} looks busy/out-of-sync; retrying \
                          attempt {} after {backoff_secs}s",
@@ -984,8 +986,6 @@ async fn note_deploy_mint_voucher_recoverable(
         },
         proof, voucher_event,
     };
-    use std::time::Duration;
-
     let endpoint = client.endpoint();
     let root_pn = dexdo_core::Address::parse(ROOT_PN_ADDRESS)?;
     let recipient_ephemeral_pubkey_hex = proof::strip_0x(recipient_ephemeral_pubkey_hex);
@@ -1200,7 +1200,7 @@ async fn note_deploy_mint_voucher_recoverable(
             endpoint,
             &root_pn,
             &format!("0x{}", checkpoint.sk_u_commit_hex),
-            Duration::from_secs(NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS),
+            NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT,
         )
         .await
         .map_err(|e| {
@@ -1610,7 +1610,8 @@ async fn deploy_private_note_from_multisig_recoverable(
                 })?;
             let pn = Address::parse(&pn_address)?;
             let recovered_active = had_persisted_deposit_proof
-                && note_deploy_wait_existing_active(client, &pn, Duration::from_secs(120)).await?;
+                && note_deploy_wait_existing_active(client, &pn, NOTE_DEPLOY_ACTIVE_TIMEOUT)
+                    .await?;
             if recovered_active {
                 resumed_existing_note = true;
                 eprintln!(
@@ -1673,7 +1674,7 @@ async fn deploy_private_note_from_multisig_recoverable(
                 )
                 .await?;
 
-                note_deploy_wait_active(client, &pn, Duration::from_secs(120)).await?;
+                note_deploy_wait_active(client, &pn, NOTE_DEPLOY_ACTIVE_TIMEOUT).await?;
                 if failpoints.after_deploy_before_note_record {
                     bail!(
                         "simulated interruption after deployPrivateNote active before recovery note record. \
@@ -1716,7 +1717,7 @@ async fn deploy_private_note_from_multisig_recoverable(
                 client,
                 &pn,
                 expected_shell,
-                Duration::from_secs(60),
+                NOTE_DEPLOY_EXISTING_SHELL_FUNDING_TIMEOUT,
             )
             .await?;
         if already_funded {
@@ -1815,14 +1816,15 @@ async fn deploy_private_note_from_multisig_recoverable(
                 client,
                 &pn,
                 expected_shell,
-                Duration::from_secs(180),
+                NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT,
             )
             .await?
             {
                 bail!(
                     "PrivateNote {pn_address} did not show expected ECC[2] funding {expected_shell} within \
-                     180s after sendEccShellToPrivateNote; recovery state was left unfinalized so rerun \
+                     {}s after sendEccShellToPrivateNote; recovery state was left unfinalized so rerun \
                      `dexdo note deploy --recovery {}` before pooling.",
+                    NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT.as_secs(),
                     recovery_path.display()
                 );
             }
@@ -1856,7 +1858,7 @@ async fn note_deploy_wait_existing_shell_funding(
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL).await;
     }
 }
 
@@ -1876,7 +1878,7 @@ async fn note_deploy_wait_existing_active(
         if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).await;
     }
 }
 
@@ -1923,7 +1925,7 @@ async fn note_deploy_wait_active(
                 timeout.as_secs()
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).await;
     }
 }
 
@@ -1940,7 +1942,7 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| anyhow::anyhow!("open {} for SHA-256: {error}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; HERMEZ_SRS_HASH_BUFFER_BYTES];
     loop {
         let read = file
             .read(&mut buffer)
@@ -2365,7 +2367,9 @@ async fn fetch_hermez_srs_attempt(
         })?;
         downloaded = next_len;
         let percent = downloaded.saturating_mul(100) / expected_size;
-        if percent >= last_percent.saturating_add(5) || downloaded == expected_size {
+        if percent >= last_percent.saturating_add(HERMEZ_SRS_PROGRESS_STEP_PERCENT)
+            || downloaded == expected_size
+        {
             eprintln!(
                 "{}",
                 hermez_srs_progress_line(attempt, downloaded, expected_size, effective_offset)
@@ -2442,7 +2446,7 @@ pub(crate) async fn ensure_hermez_srs_and_valid_pk_cache(
     prover_cache_dir: &std::path::Path,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(HERMEZ_SRS_HTTP_TIMEOUT)
         .build()
         .map_err(|e| anyhow::anyhow!("build Hermez SRS HTTP client: {e}"))?;
     ensure_hermez_srs_and_valid_pk_cache_with_options(
@@ -2976,7 +2980,57 @@ pub(crate) async fn run_note_withdraw(_args: NoteWithdrawArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
-    use dexdo_core::params::SHELL_CURRENCY_ID;
+    use dexdo_core::params::{
+        NOTE_DEPLOY_SUBMIT_NATIVE_VALUE, NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS,
+        NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS, SHELL_CURRENCY_ID,
+    };
+
+    #[test]
+    fn note_deploy_runtime_policy_is_owned_by_core_params() {
+        let note_source = include_str!("note_cmd.rs");
+        let note_production = note_source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("note_cmd unit-test module boundary")
+            .0;
+        for name in [
+            "NOTE_DEPLOY_LOCK_TIMEOUT_SECS",
+            "NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL",
+            "NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL",
+            "NOTE_DEPLOY_SUBMIT_NATIVE_VALUE",
+            "NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT",
+            "NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS",
+            "NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS",
+            "NOTE_DEPLOY_ACTIVE_TIMEOUT",
+            "NOTE_DEPLOY_EXISTING_SHELL_FUNDING_TIMEOUT",
+            "NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT",
+            "NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL",
+            "NOTE_DEPLOY_ACTIVE_POLL_INTERVAL",
+            "HERMEZ_SRS_HASH_BUFFER_BYTES",
+            "HERMEZ_SRS_PROGRESS_STEP_PERCENT",
+            "HERMEZ_SRS_HTTP_TIMEOUT",
+        ] {
+            assert!(
+                note_production.matches(name).count() >= 2,
+                "note deploy must import and consume params::{name}"
+            );
+            assert!(
+                !note_production.contains(&format!("const {name}")),
+                "note deploy must not redeclare params::{name}"
+            );
+        }
+
+        let support = include_str!("support.rs");
+        for name in ["MIN_DEPLOY_SHELLS", "DEFAULT_DEPOSIT_SHELLS"] {
+            assert!(
+                support.matches(name).count() >= 2,
+                "funding helpers must consume params::{name}"
+            );
+            assert!(
+                !support.contains(&format!("pub(crate) const {name}")),
+                "funding helpers must not redeclare params::{name}"
+            );
+        }
+    }
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
@@ -3690,6 +3744,7 @@ mod tests {
             "UpdateCustodianMultisigWallet_v2 submitTransaction has seven inputs"
         );
         assert_eq!(fields["flag"], 1);
+        assert_eq!(fields["value"], NOTE_DEPLOY_SUBMIT_NATIVE_VALUE.to_string());
         assert!(!fields.contains_key("flags"));
         assert_eq!(
             fields["dapp_id"], "4",
@@ -4908,8 +4963,7 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_wallet_submit_retry_loop_succeeds_on_third_attempt_with_expected_backoff()
-    {
+    async fn note_deploy_wallet_submit_retry_loop_succeeds_on_final_canonical_attempt() {
         let mut attempts = Vec::new();
         let mut backoffs = Vec::new();
 
@@ -4917,7 +4971,7 @@ mod tests {
             "0:wallet",
             async |attempt| {
                 attempts.push(attempt);
-                if attempt < 3 {
+                if attempt < NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS {
                     Err(anyhow::anyhow!(
                         "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: \
                          tvm_error exit-code:52 nonce desynchronized"
@@ -4929,22 +4983,26 @@ mod tests {
             async |duration| backoffs.push(duration),
         )
         .await
-        .expect("wallet-submit retry should succeed on attempt 3");
+        .expect("wallet-submit retry should succeed on the final canonical attempt");
 
         assert_eq!(state, "deployed");
-        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(
+            attempts,
+            (1..=NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS).collect::<Vec<_>>()
+        );
         assert_eq!(
             backoffs,
-            vec![
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_secs(20)
-            ]
+            (1..NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS)
+                .map(|attempt| std::time::Duration::from_secs(
+                    attempt.saturating_mul(NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS)
+                ))
+                .collect::<Vec<_>>()
         );
     }
 
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn note_deploy_wallet_submit_retry_loop_exhausts_three_attempts_with_expected_backoff() {
+    async fn note_deploy_wallet_submit_retry_loop_exhausts_canonical_attempt_budget() {
         let mut attempts = Vec::new();
         let mut backoffs = Vec::new();
 
@@ -4961,15 +5019,19 @@ mod tests {
         )
         .await;
 
-        let error = result.expect_err("wallet-submit retry should stop after attempt 3");
+        let error = result.expect_err("wallet-submit retry should stop after its canonical budget");
         assert!(error.to_string().contains("wallet busy/out-of-sync"));
-        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(
+            attempts,
+            (1..=NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS).collect::<Vec<_>>()
+        );
         assert_eq!(
             backoffs,
-            vec![
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_secs(20)
-            ]
+            (1..NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS)
+                .map(|attempt| std::time::Duration::from_secs(
+                    attempt.saturating_mul(NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS)
+                ))
+                .collect::<Vec<_>>()
         );
     }
 

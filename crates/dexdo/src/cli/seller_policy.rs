@@ -20,7 +20,7 @@ pub(crate) async fn apply_seller_dispute_policy(
             println!(
                 "policy_action failure_class=dispute_against_me action=release_if_clean \
                  token_contract={token_contract} state=funded/opened/disputed result=release_dispute_submitted \
-                 reason={reason} settlement={settlement:?}"
+                 reason={reason} settlement={settlement}"
             );
             Ok(true)
         }
@@ -154,11 +154,13 @@ pub(crate) async fn classify_by_fact_advance_failure(
     let state = chain.deal_state(token_contract).await?.ok_or_else(|| {
         anyhow!("reason=state_unavailable cannot prove ERR_NOT_OPEN is terminal/no-money")
     })?;
-    if state.opened || state.probe_accepted || state.disputed {
+    // ERR_NOT_OPEN is only benign on a deal that never ran. Promoted consumption or a settled close (drained
+    // deposit) both mean money already moved, so treat either as a fault rather than a harmless terminal.
+    if state.opened || state.disputed || state.tokens_final > 0 || state.is_stopped() {
         return Ok(AdvanceFailureDisposition::Fault {
             reason: format!(
-                "reason=unsafe_lifecycle funded={} opened={} probe_accepted={} disputed={}",
-                state.funded, state.opened, state.probe_accepted, state.disputed
+                "reason=unsafe_lifecycle funded={} opened={} disputed={} tokens_final={} deposit={}",
+                state.funded, state.opened, state.disputed, state.tokens_final, state.deposit
             ),
         });
     }
@@ -187,12 +189,12 @@ pub(crate) async fn classify_by_fact_advance_failure(
 
     Ok(AdvanceFailureDisposition::BenignTerminal {
         reason: format!(
-            "reason=err_not_open_unopened_no_money funded={} opened={} probe_accepted={} disputed={} \
+            "reason=err_not_open_unopened_no_money funded={} opened={} disputed={} tokens_final={} \
              buyer_locked={} buyer_lead={} seller_locked={} finalized_owed={} burned={}",
             state.funded,
             state.opened,
-            state.probe_accepted,
             state.disputed,
+            state.tokens_final,
             snapshot.buyer_locked,
             snapshot.buyer_lead,
             snapshot.seller_locked,
@@ -206,8 +208,12 @@ pub(crate) fn apply_seller_terminal_policy(
     token_contract: &dexdo_core::TokenContract,
     policy: &policy::SellerRuntimePolicy,
     finalized: u128,
+    state: dexdo_core::DealChainState,
 ) -> Result<SellerTerminalPolicyOutcome> {
-    if finalized == 0 {
+    // The driver can return zero when it observes a buyer STOP before its local claim cursor advances. The
+    // contract's accepted-probe latch is the authority for whether service crossed the paid-probe boundary;
+    // never turn an after-probe close into a buyer no-show from that scalar alone.
+    if !state.probe_accepted {
         match policy.buyer_no_show {
             policy::SellerBuyerNoShowAction::CleanupAndRepublish => {
                 bail!(

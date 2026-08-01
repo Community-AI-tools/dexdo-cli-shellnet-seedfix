@@ -17,7 +17,14 @@ use crate::buyer::verify::Verdict;
 use crate::buyer::Buyer;
 use crate::seller::ModelsConfig;
 use anyhow::Result;
-use dexdo_core::{ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
+use dexdo_core::{
+    params::{
+        CONTENT_PROBE_MAX_TOKENS, DEFAULT_BUYER_DEAD_GATEWAY_ACTION,
+        DEFAULT_BUYER_EMPTY_STREAM_ACTION, DEFAULT_BUYER_STALLS_MID_STREAM_ACTION,
+        DEFAULT_BUYER_VERIFICATION_BAIL_ACTION, MATCH_OPEN_TIMEOUT,
+    },
+    ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS,
+};
 use dexdo_proto::CanonChunk;
 use std::fmt;
 use std::future::Future;
@@ -30,7 +37,6 @@ use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 
 pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, DealInitError>> + Send>>;
 pub type DealInitializer = Arc<dyn Fn() -> DealInitFuture + Send + Sync>;
-const DEFAULT_DEAL_INIT_TIMEOUT: Duration = Duration::from_secs(MATCH_OPEN_TIMEOUT_SECS);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BuyerSubmitRecoveryAnchor {
@@ -209,11 +215,36 @@ pub struct BuyerApiFailurePolicy {
 
 impl Default for BuyerApiFailurePolicy {
     fn default() -> Self {
+        let verification_bail = match DEFAULT_BUYER_VERIFICATION_BAIL_ACTION {
+            "stop" => VerificationBailAction::Stop,
+            "dispute" => VerificationBailAction::Dispute,
+            "stop_and_blacklist" => VerificationBailAction::StopAndBlacklist,
+            value => panic!("invalid canonical buyer verification-bail action: {value}"),
+        };
+        let dead_gateway = match DEFAULT_BUYER_DEAD_GATEWAY_ACTION {
+            "retry_then_reclaim" => DeadGatewayAction::RetryThenReclaim,
+            "next_seller" => DeadGatewayAction::NextSeller,
+            "fail_closed" => DeadGatewayAction::FailClosed,
+            value => panic!("invalid canonical buyer dead-gateway action: {value}"),
+        };
+        let empty_stream = match DEFAULT_BUYER_EMPTY_STREAM_ACTION {
+            "reclaim" => EmptyStreamAction::Reclaim,
+            "next_seller" => EmptyStreamAction::NextSeller,
+            "fail_closed" => EmptyStreamAction::FailClosed,
+            value => panic!("invalid canonical buyer empty-stream action: {value}"),
+        };
+        let seller_stalls_mid_stream = match DEFAULT_BUYER_STALLS_MID_STREAM_ACTION {
+            "accept_delivered_then_reclaim" => {
+                SellerStallsMidStreamAction::AcceptDeliveredThenReclaim
+            }
+            "dispute" => SellerStallsMidStreamAction::Dispute,
+            value => panic!("invalid canonical buyer mid-stream-stall action: {value}"),
+        };
         Self {
-            verification_bail: VerificationBailAction::Stop,
-            dead_gateway: DeadGatewayAction::RetryThenReclaim,
-            empty_stream: EmptyStreamAction::Reclaim,
-            seller_stalls_mid_stream: SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
+            verification_bail,
+            dead_gateway,
+            empty_stream,
+            seller_stalls_mid_stream,
         }
     }
 }
@@ -368,7 +399,7 @@ impl RouteManager {
             active: RwLock::new(Some(active)),
             initializer: None,
             replace_settled: false,
-            initializer_timeout: DEFAULT_DEAL_INIT_TIMEOUT,
+            initializer_timeout: MATCH_OPEN_TIMEOUT,
             initializer_lock: Mutex::new(()),
         }
     }
@@ -462,6 +493,13 @@ impl RouteManager {
         };
         active.session.settle(reason).await
     }
+
+    async fn settle_active_on_exit(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
+        let Some(active) = self.current().await else {
+            return Ok(false);
+        };
+        active.session.settle_on_exit(reason).await
+    }
 }
 
 /// Canonical delivered-token count for a normalized chunk. Prefer structured token signals; a non-empty chunk
@@ -528,11 +566,6 @@ fn is_request_scoped_upstream_rejection(error: &str) -> bool {
         .skip(1)
         .any(|rest| rest.as_bytes().first() == Some(&b'4'))
 }
-
-/// Token cap for the one-per-deal content-identity probe. It is **<< `tick_size`**(1_000_000), so the
-/// probe stays on the probe tick -- preserving the two-tick exposure invariant (the content gate spends at
-/// most the probe tick, never a second deal tick worth of budget).
-pub(crate) const CONTENT_PROBE_MAX_TOKENS: u64 = 64;
 
 /// Content-identity check selected for a deal. The buyer pays for a model by NAME(B2); a seller
 /// declaring the correct name but serving a cheaper model is caught only by the **content** layers B8
@@ -734,9 +767,68 @@ pub struct SessionSettle {
     recovery_episode: AtomicU8,
     recovery_closed_session: AtomicBool,
     handler_recovery_reconciliation: AtomicBool,
+    recovery_submit_may_have_landed: AtomicBool,
     drop_backup_enabled: AtomicBool,
     settle_lock: Mutex<()>,
     failure_policy: BuyerApiFailurePolicy,
+    lifetime: SessionLifetimePolicy,
+    terminal_action: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifetimePolicy {
+    SettleOnExit,
+    Preserve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTerminalAction {
+    StreamStop,
+    StreamDispute,
+    StreamCleanup,
+    ObservedTerminal,
+}
+
+impl SessionTerminalAction {
+    const fn code(self) -> u8 {
+        match self {
+            Self::StreamStop => 1,
+            Self::StreamDispute => 2,
+            Self::StreamCleanup => 3,
+            Self::ObservedTerminal => 4,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::StreamStop),
+            2 => Some(Self::StreamDispute),
+            3 => Some(Self::StreamCleanup),
+            4 => Some(Self::ObservedTerminal),
+            _ => None,
+        }
+    }
+
+    pub const fn event_action(self) -> &'static str {
+        match self {
+            Self::StreamStop => "streamStop",
+            Self::StreamDispute => "streamDispute",
+            Self::StreamCleanup => "streamCleanup",
+            Self::ObservedTerminal => "observedTerminal",
+        }
+    }
+
+    pub const fn event_state(self) -> &'static str {
+        match self {
+            Self::StreamStop | Self::StreamCleanup => "stopped",
+            Self::StreamDispute => "disputed",
+            Self::ObservedTerminal => "terminal",
+        }
+    }
+
+    pub const fn chain_write_submitted(self) -> bool {
+        !matches!(self, Self::ObservedTerminal)
+    }
 }
 
 impl SessionSettle {
@@ -778,6 +870,22 @@ impl SessionSettle {
         note: Arc<dyn Note>,
         failure_policy: BuyerApiFailurePolicy,
     ) -> Self {
+        Self::new_with_failure_policy_and_lifetime(
+            chain,
+            token_contract,
+            note,
+            failure_policy,
+            SessionLifetimePolicy::SettleOnExit,
+        )
+    }
+
+    pub fn new_with_failure_policy_and_lifetime(
+        chain: Arc<dyn ChainBackend>,
+        token_contract: TokenContract,
+        note: Arc<dyn Note>,
+        failure_policy: BuyerApiFailurePolicy,
+        lifetime: SessionLifetimePolicy,
+    ) -> Self {
         let (closed_tx, _closed_rx) = watch::channel(false);
         Self {
             chain,
@@ -789,10 +897,38 @@ impl SessionSettle {
             recovery_episode: AtomicU8::new(0),
             recovery_closed_session: AtomicBool::new(false),
             handler_recovery_reconciliation: AtomicBool::new(false),
+            recovery_submit_may_have_landed: AtomicBool::new(false),
             drop_backup_enabled: AtomicBool::new(true),
             settle_lock: Mutex::new(()),
             failure_policy,
+            lifetime,
+            terminal_action: AtomicU8::new(0),
         }
+    }
+
+    async fn settle_on_exit(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
+        match self.lifetime {
+            SessionLifetimePolicy::SettleOnExit => self.settle(reason).await,
+            SessionLifetimePolicy::Preserve => {
+                self.preserve_without_implicit_chain_write(reason);
+                Ok(false)
+            }
+        }
+    }
+
+    fn preserve_without_implicit_chain_write(&self, reason: &str) -> bool {
+        if self.lifetime != SessionLifetimePolicy::Preserve {
+            return false;
+        }
+        self.close_local_api();
+        self.disable_drop_backup();
+        tracing::info!(
+            %reason,
+            token_contract = %self.token_contract,
+            chain_write_submitted = false,
+            "consumer API: implicit terminal action vetoed; durable subscription preserved"
+        );
+        true
     }
 
     pub fn dead_gateway_action(&self) -> DeadGatewayAction {
@@ -802,6 +938,28 @@ impl SessionSettle {
     /// Whether a terminal on-chain action has landed for this deal.
     pub fn is_settled(&self) -> bool {
         self.settled.load(Ordering::SeqCst)
+    }
+
+    pub fn preserves_on_exit(&self) -> bool {
+        self.lifetime == SessionLifetimePolicy::Preserve
+    }
+
+    pub fn terminal_action(&self) -> Option<SessionTerminalAction> {
+        SessionTerminalAction::from_code(self.terminal_action.load(Ordering::SeqCst))
+    }
+
+    fn record_terminal_action(&self, action: SessionTerminalAction) {
+        if action == SessionTerminalAction::ObservedTerminal {
+            let _ = self.terminal_action.compare_exchange(
+                0,
+                action.code(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        } else {
+            // A chain write is stronger evidence than a concurrent read-only terminal observation.
+            self.terminal_action.store(action.code(), Ordering::SeqCst);
+        }
     }
 
     /// Whether the local API must reject new requests for this deal. This is distinct from terminal settlement:
@@ -832,6 +990,29 @@ impl SessionSettle {
             .swap(false, Ordering::SeqCst)
             .then(|| self.recovery_episode())
             .flatten()
+    }
+
+    pub fn recovery_submit_may_have_landed(&self, kind: RecoveryKind) -> bool {
+        self.recovery_episode.load(Ordering::SeqCst) == kind.code()
+            && self.recovery_submit_may_have_landed.load(Ordering::SeqCst)
+    }
+
+    fn latch_possibly_landed_stop(&self, error: &dexdo_core::ChainError) -> bool {
+        if !matches!(error, dexdo_core::ChainError::AmbiguousSubmit(_)) {
+            return false;
+        }
+        // A STOP that may have landed supersedes any earlier recovery episode: every STOP entry point
+        // must observe this one shared latch and reconcile chain facts instead of posting again.
+        self.recovery_episode
+            .store(RecoveryKind::ReclaimOpened.code(), Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
+            .store(true, Ordering::SeqCst);
+        self.handler_recovery_reconciliation
+            .store(true, Ordering::SeqCst);
+        // Drop is a last-chance STOP only when no STOP may already have landed. Once the outcome
+        // is ambiguous, every later path is fact reconciliation and must never post again.
+        self.disable_drop_backup();
+        true
     }
 
     pub fn close_recovery_episode(&self, kind: RecoveryKind, reason: &str) -> bool {
@@ -867,6 +1048,15 @@ impl SessionSettle {
         };
         let current = self.recovery_episode.load(Ordering::SeqCst);
         if current != kind.code() {
+            return false;
+        }
+        if self.recovery_submit_may_have_landed(kind) {
+            tracing::debug!(
+                token_contract = %self.token_contract,
+                recovery_action = ?kind,
+                outcome = "possibly_landed_submit_needs_fact_read",
+                "consumer API: suppressed automatic recovery resubmit"
+            );
             return false;
         }
         if !handler_origin
@@ -907,6 +1097,8 @@ impl SessionSettle {
             return;
         }
         self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
         if self.recovery_closed_session.swap(false, Ordering::SeqCst)
             && !self.settled.load(Ordering::SeqCst)
@@ -1003,15 +1195,18 @@ impl SessionSettle {
         }
     }
 
-    /// Mark the session terminal after an external recovery path(`streamCleanup` / `streamReclaim`) already
+    /// Mark the session terminal after an external recovery path(`streamCleanup` / `streamStop`) already
     /// closed or reclaimed the deal. This prevents a later route swap from sending a duplicate STOP to the
     /// recovered TC.
     pub fn mark_recovered(&self, reason: &str) -> bool {
         if self.settled.swap(true, Ordering::SeqCst) {
             return false;
         }
+        self.record_terminal_action(SessionTerminalAction::ObservedTerminal);
         self.recovery_closed_session.store(false, Ordering::SeqCst);
         self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
         self.close_local_api();
         tracing::info!(%reason, "consumer API: session deal marked recovered");
@@ -1023,9 +1218,12 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return false;
         }
+        self.record_terminal_action(SessionTerminalAction::ObservedTerminal);
         self.settled.store(true, Ordering::SeqCst);
         self.recovery_closed_session.store(false, Ordering::SeqCst);
         self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
         self.close_local_api();
         tracing::info!(%reason, "consumer API: session deal marked recovered");
@@ -1036,6 +1234,9 @@ impl SessionSettle {
         &self,
         handler_origin: bool,
     ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        if self.preserve_without_implicit_chain_write("cleanup-unopened") {
+            return Ok(None);
+        }
         let _guard = self.settle_lock.lock().await;
         if self.settled.load(Ordering::SeqCst) {
             return Ok(None);
@@ -1054,9 +1255,12 @@ impl SessionSettle {
             }
         };
         self.close_local_api();
+        self.record_terminal_action(SessionTerminalAction::StreamCleanup);
         self.settled.store(true, Ordering::SeqCst);
         self.recovery_closed_session.store(false, Ordering::SeqCst);
         self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
         Ok(Some(settlement))
     }
@@ -1066,6 +1270,9 @@ impl SessionSettle {
         heartbeat: &dexdo_core::chain::HeartbeatGuard,
         handler_origin: bool,
     ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        if self.preserve_without_implicit_chain_write("reclaim-opened") {
+            return Ok(None);
+        }
         let _guard = self.settle_lock.lock().await;
         if self.settled.load(Ordering::SeqCst) {
             return Ok(None);
@@ -1073,14 +1280,17 @@ impl SessionSettle {
         if !self.begin_recovery_attempt(RecoveryKind::ReclaimOpened, handler_origin) {
             return Ok(None);
         }
+        // This path exists only for an explicitly configured automatic failure policy. The continuity
+        // monitor never infers STOP from idle time alone. If accepted output resumes while the policy's
+        // signed STOP is prepared, the final heartbeat guard cancels that stale automatic decision.
         let settlement = match self
             .chain
-            .seller_timeout_if_heartbeat(&self.token_contract, heartbeat)
+            .stop_if_heartbeat(&self.token_contract, self.note.as_ref(), heartbeat)
             .await
         {
             Ok(settlement) => settlement,
             Err(error) => {
-                if handler_origin {
+                if !self.latch_possibly_landed_stop(&error) && handler_origin {
                     self.handler_recovery_reconciliation
                         .store(true, Ordering::SeqCst);
                 }
@@ -1092,9 +1302,12 @@ impl SessionSettle {
             return Ok(None);
         }
         self.close_local_api();
+        self.record_terminal_action(SessionTerminalAction::StreamStop);
         self.settled.store(true, Ordering::SeqCst);
         self.recovery_closed_session.store(false, Ordering::SeqCst);
         self.handler_recovery_reconciliation
+            .store(false, Ordering::SeqCst);
+        self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
         Ok(settlement)
     }
@@ -1107,6 +1320,13 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return Ok(false); // already settled by an earlier bail / shutdown / Drop
         }
+        if self.recovery_submit_may_have_landed(RecoveryKind::ReclaimOpened) {
+            return Err(dexdo_core::ChainError::AmbiguousSubmit(format!(
+                "TokenContract {} STOP may already have landed; automatic resubmit is suppressed \
+                 until fresh chain facts prove a terminal outcome",
+                self.token_contract
+            )));
+        }
         self.close_local_api();
         match self
             .chain
@@ -1114,13 +1334,17 @@ impl SessionSettle {
             .await
         {
             Ok(s) => {
+                self.record_terminal_action(SessionTerminalAction::StreamStop);
                 self.settled.store(true, Ordering::SeqCst);
                 self.recovery_closed_session.store(false, Ordering::SeqCst);
                 self.handler_recovery_reconciliation
                     .store(false, Ordering::SeqCst);
+                self.recovery_submit_may_have_landed
+                    .store(false, Ordering::SeqCst);
                 tracing::info!(%reason, settlement = ?s, "consumer API: session deal closed with STOP")
             }
             Err(e) => {
+                self.latch_possibly_landed_stop(&e);
                 tracing::warn!(
                     %reason,
                     error = %e,
@@ -1219,6 +1443,9 @@ impl SessionSettle {
     }
 
     async fn policy_dispute(&self, failure_class: &str, action: &str, reason: &str) -> bool {
+        if self.preserve_without_implicit_chain_write(reason) {
+            return false;
+        }
         let _guard = self.settle_lock.lock().await;
         if self.settled.load(Ordering::SeqCst) {
             return false;
@@ -1230,6 +1457,7 @@ impl SessionSettle {
             .await
         {
             Ok(s) => {
+                self.record_terminal_action(SessionTerminalAction::StreamDispute);
                 self.settled.store(true, Ordering::SeqCst);
                 tracing::warn!(
                     %reason,
@@ -1259,6 +1487,9 @@ impl SessionSettle {
     /// existing streamDispute lever and reports the per-deal freeze. `stop_and_blacklist` is not silently
     /// degraded in the consumer API surface because this surface has no seller-id blacklist store.
     pub async fn settle_verification_bail(&self, reason: &str) -> bool {
+        if self.preserve_without_implicit_chain_write(reason) {
+            return false;
+        }
         let _guard = self.settle_lock.lock().await;
         if self.settled.load(Ordering::SeqCst) {
             return false;
@@ -1266,12 +1497,26 @@ impl SessionSettle {
         self.close_local_api();
         let action = self.failure_policy.verification_bail;
         match action {
+            VerificationBailAction::Stop
+                if self.recovery_submit_may_have_landed(RecoveryKind::ReclaimOpened) =>
+            {
+                tracing::debug!(
+                    %reason,
+                    policy_failure_class = "bad_output_scam",
+                    policy_action = action.as_str(),
+                    token_contract = %self.token_contract,
+                    outcome = "possibly_landed_submit_needs_fact_read",
+                    "consumer API: suppressed verification-bail STOP resubmit"
+                );
+                false
+            }
             VerificationBailAction::Stop => match self
                 .chain
                 .stop(&self.token_contract, self.note.as_ref())
                 .await
             {
                 Ok(s) => {
+                    self.record_terminal_action(SessionTerminalAction::StreamStop);
                     self.settled.store(true, Ordering::SeqCst);
                     tracing::info!(
                         %reason,
@@ -1284,6 +1529,7 @@ impl SessionSettle {
                     true
                 }
                 Err(e) => {
+                    self.latch_possibly_landed_stop(&e);
                     tracing::warn!(
                         %reason,
                         policy_failure_class = "bad_output_scam",
@@ -1301,6 +1547,7 @@ impl SessionSettle {
                 .await
             {
                 Ok(s) => {
+                    self.record_terminal_action(SessionTerminalAction::StreamDispute);
                     self.settled.store(true, Ordering::SeqCst);
                     tracing::warn!(
                         %reason,
@@ -1435,7 +1682,9 @@ fn unopened_cleanup_decision(
     state: dexdo_core::DealChainState,
     now_secs: u64,
 ) -> Option<UnopenedCleanupDecision> {
-    if !(state.funded && !state.opened && !state.disputed && !state.probe_accepted) {
+    // The never-opened case, and only it: every terminal path drains the deposit, so a funded deal with
+    // escrow still held is one the seller has not opened yet rather than one that already settled.
+    if !(state.funded && !state.opened && !state.disputed && !state.is_stopped()) {
         return None;
     }
     let Some(funded_time) = state.funded_time else {
@@ -1457,8 +1706,8 @@ fn not_safely_open_reason(
 ) -> String {
     let mut reason = format!(
         "deal is not safely opened/accountable before serving user response: funded={} opened={} \
-         probe_accepted={} disputed={}",
-        state.funded, state.opened, state.probe_accepted, state.disputed
+         disputed={} deposit={} tokens_final={}",
+        state.funded, state.opened, state.disputed, state.deposit, state.tokens_final
     );
     match cleanup {
         Some(UnopenedCleanupDecision::Ready) => {
@@ -1483,7 +1732,11 @@ impl Drop for SessionSettle {
         // funds-safety guarantee. If the session ended with no explicit settle(abnormal teardown), spawn a
         // last-chance STOP -- a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
         // `seller_timeout` is the ultimate backstop.
-        if self.settled.load(Ordering::SeqCst) || !self.drop_backup_enabled.load(Ordering::SeqCst) {
+        if self.lifetime == SessionLifetimePolicy::Preserve
+            || self.settled.load(Ordering::SeqCst)
+            || !self.drop_backup_enabled.load(Ordering::SeqCst)
+            || self.recovery_submit_may_have_landed.load(Ordering::SeqCst)
+        {
             return;
         }
         let (chain, tc, note) = (
@@ -1627,7 +1880,7 @@ pub async fn serve(
         }
         // Awaited session terminal: after graceful shutdown drains in-flight requests, STOP the
         // deal once before exit. This awaited path -- not `Drop` -- is the funds-safety guarantee.
-        if let Err(error) = deals.settle_active("shutdown").await {
+        if let Err(error) = deals.settle_active_on_exit("shutdown").await {
             tracing::error!(%error, "consumer API: graceful shutdown STOP failed");
         }
     });
@@ -1637,6 +1890,27 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_failure_policy_uses_canonical_parameters() {
+        let policy = BuyerApiFailurePolicy::default();
+        assert_eq!(
+            policy.verification_bail.as_str(),
+            DEFAULT_BUYER_VERIFICATION_BAIL_ACTION
+        );
+        assert_eq!(
+            policy.dead_gateway.as_str(),
+            DEFAULT_BUYER_DEAD_GATEWAY_ACTION
+        );
+        assert_eq!(
+            policy.empty_stream.as_str(),
+            DEFAULT_BUYER_EMPTY_STREAM_ACTION
+        );
+        assert_eq!(
+            policy.seller_stalls_mid_stream.as_str(),
+            DEFAULT_BUYER_STALLS_MID_STREAM_ACTION
+        );
+    }
 
     // fail-loud content-identity policy(pure), shared by both buyer paths. A seller can declare the
     // correct model NAME yet serve a cheaper model; only the CONTENT layers(B8 fingerprint / B7 reference)
@@ -1956,6 +2230,49 @@ mod tests {
         assert_eq!(deal.accepted_output_generation(), 1);
     }
 
+    #[tokio::test]
+    async fn accepted_openai_and_anthropic_output_never_turns_old_idle_age_into_stop() {
+        use crate::buyer::continuity::{BuyerAction, BuyerContinuity, ContinuityConfig, DealFacts};
+        use futures::StreamExt;
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let deal = |token_contract: &str| {
+            recovery_test_deal(
+                token_contract,
+                chain.clone(),
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )
+        };
+
+        let openai_deal = deal("tc-openai-idle");
+        let openai = super::openai::heartbeat_poll_test_stream(openai_deal.clone());
+        futures::pin_mut!(openai);
+        assert!(openai.next().await.is_some());
+
+        let anthropic_deal = deal("tc-anthropic-idle");
+        let anthropic = super::anthropic::heartbeat_poll_test_stream(anthropic_deal.clone());
+        futures::pin_mut!(anthropic);
+        assert!(anthropic.next().await.is_some());
+
+        for deal in [openai_deal, anthropic_deal] {
+            assert_eq!(deal.accepted_output_generation(), 1);
+            assert!(matches!(
+                BuyerContinuity::default().tick(
+                    Some(DealFacts::opened_idle(
+                        deal.route.token_contract.clone(),
+                        u64::MAX,
+                    )),
+                    None,
+                    ContinuityConfig::default(),
+                ),
+                BuyerAction::ServeCurrent { .. }
+            ));
+        }
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn accepted_output_heartbeat_is_monotonic() {
         let deal = ApiDeal::new(
@@ -1983,15 +2300,18 @@ mod tests {
     struct RecordingSettleChain {
         stop_calls: std::sync::atomic::AtomicUsize,
         dispute_calls: std::sync::atomic::AtomicUsize,
-        seller_timeout_calls: std::sync::atomic::AtomicUsize,
+        recovery_stop_calls: std::sync::atomic::AtomicUsize,
         cleanup_unopened_calls: std::sync::atomic::AtomicUsize,
         fail_stop: std::sync::atomic::AtomicBool,
         fail_dispute: std::sync::atomic::AtomicBool,
-        fail_seller_timeout: std::sync::atomic::AtomicBool,
+        fail_recovery_stop: std::sync::atomic::AtomicBool,
+        ambiguous_stop: std::sync::atomic::AtomicBool,
+        ambiguous_recovery_stop: std::sync::atomic::AtomicBool,
         fail_cleanup_unopened: std::sync::atomic::AtomicBool,
         fail_deal_state: std::sync::atomic::AtomicBool,
         deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<ApiDeal>>,
+        heartbeat_during_explicit_stop_preflight: std::sync::Mutex<Option<ApiDeal>>,
     }
 
     impl RecordingSettleChain {
@@ -2004,20 +2324,43 @@ mod tests {
         dexdo_core::chain::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
     }
 
-    fn deal_state(
-        funded: bool,
-        opened: bool,
-        disputed: bool,
-        probe_accepted: bool,
-        funded_time: Option<u64>,
-    ) -> dexdo_core::DealChainState {
+    fn never_opened_deal_state(deposit: u128, funded_time: u64) -> dexdo_core::DealChainState {
         dexdo_core::DealChainState {
-            funded,
-            opened,
-            disputed,
-            probe_accepted,
-            funded_time,
-            last_advance: 0,
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(funded_time),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: funded_time,
+            last_claim_time: funded_time,
+            dispute_time: 0,
+        }
+    }
+
+    fn opened_deal_state(deposit: u128, funded_time: u64) -> dexdo_core::DealChainState {
+        dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: false,
+            disputed: false,
+            deposit,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(funded_time),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: funded_time,
+            last_claim_time: funded_time,
+            dispute_time: 0,
         }
     }
 
@@ -2068,19 +2411,55 @@ mod tests {
             unimplemented!("not needed by settlement policy tests")
         }
 
-        async fn advance_tick(
+        async fn claim_tokens(
             &self,
             _token_contract: &TokenContract,
             _note: &dyn Note,
+            _cumulative_tokens: u128,
         ) -> Result<(), dexdo_core::ChainError> {
             unimplemented!("not needed by settlement policy tests")
         }
 
-        async fn accept_probe(
+        async fn stop_if_heartbeat(
             &self,
             _token_contract: &TokenContract,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by settlement policy tests")
+            _note: &dyn Note,
+            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+            // Simulate a legitimate claim landing between the decision to exit and the money POST.
+            if let Some(deal) = self
+                .heartbeat_during_reclaim_preflight
+                .lock()
+                .unwrap()
+                .take()
+            {
+                deal.record_accepted_output(unix_now_secs());
+            }
+            if !heartbeat.unchanged() {
+                return Ok(None);
+            }
+            self.recovery_stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .ambiguous_recovery_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected ambiguous recovery STOP".to_string(),
+                ));
+            }
+            if self
+                .fail_recovery_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dexdo_core::ChainError::Chain(
+                    "injected recovery stop failure".to_string(),
+                ));
+            }
+            Ok(Some(dexdo_core::Settlement::SellerNoShow {
+                to_buyer_refund: 0,
+                seller_bond_returned: 0,
+            }))
         }
 
         async fn stop(
@@ -2088,8 +2467,24 @@ mod tests {
             _token_contract: &TokenContract,
             _note: &dyn Note,
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            if let Some(deal) = self
+                .heartbeat_during_explicit_stop_preflight
+                .lock()
+                .unwrap()
+                .take()
+            {
+                deal.record_accepted_output(unix_now_secs());
+            }
             self.stop_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .ambiguous_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected ambiguous STOP".to_string(),
+                ));
+            }
             if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(dexdo_core::ChainError::Chain(
                     "injected stop failure".to_string(),
@@ -2117,45 +2512,6 @@ mod tests {
                 to_buyer_refund: 0,
                 seller_bond_returned: 0,
             })
-        }
-
-        async fn seller_timeout(
-            &self,
-            _token_contract: &TokenContract,
-        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            self.seller_timeout_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self
-                .fail_seller_timeout
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(dexdo_core::ChainError::Chain(
-                    "injected seller_timeout failure".to_string(),
-                ));
-            }
-            Ok(dexdo_core::Settlement::SellerNoShow {
-                to_buyer_refund: 0,
-                seller_bond_returned: 0,
-            })
-        }
-
-        async fn seller_timeout_if_heartbeat(
-            &self,
-            token_contract: &TokenContract,
-            heartbeat: &dexdo_core::chain::HeartbeatGuard,
-        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
-            if let Some(deal) = self
-                .heartbeat_during_reclaim_preflight
-                .lock()
-                .unwrap()
-                .take()
-            {
-                deal.record_accepted_output(unix_now_secs());
-            }
-            if !heartbeat.unchanged() {
-                return Ok(None);
-            }
-            self.seller_timeout(token_contract).await.map(Some)
         }
 
         async fn cleanup_unopened(
@@ -2201,6 +2557,248 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn preserve_lifetime_submits_no_implicit_terminal_chain_writes() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let session = SessionSettle::new_with_failure_policy_and_lifetime(
+            chain.clone(),
+            "tc-subscription".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy {
+                verification_bail: VerificationBailAction::Dispute,
+                dead_gateway: DeadGatewayAction::RetryThenReclaim,
+                empty_stream: EmptyStreamAction::Reclaim,
+                seller_stalls_mid_stream: SellerStallsMidStreamAction::Dispute,
+            },
+            SessionLifetimePolicy::Preserve,
+        );
+
+        assert!(session.preserves_on_exit());
+        assert!(!session.settle_on_exit("shutdown").await.unwrap());
+        assert_eq!(session.terminal_action(), None);
+        drop(session);
+        tokio::task::yield_now().await;
+
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preserve_lifetime_vetoes_implicit_incident_chain_writes() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let session = |token_contract: &str, failure_policy| {
+            SessionSettle::new_with_failure_policy_and_lifetime(
+                chain.clone(),
+                token_contract.to_string(),
+                Arc::new(dexdo_core::LocalNote::generate()),
+                failure_policy,
+                SessionLifetimePolicy::Preserve,
+            )
+        };
+
+        let bad_output = session(
+            "tc-subscription-bad-output",
+            BuyerApiFailurePolicy {
+                verification_bail: VerificationBailAction::Dispute,
+                ..BuyerApiFailurePolicy::default()
+            },
+        );
+        assert!(
+            !bad_output
+                .settle_verification_bail("content-identity-bail")
+                .await
+        );
+        assert_eq!(bad_output.terminal_action(), None);
+
+        let dead_gateway = session(
+            "tc-subscription-dead-gateway",
+            BuyerApiFailurePolicy {
+                dead_gateway: DeadGatewayAction::RetryThenReclaim,
+                ..BuyerApiFailurePolicy::default()
+            },
+        );
+        assert!(
+            !dead_gateway
+                .settle_dead_gateway("dead-gateway", &unchanged_heartbeat())
+                .await
+        );
+        assert_eq!(dead_gateway.terminal_action(), None);
+
+        let empty_stream = session(
+            "tc-subscription-empty-stream",
+            BuyerApiFailurePolicy {
+                empty_stream: EmptyStreamAction::Reclaim,
+                ..BuyerApiFailurePolicy::default()
+            },
+        );
+        assert!(
+            !empty_stream
+                .settle_empty_stream("empty-stream", &unchanged_heartbeat())
+                .await
+        );
+
+        let stalled = session(
+            "tc-subscription-stalled",
+            BuyerApiFailurePolicy {
+                seller_stalls_mid_stream: SellerStallsMidStreamAction::Dispute,
+                ..BuyerApiFailurePolicy::default()
+            },
+        );
+        assert!(
+            !stalled
+                .settle_seller_stalls_mid_stream("stalled", &unchanged_heartbeat())
+                .await
+        );
+
+        let direct_reclaim = session(
+            "tc-subscription-direct-reclaim",
+            BuyerApiFailurePolicy::default(),
+        );
+        assert!(direct_reclaim
+            .recover_reclaim_opened(&unchanged_heartbeat(), false)
+            .await
+            .unwrap()
+            .is_none());
+
+        let cleanup = session("tc-subscription-unopened", BuyerApiFailurePolicy::default());
+        assert!(cleanup
+            .recover_cleanup_unopened(true)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preserve_lifetime_naked_drop_submits_no_stop() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let session = SessionSettle::new_with_failure_policy_and_lifetime(
+            chain.clone(),
+            "tc-subscription-drop".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy::default(),
+            SessionLifetimePolicy::Preserve,
+        );
+
+        drop(session);
+        tokio::task::yield_now().await;
+
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preserve_lifetime_does_not_veto_explicit_stop() {
+        use std::sync::atomic::Ordering;
+
+        let stop_chain = Arc::new(RecordingSettleChain::default());
+        let stop = SessionSettle::new_with_failure_policy_and_lifetime(
+            stop_chain.clone(),
+            "tc-subscription-stop".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy::default(),
+            SessionLifetimePolicy::Preserve,
+        );
+        assert!(stop.settle("explicit-user-stop").await.unwrap());
+        assert_eq!(stop_chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stop.terminal_action(),
+            Some(SessionTerminalAction::StreamStop)
+        );
+        assert!(!stop.mark_recovered("later-terminal-observation"));
+        assert_eq!(
+            stop.terminal_action(),
+            Some(SessionTerminalAction::StreamStop)
+        );
+    }
+
+    fn shutdown_test_state(
+        chain: Arc<RecordingSettleChain>,
+        lifetime: SessionLifetimePolicy,
+        token_contract: &str,
+    ) -> ApiState {
+        let note = Arc::new(dexdo_core::LocalNote::generate());
+        ApiState::single(
+            Arc::new(Buyer::from_note(note.clone())),
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: token_contract.to_string(),
+                max_tokens: 100,
+            },
+            "qwen--qwen3--32b".to_string(),
+            Arc::new(SessionSettle::new_with_failure_policy_and_lifetime(
+                chain,
+                token_contract.to_string(),
+                note,
+                BuyerApiFailurePolicy::default(),
+                lifetime,
+            )),
+            Arc::new(ContentGate::skip()),
+        )
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_preserves_subscription_but_ordinary_still_stops_once() {
+        use std::sync::atomic::Ordering;
+
+        let subscription_chain = Arc::new(RecordingSettleChain::default());
+        let (subscription_shutdown_tx, subscription_shutdown_rx) =
+            tokio::sync::oneshot::channel::<()>();
+        let (_, subscription_task) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            shutdown_test_state(
+                subscription_chain.clone(),
+                SessionLifetimePolicy::Preserve,
+                "tc-subscription",
+            ),
+            false,
+            async move {
+                let _ = subscription_shutdown_rx.await;
+            },
+        )
+        .await
+        .unwrap();
+        subscription_shutdown_tx.send(()).unwrap();
+        subscription_task.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(subscription_chain.stop_calls.load(Ordering::SeqCst), 0);
+
+        let ordinary_chain = Arc::new(RecordingSettleChain::default());
+        let (ordinary_shutdown_tx, ordinary_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_, ordinary_task) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            shutdown_test_state(
+                ordinary_chain.clone(),
+                SessionLifetimePolicy::SettleOnExit,
+                "tc-ordinary",
+            ),
+            false,
+            async move {
+                let _ = ordinary_shutdown_rx.await;
+            },
+        )
+        .await
+        .unwrap();
+        ordinary_shutdown_tx.send(()).unwrap();
+        ordinary_task.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(ordinary_chain.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
     fn recovery_test_deal(
         token_contract: &str,
         chain: Arc<RecordingSettleChain>,
@@ -2240,7 +2838,7 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let chain = Arc::new(RecordingSettleChain::default());
-                chain.fail_seller_timeout.store(true, Ordering::SeqCst);
+                chain.fail_recovery_stop.store(true, Ordering::SeqCst);
                 let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
                 let initial = recovery_test_deal("tc-dead", chain.clone(), note.clone());
                 let initial_session = initial.session.clone();
@@ -2282,7 +2880,7 @@ mod tests {
                     "closed but nonterminal recovery must not move money"
                 );
 
-                chain.fail_seller_timeout.store(false, Ordering::SeqCst);
+                chain.fail_recovery_stop.store(false, Ordering::SeqCst);
                 assert_eq!(
                     initial_session.take_handler_recovery_reconciliation(),
                     Some(RecoveryKind::ReclaimOpened),
@@ -2329,7 +2927,7 @@ mod tests {
             .unwrap();
 
         assert!(settlement.is_none());
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
         assert!(!deal.session.is_settled());
         assert!(!deal.session.is_closed());
         assert_eq!(
@@ -2337,6 +2935,66 @@ mod tests {
             None,
             "a heartbeat-cancelled reclaim must not leave a stale recovery latch"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_user_stop_is_not_vetoed_by_output_during_preflight() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
+        let deal = recovery_test_deal("tc-explicit-stop", chain.clone(), note);
+        *chain
+            .heartbeat_during_explicit_stop_preflight
+            .lock()
+            .unwrap() = Some(deal.clone());
+        assert_eq!(deal.accepted_output_generation(), 0);
+
+        assert!(deal.session.settle("explicit-user-stop").await.unwrap());
+
+        assert_eq!(
+            deal.accepted_output_generation(),
+            1,
+            "the fixture must advance accepted output inside the STOP preflight window"
+        );
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
+        assert!(deal.session.is_settled());
+    }
+
+    #[tokio::test]
+    async fn concurrent_policy_stop_attempts_serialize_per_token_contract() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let session = Arc::new(SessionSettle::new(
+            chain.clone(),
+            "tc-concurrent-policy-stop".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+        ));
+        let mut attempts = Vec::new();
+        for _ in 0..16 {
+            let session = session.clone();
+            attempts.push(tokio::spawn(async move {
+                session
+                    .recover_reclaim_opened(&unchanged_heartbeat(), false)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }));
+        }
+
+        let mut landed = 0;
+        for attempt in attempts {
+            landed += usize::from(attempt.await.unwrap());
+        }
+        assert_eq!(landed, 1);
+        assert_eq!(
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
+            1,
+            "one SessionSettle is the per-TC serialization boundary"
+        );
+        assert!(session.is_settled());
     }
 
     #[tokio::test]
@@ -2475,6 +3133,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_verification_bail_stop_latches_monitor_and_drop_without_repost() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain.ambiguous_stop.store(true, Ordering::SeqCst);
+        let session = SessionSettle::new_with_verification_bail_action(
+            chain.clone(),
+            "tc-ambiguous-verification-stop".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            VerificationBailAction::Stop,
+        );
+
+        assert!(!session.settle_verification_bail("test-bail").await);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !session.settle_verification_bail("repeat-test-bail").await,
+            "the same verification-bail entry point must reconcile instead of posting STOP again"
+        );
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            1,
+            "the same verification-bail entry point must remain suppressed"
+        );
+        assert!(session.recovery_submit_may_have_landed(RecoveryKind::ReclaimOpened));
+        assert_eq!(
+            session.take_handler_recovery_reconciliation(),
+            Some(RecoveryKind::ReclaimOpened),
+            "the service monitor must reconcile fresh facts instead of submitting STOP"
+        );
+        assert!(matches!(
+            session.settle("shutdown").await,
+            Err(dexdo_core::ChainError::AmbiguousSubmit(_))
+        ));
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            1,
+            "an alternate explicit STOP entry point must remain suppressed"
+        );
+
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            1,
+            "Drop must not retry an ambiguous verification-bail STOP"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_stop_replaces_cleanup_episode_and_blocks_every_repost() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain.fail_cleanup_unopened.store(true, Ordering::SeqCst);
+        let session = SessionSettle::new_with_verification_bail_action(
+            chain.clone(),
+            "tc-cleanup-then-ambiguous-stop".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            VerificationBailAction::Stop,
+        );
+
+        session
+            .recover_cleanup_unopened(false)
+            .await
+            .expect_err("injected cleanup failure must leave its recovery episode visible");
+        assert_eq!(
+            session.recovery_episode(),
+            Some(RecoveryKind::CleanupUnopened)
+        );
+
+        chain.ambiguous_stop.store(true, Ordering::SeqCst);
+        assert!(!session.settle_verification_bail("test-bail").await);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session.recovery_episode(),
+            Some(RecoveryKind::ReclaimOpened),
+            "an ambiguous STOP must supersede an older non-STOP recovery episode"
+        );
+        assert!(session.recovery_submit_may_have_landed(RecoveryKind::ReclaimOpened));
+
+        assert!(!session.settle_verification_bail("repeat-bail").await);
+        assert_eq!(
+            session.take_handler_recovery_reconciliation(),
+            Some(RecoveryKind::ReclaimOpened),
+            "the monitor must observe the replacement STOP episode and reconcile facts"
+        );
+        assert!(matches!(
+            session.settle("shutdown").await,
+            Err(dexdo_core::ChainError::AmbiguousSubmit(_))
+        ));
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            1,
+            "neither repeated verification bail nor shutdown may repost STOP"
+        );
+
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            1,
+            "Drop must not retry after an ambiguous STOP replaced an older recovery episode"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_verification_bail_dispute_keeps_session_recoverable() {
         use std::sync::atomic::Ordering;
 
@@ -2536,7 +3300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_gateway_retry_then_reclaim_uses_seller_timeout() {
+    async fn dead_gateway_retry_then_reclaim_uses_recovery_stop() {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
@@ -2557,7 +3321,7 @@ mod tests {
         );
         assert!(session.is_closed());
         assert!(session.is_settled());
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
     }
@@ -2568,7 +3332,18 @@ mod tests {
 
         let chain = Arc::new(RecordingSettleChain::default());
         let funded_time = unix_now_secs().saturating_sub(MATCH_OPEN_TIMEOUT_SECS / 2);
-        chain.set_deal_state(deal_state(true, false, false, false, Some(funded_time)));
+        let state = never_opened_deal_state(1_000, funded_time);
+        assert_eq!(
+            (
+                state.probe_accepted,
+                state.funded_time,
+                state.prev_claim_time,
+                state.last_claim_time,
+            ),
+            (false, Some(funded_time), funded_time, funded_time),
+            "serving gate must inspect a canonical 4.0.32 funded-never-opened state"
+        );
+        chain.set_deal_state(state);
         let session = SessionSettle::new_with_failure_policy(
             chain.clone(),
             "tc-not-open".to_string(),
@@ -2598,7 +3373,7 @@ mod tests {
             "fail-closed unopened path must not submit STOP"
         );
         assert_eq!(
-            chain.seller_timeout_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             0,
             "fail-closed unopened path must not use opened-deal reclaim"
         );
@@ -2609,7 +3384,20 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.set_deal_state(deal_state(true, false, false, false, Some(0)));
+        let funded_time = unix_now_secs().saturating_sub(MATCH_OPEN_TIMEOUT_SECS.saturating_add(1));
+        assert!(funded_time > 0, "expired funded time must remain positive");
+        let state = never_opened_deal_state(1_000, funded_time);
+        assert_eq!(
+            (
+                state.probe_accepted,
+                state.funded_time,
+                state.prev_claim_time,
+                state.last_claim_time,
+            ),
+            (false, Some(funded_time), funded_time, funded_time),
+            "cleanup-ready serving gate must use a canonical 4.0.32 funded-never-opened state"
+        );
+        chain.set_deal_state(state);
         let session = SessionSettle::new_with_failure_policy(
             chain.clone(),
             "tc-not-open".to_string(),
@@ -2639,7 +3427,7 @@ mod tests {
             "fail-closed unopened path must not submit STOP"
         );
         assert_eq!(
-            chain.seller_timeout_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             0,
             "fail-closed unopened path must not use opened-deal reclaim"
         );
@@ -2650,7 +3438,20 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.set_deal_state(deal_state(true, true, false, false, Some(0)));
+        let funded_time = unix_now_secs();
+        let state = opened_deal_state(1_000, funded_time);
+        assert_eq!(
+            (
+                state.opened,
+                state.probe_accepted,
+                state.funded_time,
+                state.prev_claim_time,
+                state.last_claim_time,
+            ),
+            (true, false, Some(funded_time), funded_time, funded_time),
+            "opened serving fixture must remain distinct from never-opened cleanup facts"
+        );
+        chain.set_deal_state(state);
         let session = SessionSettle::new_with_failure_policy(
             chain.clone(),
             "tc-open".to_string(),
@@ -2669,7 +3470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_stream_reclaim_uses_seller_timeout() {
+    async fn empty_stream_reclaim_uses_recovery_stop() {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
@@ -2690,17 +3491,17 @@ mod tests {
         );
         assert!(session.is_closed());
         assert!(session.is_settled());
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn failed_seller_timeout_recovery_keeps_session_recoverable() {
+    async fn failed_recovery_stop_keeps_session_recoverable() {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.fail_seller_timeout.store(true, Ordering::SeqCst);
+        chain.fail_recovery_stop.store(true, Ordering::SeqCst);
         let session = SessionSettle::new_with_failure_policy(
             chain.clone(),
             "tc-timeout-failure".to_string(),
@@ -2724,7 +3525,7 @@ mod tests {
             !session.is_settled(),
             "failed seller_timeout must not make the session terminal"
         );
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
 
         assert!(session.settle("shutdown").await.unwrap());
@@ -2757,7 +3558,7 @@ mod tests {
         assert!(session.is_settled());
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2790,7 +3591,7 @@ mod tests {
         );
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.seller_timeout_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
 
         assert!(session.settle("shutdown").await.unwrap());
         assert!(session.is_closed());

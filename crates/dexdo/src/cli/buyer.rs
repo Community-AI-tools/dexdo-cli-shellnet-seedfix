@@ -1,4 +1,4 @@
-//! Buyer and subscription command handlers, moved out of `commands.rs`(C15, move-only).
+//! Buyer command handlers, moved out of `commands.rs`(C15, move-only).
 
 use crate::cli::args::*;
 #[cfg(any(test, feature = "shellnet"))]
@@ -6,8 +6,8 @@ use crate::cli::commands::direct_chain_read_with_timeout;
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     acquire_pool_write_lock, load_pool_json, model_target_from_config, note_pool_path,
-    read_book_target, registry_requested_model, target_from_market, try_acquire_pool_write_lock,
-    with_pool_write_lock, write_pool_private, PoolWriteLock,
+    registry_requested_model, resolve_order_book_target, target_from_market,
+    try_acquire_pool_write_lock, with_pool_write_lock, write_pool_private, PoolWriteLock,
 };
 #[cfg(all(test, feature = "shellnet"))]
 use crate::cli::commands::{
@@ -16,15 +16,14 @@ use crate::cli::commands::{
     note_deploy_multisig_secret_hex, note_deploy_recovery_pool_guard,
     note_deploy_same_file_pool_guard, note_endpoint_url, persist_pool_recovery_record,
     resolve_pool_recovery_inputs, retry_executable_read, target_from_market_for_model,
-    write_pool_private_via_temp, DealTarget, PoolRecoveryRecord, EXECUTABLE_READ_BACKOFF,
+    write_pool_private_via_temp, DealTarget, PoolRecoveryRecord,
 };
 use crate::cli::commands::{
     enforce_model_registry_policy, expected_order_book_for_note,
     load_enabled_model_registry_policy, mock_orders_from_offers, note_pubkey_id,
     order_book_active_from_contracts, print_book_table, resolve_model_registry_target,
     save_mock_runtime_deal_handle, save_runtime_deal_handle, shellnet_doctor_preflight,
-    unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput, DEAL_WAIT_SECS,
-    RESUME_LOOKBACK_SECS, TRANSIENT_QUOTE_ATTEMPTS, TRANSIENT_QUOTE_INITIAL_BACKOFF,
+    unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput,
 };
 use crate::cli::deals;
 use crate::cli::machine;
@@ -38,21 +37,49 @@ use crate::cli::support::*;
 use crate::operator_shutdown_signal;
 use anyhow::{anyhow, bail, Result};
 #[cfg(feature = "shellnet")]
+use dexdo_core::params::BUYER_SUBMIT_RECONCILE_POLL_INTERVAL;
+#[cfg(all(test, feature = "shellnet"))]
+use dexdo_core::params::EXECUTABLE_READ_BACKOFF;
+use dexdo_core::params::{
+    BUYER_API_READINESS_TIMEOUT, BUYER_HANDOVER_POLL_INTERVAL,
+    BUYER_REPLAY_PROTECTION_BACKOFF_STEP_SECS, BUYER_REPLAY_PROTECTION_MAX_ATTEMPTS,
+    CONSUMER_DEMAND_RECENT_SECS, DEAL_WAIT_SECS, RENEWAL_FAILURE_BACKOFF_SECS,
+    RESUME_LOOKBACK_SECS, TRANSIENT_QUOTE_ATTEMPTS, TRANSIENT_QUOTE_INITIAL_BACKOFF,
+};
+#[cfg(not(test))]
+use dexdo_core::params::{BUYER_MONITOR_POLL_INTERVAL, BUYER_MONITOR_RECOVERY_BACKOFF};
+
+/// Absolute deadline for a BUY order the client is about to place.
+/// The contract permits a zero deadline as GTC. The dexdo CLI deliberately applies a stricter finite-deadline
+/// policy: past the deadline anyone may expire the order permissionlessly and the escrow returns, which keeps
+/// a stale bid from sitting at an untouched price level forever.
+fn buy_order_deadline() -> Result<u64> {
+    let now = machine::now_unix()?;
+    dexdo_core::default_buy_deadline(now).ok_or_else(|| {
+        anyhow!(
+            "current unix time {now} plus the canonical BUY lifetime overflows u64; refusing BUY"
+        )
+    })
+}
+#[cfg(feature = "shellnet")]
 use dexdo::registry::{
     default_model_registry_address, resolve_registered_model_identity, ShellnetModelRegistryReader,
 };
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+#[cfg(feature = "shellnet")]
 use dexdo_core::{
-    check_buy_deposit_headroom, check_matched_token_contract_state, executable_quote,
-    model_hash_for, required_escrow_for_buy, submit_safe_single_ask_quote, ChainBackend,
-    ChainError, DealChainState, ExecutableQuote, MatchedTokenContractStatus, OrderBookOrder,
-    Settlement, MATCH_OPEN_TIMEOUT_SECS,
+    check_buy_deposit_headroom, subscription_buy_clearing_refund, DealBuyerBond, DealSellerBond,
+    DealSubscription, InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill,
+    OrderBookSnapshot, SHELL_ECC_ID, SUBSCRIPTION_ORDER_RECONCILE_POLL, TICK_SIZE,
 };
-#[cfg(feature = "shellnet")]
-use dexdo_core::{InferenceSubscriptionPlacement, OrderBookSnapshot, OrderBookSubscription};
+use dexdo_core::{
+    check_matched_token_contract_state, check_subscription_buy_reserve, executable_quote,
+    model_hash_for, order_flags as flags, required_escrow_for_buy, submit_safe_single_ask_quote,
+    subscription_buy_reserve, ChainBackend, ChainError, DealChainState, ExecutableQuote,
+    MatchedTokenContractStatus, OrderBookOrder, Settlement, SubscriptionBuyReserve,
+    MATCH_OPEN_TIMEOUT_SECS, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
+};
 use serde_json::{json, Map, Value};
-#[cfg(feature = "shellnet")]
-use std::future::Future;
 use std::sync::Arc;
 
 #[cfg(feature = "shellnet")]
@@ -137,11 +164,15 @@ const BUYER_SUBMIT_JOURNAL_SCHEMA: &str = "dexdo.buyer.submit.v2";
 #[cfg(feature = "shellnet")]
 const BUYER_SUBMIT_JOURNAL_SCHEMA_V1: &str = "dexdo.buyer.submit.v1";
 #[cfg(feature = "shellnet")]
-const BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v1";
+const BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v2";
 #[cfg(feature = "shellnet")]
-const BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v1";
-const INFERENCE_SUBSCRIPTION_CYCLES: u128 = 4;
-
+const BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v3";
+#[cfg(feature = "shellnet")]
+const LEGACY_BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v1";
+#[cfg(feature = "shellnet")]
+const LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v1";
+#[cfg(feature = "shellnet")]
+const LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA_V2: &str = "dexdo.buyer.subscriptions.v2";
 /// Journal-only representation of an owner-facing fill. The chain event decoder
 /// that produces these records is intentionally wired in a later layer.
 #[cfg(feature = "shellnet")]
@@ -227,7 +258,6 @@ impl From<BuyerSubmitJournalV1> for BuyerSubmitJournal {
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubscriptionSubmitJournal {
@@ -238,53 +268,95 @@ struct BuyerSubscriptionSubmitJournal {
     model_hash: String,
     max_price_per_tick: u128,
     ticks: u128,
+    #[serde(default)]
+    deposit: u128,
+    #[serde(default)]
+    buyer_bond: u128,
     escrow: u128,
-    cycle_budget: u128,
-    auto_renew: bool,
+    flags: u8,
+    deadline: u64,
     order_id_floor: u128,
-    fill_cursor: dexdo_core::MatchWatchCursor,
+    fill_cursor: MatchWatchCursor,
     submit_identity: String,
     created_at_unix: u64,
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubscriptionState {
     schema: String,
     note_addr: String,
-    books: Vec<BuyerSubscriptionBookState>,
+    orders: Vec<BuyerSubscriptionOrderRecord>,
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BuyerSubscriptionPhase {
+    Resting,
+    Matched,
+    Terminal,
 }
 
 #[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BuyerSubscriptionBookState {
+struct BuyerSubscriptionMatch {
+    token_contract: dexdo_core::TokenContract,
+    order_id: u128,
+    ticks: u128,
+    clearing_price: u128,
+    deal_handle: String,
+}
+
+#[cfg(feature = "shellnet")]
+impl BuyerSubscriptionMatch {
+    fn from_fill(fill: &BuyerJournalMatch) -> Self {
+        Self {
+            token_contract: fill.token_contract.clone(),
+            order_id: fill.order_id,
+            ticks: fill.ticks,
+            clearing_price: fill.clearing_price,
+            deal_handle: deals::make_handle_id(&fill.token_contract, deals::DealHandleRole::Buyer),
+        }
+    }
+
+    fn as_fill(&self) -> BuyerJournalMatch {
+        BuyerJournalMatch {
+            token_contract: self.token_contract.clone(),
+            order_id: self.order_id,
+            ticks: self.ticks,
+            clearing_price: self.clearing_price,
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuyerSubscriptionOrderRecord {
     order_book: String,
     frame_model: String,
     model_hash: String,
-    fill_cursor: dexdo_core::MatchWatchCursor,
-    subscriptions: Vec<BuyerSubscriptionRecord>,
-    #[serde(default)]
-    unattributed_matches: Vec<BuyerJournalMatch>,
-}
-
-#[cfg(feature = "shellnet")]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BuyerSubscriptionRecord {
     order_id: u128,
     max_price_per_tick: u128,
     ticks: u128,
-    escrow: u128,
-    cycle_budget: u128,
-    auto_renew: bool,
-    placed_at_unix: i64,
-    active: bool,
     #[serde(default)]
-    matches: Vec<BuyerJournalMatch>,
+    deposit: u128,
+    #[serde(default)]
+    buyer_bond: u128,
+    escrow: u128,
+    flags: u8,
+    deadline: u64,
+    fill_cursor: MatchWatchCursor,
+    phase: BuyerSubscriptionPhase,
+    matched: Option<BuyerSubscriptionMatch>,
 }
+
+#[cfg(feature = "shellnet")]
+type PersistSubscriptionHandle<'a> =
+    dyn Fn(&BuyerSubscriptionOrderRecord, &BuyerJournalMatch) -> Result<String> + Send + Sync + 'a;
 
 #[cfg(feature = "shellnet")]
 #[allow(dead_code)]
@@ -385,6 +457,272 @@ impl BuyerSubmitJournal {
     }
 }
 
+fn subscription_order_flags() -> u8 {
+    flags::AON | flags::SUBSCRIPTION
+}
+
+fn validate_subscription_order_terms(
+    max_price_per_tick: u128,
+    ticks: u128,
+    escrow: u128,
+    order_flags: u8,
+    deadline: u64,
+    created_at_unix: u64,
+) -> Result<SubscriptionBuyReserve> {
+    validate_price_step(max_price_per_tick)?;
+    let minimum = u128::from(SUBSCRIPTION_WEEKS);
+    if !(minimum..=SUBSCRIPTION_MAX_TICKS).contains(&ticks) || !ticks.is_multiple_of(minimum) {
+        bail!(
+            "subscription ticks must be {minimum}..={SUBSCRIPTION_MAX_TICKS} and divisible by \
+            {SUBSCRIPTION_WEEKS}, got {ticks}"
+        );
+    }
+    let reserve = check_subscription_buy_reserve(escrow, ticks, max_price_per_tick)
+        .map_err(anyhow::Error::msg)?;
+    let expected_flags = subscription_order_flags();
+    if order_flags & flags::SUBSCRIPTION != 0 && order_flags & flags::MARKET != 0 {
+        bail!(
+            "subscription MARKET orders are unsupported: buyer bond 2P requires a limit price \
+             before the money submit"
+        );
+    }
+    if order_flags != expected_flags {
+        bail!(
+            "subscription flags must be exactly AON|SUBSCRIPTION (0x{expected_flags:02x}), got \
+             0x{order_flags:02x}"
+        );
+    }
+    if deadline == 0 || deadline <= created_at_unix {
+        bail!(
+            "subscription deadline must be a finite absolute unix time after {created_at_unix}, got \
+             {deadline}"
+        );
+    }
+    Ok(reserve)
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_fund_split(
+    deposit: u128,
+    buyer_bond: u128,
+    reserve: SubscriptionBuyReserve,
+    label: &str,
+) -> Result<()> {
+    if deposit != reserve.deposit || buyer_bond != reserve.buyer_bond {
+        bail!(
+            "{label} money split conflicts with total escrow: stored deposit={deposit}, \
+             buyer_bond={buyer_bond}; expected deposit={}, buyer_bond={}, total_escrow={}",
+            reserve.deposit,
+            reserve.buyer_bond,
+            reserve.total_escrow
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+impl BuyerSubscriptionSubmitJournal {
+    fn validate(&self, expected_note_addr: &str) -> Result<()> {
+        if self.schema != BUYER_SUBSCRIPTION_SUBMIT_SCHEMA {
+            bail!(
+                "unsupported buyer subscription submit journal schema {}",
+                self.schema
+            );
+        }
+        let note_addr = dexdo_core::Address::parse(&self.note_addr)
+            .map_err(|error| anyhow::anyhow!("buyer subscription journal note_addr: {error}"))?
+            .with_workchain();
+        if !note_addr.eq_ignore_ascii_case(expected_note_addr) {
+            bail!(
+                "buyer subscription journal belongs to note {}, expected {}",
+                note_addr,
+                expected_note_addr
+            );
+        }
+        dexdo_core::Address::parse(&self.order_book)
+            .map_err(|error| anyhow::anyhow!("buyer subscription journal order_book: {error}"))?;
+        if self.frame_model.trim().is_empty()
+            || !model_hash_for(&self.frame_model).eq_ignore_ascii_case(&self.model_hash)
+        {
+            bail!("buyer subscription journal model identity is inconsistent");
+        }
+        let reserve = validate_subscription_order_terms(
+            self.max_price_per_tick,
+            self.ticks,
+            self.escrow,
+            self.flags,
+            self.deadline,
+            self.created_at_unix,
+        )?;
+        validate_subscription_fund_split(
+            self.deposit,
+            self.buyer_bond,
+            reserve,
+            "buyer subscription journal",
+        )?;
+        validate_buyer_submit_identity(&self.submit_identity, "buyer subscription submit journal")
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl BuyerSubscriptionState {
+    fn empty(note_addr: &str) -> Result<Self> {
+        let note_addr = dexdo_core::Address::parse(note_addr)
+            .map_err(|error| anyhow::anyhow!("buyer subscription state note_addr: {error}"))?
+            .with_workchain();
+        Ok(Self {
+            schema: BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr,
+            orders: Vec::new(),
+        })
+    }
+
+    fn validate(&self, expected_note_addr: &str) -> Result<()> {
+        if self.schema != BUYER_SUBSCRIPTION_STATE_SCHEMA {
+            bail!(
+                "unsupported buyer subscription state schema {}",
+                self.schema
+            );
+        }
+        let note_addr = dexdo_core::Address::parse(&self.note_addr)
+            .map_err(|error| anyhow::anyhow!("buyer subscription state note_addr: {error}"))?
+            .with_workchain();
+        if !note_addr.eq_ignore_ascii_case(expected_note_addr) {
+            bail!(
+                "buyer subscription state belongs to note {}, expected {}",
+                note_addr,
+                expected_note_addr
+            );
+        }
+        let mut order_keys = std::collections::BTreeSet::new();
+        let mut matched_contracts = std::collections::BTreeSet::new();
+        for order in &self.orders {
+            let order_book = dexdo_core::Address::parse(&order.order_book)
+                .map_err(|error| anyhow::anyhow!("buyer subscription order_book: {error}"))?
+                .with_workchain();
+            if order.frame_model.trim().is_empty()
+                || !model_hash_for(&order.frame_model).eq_ignore_ascii_case(&order.model_hash)
+            {
+                bail!(
+                    "buyer subscription order #{} has inconsistent model identity",
+                    order.order_id
+                );
+            }
+            let reserve = validate_subscription_order_terms(
+                order.max_price_per_tick,
+                order.ticks,
+                order.escrow,
+                order.flags,
+                order.deadline,
+                0,
+            )?;
+            validate_subscription_fund_split(
+                order.deposit,
+                order.buyer_bond,
+                reserve,
+                "buyer subscription state",
+            )?;
+            if !order_keys.insert((order_book, order.order_id)) {
+                bail!(
+                    "buyer subscription state repeats order #{} in {}",
+                    order.order_id,
+                    order.order_book
+                );
+            }
+            match (order.phase, order.matched.as_ref()) {
+                (BuyerSubscriptionPhase::Resting, None)
+                | (BuyerSubscriptionPhase::Matched, Some(_))
+                | (BuyerSubscriptionPhase::Terminal, _) => {}
+                (BuyerSubscriptionPhase::Resting, Some(_)) => bail!(
+                    "buyer subscription order #{} is resting but carries a matched deal",
+                    order.order_id
+                ),
+                (BuyerSubscriptionPhase::Matched, None) => {
+                    bail!(
+                        "buyer subscription order #{} phase {:?} has no matched deal",
+                        order.order_id,
+                        order.phase
+                    )
+                }
+            }
+            if let Some(matched) = &order.matched {
+                validate_subscription_match_record(order, matched)?;
+                let token_contract = dexdo_core::Address::parse(&matched.token_contract)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "buyer subscription matched TokenContract {}: {error}",
+                            matched.token_contract
+                        )
+                    })?
+                    .with_workchain();
+                if !matched_contracts.insert(token_contract.clone()) {
+                    bail!("buyer subscription state repeats TokenContract {token_contract}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_match_record(
+    order: &BuyerSubscriptionOrderRecord,
+    matched: &BuyerSubscriptionMatch,
+) -> Result<()> {
+    validate_subscription_match(order, &matched.as_fill())?;
+    let expected_handle =
+        deals::make_handle_id(&matched.token_contract, deals::DealHandleRole::Buyer);
+    if matched.deal_handle != expected_handle {
+        bail!(
+            "subscription order #{} matched deal handle {} is not deterministic for {}",
+            order.order_id,
+            matched.deal_handle,
+            matched.token_contract
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_match(
+    order: &BuyerSubscriptionOrderRecord,
+    matched: &BuyerJournalMatch,
+) -> Result<()> {
+    dexdo_core::Address::parse(&matched.token_contract).map_err(|error| {
+        anyhow::anyhow!(
+            "subscription order #{} matched invalid TokenContract {}: {error}",
+            order.order_id,
+            matched.token_contract
+        )
+    })?;
+    if matched.order_id != order.order_id {
+        bail!(
+            "subscription order #{} received fill for order #{}",
+            order.order_id,
+            matched.order_id
+        );
+    }
+    if matched.ticks != order.ticks {
+        bail!(
+            "subscription order #{} must fill all {} ticks from one seller, got partial/incorrect \
+             fill {}",
+            order.order_id,
+            order.ticks,
+            matched.ticks
+        );
+    }
+    validate_price_step(matched.clearing_price)?;
+    if matched.clearing_price > order.max_price_per_tick {
+        bail!(
+            "subscription order #{} clearing price {} exceeds limit {}",
+            order.order_id,
+            matched.clearing_price,
+            order.max_price_per_tick
+        );
+    }
+    Ok(())
+}
+
 #[cfg(feature = "shellnet")]
 fn validate_buyer_submit_identity(identity: &str, label: &str) -> Result<()> {
     let digest = identity
@@ -426,154 +764,6 @@ fn buyer_submit_reconciliation(
         state,
         origin,
     })
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-impl BuyerSubscriptionSubmitJournal {
-    fn validate(&self, expected_note_addr: &str) -> Result<()> {
-        if self.schema != BUYER_SUBSCRIPTION_SUBMIT_SCHEMA {
-            bail!(
-                "unsupported buyer subscription submit journal schema {}",
-                self.schema
-            );
-        }
-        let note_addr = dexdo_core::Address::parse(&self.note_addr)
-            .map_err(|error| anyhow::anyhow!("buyer subscription journal note_addr: {error}"))?
-            .with_workchain();
-        if !note_addr.eq_ignore_ascii_case(expected_note_addr) {
-            bail!(
-                "buyer subscription journal belongs to note {}, expected {}",
-                note_addr,
-                expected_note_addr
-            );
-        }
-        dexdo_core::Address::parse(&self.order_book)
-            .map_err(|error| anyhow::anyhow!("buyer subscription journal order_book: {error}"))?;
-        if self.frame_model.trim().is_empty()
-            || !model_hash_for(&self.frame_model).eq_ignore_ascii_case(&self.model_hash)
-        {
-            bail!("buyer subscription journal model identity is inconsistent");
-        }
-        if self.max_price_per_tick == 0 || self.ticks == 0 || self.escrow == 0 {
-            bail!("buyer subscription journal has a zero-sized money term");
-        }
-        check_buy_deposit_headroom(self.escrow, self.ticks, self.max_price_per_tick)
-            .map_err(anyhow::Error::msg)?;
-        if self.cycle_budget != self.escrow / INFERENCE_SUBSCRIPTION_CYCLES {
-            bail!(
-                "buyer subscription journal cycle_budget {} differs from contract escrow/{} = {}",
-                self.cycle_budget,
-                INFERENCE_SUBSCRIPTION_CYCLES,
-                self.escrow / INFERENCE_SUBSCRIPTION_CYCLES
-            );
-        }
-        validate_buyer_submit_identity(&self.submit_identity, "buyer subscription submit journal")
-    }
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-impl BuyerSubscriptionState {
-    fn empty(note_addr: &str) -> Result<Self> {
-        let note_addr = dexdo_core::Address::parse(note_addr)
-            .map_err(|error| anyhow::anyhow!("buyer subscription state note_addr: {error}"))?
-            .with_workchain();
-        Ok(Self {
-            schema: BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
-            note_addr,
-            books: Vec::new(),
-        })
-    }
-
-    fn validate(&self, expected_note_addr: &str) -> Result<()> {
-        if self.schema != BUYER_SUBSCRIPTION_STATE_SCHEMA {
-            bail!(
-                "unsupported buyer subscription state schema {}",
-                self.schema
-            );
-        }
-        let note_addr = dexdo_core::Address::parse(&self.note_addr)
-            .map_err(|error| anyhow::anyhow!("buyer subscription state note_addr: {error}"))?
-            .with_workchain();
-        if !note_addr.eq_ignore_ascii_case(expected_note_addr) {
-            bail!(
-                "buyer subscription state belongs to note {}, expected {}",
-                note_addr,
-                expected_note_addr
-            );
-        }
-        let mut books = std::collections::BTreeSet::new();
-        let mut token_contracts = std::collections::BTreeSet::new();
-        for book in &self.books {
-            let order_book = dexdo_core::Address::parse(&book.order_book)
-                .map_err(|error| anyhow::anyhow!("buyer subscription state order_book: {error}"))?
-                .with_workchain();
-            if !books.insert(order_book.clone()) {
-                bail!("buyer subscription state repeats order book {order_book}");
-            }
-            if book.frame_model.trim().is_empty()
-                || !model_hash_for(&book.frame_model).eq_ignore_ascii_case(&book.model_hash)
-            {
-                bail!("buyer subscription state has inconsistent model identity for {order_book}");
-            }
-            let mut order_ids = std::collections::BTreeSet::new();
-            for subscription in &book.subscriptions {
-                if !order_ids.insert(subscription.order_id) {
-                    bail!(
-                        "buyer subscription state repeats order #{} in {}",
-                        subscription.order_id,
-                        order_book
-                    );
-                }
-                if subscription.max_price_per_tick == 0
-                    || subscription.ticks == 0
-                    || subscription.escrow == 0
-                    || subscription.cycle_budget
-                        != subscription.escrow / INFERENCE_SUBSCRIPTION_CYCLES
-                {
-                    bail!(
-                        "buyer subscription state has invalid terms for order #{}",
-                        subscription.order_id
-                    );
-                }
-                for matched in &subscription.matches {
-                    if matched.order_id != subscription.order_id {
-                        bail!(
-                            "buyer subscription fill order #{} is stored under order #{}",
-                            matched.order_id,
-                            subscription.order_id
-                        );
-                    }
-                    let tc = dexdo_core::Address::parse(&matched.token_contract)
-                        .map_err(|error| {
-                            anyhow::anyhow!(
-                                "buyer subscription state TokenContract {}: {error}",
-                                matched.token_contract
-                            )
-                        })?
-                        .with_workchain();
-                    if !token_contracts.insert(tc.clone()) {
-                        bail!("buyer subscription state repeats TokenContract {tc}");
-                    }
-                }
-            }
-            for matched in &book.unattributed_matches {
-                let tc = dexdo_core::Address::parse(&matched.token_contract)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "buyer subscription state unattributed TokenContract {}: {error}",
-                            matched.token_contract
-                        )
-                    })?
-                    .with_workchain();
-                if !token_contracts.insert(tc.clone()) {
-                    bail!("buyer subscription state repeats TokenContract {tc}");
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -753,6 +943,11 @@ fn load_buyer_money_journal(
             journal.validate(expected_note_addr)?;
             BuyerMoneyJournal::Subscription(Box::new(journal))
         }
+        LEGACY_BUYER_SUBSCRIPTION_SUBMIT_SCHEMA => bail!(
+            "legacy buyer subscription submit journal schema {} is not compatible with the \
+             AON|SUBSCRIPTION order protocol; journal retained and no money action is safe",
+            LEGACY_BUYER_SUBSCRIPTION_SUBMIT_SCHEMA
+        ),
         other => bail!("unsupported buyer money journal schema {other}"),
     };
     Ok(Some(journal))
@@ -768,7 +963,8 @@ fn load_buyer_submit_journal(
         None => Ok(None),
         Some(BuyerMoneyJournal::Buy(journal)) => Ok(Some(*journal)),
         Some(BuyerMoneyJournal::Subscription(journal)) => bail!(
-            "buyer note {} has unresolved subscription submit {} in {}; reconcile it before a quote-bound buy",
+            "buyer note {} has unresolved subscription submit {} in {}; reconcile it with `dexdo \
+             subscription place` before a quote-bound buy",
             journal.note_addr,
             journal.submit_identity,
             journal.order_book
@@ -786,7 +982,6 @@ fn write_buyer_submit_journal(path: &std::path::Path, journal: &BuyerSubmitJourn
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
 fn write_buyer_subscription_submit_journal(
     path: &std::path::Path,
     journal: &BuyerSubscriptionSubmitJournal,
@@ -802,7 +997,6 @@ fn write_buyer_subscription_submit_journal(
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
 fn load_buyer_subscription_state(
     path: &std::path::Path,
     expected_note_addr: &str,
@@ -810,9 +1004,31 @@ fn load_buyer_subscription_state(
     let Some(bytes) = read_buyer_private_state(path, "buyer subscription state")? else {
         return BuyerSubscriptionState::empty(expected_note_addr);
     };
-    let state: BuyerSubscriptionState = serde_json::from_slice(&bytes).map_err(|error| {
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         anyhow::anyhow!(
             "buyer subscription state {} is invalid JSON: {error}",
+            path.display()
+        )
+    })?;
+    let schema = value.get("schema").and_then(Value::as_str).ok_or_else(|| {
+        anyhow::anyhow!("buyer subscription state {} has no schema", path.display())
+    })?;
+    if matches!(
+        schema,
+        LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA | LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA_V2
+    ) {
+        bail!(
+            "legacy buyer subscription state schema {} is incompatible with the \
+             durable single-TC subscription protocol; remove it only after manual reconciliation",
+            schema
+        );
+    }
+    if schema != BUYER_SUBSCRIPTION_STATE_SCHEMA {
+        bail!("unsupported buyer subscription state schema {schema}");
+    }
+    let state: BuyerSubscriptionState = serde_json::from_value(value).map_err(|error| {
+        anyhow::anyhow!(
+            "buyer subscription state {} is invalid: {error}",
             path.display()
         )
     })?;
@@ -821,7 +1037,6 @@ fn load_buyer_subscription_state(
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
 fn write_buyer_subscription_state(
     path: &std::path::Path,
     state: &BuyerSubscriptionState,
@@ -831,6 +1046,83 @@ fn write_buyer_subscription_state(
     with_pool_write_lock(path, |path| write_pool_private(path, &bytes)).map_err(|error| {
         anyhow::anyhow!("write buyer subscription state {}: {error}", path.display())
     })
+}
+
+/// Retain the durable subscription history after an explicit buyer terminal command has been
+/// authoritatively confirmed. Ordinary deals and notes without a v3 subscription store are untouched.
+#[cfg(feature = "shellnet")]
+pub(crate) fn mark_buyer_subscription_terminal(
+    note_addr: &str,
+    token_contract: &str,
+) -> Result<bool> {
+    let mut money_lock = BuyerMoneyLock::open(note_addr)?;
+    money_lock.try_acquire()?;
+    if !money_lock.subscriptions_path.exists() {
+        return Ok(false);
+    }
+    let token_contract = dexdo_core::Address::parse(token_contract)
+        .map_err(|error| anyhow::anyhow!("terminal subscription TokenContract: {error}"))?
+        .with_workchain();
+    let mut state =
+        load_buyer_subscription_state(&money_lock.subscriptions_path, &money_lock.note_addr)?;
+    let mut matched = state.orders.iter_mut().filter(|record| {
+        record
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched.token_contract.eq_ignore_ascii_case(&token_contract))
+    });
+    let Some(record) = matched.next() else {
+        return Ok(false);
+    };
+    if matched.next().is_some() {
+        bail!(
+            "durable buyer subscription state contains multiple records for TokenContract \
+             {token_contract}"
+        );
+    }
+    match record.phase {
+        BuyerSubscriptionPhase::Resting => bail!(
+            "durable buyer subscription record for TokenContract {token_contract} is resting but \
+             carries a match"
+        ),
+        BuyerSubscriptionPhase::Matched => {
+            record.phase = BuyerSubscriptionPhase::Terminal;
+            write_buyer_subscription_state(&money_lock.subscriptions_path, &state)?;
+            Ok(true)
+        }
+        BuyerSubscriptionPhase::Terminal => Ok(false),
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn mark_cancelled_buyer_subscription_terminal(
+    path: &std::path::Path,
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+) -> Result<bool> {
+    let mut state = load_buyer_subscription_state(path, note_addr)?;
+    let record =
+        subscription_order_record_mut(&mut state, order_book, order_id).ok_or_else(|| {
+            anyhow::anyhow!(
+            "confirmed subscription cancellation has no durable order #{order_id} in {order_book}"
+        )
+        })?;
+    match (record.phase, record.matched.as_ref()) {
+        (BuyerSubscriptionPhase::Resting, None) => {
+            record.phase = BuyerSubscriptionPhase::Terminal;
+            write_buyer_subscription_state(path, &state)?;
+            Ok(true)
+        }
+        (BuyerSubscriptionPhase::Terminal, None) => Ok(false),
+        (_, Some(matched)) => bail!(
+            "subscription order #{order_id} cancellation refund contradicts matched TokenContract {}",
+            matched.token_contract
+        ),
+        (BuyerSubscriptionPhase::Matched, None) => bail!(
+            "subscription order #{order_id} is matched without a TokenContract"
+        ),
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -934,7 +1226,14 @@ async fn place_buy_by_model_after_pool_preflight(
         preflight_buyer_pool_for_note(pool_note_addr)?;
     }
     chain
-        .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
+        .place_buy_by_model(
+            buyer.note.as_ref(),
+            ticks,
+            max_price,
+            escrow,
+            0,
+            buy_order_deadline()?,
+        )
         .await
         .map_err(|e| anyhow::Error::new(e).context("place model-only buy after pool preflight"))
 }
@@ -975,519 +1274,1152 @@ fn journal_match(fill: &dexdo_core::MatchedFill) -> BuyerJournalMatch {
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn ensure_subscription_book(
-    state: &mut BuyerSubscriptionState,
-    order_book: &str,
-    frame_model: &str,
-    model_hash: &str,
-    initial_cursor: &dexdo_core::MatchWatchCursor,
-) -> Result<usize> {
-    let order_book = dexdo_core::Address::parse(order_book)
-        .map_err(|error| anyhow::anyhow!("buyer subscription order_book: {error}"))?
-        .with_workchain();
-    if let Some(index) = state
-        .books
-        .iter()
-        .position(|book| book.order_book.eq_ignore_ascii_case(&order_book))
-    {
-        let book = &state.books[index];
-        if book.frame_model != frame_model || !book.model_hash.eq_ignore_ascii_case(model_hash) {
-            bail!(
-                "buyer subscription state binds {} to model {}/{}, not {}/{}",
-                order_book,
-                book.frame_model,
-                book.model_hash,
-                frame_model,
-                model_hash
-            );
-        }
-        return Ok(index);
-    }
-    state.books.push(BuyerSubscriptionBookState {
-        order_book,
-        frame_model: frame_model.to_string(),
-        model_hash: model_hash.to_string(),
-        fill_cursor: initial_cursor.clone(),
-        subscriptions: Vec::new(),
-        unattributed_matches: Vec::new(),
-    });
-    Ok(state.books.len() - 1)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubscriptionDealFacts {
+    state: DealChainState,
+    subscription: DealSubscription,
+    seller_bond: DealSellerBond,
+    buyer_bond: DealBuyerBond,
+    model_name: String,
+    model_hash: String,
+    buyer_note: String,
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn subscription_state_contains_tc(state: &BuyerSubscriptionState, token_contract: &str) -> bool {
-    state.books.iter().any(|book| {
-        book.subscriptions.iter().any(|subscription| {
-            subscription
-                .matches
-                .iter()
-                .any(|matched| matched.token_contract.eq_ignore_ascii_case(token_contract))
-        }) || book
-            .unattributed_matches
-            .iter()
-            .any(|matched| matched.token_contract.eq_ignore_ascii_case(token_contract))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubscriptionQuotaView {
+    claimed_current_week: u128,
+    remaining_current_week: u128,
+    buyer_locked_total: u128,
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubscriptionRuntimeView {
+    ticks: u128,
+    order_id: Option<u128>,
+    facts: SubscriptionDealFacts,
+    quota: SubscriptionQuotaView,
+}
+
+fn subscription_oneshot_budget(requested: u64, remaining_current_week: Option<u64>) -> Result<u64> {
+    let allowed = remaining_current_week
+        .map(|remaining| requested.min(remaining))
+        .unwrap_or(requested);
+    if allowed == 0 {
+        bail!(
+            "subscription current-week quota is exhausted; no one-shot request was sent and the \
+             subscription remains resumable"
+        );
+    }
+    Ok(allowed)
+}
+
+#[cfg(feature = "shellnet")]
+fn subscription_quota_view(facts: &SubscriptionDealFacts) -> Result<SubscriptionQuotaView> {
+    let buyer_locked_total = facts
+        .state
+        .deposit
+        .checked_add(facts.state.probe_tick)
+        .and_then(|held| held.checked_add(facts.buyer_bond.bond_held))
+        .ok_or_else(|| anyhow::anyhow!("subscription buyer locked exposure overflows u128"))?;
+    if facts.state.disputed || facts.state.is_stopped() {
+        return Ok(SubscriptionQuotaView {
+            claimed_current_week: 0,
+            remaining_current_week: 0,
+            buyer_locked_total,
+        });
+    }
+    let claimed_current_week = facts
+        .state
+        .tokens_pending
+        .checked_sub(facts.subscription.week_base_tokens)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription tokensPending {} is below weekBaseTokens {}",
+                facts.state.tokens_pending,
+                facts.subscription.week_base_tokens
+            )
+        })?;
+    if facts.subscription.is_subscription()
+        && facts.subscription.week_index >= facts.subscription.sub_weeks
+    {
+        return Ok(SubscriptionQuotaView {
+            claimed_current_week,
+            remaining_current_week: 0,
+            buyer_locked_total,
+        });
+    }
+    let remaining_current_week = facts
+        .subscription
+        .tokens_per_week
+        .checked_sub(claimed_current_week)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription current-week claim {} exceeds quota {}",
+                claimed_current_week,
+                facts.subscription.tokens_per_week
+            )
+        })?;
+    Ok(SubscriptionQuotaView {
+        claimed_current_week,
+        remaining_current_week,
+        buyer_locked_total,
     })
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn route_unattributed_subscription_matches(book: &mut BuyerSubscriptionBookState) {
-    let mut remaining = Vec::new();
-    for matched in std::mem::take(&mut book.unattributed_matches) {
-        if let Some(subscription) = book
-            .subscriptions
-            .iter_mut()
-            .find(|subscription| subscription.order_id == matched.order_id)
-        {
-            if !subscription.matches.iter().any(|existing| {
-                existing
-                    .token_contract
-                    .eq_ignore_ascii_case(&matched.token_contract)
-            }) {
-                subscription.matches.push(matched);
-            }
-        } else {
-            remaining.push(matched);
-        }
+fn validate_subscription_deal_facts(
+    expected_note_addr: &str,
+    order: &BuyerSubscriptionOrderRecord,
+    matched: &BuyerJournalMatch,
+    facts: &SubscriptionDealFacts,
+) -> Result<SubscriptionQuotaView> {
+    validate_subscription_match(order, matched)?;
+    if order.flags != subscription_order_flags() {
+        bail!(
+            "subscription order #{} flags 0x{:02x} are not exact AON|SUBSCRIPTION 0x{:02x}",
+            order.order_id,
+            order.flags,
+            subscription_order_flags()
+        );
     }
-    book.unattributed_matches = remaining;
+    if !facts.state.funded {
+        bail!(
+            "subscription TokenContract {} is not funded",
+            matched.token_contract
+        );
+    }
+    if facts.model_name != order.frame_model
+        || !facts.model_hash.eq_ignore_ascii_case(&order.model_hash)
+        || !model_hash_for(&facts.model_name).eq_ignore_ascii_case(&order.model_hash)
+    {
+        bail!(
+            "subscription TokenContract {} model identity contradicts durable order #{}",
+            matched.token_contract,
+            order.order_id
+        );
+    }
+    let expected_note = dexdo_core::Address::parse(expected_note_addr)
+        .map_err(|error| anyhow::anyhow!("subscription expected buyer note: {error}"))?
+        .with_workchain();
+    let actual_note = dexdo_core::Address::parse(&facts.buyer_note)
+        .map_err(|error| anyhow::anyhow!("subscription TokenContract buyer note: {error}"))?
+        .with_workchain();
+    if !actual_note.eq_ignore_ascii_case(&expected_note) {
+        bail!(
+            "subscription TokenContract {} buyer note {} is not durable owner {}",
+            matched.token_contract,
+            actual_note,
+            expected_note
+        );
+    }
+    if !facts.subscription.is_subscription()
+        || facts.subscription.sub_weeks != SUBSCRIPTION_WEEKS
+        // The book-side identity is exactly AON|SUBSCRIPTION(validated from the durable order).
+        // TokenContract deliberately records only the DEAL_MASK slice, so the corresponding exact
+        // on-chain identity is SUBSCRIPTION with no TEE bit or other mutation.
+        || facts.subscription.deal_flags != flags::SUBSCRIPTION
+    {
+        bail!(
+            "TokenContract {} is not the canonical four-week subscription shape",
+            matched.token_contract
+        );
+    }
+    let funded_tokens = order
+        .ticks
+        .checked_mul(TICK_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("subscription funded token volume overflows u128"))?;
+    if facts.subscription.funded_tokens != funded_tokens {
+        bail!(
+            "subscription TokenContract {} fundedTokens {} differs from full AON order volume {}",
+            matched.token_contract,
+            facts.subscription.funded_tokens,
+            funded_tokens
+        );
+    }
+    let matched_reserve = subscription_buy_reserve(order.ticks, matched.clearing_price)
+        .map_err(anyhow::Error::msg)?;
+    let expected_bond = matched_reserve.buyer_bond;
+    if facts.buyer_bond.bond_required != expected_bond {
+        bail!(
+            "subscription TokenContract {} buyer bondRequired {} differs from canonical 2P {} at \
+             clearing price {}",
+            matched.token_contract,
+            facts.buyer_bond.bond_required,
+            expected_bond,
+            matched.clearing_price
+        );
+    }
+    if facts.seller_bond.bond_required != expected_bond {
+        bail!(
+            "subscription TokenContract {} seller bondRequired {} differs from canonical 2P {} at \
+             clearing price {}",
+            matched.token_contract,
+            facts.seller_bond.bond_required,
+            expected_bond,
+            matched.clearing_price
+        );
+    }
+    if facts.seller_bond.bond_held > expected_bond {
+        bail!(
+            "subscription TokenContract {} seller bondHeld {} exceeds canonical 2P {}",
+            matched.token_contract,
+            facts.seller_bond.bond_held,
+            expected_bond
+        );
+    }
+    let live = !facts.state.disputed && !facts.state.is_stopped();
+    if live && facts.buyer_bond.bond_held != expected_bond {
+        bail!(
+            "subscription TokenContract {} live buyer bondHeld {} differs from canonical 2P {}",
+            matched.token_contract,
+            facts.buyer_bond.bond_held,
+            expected_bond
+        );
+    }
+    if !facts.seller_bond.bond_funded && facts.seller_bond.bond_held != 0 {
+        bail!(
+            "subscription TokenContract {} unfunded seller bond unexpectedly holds {}",
+            matched.token_contract,
+            facts.seller_bond.bond_held
+        );
+    }
+    if facts.state.opened && !facts.seller_bond.bond_funded {
+        bail!(
+            "subscription TokenContract {} is opened without a funded seller bond",
+            matched.token_contract
+        );
+    }
+    if live && facts.seller_bond.bond_funded && facts.seller_bond.bond_held != expected_bond {
+        bail!(
+            "subscription TokenContract {} live funded seller bondHeld {} differs from canonical \
+             2P {}",
+            matched.token_contract,
+            facts.seller_bond.bond_held,
+            expected_bond
+        );
+    }
+    subscription_quota_view(facts)
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn persist_subscription_fills_and_cursor(
-    note_addr: &str,
-    state_path: &std::path::Path,
-    state: &mut BuyerSubscriptionState,
-    book_index: usize,
-    cursor: dexdo_core::MatchWatchCursor,
-    fills: Vec<(u128, dexdo_core::MatchedFill)>,
-    unattributed_order_id_floor: Option<u128>,
-) -> Result<()> {
-    let mut fresh = Vec::new();
-    for (order_id, fill) in fills {
-        let matched = BuyerJournalMatch {
-            token_contract: dexdo_core::Address::parse(&fill.token_contract)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "buyer subscription fill TokenContract {}: {error}",
-                        fill.token_contract
-                    )
-                })?
-                .with_workchain(),
-            order_id,
-            ticks: fill.ticks,
-            clearing_price: fill.price_per_tick,
-        };
-        let known_subscription = state.books[book_index]
-            .subscriptions
-            .iter()
-            .any(|subscription| subscription.order_id == matched.order_id);
-        if !known_subscription
-            && unattributed_order_id_floor.is_none_or(|floor| matched.order_id < floor)
-        {
-            continue;
+async fn classify_subscription_resume_target(
+    chain: &dyn ChainBackend,
+    expected_note_addr: &str,
+    frame_model: &str,
+    token_contract: &str,
+    historical_fill: Option<&MatchedFill>,
+) -> Result<Option<SubscriptionRuntimeView>> {
+    let snapshot = chain
+        .deal_snapshot(&token_contract.to_string())
+        .await
+        .map_err(anyhow::Error::new)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "TokenContract {token_contract}: coherent snapshot is unavailable; refusing to \
+                 treat an unknown deal shape as ordinary"
+            )
+        })?;
+    if !snapshot.subscription.is_subscription() {
+        return Ok(None);
+    }
+    if snapshot.state.disputed || snapshot.state.is_stopped() {
+        bail!("subscription TokenContract {token_contract} is terminal/disputed and cannot be resumed");
+    }
+
+    // The live-target assertion proves buyer ownership plus the exact model/book identity. It is
+    // intentionally after the subscription/terminal read: terminal history is reconciled as terminal
+    // rather than being misreported as an invalid active target.
+    chain
+        .assert_model_only_resume_target(&token_contract.to_string())
+        .await
+        .map_err(anyhow::Error::new)?;
+
+    let ticks = snapshot
+        .subscription
+        .funded_tokens
+        .checked_div(TICK_SIZE)
+        .filter(|_| {
+            snapshot
+                .subscription
+                .funded_tokens
+                .is_multiple_of(TICK_SIZE)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription TokenContract {token_contract} fundedTokens {} is not an exact \
+                 multiple of TICK_SIZE {TICK_SIZE}",
+                snapshot.subscription.funded_tokens
+            )
+        })?;
+    let (order_id, clearing_price) = if let Some(fill) = historical_fill {
+        if !fill.token_contract.eq_ignore_ascii_case(token_contract) {
+            bail!(
+                "historical subscription fill names {}, expected {token_contract}",
+                fill.token_contract
+            );
         }
-        if subscription_state_contains_tc(state, &matched.token_contract)
-            || fresh.iter().any(|existing: &BuyerJournalMatch| {
-                existing
-                    .token_contract
-                    .eq_ignore_ascii_case(&matched.token_contract)
-            })
-        {
-            continue;
+        if fill.ticks != ticks {
+            bail!(
+                "historical subscription fill volume {} differs from TokenContract funded volume \
+                 {ticks}",
+                fill.ticks
+            );
         }
-        persist_buyer_token_contract_for_note_result(Some(note_addr), &matched.token_contract)
-            .map_err(|error| {
+        (fill.order_id, fill.price_per_tick)
+    } else {
+        let required = snapshot.buyer_bond.bond_required;
+        if required == 0 || !required.is_multiple_of(2) {
+            bail!(
+                "subscription TokenContract {token_contract} buyer bondRequired {required} cannot \
+                 encode canonical 2P"
+            );
+        }
+        (0, required / 2)
+    };
+    let reserve = validate_subscription_order_terms(
+        clearing_price,
+        ticks,
+        subscription_buy_reserve(ticks, clearing_price)
+            .map_err(anyhow::Error::msg)?
+            .total_escrow,
+        subscription_order_flags(),
+        u64::MAX,
+        0,
+    )?;
+    let order = BuyerSubscriptionOrderRecord {
+        order_book: chain
+            .model_buy_order_book_identity()
+            .unwrap_or_else(|| "authoritative-token-contract".to_string()),
+        frame_model: frame_model.to_string(),
+        model_hash: model_hash_for(frame_model),
+        order_id,
+        max_price_per_tick: clearing_price,
+        ticks,
+        deposit: reserve.deposit,
+        buyer_bond: reserve.buyer_bond,
+        escrow: reserve.total_escrow,
+        flags: subscription_order_flags(),
+        deadline: u64::MAX,
+        fill_cursor: MatchWatchCursor::new(0),
+        phase: BuyerSubscriptionPhase::Matched,
+        matched: None,
+    };
+    let matched = BuyerJournalMatch {
+        token_contract: token_contract.to_string(),
+        order_id,
+        ticks,
+        clearing_price,
+    };
+    let facts = SubscriptionDealFacts {
+        state: snapshot.state,
+        subscription: snapshot.subscription,
+        seller_bond: snapshot.seller_bond,
+        buyer_bond: snapshot.buyer_bond,
+        // The live-target assertion above proved these exact identities from the TokenContract.
+        model_name: frame_model.to_string(),
+        model_hash: model_hash_for(frame_model),
+        buyer_note: expected_note_addr.to_string(),
+    };
+    let quota = validate_subscription_deal_facts(expected_note_addr, &order, &matched, &facts)?;
+    Ok(Some(SubscriptionRuntimeView {
+        ticks,
+        order_id: historical_fill.map(|fill| fill.order_id),
+        facts,
+        quota,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+trait SubscriptionOrderOps: Send + Sync {
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    async fn submit_subscription_order(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        order_book: &str,
+        model_hash: &str,
+        max_price_per_tick: u128,
+        ticks: u128,
+        escrow: u128,
+        order_flags: u8,
+        deadline: u64,
+        fill_cursor: &mut MatchWatchCursor,
+        before_post: &mut (dyn FnMut(String, u128, MatchWatchCursor, Vec<(u128, MatchedFill)>) -> Result<()>
+                  + Send),
+    ) -> Result<Value>;
+
+    async fn subscription_placements(
+        &self,
+        order_book: &str,
+        buyer_note: &str,
+        order_id_floor: u128,
+        max_price_per_tick: u128,
+        ticks: u128,
+    ) -> Result<Vec<InferenceSubscriptionPlacement>>;
+
+    async fn attributed_subscription_fills(
+        &self,
+        order_book: &str,
+        buyer_note: &str,
+        cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<(u128, MatchedFill)>>;
+
+    async fn subscription_order_active(
+        &self,
+        order_book: &str,
+        order_id: u128,
+        buyer_note: &str,
+    ) -> Result<bool>;
+
+    async fn subscription_deal_facts(
+        &self,
+        expected_note_addr: &str,
+        order: &BuyerSubscriptionOrderRecord,
+        matched: &BuyerJournalMatch,
+    ) -> Result<SubscriptionDealFacts>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+impl SubscriptionOrderOps for dexdo_core::RealChainBackend {
+    async fn submit_subscription_order(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        order_book: &str,
+        model_hash: &str,
+        max_price_per_tick: u128,
+        ticks: u128,
+        escrow: u128,
+        order_flags: u8,
+        deadline: u64,
+        fill_cursor: &mut MatchWatchCursor,
+        before_post: &mut (dyn FnMut(String, u128, MatchWatchCursor, Vec<(u128, MatchedFill)>) -> Result<()>
+                  + Send),
+    ) -> Result<Value> {
+        if order_flags != subscription_order_flags() {
+            bail!(
+                "subscription submit requires exact flags 0x{:02x}, got 0x{order_flags:02x}",
+                subscription_order_flags()
+            );
+        }
+        check_subscription_buy_reserve(escrow, ticks, max_price_per_tick)
+            .map_err(|error| anyhow::anyhow!("subscription submit preflight: {error}"))?;
+        let order_book = dexdo_core::Address::parse(order_book)
+            .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+        self.place_inference_buy_with_identity_and_cursors(
+            note,
+            keys,
+            &order_book,
+            model_hash,
+            max_price_per_tick,
+            ticks,
+            escrow,
+            order_flags,
+            deadline,
+            fill_cursor,
+            before_post,
+        )
+        .await
+    }
+
+    async fn subscription_placements(
+        &self,
+        order_book: &str,
+        buyer_note: &str,
+        order_id_floor: u128,
+        max_price_per_tick: u128,
+        ticks: u128,
+    ) -> Result<Vec<InferenceSubscriptionPlacement>> {
+        let order_book = dexdo_core::Address::parse(order_book)
+            .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+        let buyer_note = dexdo_core::Address::parse(buyer_note)
+            .map_err(|error| anyhow::anyhow!("subscription buyer note: {error}"))?;
+        self.inference_subscription_placements_since(
+            &order_book,
+            &buyer_note,
+            order_id_floor,
+            max_price_per_tick,
+            ticks,
+        )
+        .await
+    }
+
+    async fn attributed_subscription_fills(
+        &self,
+        order_book: &str,
+        buyer_note: &str,
+        cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<(u128, MatchedFill)>> {
+        let order_book = dexdo_core::Address::parse(order_book)
+            .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+        let buyer_note = dexdo_core::Address::parse(buyer_note)
+            .map_err(|error| anyhow::anyhow!("subscription buyer note: {error}"))?;
+        self.poll_inference_attributed_fills(&buyer_note, &order_book, cursor)
+            .await
+    }
+
+    async fn subscription_order_active(
+        &self,
+        order_book: &str,
+        order_id: u128,
+        buyer_note: &str,
+    ) -> Result<bool> {
+        let order_book = dexdo_core::Address::parse(order_book)
+            .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+        self.inference_buyer_order_is_active_for_owner(&order_book, order_id, buyer_note)
+            .await
+    }
+
+    async fn subscription_deal_facts(
+        &self,
+        _expected_note_addr: &str,
+        _order: &BuyerSubscriptionOrderRecord,
+        matched: &BuyerJournalMatch,
+    ) -> Result<SubscriptionDealFacts> {
+        let tc = dexdo_core::Address::parse(&matched.token_contract).map_err(|error| {
+            anyhow::anyhow!(
+                "subscription matched TokenContract {}: {error}",
+                matched.token_contract
+            )
+        })?;
+        let snapshot = self
+            .token_contract_deal_snapshot(&tc)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("TokenContract {tc}: coherent snapshot is unavailable")
+            })?;
+        let model_name = self.token_contract_model_name(&tc).await?.ok_or_else(|| {
+            anyhow::anyhow!("TokenContract {tc}: getModelName() returned no data")
+        })?;
+        let model_hash = self.token_contract_model_hash(&tc).await?.ok_or_else(|| {
+            anyhow::anyhow!("TokenContract {tc}: getModelHash() returned no data")
+        })?;
+        let buyer_note = self
+            .token_contract_buyer_note(&tc)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("TokenContract {tc}: getBuyerNote() returned no data"))?
+            .with_workchain();
+        Ok(SubscriptionDealFacts {
+            state: snapshot.state,
+            subscription: snapshot.subscription,
+            seller_bond: snapshot.seller_bond,
+            buyer_bond: snapshot.buyer_bond,
+            model_name,
+            model_hash,
+            buyer_note,
+        })
+    }
+}
+
+#[cfg(feature = "shellnet")]
+struct BuyerSubscriptionResumeOps<'a> {
+    chain: &'a dyn ChainBackend,
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+impl SubscriptionOrderOps for BuyerSubscriptionResumeOps<'_> {
+    async fn submit_subscription_order(
+        &self,
+        _note: &dexdo_core::Address,
+        _keys: &dexdo_core::KeyPair,
+        _order_book: &str,
+        _model_hash: &str,
+        _max_price_per_tick: u128,
+        _ticks: u128,
+        _escrow: u128,
+        _order_flags: u8,
+        _deadline: u64,
+        _fill_cursor: &mut MatchWatchCursor,
+        _before_post: &mut (dyn FnMut(String, u128, MatchWatchCursor, Vec<(u128, MatchedFill)>) -> Result<()>
+                  + Send),
+    ) -> Result<Value> {
+        bail!("buyer subscription resume never submits a fresh order")
+    }
+
+    async fn subscription_placements(
+        &self,
+        order_book: &str,
+        buyer_note: &str,
+        order_id_floor: u128,
+        max_price_per_tick: u128,
+        ticks: u128,
+    ) -> Result<Vec<InferenceSubscriptionPlacement>> {
+        self.chain
+            .subscription_placements_since(
+                order_book,
+                buyer_note,
+                order_id_floor,
+                max_price_per_tick,
+                ticks,
+            )
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn attributed_subscription_fills(
+        &self,
+        order_book: &str,
+        _buyer_note: &str,
+        cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<(u128, MatchedFill)>> {
+        self.chain
+            .poll_attributed_model_buys_for_order_book(order_book, cursor)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn subscription_order_active(
+        &self,
+        order_book: &str,
+        order_id: u128,
+        buyer_note: &str,
+    ) -> Result<bool> {
+        self.chain
+            .buyer_order_is_active_for_owner(order_book, order_id, buyer_note)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn subscription_deal_facts(
+        &self,
+        expected_note_addr: &str,
+        order: &BuyerSubscriptionOrderRecord,
+        matched: &BuyerJournalMatch,
+    ) -> Result<SubscriptionDealFacts> {
+        let snapshot = self
+            .chain
+            .deal_snapshot(&matched.token_contract)
+            .await
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "persist subscription fill TokenContract {} before advancing its cursor: {error:#}",
+                    "TokenContract {}: coherent snapshot is unavailable",
                     matched.token_contract
                 )
             })?;
-        fresh.push(matched);
-    }
-    let book = state
-        .books
-        .get_mut(book_index)
-        .ok_or_else(|| anyhow::anyhow!("buyer subscription state lost book index {book_index}"))?;
-    for matched in fresh {
-        if let Some(subscription) = book
-            .subscriptions
-            .iter_mut()
-            .find(|subscription| subscription.order_id == matched.order_id)
-        {
-            subscription.matches.push(matched);
-        } else {
-            book.unattributed_matches.push(matched);
+        if !snapshot.state.disputed && !snapshot.state.is_stopped() {
+            self.chain
+                .assert_model_only_resume_target(&matched.token_contract)
+                .await
+                .map_err(anyhow::Error::new)?;
         }
+        Ok(SubscriptionDealFacts {
+            state: snapshot.state,
+            subscription: snapshot.subscription,
+            seller_bond: snapshot.seller_bond,
+            buyer_bond: snapshot.buyer_bond,
+            // `assert_model_only_resume_target` just proved these three identities from chain getters.
+            model_name: order.frame_model.clone(),
+            model_hash: order.model_hash.clone(),
+            buyer_note: expected_note_addr.to_string(),
+        })
     }
-    route_unattributed_subscription_matches(book);
-    book.fill_cursor = cursor;
-    write_buyer_subscription_state(state_path, state)
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn route_known_subscription_fills(
-    note_addr: &str,
-    state_path: &std::path::Path,
+fn subscription_order_record<'a>(
+    state: &'a BuyerSubscriptionState,
     order_book: &str,
-    cursor: dexdo_core::MatchWatchCursor,
-    fills: Vec<(u128, dexdo_core::MatchedFill)>,
-) -> Result<Vec<(u128, dexdo_core::MatchedFill)>> {
-    let mut state = load_buyer_subscription_state(state_path, note_addr)?;
-    let Some(book_index) = state
-        .books
-        .iter()
-        .position(|book| book.order_book.eq_ignore_ascii_case(order_book))
-    else {
-        return Ok(fills);
-    };
-    let subscription_order_ids = state.books[book_index]
-        .subscriptions
-        .iter()
-        .map(|subscription| subscription.order_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    let (subscription_fills, other_fills): (Vec<_>, Vec<_>) = fills
-        .into_iter()
-        .partition(|(order_id, _)| subscription_order_ids.contains(order_id));
-    persist_subscription_fills_and_cursor(
-        note_addr,
-        state_path,
-        &mut state,
-        book_index,
-        cursor,
-        subscription_fills,
-        None,
-    )?;
-    Ok(other_fills)
+    order_id: u128,
+) -> Option<&'a BuyerSubscriptionOrderRecord> {
+    state.orders.iter().find(|record| {
+        record.order_id == order_id && record.order_book.eq_ignore_ascii_case(order_book)
+    })
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn record_subscription_placements(
+fn subscription_order_record_mut<'a>(
+    state: &'a mut BuyerSubscriptionState,
+    order_book: &str,
+    order_id: u128,
+) -> Option<&'a mut BuyerSubscriptionOrderRecord> {
+    state.orders.iter_mut().find(|record| {
+        record.order_id == order_id && record.order_book.eq_ignore_ascii_case(order_book)
+    })
+}
+
+#[cfg(feature = "shellnet")]
+fn record_subscription_placement(
     state: &mut BuyerSubscriptionState,
-    book_index: usize,
     journal: &BuyerSubscriptionSubmitJournal,
-    placements: &[InferenceSubscriptionPlacement],
-) -> Result<()> {
-    let book = state
-        .books
-        .get_mut(book_index)
-        .ok_or_else(|| anyhow::anyhow!("buyer subscription state lost book index {book_index}"))?;
-    for placement in placements {
-        if let Some(existing) = book
-            .subscriptions
-            .iter()
-            .find(|subscription| subscription.order_id == placement.order_id)
-        {
-            if existing.max_price_per_tick != placement.max_price_per_tick
-                || existing.ticks != placement.ticks
-                || existing.cycle_budget != placement.cycle_budget
-                || existing.auto_renew != placement.auto_renew
-            {
+    placement: &InferenceSubscriptionPlacement,
+) -> Result<BuyerSubscriptionOrderRecord> {
+    let owner = dexdo_core::Address::parse(&placement.buyer_note)
+        .map_err(|error| anyhow::anyhow!("subscription placement buyer note: {error}"))?
+        .with_workchain();
+    let created_at = u64::try_from(placement.created_at).map_err(|_| {
+        anyhow::anyhow!(
+            "subscription placement #{} has negative created_at",
+            placement.order_id
+        )
+    })?;
+    if !owner.eq_ignore_ascii_case(&journal.note_addr)
+        || placement.order_id < journal.order_id_floor
+        || placement.max_price_per_tick != journal.max_price_per_tick
+        || placement.ticks != journal.ticks
+        || placement.sub_weeks != SUBSCRIPTION_WEEKS
+        || placement.deadline != journal.deadline
+        || created_at >= journal.deadline
+    {
+        bail!(
+            "subscription placement #{} contradicts the exact durable BOC intent",
+            placement.order_id
+        );
+    }
+    let candidate = BuyerSubscriptionOrderRecord {
+        order_book: journal.order_book.clone(),
+        frame_model: journal.frame_model.clone(),
+        model_hash: journal.model_hash.clone(),
+        order_id: placement.order_id,
+        max_price_per_tick: journal.max_price_per_tick,
+        ticks: journal.ticks,
+        deposit: journal.deposit,
+        buyer_bond: journal.buyer_bond,
+        escrow: journal.escrow,
+        flags: journal.flags,
+        deadline: journal.deadline,
+        fill_cursor: journal.fill_cursor.clone(),
+        phase: BuyerSubscriptionPhase::Resting,
+        matched: None,
+    };
+    let reserve = validate_subscription_order_terms(
+        candidate.max_price_per_tick,
+        candidate.ticks,
+        candidate.escrow,
+        candidate.flags,
+        candidate.deadline,
+        0,
+    )?;
+    validate_subscription_fund_split(
+        candidate.deposit,
+        candidate.buyer_bond,
+        reserve,
+        "subscription placement",
+    )?;
+    if let Some(existing) =
+        subscription_order_record(state, &candidate.order_book, candidate.order_id)
+    {
+        let mut comparable = existing.clone();
+        comparable.fill_cursor = candidate.fill_cursor.clone();
+        comparable.phase = BuyerSubscriptionPhase::Resting;
+        comparable.matched = None;
+        if comparable != candidate {
+            bail!(
+                "subscription placement #{} conflicts with durable state",
+                placement.order_id
+            );
+        }
+        return Ok(existing.clone());
+    }
+    state.orders.push(candidate.clone());
+    state
+        .orders
+        .sort_by_key(|record| (record.order_book.clone(), record.order_id));
+    Ok(candidate)
+}
+
+#[cfg(feature = "shellnet")]
+fn coalesce_journal_subscription_placements(
+    journal: &BuyerSubscriptionSubmitJournal,
+    placements: Vec<InferenceSubscriptionPlacement>,
+) -> Result<Vec<InferenceSubscriptionPlacement>> {
+    let mut placements = placements
+        .into_iter()
+        .filter(|placement| placement.order_id >= journal.order_id_floor)
+        .map(|mut placement| {
+            placement.buyer_note = dexdo_core::Address::parse(&placement.buyer_note)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "subscription placement #{} buyer note {}: {error}",
+                        placement.order_id,
+                        placement.buyer_note
+                    )
+                })?
+                .with_workchain();
+            Ok(placement)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    placements.sort_by(|left, right| {
+        left.order_id
+            .cmp(&right.order_id)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+    let mut correlated = Vec::new();
+    let mut start = 0;
+    while start < placements.len() {
+        let order_id = placements[start].order_id;
+        let mut end = start + 1;
+        while end < placements.len() && placements[end].order_id == order_id {
+            end += 1;
+        }
+        let group = &placements[start..end];
+        let has_exact = group.iter().any(|placement| {
+            placement
+                .buyer_note
+                .eq_ignore_ascii_case(&journal.note_addr)
+                && placement.max_price_per_tick == journal.max_price_per_tick
+                && placement.ticks == journal.ticks
+                && placement.sub_weeks == SUBSCRIPTION_WEEKS
+                && placement.deadline == journal.deadline
+                && u64::try_from(placement.created_at)
+                    .is_ok_and(|created_at| created_at < journal.deadline)
+        });
+        if has_exact {
+            let first = &group[0];
+            if group.iter().any(|placement| placement != first) {
                 bail!(
-                    "subscription placement event for order #{} conflicts with durable state",
-                    placement.order_id
+                    "subscription order #{order_id} has conflicting authenticated placement facts"
                 );
             }
+            correlated.push(first.clone());
+        }
+        start = end;
+    }
+    Ok(correlated)
+}
+
+#[cfg(feature = "shellnet")]
+async fn sync_subscription_match_once(
+    ops: &dyn SubscriptionOrderOps,
+    state_path: &std::path::Path,
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+    persist_handle: &PersistSubscriptionHandle<'_>,
+) -> Result<BuyerSubscriptionOrderRecord> {
+    let mut state = load_buyer_subscription_state(state_path, note_addr)?;
+    let current = subscription_order_record(&state, order_book, order_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("subscription order #{order_id} is absent from durable state")
+        })?;
+    let mut cursor = current.fill_cursor.clone();
+    let fills = ops
+        .attributed_subscription_fills(order_book, note_addr, &mut cursor)
+        .await?;
+    let mut correlated = Vec::<BuyerJournalMatch>::new();
+    for (fill_order_id, fill) in fills {
+        if fill_order_id != order_id {
             continue;
         }
-        book.subscriptions.push(BuyerSubscriptionRecord {
-            order_id: placement.order_id,
-            max_price_per_tick: placement.max_price_per_tick,
-            ticks: placement.ticks,
-            escrow: journal.escrow,
-            cycle_budget: placement.cycle_budget,
-            auto_renew: placement.auto_renew,
-            placed_at_unix: placement.created_at,
-            active: true,
-            matches: Vec::new(),
-        });
-    }
-    book.subscriptions
-        .sort_by_key(|subscription| subscription.order_id);
-    route_unattributed_subscription_matches(book);
-    Ok(())
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-async fn sync_subscription_state_with_backend(
-    chain: &dyn ChainBackend,
-    note_addr: &str,
-    state_path: &std::path::Path,
-    order_book: &str,
-    unattributed_order_id_floor: Option<u128>,
-) -> Result<BuyerSubscriptionState> {
-    let mut state = load_buyer_subscription_state(state_path, note_addr)?;
-    let Some(book_index) = state
-        .books
-        .iter()
-        .position(|book| book.order_book.eq_ignore_ascii_case(order_book))
-    else {
-        return Ok(state);
-    };
-    let mut cursor = state.books[book_index].fill_cursor.clone();
-    let fills = chain
-        .poll_attributed_model_buys_for_order_book(order_book, &mut cursor)
-        .await
-        .map_err(anyhow::Error::new)?;
-    persist_subscription_fills_and_cursor(
-        note_addr,
-        state_path,
-        &mut state,
-        book_index,
-        cursor,
-        fills,
-        unattributed_order_id_floor,
-    )?;
-    let order_ids = state.books[book_index]
-        .subscriptions
-        .iter()
-        .map(|subscription| subscription.order_id)
-        .collect::<Vec<_>>();
-    for order_id in order_ids {
-        let active = chain
-            .buyer_order_is_active_for_owner(order_book, order_id, note_addr)
-            .await
-            .map_err(anyhow::Error::new)?;
-        if let Some(subscription) = state.books[book_index]
-            .subscriptions
-            .iter_mut()
-            .find(|subscription| subscription.order_id == order_id)
-        {
-            subscription.active = active;
+        if fill.order_id != fill_order_id {
+            bail!(
+                "subscription order #{order_id} received an attributed fill whose embedded order \
+                 id is {}",
+                fill.order_id
+            );
+        }
+        let mut matched = journal_match(&fill);
+        matched.order_id = fill_order_id;
+        matched.token_contract = dexdo_core::Address::parse(&matched.token_contract)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "subscription fill TokenContract {}: {error}",
+                    matched.token_contract
+                )
+            })?
+            .with_workchain();
+        validate_subscription_match(&current, &matched)?;
+        if !correlated.contains(&matched) {
+            correlated.push(matched);
         }
     }
+    if correlated.len() > 1 {
+        bail!(
+            "subscription order #{order_id} produced {} distinct seller fills; expected exactly one",
+            correlated.len()
+        );
+    }
+    let fresh = correlated.into_iter().next();
+    let adopted = match (&current.matched, fresh.as_ref()) {
+        (Some(existing), Some(fresh)) => {
+            if existing.as_fill() != *fresh {
+                bail!(
+                    "subscription order #{order_id} already records seller {}, but a contradictory fill \
+                     names {}",
+                    existing.token_contract,
+                    fresh.token_contract
+                );
+            }
+            None
+        }
+        (None, Some(fresh)) => {
+            let facts = ops
+                .subscription_deal_facts(note_addr, &current, fresh)
+                .await?;
+            validate_subscription_deal_facts(note_addr, &current, fresh, &facts)?;
+            if facts.state.disputed || facts.state.is_stopped() {
+                bail!(
+                    "subscription order #{order_id} matched {}, but it is already terminal/disputed",
+                    fresh.token_contract
+                );
+            }
+            let handle = persist_handle(&current, fresh)?;
+            let mut matched = BuyerSubscriptionMatch::from_fill(fresh);
+            if matched.deal_handle != handle {
+                bail!(
+                    "subscription order #{order_id} handle writer returned {}, expected {}",
+                    handle,
+                    matched.deal_handle
+                );
+            }
+            matched.deal_handle = handle;
+            Some(matched)
+        }
+        _ => None,
+    };
+    let record = subscription_order_record_mut(&mut state, order_book, order_id)
+        .expect("record was resolved above");
+    if let Some(adopted) = adopted {
+        record.phase = BuyerSubscriptionPhase::Matched;
+        record.matched = Some(adopted);
+    }
+    record.fill_cursor = cursor;
+    let result = record.clone();
     write_buyer_subscription_state(state_path, &state)?;
-    Ok(state)
+    Ok(result)
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-async fn reconcile_subscription_submit_with_backend(
-    chain: &dyn ChainBackend,
+async fn refresh_subscription_match(
+    ops: &dyn SubscriptionOrderOps,
+    state_path: &std::path::Path,
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+) -> Result<(
+    BuyerSubscriptionOrderRecord,
+    SubscriptionDealFacts,
+    SubscriptionQuotaView,
+)> {
+    let mut state = load_buyer_subscription_state(state_path, note_addr)?;
+    let current = subscription_order_record(&state, order_book, order_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("subscription order #{order_id} is absent from durable state")
+        })?;
+    let matched = current.matched.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("subscription order #{order_id} has no matched TokenContract")
+    })?;
+    let fill = matched.as_fill();
+    let facts = ops
+        .subscription_deal_facts(note_addr, &current, &fill)
+        .await?;
+    let quota = validate_subscription_deal_facts(note_addr, &current, &fill, &facts)?;
+    let terminal = facts.state.disputed || facts.state.is_stopped();
+    let record = subscription_order_record_mut(&mut state, order_book, order_id)
+        .expect("record was resolved above");
+    match (record.phase, terminal) {
+        (BuyerSubscriptionPhase::Matched, true) => {
+            record.phase = BuyerSubscriptionPhase::Terminal;
+            write_buyer_subscription_state(state_path, &state)?;
+        }
+        (BuyerSubscriptionPhase::Terminal, false) => bail!(
+            "subscription order #{order_id} is durably terminal but TokenContract {} reports live",
+            matched.token_contract
+        ),
+        (BuyerSubscriptionPhase::Resting, _) => {
+            bail!("subscription order #{order_id} carries a match while phase is resting")
+        }
+        _ => {}
+    }
+    let state = load_buyer_subscription_state(state_path, note_addr)?;
+    let record = subscription_order_record(&state, order_book, order_id)
+        .expect("record survived refresh")
+        .clone();
+    Ok((record, facts, quota))
+}
+
+#[cfg(feature = "shellnet")]
+async fn reconcile_subscription_submit(
+    ops: &dyn SubscriptionOrderOps,
     journal_path: &std::path::Path,
     state_path: &std::path::Path,
     journal: &BuyerSubscriptionSubmitJournal,
-    wait: Option<std::time::Duration>,
-) -> Result<Vec<InferenceSubscriptionPlacement>> {
+    wait: std::time::Duration,
+    persist_handle: &PersistSubscriptionHandle<'_>,
+) -> Result<BuyerSubscriptionOrderRecord> {
+    journal.validate(&journal.note_addr)?;
     let started = std::time::Instant::now();
     loop {
-        let placements = chain
-            .subscription_placements_since(
+        let placements = ops
+            .subscription_placements(
                 &journal.order_book,
                 &journal.note_addr,
                 journal.order_id_floor,
                 journal.max_price_per_tick,
                 journal.ticks,
-                journal.cycle_budget,
-                journal.auto_renew,
             )
             .await
             .map_err(|error| {
                 anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                    "could not read placement facts for durable subscription submit {}; journal retained and no fresh BOC is safe: {error}",
+                    "could not read placement facts for durable subscription submit {}; journal \
+                     retained and no fresh BOC is safe: {error:#}",
                     journal.submit_identity
                 )))
             })?;
-        let mut state = load_buyer_subscription_state(state_path, &journal.note_addr)?;
-        let book_index = ensure_subscription_book(
-            &mut state,
-            &journal.order_book,
-            &journal.frame_model,
-            &journal.model_hash,
-            &journal.fill_cursor,
-        )?;
-        record_subscription_placements(&mut state, book_index, journal, &placements)?;
-        write_buyer_subscription_state(state_path, &state)?;
-        sync_subscription_state_with_backend(
-            chain,
-            &journal.note_addr,
-            state_path,
-            &journal.order_book,
-            Some(journal.order_id_floor),
-        )
-        .await
-        .map_err(|error| {
-            anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "could not persist fill/activity facts for durable subscription submit {}; journal retained and no fresh BOC is safe: {error:#}",
-                journal.submit_identity
-            )))
-        })?;
-        if placements.len() == 1 {
-            clear_buyer_submit_journal(journal_path)?;
-            return Ok(placements);
-        }
+        let placements =
+            coalesce_journal_subscription_placements(journal, placements).map_err(|error| {
+                anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
+                    "durable subscription submit {} has contradictory placement facts; journal \
+                     retained and no fresh BOC is safe: {error:#}",
+                    journal.submit_identity
+                )))
+            })?;
         if placements.len() > 1 {
             return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "durable subscription submit {} produced {} correlated placements; journal retained and no new BOC is safe",
+                "durable subscription submit {} produced {} exact correlated placements; journal \
+                 retained and no new BOC is safe",
                 journal.submit_identity,
                 placements.len()
             ))));
         }
-        let Some(timeout) = wait else {
-            return Ok(Vec::new());
-        };
-        if started.elapsed() >= timeout {
-            return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "subscription submit {} has no authoritative InferenceSubscriptionPlaced event yet; journal retained and no new BOC is safe",
-                journal.submit_identity
-            ))));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-async fn sync_subscription_state_with_real_chain(
-    chain: &dexdo_core::RealChainBackend,
-    note: &dexdo_core::Address,
-    state_path: &std::path::Path,
-    order_book: &dexdo_core::Address,
-    unattributed_order_id_floor: Option<u128>,
-) -> Result<BuyerSubscriptionState> {
-    let note_addr = note.with_workchain();
-    let order_book_addr = order_book.with_workchain();
-    let mut state = load_buyer_subscription_state(state_path, &note_addr)?;
-    let Some(book_index) = state
-        .books
-        .iter()
-        .position(|book| book.order_book.eq_ignore_ascii_case(&order_book_addr))
-    else {
-        return Ok(state);
-    };
-    let mut cursor = state.books[book_index].fill_cursor.clone();
-    let fills = chain
-        .poll_inference_attributed_fills(note, order_book, &mut cursor)
-        .await?;
-    persist_subscription_fills_and_cursor(
-        &note_addr,
-        state_path,
-        &mut state,
-        book_index,
-        cursor,
-        fills,
-        unattributed_order_id_floor,
-    )?;
-    let order_ids = state.books[book_index]
-        .subscriptions
-        .iter()
-        .map(|subscription| subscription.order_id)
-        .collect::<Vec<_>>();
-    for order_id in order_ids {
-        let active = chain
-            .inference_buyer_order_is_active_for_owner(order_book, order_id, &note_addr)
+        if let Some(placement) = placements.first() {
+            let mut state = load_buyer_subscription_state(state_path, &journal.note_addr)?;
+            record_subscription_placement(&mut state, journal, placement)?;
+            write_buyer_subscription_state(state_path, &state)?;
+            let record = sync_subscription_match_once(
+                ops,
+                state_path,
+                &journal.note_addr,
+                &journal.order_book,
+                placement.order_id,
+                persist_handle,
+            )
             .await?;
-        if let Some(subscription) = state.books[book_index]
-            .subscriptions
-            .iter_mut()
-            .find(|subscription| subscription.order_id == order_id)
-        {
-            subscription.active = active;
+            let active = ops
+                .subscription_order_active(
+                    &journal.order_book,
+                    placement.order_id,
+                    &journal.note_addr,
+                )
+                .await?;
+            match (active, record.matched.is_some()) {
+                (true, false) | (false, true) => {
+                    clear_buyer_submit_journal(journal_path)?;
+                    return Ok(record);
+                }
+                (true, true) => {
+                    return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
+                        "subscription order #{} is simultaneously resting and filled; journal \
+                         retained",
+                        placement.order_id
+                    ))));
+                }
+                (false, false) => {}
+            }
         }
+        if started.elapsed() >= wait {
+            return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
+                "subscription submit {} is not yet provable as one resting order or one full seller \
+                 fill; journal retained and no resubmit is safe",
+                journal.submit_identity
+            ))));
+        }
+        tokio::time::sleep(SUBSCRIPTION_ORDER_RECONCILE_POLL).await;
     }
-    write_buyer_subscription_state(state_path, &state)?;
-    Ok(state)
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-async fn reconcile_subscription_submit_with_real_chain(
-    chain: &dexdo_core::RealChainBackend,
+#[allow(clippy::too_many_arguments)]
+async fn submit_subscription_with_journal(
+    ops: &dyn SubscriptionOrderOps,
     note: &dexdo_core::Address,
+    keys: &dexdo_core::KeyPair,
+    order_book: &str,
+    frame_model: &str,
+    model_hash: &str,
+    max_price_per_tick: u128,
+    ticks: u128,
+    escrow: u128,
+    deadline: u64,
     journal_path: &std::path::Path,
     state_path: &std::path::Path,
-    journal: &BuyerSubscriptionSubmitJournal,
-    wait: Option<std::time::Duration>,
-) -> Result<Vec<InferenceSubscriptionPlacement>> {
-    let order_book = dexdo_core::Address::parse(&journal.order_book)
-        .map_err(|error| anyhow::anyhow!("buyer subscription journal order_book: {error}"))?;
-    let started = std::time::Instant::now();
-    loop {
-        let placements = chain
-            .inference_subscription_placements_since(
-                &order_book,
-                note,
-                journal.order_id_floor,
-                journal.max_price_per_tick,
-                journal.ticks,
-                journal.cycle_budget,
-                journal.auto_renew,
-            )
-            .await
-            .map_err(|error| {
-                anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                    "could not read placement facts for durable subscription submit {}; journal retained and no fresh BOC is safe: {error:#}",
-                    journal.submit_identity
-                )))
-            })?;
-        let mut state = load_buyer_subscription_state(state_path, &journal.note_addr)?;
-        let book_index = ensure_subscription_book(
-            &mut state,
-            &journal.order_book,
-            &journal.frame_model,
-            &journal.model_hash,
-            &journal.fill_cursor,
-        )?;
-        record_subscription_placements(&mut state, book_index, journal, &placements)?;
-        write_buyer_subscription_state(state_path, &state)?;
-        sync_subscription_state_with_real_chain(
-            chain,
-            note,
-            state_path,
-            &order_book,
-            Some(journal.order_id_floor),
+    wait: std::time::Duration,
+    persist_handle: &PersistSubscriptionHandle<'_>,
+) -> Result<BuyerSubscriptionOrderRecord> {
+    let note_addr = note.with_workchain();
+    let created_at_unix = unix_now_secs();
+    let order_flags = subscription_order_flags();
+    let reserve = validate_subscription_order_terms(
+        max_price_per_tick,
+        ticks,
+        escrow,
+        order_flags,
+        deadline,
+        created_at_unix,
+    )?;
+    let mut fill_cursor = MatchWatchCursor::new(0);
+    let mut before_post = |submit_identity: String,
+                           order_id_floor: u128,
+                           final_cursor: MatchWatchCursor,
+                           _pre_post_fills: Vec<(u128, MatchedFill)>| {
+        write_buyer_subscription_submit_journal(
+            journal_path,
+            &BuyerSubscriptionSubmitJournal {
+                schema: BUYER_SUBSCRIPTION_SUBMIT_SCHEMA.to_string(),
+                note_addr: note_addr.clone(),
+                order_book: order_book.to_string(),
+                frame_model: frame_model.to_string(),
+                model_hash: model_hash.to_string(),
+                max_price_per_tick,
+                ticks,
+                deposit: reserve.deposit,
+                buyer_bond: reserve.buyer_bond,
+                escrow,
+                flags: order_flags,
+                deadline,
+                order_id_floor,
+                fill_cursor: final_cursor,
+                submit_identity,
+                created_at_unix,
+            },
         )
-        .await
-        .map_err(|error| {
-            anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "could not persist fill/activity facts for durable subscription submit {}; journal retained and no fresh BOC is safe: {error:#}",
-                journal.submit_identity
-            )))
-        })?;
-        if placements.len() == 1 {
-            clear_buyer_submit_journal(journal_path)?;
-            return Ok(placements);
-        }
-        if placements.len() > 1 {
-            return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "durable subscription submit {} produced {} correlated placements; journal retained and no new BOC is safe",
-                journal.submit_identity,
-                placements.len()
-            ))));
-        }
-        let Some(timeout) = wait else {
-            return Ok(Vec::new());
-        };
-        if started.elapsed() >= timeout {
-            return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "subscription submit {} has no authoritative InferenceSubscriptionPlaced event yet; journal retained and no new BOC is safe",
-                journal.submit_identity
-            ))));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-fn retain_subscription_journal_after_submit_result<T>(
-    journal_path: &std::path::Path,
-    submit_result: &Result<T>,
-) -> Result<bool> {
-    let Some(error) = submit_result.as_ref().err() else {
-        return Ok(true);
     };
-    if !money_submit_error_clears_journal(error) {
-        return Ok(true);
+    let submit_result = ops
+        .submit_subscription_order(
+            note,
+            keys,
+            order_book,
+            model_hash,
+            max_price_per_tick,
+            ticks,
+            escrow,
+            order_flags,
+            deadline,
+            &mut fill_cursor,
+            &mut before_post,
+        )
+        .await;
+    if let Err(error) = &submit_result {
+        if money_submit_error_clears_journal(error) {
+            clear_buyer_submit_journal(journal_path)?;
+            return Err(anyhow::anyhow!("{error:#}"));
+        }
     }
-    clear_buyer_submit_journal(journal_path)?;
-    Ok(false)
+    let journal = match load_buyer_money_journal(journal_path, &note_addr)? {
+        Some(BuyerMoneyJournal::Subscription(journal)) => *journal,
+        Some(BuyerMoneyJournal::Buy(_)) => {
+            bail!("subscription submit journal was replaced by an ordinary BUY journal")
+        }
+        None => {
+            bail!("subscription money POST may have landed, but its durable journal disappeared")
+        }
+    };
+    reconcile_subscription_submit(
+        ops,
+        journal_path,
+        state_path,
+        &journal,
+        wait,
+        persist_handle,
+    )
+    .await
 }
 
 #[cfg(feature = "shellnet")]
@@ -1500,6 +2432,62 @@ fn persist_buyer_token_contract_for_note_result(
     let note_addr = note_addr
         .ok_or_else(|| anyhow::anyhow!("buyer note address disappeared after buyer money moved"))?;
     persist_pool_token_contract_for_note(&pool_path, note_addr, token_contract, "buyer")
+}
+
+#[cfg(feature = "shellnet")]
+fn persist_subscription_runtime_handle(
+    record: &BuyerSubscriptionOrderRecord,
+    matched: &BuyerJournalMatch,
+    note_addr: &str,
+    deals_dir: Option<&std::path::Path>,
+    market_path: Option<&std::path::Path>,
+    contracts: &std::path::Path,
+) -> Result<String> {
+    validate_subscription_match(record, matched)?;
+    let handle = deals::make_handle_id(&matched.token_contract, deals::DealHandleRole::Buyer);
+    let directory = deals::resolve_deals_dir(deals_dir)?;
+    let path = deals::handle_path(&directory, &handle);
+    if path.exists() {
+        let existing = deals::load_deal_handle(&path)?;
+        let same_identity = existing.handle == handle
+            && existing.role == deals::DealHandleRole::Buyer
+            && existing
+                .token_contract
+                .eq_ignore_ascii_case(&matched.token_contract)
+            && existing.note_addr.eq_ignore_ascii_case(note_addr)
+            && existing.frame_model == record.frame_model
+            && existing.created_order_ids.contains(&record.order_id);
+        if !same_identity {
+            bail!(
+                "subscription deal handle {} already exists with contradictory identity",
+                path.display()
+            );
+        }
+        return Ok(handle);
+    }
+    let saved = save_runtime_deal_handle(
+        RuntimeDealHandleInput {
+            role: deals::DealHandleRole::Buyer,
+            deals_dir,
+            token_contract: &matched.token_contract,
+            note_addr,
+            frame_model: &record.frame_model,
+            market: None,
+            market_path,
+            contracts,
+            endpoint: None,
+            created_order_ids: vec![record.order_id],
+        },
+        false,
+    )?;
+    if saved.handle != handle {
+        bail!(
+            "subscription deal handle persistence returned {}, expected {}",
+            saved.handle,
+            handle
+        );
+    }
+    Ok(handle)
 }
 
 #[cfg(feature = "shellnet")]
@@ -1736,7 +2724,7 @@ async fn reconcile_pending_buyer_submit(
                     journal.submit_identity
                 ))));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(BUYER_SUBMIT_RECONCILE_POLL_INTERVAL).await;
         }
     };
     let expected = journal.quote.fills.first();
@@ -1899,37 +2887,18 @@ async fn raise_pending_buyer_money_before_fresh_reads(
     money_lock.try_acquire()?;
     let journal_note = money_lock.note_addr.clone();
     let journal_path = money_lock.journal_path.clone();
-    let subscriptions_path = money_lock.subscriptions_path.clone();
     let Some(journal) = load_buyer_money_journal(&journal_path, &journal_note)? else {
         return Ok(None);
     };
     let pending = match journal {
         BuyerMoneyJournal::Buy(pending) => *pending,
-        BuyerMoneyJournal::Subscription(pending) => {
-            let placements = reconcile_subscription_submit_with_backend(
-                chain,
-                &journal_path,
-                &subscriptions_path,
-                &pending,
-                None,
-            )
-            .await?;
-            if placements.is_empty() {
-                return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                    "durable subscription submit {} is unresolved in {}; no fresh buyer read or BOC is safe",
-                    pending.submit_identity, pending.order_book
-                ))));
-            }
-            let ids = placements
-                .iter()
-                .map(|placement| placement.order_id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "durable subscription submit {} was reconciled before fresh buyer reads as order(s) {ids}; no new buyer BOC was sent",
-                pending.submit_identity
-            ))));
-        }
+        BuyerMoneyJournal::Subscription(pending) => bail!(
+            "buyer note {} has unresolved subscription submit {} in {}; reconcile it with `dexdo \
+             subscription place` before a quote-bound buy",
+            pending.note_addr,
+            pending.submit_identity,
+            pending.order_book
+        ),
     };
     let selection = BuyerQuoteSelection {
         order_book: if pending.expected_token_contract.is_some() {
@@ -2941,747 +3910,6 @@ fn merge_json_fields(base: &mut Value, extra: Value) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-struct SubscriptionPlacePlan {
-    ticks: u128,
-    escrow: u128,
-    unused_budget: u128,
-}
-
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-fn subscription_place_plan(args: &SubscriptionPlaceArgs) -> Result<SubscriptionPlacePlan> {
-    super::support::validate_price_step(args.max_price_per_tick)?;
-    let plan = match (args.ticks, args.budget) {
-        (Some(_), Some(_)) | (None, None) => {
-            bail!("subscription place requires exactly one of --ticks or --budget")
-        }
-        (Some(ticks), None) => {
-            if ticks == 0 {
-                bail!("subscription place requires --ticks > 0");
-            }
-            let escrow = required_escrow_for_buy(ticks, args.max_price_per_tick);
-            check_buy_deposit_headroom(escrow, ticks, args.max_price_per_tick)
-                .map_err(|e| anyhow::anyhow!("subscription escrow: {e}"))?;
-            SubscriptionPlacePlan {
-                ticks,
-                escrow,
-                unused_budget: 0,
-            }
-        }
-        (None, Some(budget)) => {
-            if budget == 0 {
-                bail!("subscription place requires --budget > 0");
-            }
-            let unit = required_escrow_for_buy(1, args.max_price_per_tick);
-            check_buy_deposit_headroom(unit, 1, args.max_price_per_tick)
-                .map_err(|e| anyhow::anyhow!("subscription budget: {e}"))?;
-            let ticks = budget / unit;
-            if ticks == 0 {
-                bail!(
-                    "subscription budget {budget} buys zero whole ticks at maxPricePerTick {} \
-                     (fee-inclusive unit {unit})",
-                    args.max_price_per_tick
-                );
-            }
-            let escrow = required_escrow_for_buy(ticks, args.max_price_per_tick);
-            check_buy_deposit_headroom(escrow, ticks, args.max_price_per_tick)
-                .map_err(|e| anyhow::anyhow!("subscription escrow: {e}"))?;
-            SubscriptionPlacePlan {
-                ticks,
-                escrow,
-                unused_budget: budget.saturating_sub(escrow),
-            }
-        }
-    };
-
-    let minimum_ticks = 2 * INFERENCE_SUBSCRIPTION_CYCLES;
-    let required_minimum = required_escrow_for_buy(minimum_ticks, args.max_price_per_tick);
-    check_buy_deposit_headroom(required_minimum, minimum_ticks, args.max_price_per_tick)
-        .map_err(|e| anyhow::anyhow!("subscription cycle budget: {e}"))?;
-    let required_cycle_budget = required_escrow_for_buy(2, args.max_price_per_tick);
-    let cycle_budget = plan.escrow / INFERENCE_SUBSCRIPTION_CYCLES;
-    if cycle_budget < required_cycle_budget {
-        let selector = match (args.ticks, args.budget) {
-            (Some(ticks), None) => format!("--ticks {ticks}"),
-            (None, Some(budget)) => format!("--budget {budget} raw SHELL"),
-            _ => unreachable!("subscription selector was validated above"),
-        };
-        bail!(
-            "subscription place {selector} derives ticks {} and escrow {} raw SHELL, giving \
-             cycleBudget {} raw SHELL below required per-cycle minimum {} raw SHELL: escrow / \
-             SUB_CYCLES={} must fund 2 fee-inclusive ticks per cycle at maxPricePerTick {}; minimum \
-             total escrow {} raw SHELL and minimum ticks {}",
-            plan.ticks,
-            plan.escrow,
-            cycle_budget,
-            required_cycle_budget,
-            INFERENCE_SUBSCRIPTION_CYCLES,
-            args.max_price_per_tick,
-            required_minimum,
-            minimum_ticks,
-        );
-    }
-    Ok(plan)
-}
-
-#[cfg(feature = "shellnet")]
-#[allow(dead_code)]
-async fn place_subscription_after_pool_preflight(
-    note_addr: &str,
-    submit: impl Future<Output = Result<Value>>,
-) -> Result<Value> {
-    preflight_buyer_pool_for_note(Some(note_addr))?;
-    submit.await
-}
-
-#[cfg(feature = "shellnet")]
-fn subscription_target(args: &SubscriptionArgs) -> Result<BookTarget> {
-    if let Some(market) = args.market.as_deref() {
-        if args.model.is_some() {
-            bail!("--market and --model are mutually exclusive for subscription");
-        }
-        target_from_market(market)
-    } else {
-        let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "subscription without --market requires --note-addr to derive the order-book address"
-            )
-        })?;
-        model_target_from_config(
-            &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
-            Some(note_addr),
-        )
-    }
-}
-
-#[cfg(feature = "shellnet")]
-fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<dexdo_core::Address> {
-    let note_addr = args
-        .identity
-        .note_addr
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("subscription {action} requires --note-addr"))?;
-    dexdo_core::Address::parse(note_addr)
-        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))
-}
-
-#[cfg(feature = "shellnet")]
-fn require_subscription_keys(
-    args: &SubscriptionArgs,
-    action: &str,
-    subcommand_note_key: Option<&std::path::Path>,
-) -> Result<dexdo_core::KeyPair> {
-    let note_key = match (args.identity.note_key.as_deref(), subcommand_note_key) {
-        (Some(parent), Some(child)) if parent != child => {
-            bail!(
-                "subscription {action}: pass --note-key only once; parent and place values differ"
-            )
-        }
-        (Some(parent), _) => parent,
-        (_, Some(child)) => child,
-        (None, None) => bail!("subscription {action} requires --note-key"),
-    };
-    dexdo_core::KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-        .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))
-}
-
-#[cfg(feature = "shellnet")]
-fn order_owned_by_note(order: &OrderBookOrder, note_addr: &str) -> bool {
-    let want = dexdo_core::normalize_wallet_address(note_addr)
-        .unwrap_or_else(|_| note_addr.trim().to_string());
-    dexdo_core::normalize_wallet_address(&order.owner_note)
-        .map(|owner| owner == want)
-        .unwrap_or_else(|_| order.owner_note.eq_ignore_ascii_case(&want))
-}
-
-#[cfg(feature = "shellnet")]
-fn render_subscription_line(
-    snapshot: &OrderBookSnapshot,
-    order_id: u128,
-    order: Option<&OrderBookOrder>,
-    sub: Option<&OrderBookSubscription>,
-) -> String {
-    let Some(sub) = sub else {
-        return format!(
-            "subscription model={} order_book={} order_id={} book_active={} exists=false order_found={}",
-            snapshot.frame_model,
-            snapshot.order_book,
-            order_id,
-            snapshot.active(),
-            order.is_some()
-        );
-    };
-    let Some(order) = order else {
-        let stale = sub.exists;
-        return format!(
-            "subscription model={} order_book={} order_id={} exists={} order_found=false stale_subscription={} period_start={} cur_cycle={} cycle_budget={} cycle_spent={} cycle_remaining={} auto_renew={}",
-            snapshot.frame_model,
-            snapshot.order_book,
-            order_id,
-            sub.exists,
-            stale,
-            sub.period_start,
-            sub.cur_cycle,
-            sub.cycle_budget,
-            sub.cycle_spent,
-            sub.cycle_remaining(),
-            sub.auto_renew
-        );
-    };
-    format!(
-        "subscription model={} order_book={} order_id={} exists={} owner={} price_per_tick={} ticks={} escrow={} deadline={} period_start={} cur_cycle={} cycle_budget={} cycle_spent={} cycle_remaining={} auto_renew={}",
-        snapshot.frame_model,
-        snapshot.order_book,
-        order_id,
-        sub.exists,
-        order.owner_note,
-        order.price_per_tick,
-        order.ticks,
-        order.escrow,
-        order.deadline,
-        sub.period_start,
-        sub.cur_cycle,
-        sub.cycle_budget,
-        sub.cycle_spent,
-        sub.cycle_remaining(),
-        sub.auto_renew
-    )
-}
-
-#[cfg(feature = "shellnet")]
-fn validate_subscription_poke<'a>(
-    order_book: &str,
-    order_is_resting: bool,
-    order_id: u128,
-    subscription: Option<&'a OrderBookSubscription>,
-) -> Result<&'a OrderBookSubscription> {
-    if !order_is_resting {
-        bail!(
-            "subscription poke: order {order_id} is not resting in selected order book {order_book}"
-        );
-    }
-    let subscription = subscription.ok_or_else(|| {
-        anyhow::anyhow!(
-            "subscription poke: getSubscription({order_id}) unavailable in {order_book}"
-        )
-    })?;
-    if !subscription.exists {
-        bail!("subscription poke: order {order_id} is not a live subscription in {order_book}");
-    }
-    Ok(subscription)
-}
-
-#[cfg(feature = "shellnet")]
-fn validate_subscription_poke_postread(
-    before_cycle: u8,
-    order_book_active: bool,
-    order_is_resting: bool,
-    subscription: Option<&OrderBookSubscription>,
-) -> Result<bool> {
-    if !order_book_active {
-        bail!("subscription poke: post-read order book is not Active");
-    }
-    match subscription {
-        Some(subscription) if subscription.exists => {
-            if subscription.cur_cycle < before_cycle {
-                bail!(
-                    "subscription poke: contradictory post-read cycle {} < {}",
-                    subscription.cur_cycle,
-                    before_cycle
-                );
-            }
-            Ok(order_is_resting && subscription.cur_cycle > before_cycle)
-        }
-        Some(_) => Ok(!order_is_resting),
-        None => bail!("subscription poke: post-read getSubscription unavailable"),
-    }
-}
-
-#[cfg(feature = "shellnet")]
-async fn submit_subscription_poke_after_validation(
-    preflight: Result<&OrderBookSubscription>,
-    submit: impl Future<Output = Result<Value>>,
-) -> Result<(u8, u128)> {
-    let before = preflight?;
-    let result = (before.cur_cycle, before.cycle_remaining());
-    submit.await?;
-    Ok(result)
-}
-
-#[cfg(feature = "shellnet")]
-async fn raise_subscription_place_journal_before_fresh_reads(
-    chain: &dexdo_core::RealChainBackend,
-    args: &SubscriptionArgs,
-) -> Result<()> {
-    if !matches!(&args.command, SubscriptionCommand::Place(_)) {
-        return Ok(());
-    }
-    let note_addr = args
-        .identity
-        .note_addr
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("subscription place requires --note-addr"))?;
-    let note = dexdo_core::Address::parse(note_addr)
-        .map_err(|error| anyhow::anyhow!("subscription place note: {error}"))?;
-    let mut money_lock = BuyerMoneyLock::open(note_addr)?;
-    let journal_note = money_lock.note_addr.clone();
-    let journal_path = money_lock.journal_path.clone();
-    let subscriptions_path = money_lock.subscriptions_path.clone();
-    money_lock.try_acquire()?;
-    let Some(journal) = load_buyer_money_journal(&journal_path, &journal_note)? else {
-        return Ok(());
-    };
-    match journal {
-        BuyerMoneyJournal::Buy(journal) => Err(anyhow::Error::new(
-            ChainError::AmbiguousSubmit(format!(
-                "subscription place refused before fresh market reads: buyer note {journal_note} has durable BUY submit {}",
-                journal.submit_identity
-            )),
-        )),
-        BuyerMoneyJournal::Subscription(journal) => {
-            let placements = reconcile_subscription_submit_with_real_chain(
-                chain,
-                &note,
-                &journal_path,
-                &subscriptions_path,
-                &journal,
-                Some(std::time::Duration::from_secs(DEAL_WAIT_SECS)),
-            )
-            .await?;
-            let ids = placements
-                .iter()
-                .map(|placement| placement.order_id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "durable subscription submit {} was reconciled before fresh market reads as order(s) {ids}; no new subscription BOC was sent",
-                journal.submit_identity
-            ))))
-        }
-    }
-}
-
-#[cfg(feature = "shellnet")]
-pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
-    // A subscription is a resting limit BUY. Compute and validate its exact escrow before backend
-    // construction, journal reconciliation, chain reads, money locks, signing, or submits.
-    let place_plan = match &args.command {
-        SubscriptionCommand::Place(place) => Some(subscription_place_plan(place)?),
-        _ => None,
-    };
-    let chain = dexdo_core::RealChainBackend::connect(
-        args.contracts
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
-    )?;
-    raise_subscription_place_journal_before_fresh_reads(&chain, &args).await?;
-    let registry_policy =
-        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
-    let target = if registry_policy.is_some() && args.market.is_none() {
-        let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "subscription without --market requires --note-addr to derive the order-book address"
-            )
-        })?;
-        let requested_model = registry_requested_model(
-            &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
-        )?;
-        BookTarget {
-            model_hash: model_hash_for(&requested_model),
-            frame_model: requested_model,
-            order_book: None,
-            root_model: None,
-            note_addr: Some(note_addr),
-        }
-    } else {
-        subscription_target(&args)?
-    };
-    let requested_model = target.frame_model.clone();
-    let (target, snapshot) =
-        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-            let target = resolve_model_registry_target(
-                RegistryRole::Buyer,
-                registry_policy.as_ref(),
-                &args.contracts,
-                &requested_model,
-                target,
-            )
-            .await?;
-            let snapshot = read_book_target(&chain, &target).await?;
-            if matches!(&args.command, SubscriptionCommand::Place(_)) {
-                if let Some(policy) = registry_policy.as_ref() {
-                    enforce_model_registry_policy(
-                        RegistryRole::Buyer,
-                        policy,
-                        &args.contracts,
-                        &target.frame_model,
-                        &snapshot.order_book,
-                        snapshot.active(),
-                        BuyerMissingBookPolicy::Reject,
-                    )
-                    .await?;
-                }
-            }
-            Ok((target, snapshot))
-        })
-        .await?;
-    if !snapshot.active() {
-        bail!(
-            "subscription: InferenceOrderBook {} for model {} is not active; run `dexdo deploy-market` or `dexdo provision` first",
-            snapshot.order_book,
-            snapshot.frame_model
-        );
-    }
-    let ob = dexdo_core::Address::parse(&snapshot.order_book)
-        .map_err(|e| anyhow::anyhow!("order_book {}: {e}", snapshot.order_book))?;
-
-    match &args.command {
-        SubscriptionCommand::Place(place) => {
-            let note_addr = args
-                .identity
-                .note_addr
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription place requires --note-addr"))?;
-            let note = require_subscription_note(&args, "place")?;
-            let keys = require_subscription_keys(&args, "place", place.note_key.as_deref())?;
-            let mut money_lock =
-                buyer_money_lock_for_submit(false, Some(note_addr))?.ok_or_else(|| {
-                    anyhow::anyhow!("subscription place requires a per-note money lock")
-                })?;
-            let journal_note = money_lock.note_addr.clone();
-            let journal_path = money_lock.journal_path.clone();
-            let subscriptions_path = money_lock.subscriptions_path.clone();
-            money_lock.try_acquire()?;
-            if let Some(pending) = load_buyer_money_journal(&journal_path, &journal_note)? {
-                match pending {
-                    BuyerMoneyJournal::Buy(pending) => {
-                        bail!(
-                            "subscription place refused: buyer note {} has unresolved quote-bound submit {} for intent {:?}",
-                            journal_note,
-                            pending.submit_identity,
-                            pending.intent.kind
-                        );
-                    }
-                    BuyerMoneyJournal::Subscription(pending) => {
-                        let placements = reconcile_subscription_submit_with_real_chain(
-                            &chain,
-                            &note,
-                            &journal_path,
-                            &subscriptions_path,
-                            &pending,
-                            Some(std::time::Duration::from_secs(DEAL_WAIT_SECS)),
-                        )
-                        .await?;
-                        let ids = placements
-                            .iter()
-                            .map(|placement| placement.order_id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                            "reconciled prior durable subscription submit {} as order(s) {ids}; no new subscription BOC was sent",
-                            pending.submit_identity
-                        ))));
-                    }
-                }
-            }
-            preflight_buyer_pool_for_note(Some(note_addr))?;
-            direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.assert_note_owner_matches("subscription place", &note, &keys),
-            )
-            .await?;
-            let plan = place_plan.expect("subscription place plan was preflighted");
-            let mut state = load_buyer_subscription_state(&subscriptions_path, &journal_note)?;
-            let book_index = ensure_subscription_book(
-                &mut state,
-                &snapshot.order_book,
-                &snapshot.frame_model,
-                &target.model_hash,
-                &dexdo_core::MatchWatchCursor::new(0),
-            )?;
-            write_buyer_subscription_state(&subscriptions_path, &state)?;
-            let mut fill_cursor = state.books[book_index].fill_cursor.clone();
-            let cycle_budget = plan.escrow / INFERENCE_SUBSCRIPTION_CYCLES;
-            let mut before_post =
-                |submit_identity: String,
-                 order_id_floor: u128,
-                 final_cursor: dexdo_core::MatchWatchCursor,
-                 pre_post_fills: Vec<(u128, dexdo_core::MatchedFill)>| {
-                    let mut state =
-                        load_buyer_subscription_state(&subscriptions_path, &journal_note)?;
-                    let book_index = ensure_subscription_book(
-                        &mut state,
-                        &snapshot.order_book,
-                        &snapshot.frame_model,
-                        &target.model_hash,
-                        &final_cursor,
-                    )?;
-                    persist_subscription_fills_and_cursor(
-                        &journal_note,
-                        &subscriptions_path,
-                        &mut state,
-                        book_index,
-                        final_cursor.clone(),
-                        pre_post_fills,
-                        None,
-                    )?;
-                    write_buyer_subscription_submit_journal(
-                        &journal_path,
-                        &BuyerSubscriptionSubmitJournal {
-                            schema: BUYER_SUBSCRIPTION_SUBMIT_SCHEMA.to_string(),
-                            note_addr: journal_note.clone(),
-                            order_book: snapshot.order_book.clone(),
-                            frame_model: snapshot.frame_model.clone(),
-                            model_hash: target.model_hash.clone(),
-                            max_price_per_tick: place.max_price_per_tick,
-                            ticks: plan.ticks,
-                            escrow: plan.escrow,
-                            cycle_budget,
-                            auto_renew: place.auto_renew,
-                            order_id_floor,
-                            fill_cursor: final_cursor,
-                            submit_identity,
-                            created_at_unix: unix_now_secs(),
-                        },
-                    )
-                };
-            let submit_result = chain
-                .place_inference_subscription_with_identity_and_cursors(
-                    &note,
-                    &keys,
-                    &ob,
-                    &target.model_hash,
-                    place.max_price_per_tick,
-                    plan.ticks,
-                    plan.escrow,
-                    place.auto_renew,
-                    &mut fill_cursor,
-                    &mut before_post,
-                )
-                .await;
-            retain_subscription_journal_after_submit_result(&journal_path, &submit_result)?;
-            if let Err(error) = submit_result {
-                if money_submit_error_clears_journal(&error) {
-                    return Err(error);
-                }
-            }
-            let journal = match load_buyer_money_journal(&journal_path, &journal_note)? {
-                Some(BuyerMoneyJournal::Subscription(journal)) => journal,
-                Some(BuyerMoneyJournal::Buy(_)) => {
-                    bail!("subscription submit journal was replaced by a BUY journal")
-                }
-                None => bail!(
-                    "subscription money POST may have landed, but its durable journal disappeared"
-                ),
-            };
-            let placements = reconcile_subscription_submit_with_real_chain(
-                &chain,
-                &note,
-                &journal_path,
-                &subscriptions_path,
-                &journal,
-                Some(std::time::Duration::from_secs(DEAL_WAIT_SECS)),
-            )
-            .await?;
-            if placements.len() != 1 {
-                bail!(
-                    "subscription submit {} matched {} placement events; no single order was adopted",
-                    journal.submit_identity,
-                    placements.len()
-                );
-            }
-            println!(
-                "subscription place confirmed model={} order_book={} owner={} order_id={} max_price_per_tick={} ticks={} escrow={} unused_budget={} auto_renew={}",
-                snapshot.frame_model,
-                snapshot.order_book,
-                note_addr,
-                placements[0].order_id,
-                place.max_price_per_tick,
-                plan.ticks,
-                plan.escrow,
-                plan.unused_budget,
-                place.auto_renew
-            );
-        }
-        SubscriptionCommand::Status { order_id } => {
-            let order_id = *order_id;
-            let order = snapshot.orders.iter().find(|o| o.order_id == order_id);
-            if let Some(note_addr) = args.identity.note_addr.as_deref() {
-                if let Some(order) = order {
-                    if !order_owned_by_note(order, note_addr) {
-                        bail!(
-                            "subscription status: order {order_id} is owned by {}, not note {note_addr}",
-                            order.owner_note
-                        );
-                    }
-                }
-            }
-            let sub = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.inference_orderbook_subscription(&ob, order_id),
-            )
-            .await?;
-            println!(
-                "{}",
-                render_subscription_line(&snapshot, order_id, order, sub.as_ref())
-            );
-        }
-        SubscriptionCommand::Cancel { order_id } => {
-            let order_id = *order_id;
-            let note_addr = args
-                .identity
-                .note_addr
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription cancel requires --note-addr"))?;
-            let order = snapshot
-                .orders
-                .iter()
-                .find(|o| o.order_id == order_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "refusing to cancel subscription: order {order_id} is not resting in {}",
-                        snapshot.order_book
-                    )
-                })?;
-            if !order_owned_by_note(order, note_addr) {
-                bail!(
-                    "refusing to cancel subscription: order {order_id} is owned by {}, not note {note_addr}",
-                    order.owner_note
-                );
-            }
-            let sub = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.inference_orderbook_subscription(&ob, order_id),
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "refusing to cancel subscription: could not read getSubscription({order_id})"
-                )
-            })?;
-            if !sub.exists {
-                bail!(
-                    "refusing to cancel subscription: order {order_id} is not a live subscription"
-                );
-            }
-            let note = require_subscription_note(&args, "cancel")?;
-            let keys = require_subscription_keys(&args, "cancel", None)?;
-            direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.assert_note_owner_matches("subscription cancel", &note, &keys),
-            )
-            .await?;
-            chain
-                .cancel_inference_order(&note, &keys, &target.model_hash, order_id)
-                .await?;
-            println!(
-                "subscription cancel submitted model={} order_book={} order_id={} owner={} cycle={} cycle_remaining={}",
-                snapshot.frame_model,
-                snapshot.order_book,
-                order_id,
-                note_addr,
-                sub.cur_cycle,
-                sub.cycle_remaining()
-            );
-        }
-        SubscriptionCommand::Poke { order_id } => {
-            let order_id = *order_id;
-            let deployed = dexdo_core::Deployed::load(&args.contracts)?;
-            let expected_hash = deployed
-                .contract_hashes
-                .get("InferenceOrderBook")
-                .ok_or_else(|| {
-                    anyhow::anyhow!("deployed manifest has no InferenceOrderBook code hash")
-                })?;
-            let (active, code_hash) = chain.account_active_code_hash(&ob).await?;
-            let canonical = dexdo_core::RealChainBackend::canonical_inference_orderbook_address(
-                &target.model_hash,
-            )?;
-            let params = chain
-                .inference_orderbook_params(&ob)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("InferenceOrderBook {ob} getParams unavailable"))?;
-            let target_identity_ok = active
-                && code_hash.as_deref() == Some(expected_hash.trim_start_matches("0x"))
-                && canonical.with_workchain() == ob.with_workchain()
-                && params["modelHash"]
-                    .as_str()
-                    .is_some_and(|hash| hash.eq_ignore_ascii_case(&target.model_hash));
-            let before_subscription = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.inference_orderbook_subscription(&ob, order_id),
-            )
-            .await?;
-            let preflight = if target_identity_ok {
-                validate_subscription_poke(
-                    &snapshot.order_book,
-                    snapshot
-                        .orders
-                        .iter()
-                        .any(|order| order.order_id == order_id),
-                    order_id,
-                    before_subscription.as_ref(),
-                )
-            } else {
-                bail!("subscription poke: wrong InferenceOrderBook identity");
-            };
-            let (before_cycle, before_remaining) = submit_subscription_poke_after_validation(
-                preflight,
-                chain.poke_inference_subscription(&ob, order_id),
-            )
-            .await?;
-            let after_snapshot = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                read_book_target(&chain, &target),
-            )
-            .await?;
-            let after_order = after_snapshot
-                .orders
-                .iter()
-                .find(|order| order.order_id == order_id);
-            let after_subscription = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.inference_orderbook_subscription(&ob, order_id),
-            )
-            .await?;
-            let confirmed = validate_subscription_poke_postread(
-                before_cycle,
-                after_snapshot.active(),
-                after_order.is_some(),
-                after_subscription.as_ref(),
-            )?;
-            let status = if confirmed { "confirmed" } else { "pending" };
-            println!(
-                "subscription poke submitted model={} order_book={} order_id={} before_cycle={} before_remaining={} status={} after={}",
-                snapshot.frame_model,
-                snapshot.order_book,
-                order_id,
-                before_cycle,
-                before_remaining,
-                status,
-                render_subscription_line(
-                    &after_snapshot,
-                    order_id,
-                    after_order,
-                    after_subscription.as_ref()
-                )
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_subscription(_args: SubscriptionArgs) -> Result<()> {
-    bail!("subscription unavailable: build with `--features shellnet`")
-}
 /// Render the per-model inference order book before a model-only buy: reads the resting asks
 /// (`discover_offers`) and delegates to [`print_book_table`], marking asks executable at
 /// `--max-price-per-tick` and appending the buyer's order summary.
@@ -3751,6 +3979,7 @@ fn buyer_renewal_threshold_tokens() -> u64 {
             dexdo::buyer::continuity::ContinuityConfig::default().renewal_threshold_tokens
         })
 }
+
 fn elapsed_since(now_secs: u64, at: Option<u64>) -> u64 {
     at.filter(|v| *v > 0)
         .map(|v| now_secs.saturating_sub(v))
@@ -3840,15 +4069,27 @@ async fn apply_malformed_handover_policy(
     buyer: &dexdo::buyer::Buyer,
     token_contract: &dexdo_core::TokenContract,
     buyer_policy: &policy::BuyerRuntimePolicy,
+    preserve_matched_subscription: bool,
     error: &anyhow::Error,
 ) -> Result<()> {
+    if preserve_matched_subscription {
+        bail!(
+            "buyer: malformed handover for {token_contract}: {error}\n\
+             policy_action failure_class=malformed_handover action={} token_contract={token_contract} \
+             state=matched/subscription result=subscription_preserved chain_write_submitted=false",
+            buyer_policy.malformed_handover.as_str()
+        );
+    }
     match buyer_policy.malformed_handover {
         policy::MalformedHandoverAction::Reclaim => {
-            let settlement = chain.seller_timeout(token_contract).await?;
+            // A malformed handover means the deal is unusable; STOP recovers the escrow immediately. There
+            // is no inactivity gate to wait out any more, and stopping returns everything except the
+            // consumption already promoted.
+            let settlement = chain.stop(token_contract, buyer.note.as_ref()).await?;
             bail!(
                 "buyer: malformed handover for {token_contract}: {error}\n\
                  policy_action failure_class=malformed_handover action=reclaim token_contract={token_contract} \
-                 state=funded/opened result=reclaimed settlement={settlement:?}"
+                 state=funded/opened result=reclaimed settlement={settlement}"
             );
         }
         policy::MalformedHandoverAction::Dispute => {
@@ -3856,7 +4097,7 @@ async fn apply_malformed_handover_policy(
             bail!(
                 "buyer: malformed handover for {token_contract}: {error}\n\
                  policy_action failure_class=malformed_handover action=dispute token_contract={token_contract} \
-                 state=funded/opened/disputed result=dispute_opened settlement={settlement:?}; \
+                 state=funded/opened/disputed result=dispute_opened settlement={settlement}; \
                  warning=dispute_freezes_this_token_contract_buyer_D_and_seller_bond_until_resolution"
             );
         }
@@ -3930,7 +4171,7 @@ async fn policy_cleanup_unopened_after_match_timeout(
     let settlement = chain.cleanup_unopened(token_contract).await?;
     println!(
         "policy_action failure_class=no_handover_after_match action={} token_contract={} \
-         state=funded/opened result=cleanup_unopened_submitted settlement={settlement:?}",
+         state=funded/opened result=cleanup_unopened_submitted settlement={settlement}",
         policy_action.as_str(),
         token_contract
     );
@@ -4042,11 +4283,20 @@ async fn apply_no_handover_after_match_policy(
     buyer: &dexdo::buyer::Buyer,
     token_contract: &dexdo_core::TokenContract,
     buyer_policy: &policy::BuyerRuntimePolicy,
+    preserve_matched_subscription: bool,
     next_buy: Option<(u128, u128, u128)>,
     attempt: u64,
     diagnostic: &str,
     pool_note_addr: Option<&str>,
 ) -> Result<NoHandoverPolicyOutcome> {
+    if preserve_matched_subscription {
+        bail!(
+            "{diagnostic}\npolicy_action failure_class=no_handover_after_match action={} \
+             token_contract={token_contract} state=matched/subscription \
+             result=subscription_preserved chain_write_submitted=false",
+            buyer_policy.no_handover_after_match.as_str()
+        );
+    }
     match buyer_policy.no_handover_after_match {
         policy::NoHandoverAfterMatchAction::FailClosed => {
             bail!(
@@ -4066,7 +4316,7 @@ async fn apply_no_handover_after_match_policy(
             };
             bail!(
                 "{diagnostic}\npolicy_action failure_class=no_handover_after_match action=wait_then_reclaim \
-                 token_contract={token_contract} state=funded/opened result=money_reclaimed settlement={settlement:?}"
+                 token_contract={token_contract} state=funded/opened result=money_reclaimed settlement={settlement}"
             );
         }
         policy::NoHandoverAfterMatchAction::NextSeller => {
@@ -4141,7 +4391,7 @@ fn buyer_monitor_current_facts(
         return DealFacts::closed(token_contract);
     }
     if state.opened {
-        let latest_activity = state.last_advance.max(last_accepted_output_secs);
+        let latest_activity = state.last_claim_time.max(last_accepted_output_secs);
         let idle_secs = if latest_activity == 0 {
             0
         } else {
@@ -4149,7 +4399,9 @@ fn buyer_monitor_current_facts(
         };
         return DealFacts::opened_idle(token_contract, idle_secs);
     }
-    if state.funded && !state.probe_accepted {
+    // Funded with escrow still held and never opened: the recoverable no-show case. A settled close drains
+    // the deposit, which is what tells the two apart now that the probe latch is gone.
+    if state.funded && !state.is_stopped() {
         return DealFacts::funded_never_opened(
             token_contract,
             elapsed_since(now_secs, state.funded_time),
@@ -4186,7 +4438,7 @@ fn on_demand_monitor_defers_buy(
 
 #[cfg(not(test))]
 fn buyer_monitor_poll_interval() -> std::time::Duration {
-    std::time::Duration::from_secs(1)
+    BUYER_MONITOR_POLL_INTERVAL
 }
 
 #[cfg(test)]
@@ -4196,7 +4448,7 @@ fn buyer_monitor_poll_interval() -> std::time::Duration {
 
 #[cfg(not(test))]
 fn buyer_monitor_recovery_backoff() -> std::time::Duration {
-    std::time::Duration::from_secs(30)
+    BUYER_MONITOR_RECOVERY_BACKOFF
 }
 
 #[cfg(test)]
@@ -4207,7 +4459,6 @@ fn buyer_monitor_recovery_backoff() -> std::time::Duration {
 async fn execute_buyer_monitor_recovery(
     chain: &dyn ChainBackend,
     action: dexdo::buyer::continuity::BuyerAction,
-    heartbeat: Option<&dexdo_core::chain::HeartbeatGuard>,
     session: Option<&dexdo::buyer::api::SessionSettle>,
 ) -> Option<(
     BuyerMonitorRecoveryKind,
@@ -4224,22 +4475,6 @@ async fn execute_buyer_monitor_recovery(
             };
             Some((
                 BuyerMonitorRecoveryKind::CleanupUnopened,
-                token_contract,
-                result,
-            ))
-        }
-        BuyerAction::ReclaimOpened { token_contract } => {
-            let heartbeat = heartbeat?;
-            let result = match session {
-                Some(session) => session.recover_reclaim_opened(heartbeat, false).await,
-                None => {
-                    chain
-                        .seller_timeout_if_heartbeat(&token_contract, heartbeat)
-                        .await
-                }
-            };
-            Some((
-                BuyerMonitorRecoveryKind::ReclaimOpened,
                 token_contract,
                 result,
             ))
@@ -4288,8 +4523,9 @@ async fn submit_buyer_monitor_next_deal(
     escrow: u128,
 ) -> Result<dexdo_core::TokenContract, ChainError> {
     let since_unix = unix_now_secs() as i64;
+    let deadline = buy_order_deadline().map_err(|e| ChainError::Chain(e.to_string()))?;
     chain
-        .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
+        .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow, 0, deadline)
         .await?;
     let fill = chain
         .wait_matched_token_contract(since_unix, std::time::Duration::from_secs(DEAL_WAIT_SECS))
@@ -4329,8 +4565,6 @@ fn spawn_buyer_service_renewal(
         retry_at: std::time::Instant,
     }
 
-    const RENEWAL_FAILURE_BACKOFF_SECS: u64 = 30;
-    const CONSUMER_DEMAND_RECENT_SECS: u64 = 30;
     let on_demand_recovery =
         continuity_mode == dexdo::buyer::continuity::ContinuityMode::OnDemand && deals.is_lazy();
 
@@ -4416,6 +4650,23 @@ fn spawn_buyer_service_renewal(
                         );
                         continue;
                     }
+                    Ok(_)
+                        if active
+                            .session
+                            .recovery_submit_may_have_landed(recovery_kind) =>
+                    {
+                        retry.retry_at =
+                            std::time::Instant::now() + buyer_monitor_recovery_backoff();
+                        planner.keep_active(&current_tc);
+                        tracing::warn!(
+                            token_contract = %current_tc,
+                            recovery_action = ?recovery_kind,
+                            backoff_ms = buyer_monitor_recovery_backoff().as_millis(),
+                            outcome = "possibly_landed_waiting_for_terminal_fact",
+                            "buyer continuity: fresh state is still non-terminal; automatic recovery resubmit remains suppressed"
+                        );
+                        continue;
+                    }
                     Ok(_) => {
                         planner.keep_active(&current_tc);
                         recovery_retry = None;
@@ -4435,8 +4686,6 @@ fn spawn_buyer_service_renewal(
                 }
             };
             let now_secs = unix_now_secs();
-            let accepted_output_heartbeat = active.accepted_output_guard();
-            let current_opened = chain_state.as_ref().is_some_and(|state| state.opened);
             let current_facts = buyer_monitor_current_facts(
                 current_tc.clone(),
                 active.remaining_tokens(),
@@ -4470,15 +4719,14 @@ fn spawn_buyer_service_renewal(
                             cfg,
                         );
                         if let Some((_kind, token_contract, result)) =
-                            execute_buyer_monitor_recovery(chain.as_ref(), recovery, None, None)
-                                .await
+                            execute_buyer_monitor_recovery(chain.as_ref(), recovery, None).await
                         {
                             match result {
                                 Ok(Some(settlement)) => {
                                     tracing::warn!(
                                         current = %current_tc,
                                         next = %token_contract,
-                                        settlement = ?settlement,
+                                        settlement = %settlement,
                                         "buyer continuity: cleaned up renewal deal that never opened"
                                     );
                                 }
@@ -4507,27 +4755,10 @@ fn spawn_buyer_service_renewal(
                 continue;
             }
 
-            let mut current_cfg = cfg;
-            if current_opened {
-                current_cfg.stream_timeout_secs = match chain.deal_stream_timeout(&current_tc).await
-                {
-                    Ok(timeout) => timeout,
-                    Err(e) => {
-                        planner.keep_active(&current_tc);
-                        tracing::warn!(
-                            token_contract = %current_tc,
-                            error = %e,
-                            "buyer continuity: getConfig().streamTimeout unreadable; refusing inactivity reclaim"
-                        );
-                        continue;
-                    }
-                };
-            }
-
             let action = planner.tick_with_mode(
                 Some(current_facts),
                 ready_next,
-                current_cfg,
+                cfg,
                 continuity_mode,
                 consumer_demand,
             );
@@ -4554,51 +4785,41 @@ fn spawn_buyer_service_renewal(
                         "buyer continuity: fail-closed planner action"
                     );
                 }
-                action @ (BuyerAction::CleanupUnopened { .. }
-                | BuyerAction::ReclaimOpened { .. }) => {
+                action @ BuyerAction::CleanupUnopened { .. } => {
                     if on_demand_recovery && !active.session.is_closed() {
-                        if matches!(&action, BuyerAction::ReclaimOpened { .. })
-                            && active.has_active_request()
-                        {
-                            active.session.close_recovery_episode(
-                                BuyerMonitorRecoveryKind::ReclaimOpened,
-                                "active-consumer-request-without-accepted-output-at-stream-timeout",
-                            );
-                        } else {
-                            planner.keep_active(&current_tc);
-                            tracing::debug!(
-                                token_contract = %current_tc,
-                                outcome = "healthy_session_not_recoverable",
-                                "buyer continuity: on-demand recovery waits for a failed local session"
-                            );
-                            continue;
-                        }
+                        planner.keep_active(&current_tc);
+                        tracing::debug!(
+                            token_contract = %current_tc,
+                            outcome = "healthy_session_not_recoverable",
+                            "buyer continuity: on-demand recovery waits for a failed local session"
+                        );
+                        continue;
                     }
                     if let Some((kind, token_contract, result)) = execute_buyer_monitor_recovery(
                         chain.as_ref(),
                         action,
-                        Some(&accepted_output_heartbeat),
                         Some(active.session.as_ref()),
                     )
                     .await
                     {
-                        match (kind, result) {
-                            (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(Some(settlement))) => {
+                        debug_assert_eq!(kind, BuyerMonitorRecoveryKind::CleanupUnopened);
+                        match result {
+                            Ok(Some(settlement)) => {
                                 tracing::warn!(
                                     token_contract = %token_contract,
-                                    settlement = ?settlement,
+                                    settlement = %settlement,
                                     outcome = "terminal",
                                     "buyer continuity: cleaned current funded-never-opened deal"
                                 );
                             }
-                            (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(None)) => {
+                            Ok(None) => {
                                 tracing::debug!(
                                     token_contract = %token_contract,
                                     outcome = "already_terminal",
                                     "buyer continuity: cleanup recovery needed no transaction"
                                 );
                             }
-                            (BuyerMonitorRecoveryKind::CleanupUnopened, Err(e)) => {
+                            Err(e) => {
                                 if on_demand_recovery {
                                     planner.keep_active(&token_contract);
                                     recovery_retry = Some(RecoveryRetry {
@@ -4619,46 +4840,6 @@ fn spawn_buyer_service_renewal(
                                         token_contract = %token_contract,
                                         error = %e,
                                         "buyer continuity: cleanup current funded-never-opened deal failed"
-                                    );
-                                }
-                            }
-                            (BuyerMonitorRecoveryKind::ReclaimOpened, Ok(Some(settlement))) => {
-                                tracing::warn!(
-                                    token_contract = %token_contract,
-                                    settlement = ?settlement,
-                                    outcome = "terminal",
-                                    "buyer continuity: reclaimed current opened idle deal"
-                                );
-                            }
-                            (BuyerMonitorRecoveryKind::ReclaimOpened, Ok(None)) => {
-                                planner.keep_active(&token_contract);
-                                tracing::info!(
-                                    token_contract = %token_contract,
-                                    outcome = "accepted_output_heartbeat_changed",
-                                    "buyer continuity: reclaim cancelled before submit"
-                                );
-                            }
-                            (BuyerMonitorRecoveryKind::ReclaimOpened, Err(e)) => {
-                                if on_demand_recovery {
-                                    planner.keep_active(&token_contract);
-                                    recovery_retry = Some(RecoveryRetry {
-                                        current: token_contract.clone(),
-                                        kind,
-                                        retry_at: std::time::Instant::now()
-                                            + buyer_monitor_recovery_backoff(),
-                                    });
-                                    tracing::warn!(
-                                        token_contract = %token_contract,
-                                        error = %e,
-                                        backoff_ms = buyer_monitor_recovery_backoff().as_millis(),
-                                        outcome = "retry_scheduled",
-                                        "buyer continuity: reclaim current opened idle deal failed"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        token_contract = %token_contract,
-                                        error = %e,
-                                        "buyer continuity: reclaim current opened idle deal failed"
                                     );
                                 }
                             }
@@ -4910,6 +5091,1295 @@ impl BuyerCommandRuntime {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubscriptionPlacePlan {
+    ticks: u128,
+    reserve: SubscriptionBuyReserve,
+}
+
+fn subscription_place_plan(args: &SubscriptionPlaceArgs) -> Result<SubscriptionPlacePlan> {
+    let reserve = subscription_buy_reserve(args.ticks, args.max_price_per_tick)
+        .map_err(anyhow::Error::msg)?;
+    validate_subscription_order_terms(
+        args.max_price_per_tick,
+        args.ticks,
+        reserve.total_escrow,
+        subscription_order_flags(),
+        2,
+        1,
+    )?;
+    Ok(SubscriptionPlacePlan {
+        ticks: args.ticks,
+        reserve,
+    })
+}
+
+fn subscription_mock_mode(mock: &MockFlags) -> Result<bool> {
+    match (mock.mock_model, mock.mock_chain) {
+        (false, false) => Ok(false),
+        (true, true) => Ok(true),
+        _ => bail!(
+            "subscription mock mode requires --mock-model and --mock-chain together; omit both \
+             flags for real shellnet"
+        ),
+    }
+}
+
+fn mock_subscription_target(args: &SubscriptionArgs) -> Result<(String, String)> {
+    if let Some(market_path) = args.market.as_deref() {
+        if args.model.is_some() {
+            bail!("--market and --model are mutually exclusive for subscription");
+        }
+        let market = load_market(market_path)?;
+        return Ok((market.frame_model, market.inference_order_book));
+    }
+
+    let requested_model = args
+        .model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?;
+    let frame_model = if requested_model.contains("--") || requested_model.contains('/') {
+        requested_model.to_string()
+    } else {
+        dexdo::seller::ModelsConfig::load(&args.models)?
+            .get(requested_model)?
+            .frame_model
+            .clone()
+    };
+    if frame_model.trim().is_empty() {
+        bail!("subscription model id must not be empty");
+    }
+    let model_hash = model_hash_for(&frame_model);
+    let order_book = format!(
+        "0:{}",
+        model_hash
+            .strip_prefix("0x")
+            .expect("model_hash_for always returns 0x-prefixed hex")
+    );
+    Ok((frame_model, order_book))
+}
+
+fn execute_mock_subscription_command(
+    backend: &dexdo_core::MockChainBackend,
+    note: &dexdo_core::LocalNote,
+    frame_model: &str,
+    order_book: &str,
+    command: &SubscriptionCommand,
+    place_plan: Option<SubscriptionPlacePlan>,
+) -> Result<String> {
+    match command {
+        SubscriptionCommand::Place(place) => {
+            let plan = place_plan.expect("place plan is present for subscription place");
+            let deadline = buy_order_deadline()?;
+            let order = backend.place_subscription_order(
+                order_book,
+                note,
+                place.max_price_per_tick,
+                plan.ticks,
+                plan.reserve.total_escrow,
+                subscription_order_flags(),
+                deadline,
+            )?;
+            Ok(format!(
+                "subscription place confirmed network=mock model={frame_model} \
+                 order_book={order_book} owner={} order_id={} max_price_per_tick={} ticks={} \
+                 deposit={} buyer_bond={} total_escrow={} flags=0x{:02x} deadline={} \
+                 resting=true matched_token_contract=-",
+                order.owner_note,
+                order.order_id,
+                order.price_per_tick,
+                order.ticks,
+                plan.reserve.deposit,
+                plan.reserve.buyer_bond,
+                order.escrow,
+                order.flags,
+                order.deadline
+            ))
+        }
+        SubscriptionCommand::Status { order_id } => {
+            let order = backend
+                .subscription_order(order_book, *order_id, note)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mock subscription order {order_id} is absent or owned by another note"
+                    )
+                })?;
+            let reserve = validate_subscription_order_terms(
+                order.price_per_tick,
+                order.ticks,
+                order.escrow,
+                order.flags,
+                order.deadline,
+                order.timestamp,
+            )?;
+            Ok(format!(
+                "subscription network=mock model={frame_model} order_book={order_book} \
+                 order_id={} owner={} price_per_tick={} ticks={} deposit={} buyer_bond={} \
+                 total_escrow={} flags=0x{:02x} deadline={} resting=true \
+                 matched_token_contract=-",
+                order.order_id,
+                order.owner_note,
+                order.price_per_tick,
+                order.ticks,
+                reserve.deposit,
+                reserve.buyer_bond,
+                order.escrow,
+                order.flags,
+                order.deadline
+            ))
+        }
+        SubscriptionCommand::Cancel { order_id } => {
+            let order = backend.cancel_subscription_order(order_book, *order_id, note)?;
+            Ok(format!(
+                "subscription cancel confirmed network=mock model={frame_model} \
+                 order_book={order_book} order_id={} owner={} refund={}",
+                order.order_id, order.owner_note, order.escrow
+            ))
+        }
+    }
+}
+
+fn run_mock_subscription(
+    args: &SubscriptionArgs,
+    place_plan: Option<SubscriptionPlacePlan>,
+) -> Result<()> {
+    let endpoints_file = resolve_endpoints_file(args.endpoints_file.clone())?;
+    let backend = dexdo_core::MockChainBackend::new(
+        endpoints_file,
+        dexdo_core::ProtocolConsts::canonical(),
+        dexdo_core::DobParams::canonical(),
+    );
+    let mut identity = args.identity.clone();
+    if let SubscriptionCommand::Place(place) = &args.command {
+        identity.note_key = match (args.identity.note_key.as_deref(), place.note_key.as_deref()) {
+            (Some(parent), Some(child)) if parent != child => {
+                bail!(
+                    "subscription place: pass --note-key only once; parent and place values differ"
+                )
+            }
+            (Some(parent), _) => Some(parent.to_path_buf()),
+            (_, Some(child)) => Some(child.to_path_buf()),
+            (None, None) => None,
+        };
+    }
+    let note = load_note_identity(&identity)?;
+    let (frame_model, order_book) = mock_subscription_target(args)?;
+    let output = execute_mock_subscription_command(
+        &backend,
+        &note,
+        &frame_model,
+        &order_book,
+        &args.command,
+        place_plan,
+    )?;
+    println!("{output}");
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn ensure_subscription_note_balance(
+    balance: Option<u128>,
+    reserve: SubscriptionBuyReserve,
+) -> Result<u128> {
+    let balance = balance.ok_or_else(|| {
+        anyhow::anyhow!(
+            "subscription place cannot prove live account ECC[{SHELL_ECC_ID}] SHELL balance; \
+             missing currency is not treated as zero"
+        )
+    })?;
+    if balance < reserve.total_escrow {
+        bail!(
+            "subscription place requires total escrow {} raw SHELL (= deposit {} + buyer bond {}), \
+             but live account ECC[{SHELL_ECC_ID}] balance is {balance}",
+            reserve.total_escrow,
+            reserve.deposit,
+            reserve.buyer_bond
+        );
+    }
+    Ok(balance)
+}
+
+#[cfg(feature = "shellnet")]
+async fn subscription_note_ecc_balance(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+) -> Result<u128> {
+    let account = chain
+        .client()
+        .get_account(note)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("PrivateNote {note} account is missing"))?;
+    chain.assert_note_balance_private_note_account(note, Some(&account))?;
+    account
+        .ecc
+        .iter()
+        .find(|(currency, _)| *currency == SHELL_ECC_ID)
+        .map(|(_, balance)| *balance)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription place cannot prove live account ECC[{SHELL_ECC_ID}] SHELL balance; \
+                 missing currency is not treated as zero"
+            )
+        })
+}
+
+#[cfg(feature = "shellnet")]
+fn subscription_target(args: &SubscriptionArgs) -> Result<BookTarget> {
+    if let Some(market) = args.market.as_deref() {
+        if args.model.is_some() {
+            bail!("--market and --model are mutually exclusive for subscription");
+        }
+        target_from_market(market)
+    } else {
+        let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription without --market requires --note-addr to derive the order-book address"
+            )
+        })?;
+        model_target_from_config(
+            &args.models,
+            args.model
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
+            Some(note_addr),
+        )
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<dexdo_core::Address> {
+    let note_addr = args
+        .identity
+        .note_addr
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("subscription {action} requires --note-addr"))?;
+    dexdo_core::Address::parse(note_addr)
+        .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))
+}
+
+#[cfg(feature = "shellnet")]
+fn require_subscription_keys(
+    args: &SubscriptionArgs,
+    action: &str,
+    subcommand_note_key: Option<&std::path::Path>,
+) -> Result<dexdo_core::KeyPair> {
+    let note_key = match (args.identity.note_key.as_deref(), subcommand_note_key) {
+        (Some(parent), Some(child)) if parent != child => {
+            bail!(
+                "subscription {action}: pass --note-key only once; parent and place values differ"
+            )
+        }
+        (Some(parent), _) => parent,
+        (_, Some(child)) => child,
+        (None, None) => bail!("subscription {action} requires --note-key"),
+    };
+    dexdo_core::KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
+        .map_err(|error| anyhow::anyhow!("--note-key (SDK secret hex): {error:?}"))
+}
+
+#[cfg(feature = "shellnet")]
+fn order_owned_by_note(order: &OrderBookOrder, note_addr: &str) -> bool {
+    let expected = dexdo_core::normalize_wallet_address(note_addr)
+        .unwrap_or_else(|_| note_addr.trim().to_string());
+    dexdo_core::normalize_wallet_address(&order.owner_note)
+        .map(|owner| owner == expected)
+        .unwrap_or_else(|_| order.owner_note.eq_ignore_ascii_case(&expected))
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_live_order<'a>(
+    order_book: &str,
+    order: Option<&'a OrderBookOrder>,
+    order_id: u128,
+    note_addr: &str,
+) -> Result<&'a OrderBookOrder> {
+    let order = order.ok_or_else(|| {
+        anyhow::anyhow!("subscription order {order_id} is not resting in {order_book}")
+    })?;
+    if order.order_id != order_id {
+        bail!(
+            "subscription order getter returned #{} while #{} was requested",
+            order.order_id,
+            order_id
+        );
+    }
+    if !order_owned_by_note(order, note_addr) {
+        bail!(
+            "subscription order {order_id} is owned by {}, not note {note_addr}",
+            order.owner_note
+        );
+    }
+    if !order.is_buy || order.token_contract.is_some() {
+        bail!("order {order_id} is not an ordinary resting BUY");
+    }
+    validate_subscription_order_terms(
+        order.price_per_tick,
+        order.ticks,
+        order.escrow,
+        order.flags,
+        order.deadline,
+        order.timestamp,
+    )?;
+    Ok(order)
+}
+
+#[cfg(feature = "shellnet")]
+async fn read_subscription_book_summary(
+    chain: &dexdo_core::RealChainBackend,
+    target: &BookTarget,
+) -> Result<OrderBookSnapshot> {
+    let order_book = resolve_order_book_target(chain, target).await?;
+    let order_book = dexdo_core::Address::parse(&order_book)
+        .map_err(|error| anyhow::anyhow!("order_book {order_book}: {error}"))?;
+    chain
+        .inference_orderbook_summary(&order_book, &target.frame_model, &target.model_hash)
+        .await
+}
+
+#[cfg(feature = "shellnet")]
+fn ensure_subscription_record_from_order(
+    state: &mut BuyerSubscriptionState,
+    snapshot: &OrderBookSnapshot,
+    order: &OrderBookOrder,
+) -> Result<BuyerSubscriptionOrderRecord> {
+    if let Some(existing) = subscription_order_record(state, &snapshot.order_book, order.order_id) {
+        validate_subscription_record_matches_live_order(existing, snapshot, order)?;
+        return Ok(existing.clone());
+    }
+    let reserve = validate_subscription_order_terms(
+        order.price_per_tick,
+        order.ticks,
+        order.escrow,
+        order.flags,
+        order.deadline,
+        order.timestamp,
+    )?;
+    let record = BuyerSubscriptionOrderRecord {
+        order_book: snapshot.order_book.clone(),
+        frame_model: snapshot.frame_model.clone(),
+        model_hash: snapshot.model_hash.clone(),
+        order_id: order.order_id,
+        max_price_per_tick: order.price_per_tick,
+        ticks: order.ticks,
+        deposit: reserve.deposit,
+        buyer_bond: reserve.buyer_bond,
+        escrow: order.escrow,
+        flags: order.flags,
+        deadline: order.deadline,
+        fill_cursor: MatchWatchCursor::new(0),
+        phase: BuyerSubscriptionPhase::Resting,
+        matched: None,
+    };
+    state.orders.push(record.clone());
+    state.validate(&state.note_addr)?;
+    Ok(record)
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_record_matches_live_order(
+    record: &BuyerSubscriptionOrderRecord,
+    snapshot: &OrderBookSnapshot,
+    order: &OrderBookOrder,
+) -> Result<()> {
+    let reserve = validate_subscription_order_terms(
+        order.price_per_tick,
+        order.ticks,
+        order.escrow,
+        order.flags,
+        order.deadline,
+        order.timestamp,
+    )?;
+    if !record.order_book.eq_ignore_ascii_case(&snapshot.order_book)
+        || record.frame_model != snapshot.frame_model
+        || !record.model_hash.eq_ignore_ascii_case(&snapshot.model_hash)
+        || record.order_id != order.order_id
+        || record.max_price_per_tick != order.price_per_tick
+        || record.ticks != order.ticks
+        || record.deposit != reserve.deposit
+        || record.buyer_bond != reserve.buyer_bond
+        || record.escrow != order.escrow
+        || record.flags != order.flags
+        || record.deadline != order.deadline
+        || record.phase != BuyerSubscriptionPhase::Resting
+        || record.matched.is_some()
+    {
+        bail!(
+            "resting subscription order #{} conflicts with durable state",
+            order.order_id
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn reconcile_existing_subscription_journal(
+    chain: &dexdo_core::RealChainBackend,
+    money_lock: &BuyerMoneyLock,
+    expected_book: &OrderBookSnapshot,
+    wait: std::time::Duration,
+    persist_handle: &PersistSubscriptionHandle<'_>,
+) -> Result<Option<BuyerSubscriptionOrderRecord>> {
+    load_buyer_subscription_state(&money_lock.subscriptions_path, &money_lock.note_addr)?;
+    let Some(journal) = load_buyer_money_journal(&money_lock.journal_path, &money_lock.note_addr)?
+    else {
+        return Ok(None);
+    };
+    match journal {
+        BuyerMoneyJournal::Buy(journal) => bail!(
+            "subscription command refused: buyer note {} has unresolved ordinary BUY submit {}",
+            money_lock.note_addr,
+            journal.submit_identity
+        ),
+        BuyerMoneyJournal::Subscription(journal) => {
+            validate_subscription_journal_target(&journal, expected_book)?;
+            reconcile_subscription_submit(
+                chain,
+                &money_lock.journal_path,
+                &money_lock.subscriptions_path,
+                &journal,
+                wait,
+                persist_handle,
+            )
+            .await
+            .map(Some)
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn validate_subscription_journal_target(
+    journal: &BuyerSubscriptionSubmitJournal,
+    expected_book: &OrderBookSnapshot,
+) -> Result<()> {
+    if !journal
+        .order_book
+        .eq_ignore_ascii_case(&expected_book.order_book)
+        || !journal
+            .model_hash
+            .eq_ignore_ascii_case(&expected_book.model_hash)
+        || journal.frame_model != expected_book.frame_model
+    {
+        bail!(
+            "durable subscription submit target {}/{}/{} contradicts the requested canonical book \
+             {}/{}/{}; journal retained and no money action is safe",
+            journal.frame_model,
+            journal.model_hash,
+            journal.order_book,
+            expected_book.frame_model,
+            expected_book.model_hash,
+            expected_book.order_book
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone)]
+struct BuyerSubscriptionResumeSelection {
+    record: BuyerSubscriptionOrderRecord,
+    facts: SubscriptionDealFacts,
+    quota: SubscriptionQuotaView,
+}
+
+enum BuyerSubscriptionResumeCandidate {
+    #[cfg(feature = "shellnet")]
+    Active(Box<BuyerSubscriptionResumeSelection>),
+    None,
+}
+
+impl BuyerSubscriptionResumeCandidate {
+    fn is_active(&self) -> bool {
+        #[cfg(feature = "shellnet")]
+        if matches!(self, Self::Active(_)) {
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn resolve_buyer_subscription_resume(
+    chain: &dyn ChainBackend,
+    note_addr: &str,
+    frame_model: &str,
+    expected_token_contract: Option<&str>,
+    money_lock: &BuyerMoneyLock,
+    wait: std::time::Duration,
+    persist_handle: &PersistSubscriptionHandle<'_>,
+) -> Result<Option<BuyerSubscriptionResumeSelection>> {
+    let ops = BuyerSubscriptionResumeOps { chain };
+    let model_hash = model_hash_for(frame_model);
+    let order_book = chain.model_buy_order_book_identity().ok_or_else(|| {
+        anyhow::anyhow!(
+            "buyer subscription resume backend did not expose the canonical model order book"
+        )
+    })?;
+
+    // Crash recovery is ordered deliberately: replay the money journal before consulting the
+    // durable active-record index or the bounded historical event fallback.
+    if let Some(journal) = load_buyer_money_journal(&money_lock.journal_path, note_addr)? {
+        match journal {
+            BuyerMoneyJournal::Buy(_) => return Ok(None),
+            BuyerMoneyJournal::Subscription(journal) => {
+                validate_subscription_journal_target(
+                    &journal,
+                    &OrderBookSnapshot {
+                        frame_model: frame_model.to_string(),
+                        model_hash: model_hash.clone(),
+                        order_book: order_book.clone(),
+                        stats: None,
+                        orders: Vec::new(),
+                    },
+                )?;
+                let record = reconcile_subscription_submit(
+                    &ops,
+                    &money_lock.journal_path,
+                    &money_lock.subscriptions_path,
+                    &journal,
+                    wait,
+                    persist_handle,
+                )
+                .await?;
+                if record.phase == BuyerSubscriptionPhase::Resting {
+                    bail!(
+                        "subscription order #{} is still resting; resume submitted no BUY and cannot \
+                         serve before one full seller match",
+                        record.order_id
+                    );
+                }
+                if let Some(expected) = expected_token_contract {
+                    let actual = record
+                        .matched
+                        .as_ref()
+                        .map(|matched| matched.token_contract.as_str())
+                        .unwrap_or("<missing>");
+                    if !actual.eq_ignore_ascii_case(expected) {
+                        bail!(
+                            "subscription journal reconciled TokenContract {actual}, but explicit \
+                             resume requested {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let state = load_buyer_subscription_state(&money_lock.subscriptions_path, note_addr)?;
+    let matching_order_ids = state
+        .orders
+        .iter()
+        .filter(|record| {
+            record.frame_model == frame_model
+                && record.model_hash.eq_ignore_ascii_case(&model_hash)
+                && record.order_book.eq_ignore_ascii_case(&order_book)
+        })
+        .map(|record| record.order_id)
+        .collect::<Vec<_>>();
+    for order_id in matching_order_ids.iter().copied() {
+        let record = subscription_order_record(&state, &order_book, order_id)
+            .expect("matching order id came from this state");
+        if record.phase == BuyerSubscriptionPhase::Resting {
+            sync_subscription_match_once(
+                &ops,
+                &money_lock.subscriptions_path,
+                note_addr,
+                &order_book,
+                order_id,
+                persist_handle,
+            )
+            .await?;
+        }
+    }
+
+    // Reconcile every locally matched candidate against the authoritative TokenContract before
+    // deciding whether resume is ambiguous. A stale local `Matched` record must not mask a single
+    // genuinely live subscription merely because its deal became disputed/stopped while the CLI
+    // was offline.
+    let state = load_buyer_subscription_state(&money_lock.subscriptions_path, note_addr)?;
+    let matched_order_ids = state
+        .orders
+        .iter()
+        .filter(|record| {
+            record.frame_model == frame_model
+                && record.model_hash.eq_ignore_ascii_case(&model_hash)
+                && record.order_book.eq_ignore_ascii_case(&order_book)
+                && record.phase == BuyerSubscriptionPhase::Matched
+        })
+        .map(|record| record.order_id)
+        .collect::<Vec<_>>();
+    let mut refreshed_matches = std::collections::BTreeMap::new();
+    for order_id in matched_order_ids {
+        let refreshed = refresh_subscription_match(
+            &ops,
+            &money_lock.subscriptions_path,
+            note_addr,
+            &order_book,
+            order_id,
+        )
+        .await?;
+        refreshed_matches.insert(order_id, refreshed);
+    }
+
+    let state = load_buyer_subscription_state(&money_lock.subscriptions_path, note_addr)?;
+    let matching = state
+        .orders
+        .iter()
+        .filter(|record| {
+            record.frame_model == frame_model
+                && record.model_hash.eq_ignore_ascii_case(&model_hash)
+                && record.order_book.eq_ignore_ascii_case(&order_book)
+                && expected_token_contract.is_none_or(|expected| {
+                    record.matched.as_ref().is_some_and(|matched| {
+                        matched.token_contract.eq_ignore_ascii_case(expected)
+                    })
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let active = matching
+        .iter()
+        .filter(|record| record.phase == BuyerSubscriptionPhase::Matched)
+        .cloned()
+        .collect::<Vec<_>>();
+    if active.len() > 1 {
+        let candidates = active
+            .iter()
+            .filter_map(|record| record.matched.as_ref())
+            .map(|matched| matched.deal_handle.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "subscription resume is ambiguous for model {frame_model}; candidate handles: {candidates}"
+        );
+    }
+    let candidate = if let Some(candidate) = active.into_iter().next() {
+        candidate
+    } else if matching
+        .iter()
+        .any(|record| record.phase == BuyerSubscriptionPhase::Resting)
+    {
+        let order_ids = matching
+            .iter()
+            .filter(|record| record.phase == BuyerSubscriptionPhase::Resting)
+            .map(|record| record.order_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "subscription order(s) {order_ids} are still resting; resume submitted no BUY and \
+             did not fall back to historical deal discovery"
+        );
+    } else if !matching.is_empty() {
+        let identities = matching
+            .iter()
+            .map(|record| {
+                record
+                    .matched
+                    .as_ref()
+                    .map(|matched| matched.deal_handle.clone())
+                    .unwrap_or_else(|| format!("order#{}", record.order_id))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("subscription(s) {identities} are terminal and cannot be resumed");
+    } else {
+        return Ok(None);
+    };
+    let (record, facts, quota) = refreshed_matches
+        .remove(&candidate.order_id)
+        .expect("every matched candidate was authoritatively refreshed");
+    if record.phase != BuyerSubscriptionPhase::Matched {
+        bail!(
+            "subscription {} is not live and cannot be resumed",
+            record
+                .matched
+                .as_ref()
+                .map(|matched| matched.deal_handle.as_str())
+                .unwrap_or("<missing-handle>")
+        );
+    }
+    Ok(Some(BuyerSubscriptionResumeSelection {
+        record,
+        facts,
+        quota,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubscriptionCancelOutcome {
+    Refunded { expected_balance: u128 },
+    Filled { token_contract: String },
+    ContradictoryFill { token_contract: String },
+    Unconfirmed { expected_balance: u128 },
+}
+
+#[cfg(feature = "shellnet")]
+fn subscription_cancel_outcome(
+    active: bool,
+    balance_before: u128,
+    balance_after: u128,
+    escrow: u128,
+    matched: Option<&BuyerSubscriptionMatch>,
+) -> Result<SubscriptionCancelOutcome> {
+    let expected_balance = balance_before
+        .checked_add(escrow)
+        .ok_or_else(|| anyhow::anyhow!("subscription cancel refund balance overflows u128"))?;
+    if let Some(matched) = matched {
+        return Ok(if active {
+            SubscriptionCancelOutcome::ContradictoryFill {
+                token_contract: matched.token_contract.clone(),
+            }
+        } else {
+            SubscriptionCancelOutcome::Filled {
+                token_contract: matched.token_contract.clone(),
+            }
+        });
+    }
+    if !active && balance_after == expected_balance {
+        return Ok(SubscriptionCancelOutcome::Refunded { expected_balance });
+    }
+    Ok(SubscriptionCancelOutcome::Unconfirmed { expected_balance })
+}
+
+#[cfg(feature = "shellnet")]
+async fn reconcile_subscription_cancel<F, Fut>(
+    wait: std::time::Duration,
+    balance_before: u128,
+    escrow: u128,
+    mut observe: F,
+) -> Result<SubscriptionCancelOutcome>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(bool, u128, Option<BuyerSubscriptionMatch>)>>,
+{
+    let started = std::time::Instant::now();
+    let mut last_outcome =
+        subscription_cancel_outcome(true, balance_before, balance_before, escrow, None)?;
+    loop {
+        let remaining = wait.saturating_sub(started.elapsed());
+        let (active, balance_after, matched) =
+            match tokio::time::timeout(remaining, observe()).await {
+                Ok(observation) => observation?,
+                Err(_) => return Ok(last_outcome),
+            };
+        let outcome = subscription_cancel_outcome(
+            active,
+            balance_before,
+            balance_after,
+            escrow,
+            matched.as_ref(),
+        )?;
+        if matches!(
+            outcome,
+            SubscriptionCancelOutcome::Refunded { .. } | SubscriptionCancelOutcome::Filled { .. }
+        ) {
+            return Ok(outcome);
+        }
+        last_outcome = outcome;
+        let elapsed = started.elapsed();
+        if elapsed >= wait {
+            return Ok(last_outcome);
+        }
+        tokio::time::sleep(SUBSCRIPTION_ORDER_RECONCILE_POLL.min(wait.saturating_sub(elapsed)))
+            .await;
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn render_subscription_record(
+    _snapshot: &OrderBookSnapshot,
+    record: &BuyerSubscriptionOrderRecord,
+    note_addr: &str,
+    resting: bool,
+    live: Option<(&SubscriptionDealFacts, &SubscriptionQuotaView)>,
+) -> Result<String> {
+    let matched = record
+        .matched
+        .as_ref()
+        .map(|matched| matched.token_contract.as_str())
+        .unwrap_or("-");
+    let price_improvement_refund = record
+        .matched
+        .as_ref()
+        .map(|matched| {
+            subscription_buy_clearing_refund(
+                record.ticks,
+                record.max_price_per_tick,
+                matched.clearing_price,
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let phase = match record.phase {
+        BuyerSubscriptionPhase::Resting => "resting",
+        BuyerSubscriptionPhase::Matched => "matched",
+        BuyerSubscriptionPhase::Terminal => "terminal",
+    };
+    let mut rendered = format!(
+        "subscription model={} order_book={} order_id={} owner={} price_per_tick={} ticks={} \
+         deposit={} buyer_bond={} total_escrow={} price_improvement_refund={} flags=0x{:02x} \
+         deadline={} phase={} resting={} matched_token_contract={}",
+        record.frame_model,
+        record.order_book,
+        record.order_id,
+        note_addr,
+        record.max_price_per_tick,
+        record.ticks,
+        record.deposit,
+        record.buyer_bond,
+        record.escrow,
+        price_improvement_refund,
+        record.flags,
+        record.deadline,
+        phase,
+        resting,
+        matched
+    );
+    if let Some((facts, quota)) = live {
+        rendered.push_str(&format!(
+            " probe_accepted={} week_index={} week_base_tokens={} tokens_per_week={} \
+             tokens_final={} tokens_superseded={} tokens_pending={} used_current_week={} \
+             remaining_current_week={} funded_tokens={} tokens_paid={} deposit={} probe_tick={} \
+             buyer_bond_held={} buyer_bond_required={} buyer_locked_total={} seller_bond_held={} \
+             seller_bond_required={} disputed={} terminal={}",
+            facts.state.probe_accepted,
+            facts.subscription.week_index,
+            facts.subscription.week_base_tokens,
+            facts.subscription.tokens_per_week,
+            facts.state.tokens_final,
+            facts.state.tokens_superseded,
+            facts.state.tokens_pending,
+            quota.claimed_current_week,
+            quota.remaining_current_week,
+            facts.subscription.funded_tokens,
+            facts.subscription.tokens_paid,
+            facts.state.deposit,
+            facts.state.probe_tick,
+            facts.buyer_bond.bond_held,
+            facts.buyer_bond.bond_required,
+            quota.buyer_locked_total,
+            facts.seller_bond.bond_held,
+            facts.seller_bond.bond_required,
+            facts.state.disputed,
+            facts.state.is_stopped()
+        ));
+    }
+    Ok(rendered)
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
+    let mock_mode = subscription_mock_mode(&args.mock)?;
+    let place_plan = match &args.command {
+        SubscriptionCommand::Place(place) => Some(subscription_place_plan(place)?),
+        _ => None,
+    };
+    if mock_mode {
+        return run_mock_subscription(&args, place_plan);
+    }
+    let chain = dexdo_core::RealChainBackend::connect(
+        args.contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )?;
+    let note = require_subscription_note(&args, "command")?;
+    let note_addr = note.with_workchain();
+    let mut money_lock = BuyerMoneyLock::open(&note_addr)?;
+    money_lock.try_acquire()?;
+    let reconcile_wait = std::time::Duration::from_secs(args.read_timeout.read_timeout_secs);
+    let handle_note_addr = note_addr.clone();
+    let handle_deals_dir = args.deals_dir.clone();
+    let handle_market = args.market.clone();
+    let handle_contracts = args.contracts.clone();
+    let persist_handle: Arc<PersistSubscriptionHandle<'static>> =
+        Arc::new(move |record, matched| {
+            persist_subscription_runtime_handle(
+                record,
+                matched,
+                &handle_note_addr,
+                handle_deals_dir.as_deref(),
+                handle_market.as_deref(),
+                &handle_contracts,
+            )
+        });
+
+    let registry_policy =
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
+    let initial_target = if registry_policy.is_some() && args.market.is_none() {
+        let requested_model = registry_requested_model(
+            &args.models,
+            args.model
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
+        )?;
+        BookTarget {
+            model_hash: model_hash_for(&requested_model),
+            frame_model: requested_model,
+            order_book: None,
+            root_model: None,
+            note_addr: Some(note_addr.clone()),
+        }
+    } else {
+        subscription_target(&args)?
+    };
+    let requested_model = initial_target.frame_model.clone();
+    let (target, snapshot) =
+        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            let target = resolve_model_registry_target(
+                RegistryRole::Buyer,
+                registry_policy.as_ref(),
+                &args.contracts,
+                &requested_model,
+                initial_target,
+            )
+            .await?;
+            let snapshot = read_subscription_book_summary(&chain, &target).await?;
+            if matches!(&args.command, SubscriptionCommand::Place(_)) {
+                if let Some(policy) = registry_policy.as_ref() {
+                    enforce_model_registry_policy(
+                        RegistryRole::Buyer,
+                        policy,
+                        &args.contracts,
+                        &target.frame_model,
+                        &snapshot.order_book,
+                        snapshot.active(),
+                        BuyerMissingBookPolicy::Reject,
+                    )
+                    .await?;
+                }
+            }
+            Ok((target, snapshot))
+        })
+        .await?;
+    if !snapshot.active() {
+        bail!(
+            "subscription: InferenceOrderBook {} for model {} is not active",
+            snapshot.order_book,
+            snapshot.frame_model
+        );
+    }
+    let reconciled = reconcile_existing_subscription_journal(
+        &chain,
+        &money_lock,
+        &snapshot,
+        reconcile_wait,
+        persist_handle.as_ref(),
+    )
+    .await?;
+    if matches!(&args.command, SubscriptionCommand::Place(_)) {
+        if let Some(record) = reconciled {
+            println!(
+                "subscription place reconciled order_id={} order_book={} deposit={} buyer_bond={} \
+                 total_escrow={} resting={} matched_token_contract={} no_second_boc=true",
+                record.order_id,
+                record.order_book,
+                record.deposit,
+                record.buyer_bond,
+                record.escrow,
+                record.matched.is_none(),
+                record
+                    .matched
+                    .as_ref()
+                    .map(|matched| matched.token_contract.as_str())
+                    .unwrap_or("-")
+            );
+            return Ok(());
+        }
+    }
+    if matches!(
+        &args.command,
+        SubscriptionCommand::Place(_) | SubscriptionCommand::Cancel { .. }
+    ) {
+        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+    }
+    let live_order = match &args.command {
+        SubscriptionCommand::Status { order_id } | SubscriptionCommand::Cancel { order_id } => {
+            let order_book = dexdo_core::Address::parse(&snapshot.order_book)
+                .map_err(|error| anyhow::anyhow!("order_book {}: {error}", snapshot.order_book))?;
+            direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.inference_orderbook_parsed_order(&order_book, *order_id),
+            )
+            .await?
+        }
+        SubscriptionCommand::Place(_) => None,
+    };
+    match &args.command {
+        SubscriptionCommand::Place(place) => {
+            let plan = place_plan.expect("place plan was validated before chain reads");
+            let keys = require_subscription_keys(&args, "place", place.note_key.as_deref())?;
+            preflight_buyer_pool_for_note(Some(&note_addr))?;
+            direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+                chain.assert_seller_note_current(&note).await?;
+                chain
+                    .assert_note_owner_matches("subscription place", &note, &keys)
+                    .await?;
+                chain.assert_note_can_place_inference_buy(&note).await?;
+                Ok(())
+            })
+            .await?;
+            let balance = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                subscription_note_ecc_balance(&chain, &note),
+            )
+            .await?;
+            ensure_subscription_note_balance(Some(balance), plan.reserve)?;
+            let deadline = buy_order_deadline()?;
+            let record = submit_subscription_with_journal(
+                &chain,
+                &note,
+                &keys,
+                &snapshot.order_book,
+                &snapshot.frame_model,
+                &target.model_hash,
+                place.max_price_per_tick,
+                plan.ticks,
+                plan.reserve.total_escrow,
+                deadline,
+                &money_lock.journal_path,
+                &money_lock.subscriptions_path,
+                reconcile_wait,
+                persist_handle.as_ref(),
+            )
+            .await?;
+            println!(
+                "subscription place confirmed model={} order_book={} owner={} order_id={} \
+                 max_price_per_tick={} ticks={} deposit={} buyer_bond={} total_escrow={} \
+                 flags=0x{:02x} deadline={} resting={} matched_token_contract={}",
+                snapshot.frame_model,
+                snapshot.order_book,
+                note_addr,
+                record.order_id,
+                record.max_price_per_tick,
+                record.ticks,
+                record.deposit,
+                record.buyer_bond,
+                record.escrow,
+                record.flags,
+                record.deadline,
+                record.matched.is_none(),
+                record
+                    .matched
+                    .as_ref()
+                    .map(|matched| matched.token_contract.as_str())
+                    .unwrap_or("-")
+            );
+        }
+        SubscriptionCommand::Status { order_id } => {
+            if let Some(live_order) = live_order.as_ref() {
+                let order = validate_subscription_live_order(
+                    &snapshot.order_book,
+                    Some(live_order),
+                    *order_id,
+                    &note_addr,
+                )?;
+                let state =
+                    load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)?;
+                let record = if let Some(record) =
+                    subscription_order_record(&state, &snapshot.order_book, *order_id)
+                {
+                    validate_subscription_record_matches_live_order(record, &snapshot, order)?;
+                    record.clone()
+                } else {
+                    let reserve = check_subscription_buy_reserve(
+                        order.escrow,
+                        order.ticks,
+                        order.price_per_tick,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    BuyerSubscriptionOrderRecord {
+                        order_book: snapshot.order_book.clone(),
+                        frame_model: snapshot.frame_model.clone(),
+                        model_hash: snapshot.model_hash.clone(),
+                        order_id: order.order_id,
+                        max_price_per_tick: order.price_per_tick,
+                        ticks: order.ticks,
+                        deposit: reserve.deposit,
+                        buyer_bond: reserve.buyer_bond,
+                        escrow: order.escrow,
+                        flags: order.flags,
+                        deadline: order.deadline,
+                        fill_cursor: MatchWatchCursor::new(0),
+                        phase: BuyerSubscriptionPhase::Resting,
+                        matched: None,
+                    }
+                };
+                println!(
+                    "{}",
+                    render_subscription_record(&snapshot, &record, &note_addr, true, None)?
+                );
+            } else {
+                let state =
+                    load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)?;
+                subscription_order_record(&state, &snapshot.order_book, *order_id).ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "subscription status cannot prove order #{order_id} belonged to note \
+                             {note_addr}: it is absent from both the live book and durable subscription state"
+                        )
+                    },
+                )?;
+                let record = sync_subscription_match_once(
+                    &chain,
+                    &money_lock.subscriptions_path,
+                    &note_addr,
+                    &snapshot.order_book,
+                    *order_id,
+                    persist_handle.as_ref(),
+                )
+                .await?;
+                match record.phase {
+                    BuyerSubscriptionPhase::Matched => {
+                        let (record, facts, quota) = refresh_subscription_match(
+                            &chain,
+                            &money_lock.subscriptions_path,
+                            &note_addr,
+                            &snapshot.order_book,
+                            *order_id,
+                        )
+                        .await?;
+                        println!(
+                            "{}",
+                            render_subscription_record(
+                                &snapshot,
+                                &record,
+                                &note_addr,
+                                false,
+                                Some((&facts, &quota)),
+                            )?
+                        );
+                    }
+                    BuyerSubscriptionPhase::Terminal => println!(
+                        "{} authoritative_terminal=true",
+                        render_subscription_record(&snapshot, &record, &note_addr, false, None)?
+                    ),
+                    BuyerSubscriptionPhase::Resting => println!(
+                        "{} state=absent_without_authenticated_fill",
+                        render_subscription_record(&snapshot, &record, &note_addr, false, None)?
+                    ),
+                }
+            }
+        }
+        SubscriptionCommand::Cancel { order_id } => {
+            let order = validate_subscription_live_order(
+                &snapshot.order_book,
+                live_order.as_ref(),
+                *order_id,
+                &note_addr,
+            )?
+            .clone();
+            let keys = require_subscription_keys(&args, "cancel", None)?;
+            direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+                chain.assert_seller_note_current(&note).await?;
+                chain
+                    .assert_note_owner_matches("subscription cancel", &note, &keys)
+                    .await
+            })
+            .await?;
+            let mut state =
+                load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)?;
+            ensure_subscription_record_from_order(&mut state, &snapshot, &order)?;
+            write_buyer_subscription_state(&money_lock.subscriptions_path, &state)?;
+            let balance_before = subscription_note_ecc_balance(&chain, &note).await?;
+            let submit = chain
+                .cancel_inference_order(&note, &keys, &target.model_hash, *order_id)
+                .await;
+            let outcome =
+                reconcile_subscription_cancel(reconcile_wait, balance_before, order.escrow, || {
+                    let chain = &chain;
+                    let note = note.clone();
+                    let note_addr = note_addr.clone();
+                    let order_book = snapshot.order_book.clone();
+                    let state_path = money_lock.subscriptions_path.clone();
+                    let persist_handle = persist_handle.clone();
+                    let order_id = *order_id;
+                    async move {
+                        let active = chain
+                            .inference_buyer_order_is_active_for_owner(
+                                &dexdo_core::Address::parse(&order_book)?,
+                                order_id,
+                                &note_addr,
+                            )
+                            .await?;
+                        let balance_after = subscription_note_ecc_balance(chain, &note).await?;
+                        let record = sync_subscription_match_once(
+                            chain,
+                            &state_path,
+                            &note_addr,
+                            &order_book,
+                            order_id,
+                            persist_handle.as_ref(),
+                        )
+                        .await?;
+                        Ok((active, balance_after, record.matched))
+                    }
+                })
+                .await?;
+            match outcome {
+                SubscriptionCancelOutcome::Refunded { expected_balance } => {
+                    mark_cancelled_buyer_subscription_terminal(
+                        &money_lock.subscriptions_path,
+                        &note_addr,
+                        &snapshot.order_book,
+                        *order_id,
+                    )?;
+                    println!(
+                        "subscription cancel confirmed model={} order_book={} order_id={} owner={} \
+                         refund={} balance_before={} balance_after={}",
+                        snapshot.frame_model,
+                        snapshot.order_book,
+                        order_id,
+                        note_addr,
+                        order.escrow,
+                        balance_before,
+                        expected_balance
+                    );
+                    return Ok(());
+                }
+                SubscriptionCancelOutcome::Filled { token_contract } => {
+                    bail!(
+                        "subscription cancel lost the fill race: order #{order_id} matched \
+                         {token_contract} in full; no second money action was submitted"
+                    );
+                }
+                SubscriptionCancelOutcome::ContradictoryFill { token_contract } => {
+                    return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
+                        "subscription order #{order_id} is simultaneously resting and filled as \
+                         {token_contract}; no retry was sent"
+                    ))));
+                }
+                SubscriptionCancelOutcome::Unconfirmed { expected_balance } => {
+                    if let Err(error) = submit {
+                        return Err(error.context(
+                            "subscription cancel was not confirmed by order removal plus exact refund",
+                        ));
+                    }
+                    return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
+                        "subscription cancel submit returned, but order/refund/fill facts remained \
+                         unconfirmed through the read timeout; expected balance {expected_balance}; \
+                         no retry was sent"
+                    ))));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
+    let mock_mode = subscription_mock_mode(&args.mock)?;
+    let place_plan = match &args.command {
+        SubscriptionCommand::Place(place) => Some(subscription_place_plan(place)?),
+        _ => None,
+    };
+    if mock_mode {
+        return run_mock_subscription(&args, place_plan);
+    }
+    bail!("subscription unavailable: build with `--features shellnet`")
+}
+
 pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
     let json_mode = args.json;
     let mut machine_events = json_mode.then(machine::BuyerEventWriter::new);
@@ -5056,6 +6526,59 @@ async fn emit_shared_buyer_event(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuyerShutdownReport {
+    SubscriptionPreserved,
+    Settlement {
+        action: &'static str,
+        state: &'static str,
+        submitted: bool,
+        outcome: &'static str,
+    },
+    NoDeal,
+}
+
+impl BuyerShutdownReport {
+    const fn chain_write_submitted(self) -> bool {
+        match self {
+            Self::SubscriptionPreserved | Self::NoDeal => false,
+            Self::Settlement { submitted, .. } => submitted,
+        }
+    }
+}
+
+fn buyer_shutdown_report(
+    session: Option<&dexdo::buyer::api::SessionSettle>,
+) -> BuyerShutdownReport {
+    let Some(session) = session else {
+        return BuyerShutdownReport::NoDeal;
+    };
+    if let Some(action) = session.terminal_action() {
+        let outcome = match action {
+            dexdo::buyer::api::SessionTerminalAction::StreamStop
+            | dexdo::buyer::api::SessionTerminalAction::StreamCleanup => "settled",
+            dexdo::buyer::api::SessionTerminalAction::StreamDispute => "disputed",
+            dexdo::buyer::api::SessionTerminalAction::ObservedTerminal => "terminal",
+        };
+        return BuyerShutdownReport::Settlement {
+            action: action.event_action(),
+            state: action.event_state(),
+            submitted: action.chain_write_submitted(),
+            outcome,
+        };
+    }
+    if session.preserves_on_exit() {
+        BuyerShutdownReport::SubscriptionPreserved
+    } else {
+        BuyerShutdownReport::Settlement {
+            action: "streamStop",
+            state: "unconfirmed",
+            submitted: false,
+            outcome: "unconfirmed",
+        }
+    }
+}
+
 fn require_complete_buyer_quote(selection: &BuyerQuoteSelection) -> Result<()> {
     if selection.quote.filled_ticks == 0 {
         bail!("buyer quote: no liquidity");
@@ -5126,7 +6649,6 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     shellnet_preflight: BuyerShellnetPreflight,
 ) -> std::result::Result<dexdo::buyer::api::ApiDeal, dexdo::buyer::api::DealInitError> {
-    const MAX_ATTEMPTS: u64 = 3;
     let mut attempt = 1u64;
     loop {
         let result = prepare_lazy_buyer_api_deal_once(
@@ -5146,8 +6668,12 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
         .await;
         match result {
             Ok(deal) => return Ok(deal),
-            Err(err) if is_replay_protection_error(&err) && attempt < MAX_ATTEMPTS => {
-                let backoff_secs = attempt.saturating_mul(2);
+            Err(err)
+                if is_replay_protection_error(&err)
+                    && attempt < BUYER_REPLAY_PROTECTION_MAX_ATTEMPTS =>
+            {
+                let backoff_secs =
+                    attempt.saturating_mul(BUYER_REPLAY_PROTECTION_BACKOFF_STEP_SECS);
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 attempt = attempt.saturating_add(1);
             }
@@ -5237,8 +6763,20 @@ async fn prepare_lazy_buyer_api_deal_once(
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
+    #[cfg(feature = "shellnet")]
+    let resumed_from_ordinary_journal = args.resume && raised_money.is_some();
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let mut buyer_order_id = None;
+    #[cfg(feature = "shellnet")]
+    let mut subscription_route_budget = None;
+    #[cfg(not(feature = "shellnet"))]
+    let subscription_route_budget = Option::<u64>::default();
+    #[cfg(feature = "shellnet")]
+    let mut preserve_subscription = false;
+    #[cfg(not(feature = "shellnet"))]
+    let preserve_subscription = false;
+    #[cfg(feature = "shellnet")]
+    let mut historical_resume_fill = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         if args.resume {
             emit_shared_buyer_event(
@@ -5384,9 +6922,12 @@ async fn prepare_lazy_buyer_api_deal_once(
                     .ok_or_else(|| {
                         ChainError::Chain("buyer fill event returned no match".to_string())
                     })?;
-                let tc = fill.token_contract;
+                let tc = fill.token_contract.clone();
                 buyer_order_id = Some(fill.order_id);
-                chain.assert_model_only_resume_target(&tc).await?;
+                #[cfg(feature = "shellnet")]
+                {
+                    historical_resume_fill = Some(fill.clone());
+                }
                 emit_shared_buyer_event(
                     &events,
                     "resume_selected",
@@ -5401,7 +6942,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                     }),
                 )
                 .await?;
-                (tc, args.ticks)
+                (tc, fill.ticks)
             }
             None => {
                 let ticks = args.ticks;
@@ -5478,6 +7019,64 @@ async fn prepare_lazy_buyer_api_deal_once(
             }
         }
     };
+    #[cfg(feature = "shellnet")]
+    let mut buy_ticks = buy_ticks;
+
+    #[cfg(feature = "shellnet")]
+    if args.resume && !args.mock.mock_chain && !resumed_from_ordinary_journal {
+        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("subscription resume requires --note-addr for ownership validation")
+        })?;
+        if let Some(subscription) = classify_subscription_resume_target(
+            chain.as_ref(),
+            note_addr,
+            &frame_model,
+            &token_contract,
+            historical_resume_fill.as_ref(),
+        )
+        .await?
+        {
+            buy_ticks = subscription.ticks;
+            buyer_order_id = buyer_order_id.or(subscription.order_id);
+            subscription_route_budget = Some(
+                u64::try_from(subscription.quota.remaining_current_week).map_err(|_| {
+                    anyhow::anyhow!(
+                        "subscription remaining weekly quota {} exceeds u64",
+                        subscription.quota.remaining_current_week
+                    )
+                })?,
+            );
+            preserve_subscription = true;
+            emit_shared_buyer_event(
+                &events,
+                "subscription_resume_classified",
+                machine::OP_BUYER_START,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "source": if historical_resume_fill.is_some() {
+                        "note_fill_event"
+                    } else {
+                        "explicit_token_contract"
+                    },
+                    "week_index": subscription.facts.subscription.week_index,
+                    "week_base_tokens": machine::amount(
+                        subscription.facts.subscription.week_base_tokens
+                    ),
+                    "remaining_current_week": machine::amount(
+                        subscription.quota.remaining_current_week
+                    ),
+                    "buyer_locked_total": machine::amount(
+                        subscription.quota.buyer_locked_total
+                    )
+                }),
+            )
+            .await?;
+        } else if historical_resume_fill.is_some() {
+            chain
+                .assert_model_only_resume_target(&token_contract)
+                .await?;
+        }
+    }
 
     record_buyer_token_contract_after_money_move(args.as_ref(), &token_contract);
 
@@ -5493,7 +7092,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             json!({
                 "token_contract": token_contract.clone(),
                 "deadline_unix": hv_deadline_unix,
-                "poll_interval_ms": 500
+                "poll_interval_ms": BUYER_HANDOVER_POLL_INTERVAL.as_millis()
             }),
         )
         .await?;
@@ -5511,6 +7110,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 buyer.as_ref(),
                                 &token_contract,
                                 policy,
+                                preserve_subscription,
                                 &e,
                             )
                             .await?;
@@ -5533,6 +7133,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 buyer.as_ref(),
                                 &token_contract,
                                 policy,
+                                preserve_subscription,
                                 service_renewal,
                                 handover_attempt,
                                 &diagnostic,
@@ -5559,7 +7160,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                         }
                         return Err(e.context(diagnostic));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(BUYER_HANDOVER_POLL_INTERVAL).await;
                 }
             }
         }
@@ -5617,17 +7218,25 @@ async fn prepare_lazy_buyer_api_deal_once(
         adopted_submit_identity.as_deref(),
         &token_contract,
     )?;
-    let session = Arc::new(dexdo::buyer::api::SessionSettle::new_with_failure_policy(
-        chain,
-        token_contract.clone(),
-        buyer.note.clone(),
-        api_failure_policy,
-    ));
+    let session = Arc::new(
+        dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
+            chain,
+            token_contract.clone(),
+            buyer.note.clone(),
+            api_failure_policy,
+            if preserve_subscription {
+                dexdo::buyer::api::SessionLifetimePolicy::Preserve
+            } else {
+                dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit
+            },
+        ),
+    );
     Ok(dexdo::buyer::api::ApiDeal::new(
         dexdo::buyer::api::Route {
             handover,
             token_contract,
-            max_tokens: consumer_api_token_budget(buy_ticks),
+            max_tokens: subscription_route_budget
+                .unwrap_or_else(|| consumer_api_token_budget(buy_ticks)),
         },
         session,
         Arc::new(dexdo::buyer::api::ContentGate::new(
@@ -5900,7 +7509,7 @@ async fn run_buyer_on_demand_local_api(
     let base_url = format!("http://{addr}/v1");
     let models_url = format!("{base_url}/models");
     let readiness = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(BUYER_API_READINESS_TIMEOUT)
         .build()?
         .get(&models_url)
         .send()
@@ -5975,6 +7584,7 @@ async fn run_buyer_on_demand_local_api(
     task.await?;
 
     let active = deals.current().await;
+    let shutdown_report = buyer_shutdown_report(active.as_ref().map(|deal| deal.session.as_ref()));
     let (token_contract, deal_handle) = active
         .as_ref()
         .map(|deal| {
@@ -5995,33 +7605,91 @@ async fn run_buyer_on_demand_local_api(
         }),
     )
     .await?;
-    emit_shared_buyer_event(
-        &events,
-        "settlement_submitted",
-        machine::OP_BUYER_SHUTDOWN,
-        json!({
-            "token_contract": token_contract.clone(),
-            "deal_handle": deal_handle.clone(),
-            "role": "buyer",
-            "action": "streamStop",
-            "submitted": active.is_some()
-        }),
-    )
-    .await?;
-    emit_shared_buyer_event(
-        &events,
-        "settled",
-        machine::OP_BUYER_SHUTDOWN,
-        json!({
-            "token_contract": token_contract.clone(),
-            "deal_handle": deal_handle.clone(),
-            "role": "buyer",
-            "action": "streamStop",
-            "state": if active.is_some() { "stopped" } else { "no_deal" },
-            "terminal": false
-        }),
-    )
-    .await?;
+    match shutdown_report {
+        BuyerShutdownReport::SubscriptionPreserved => {
+            emit_shared_buyer_event(
+                &events,
+                "subscription_preserved",
+                machine::OP_BUYER_SHUTDOWN,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "deal_handle": deal_handle.clone(),
+                    "role": "buyer",
+                    "chain_write_submitted": shutdown_report.chain_write_submitted(),
+                    "terminal": false
+                }),
+            )
+            .await?;
+        }
+        BuyerShutdownReport::Settlement {
+            action,
+            state,
+            submitted,
+            ..
+        } => {
+            emit_shared_buyer_event(
+                &events,
+                "settlement_submitted",
+                machine::OP_BUYER_SHUTDOWN,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "deal_handle": deal_handle.clone(),
+                    "role": "buyer",
+                    "action": action,
+                    "submitted": submitted
+                }),
+            )
+            .await?;
+            emit_shared_buyer_event(
+                &events,
+                "settled",
+                machine::OP_BUYER_SHUTDOWN,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "deal_handle": deal_handle.clone(),
+                    "role": "buyer",
+                    "action": action,
+                    "state": state,
+                    "terminal": false
+                }),
+            )
+            .await?;
+        }
+        BuyerShutdownReport::NoDeal => {
+            emit_shared_buyer_event(
+                &events,
+                "settlement_submitted",
+                machine::OP_BUYER_SHUTDOWN,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "deal_handle": deal_handle.clone(),
+                    "role": "buyer",
+                    "action": "streamStop",
+                    "submitted": false
+                }),
+            )
+            .await?;
+            emit_shared_buyer_event(
+                &events,
+                "settled",
+                machine::OP_BUYER_SHUTDOWN,
+                json!({
+                    "token_contract": token_contract.clone(),
+                    "deal_handle": deal_handle.clone(),
+                    "role": "buyer",
+                    "action": "streamStop",
+                    "state": "no_deal",
+                    "terminal": false
+                }),
+            )
+            .await?;
+        }
+    }
+    let outcome = match shutdown_report {
+        BuyerShutdownReport::SubscriptionPreserved => "subscription_preserved",
+        BuyerShutdownReport::Settlement { outcome, .. } => outcome,
+        BuyerShutdownReport::NoDeal => "no_deal",
+    };
     emit_shared_buyer_event(
         &events,
         "exiting",
@@ -6029,7 +7697,7 @@ async fn run_buyer_on_demand_local_api(
         json!({
             "token_contract": token_contract,
             "deal_handle": deal_handle,
-            "outcome": "settled",
+            "outcome": outcome,
             "exit_code": 0
         }),
     )
@@ -6246,12 +7914,52 @@ async fn run_buyer_inner(
         buyer_real_backend(&args, &frame_model)?
     };
     let buyer = dexdo::buyer::Buyer::from_note(note);
+    #[cfg(feature = "shellnet")]
+    let mut subscription_resume = BuyerSubscriptionResumeCandidate::None;
+    #[cfg(not(feature = "shellnet"))]
+    let subscription_resume = BuyerSubscriptionResumeCandidate::None;
+    #[cfg(feature = "shellnet")]
+    if args.resume && !args.mock.mock_chain {
+        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("subscription resume requires --note-addr for durable ownership")
+        })?;
+        let mut money_lock = BuyerMoneyLock::open(note_addr)?;
+        money_lock.try_acquire()?;
+        let handle_note_addr = money_lock.note_addr.clone();
+        let handle_deals_dir = args.deals_dir.clone();
+        let handle_market = args.market.clone();
+        let handle_contracts = args.contracts.clone();
+        let persist_handle = move |record: &BuyerSubscriptionOrderRecord,
+                                   matched: &BuyerJournalMatch| {
+            persist_subscription_runtime_handle(
+                record,
+                matched,
+                &handle_note_addr,
+                handle_deals_dir.as_deref(),
+                handle_market.as_deref(),
+                &handle_contracts,
+            )
+        };
+        if let Some(resumed) = resolve_buyer_subscription_resume(
+            chain.as_ref(),
+            note_addr,
+            &frame_model,
+            explicit_tc.as_deref(),
+            &money_lock,
+            std::time::Duration::from_secs(DEAL_WAIT_SECS),
+            &persist_handle,
+        )
+        .await?
+        {
+            subscription_resume = BuyerSubscriptionResumeCandidate::Active(Box::new(resumed));
+        }
+    }
     let submit_intent = if args.continuity_mode == ContinuityModeArg::OnDemand {
         BuyerSubmitIntent::on_demand()
     } else {
         BuyerSubmitIntent::foreground()
     };
-    let raised_money = if args.mock.mock_chain {
+    let raised_money = if args.mock.mock_chain || subscription_resume.is_active() {
         None
     } else {
         let escrow = args
@@ -6269,7 +7977,10 @@ async fn run_buyer_inner(
         )
         .await?
     };
-    if args.local_listen.is_some() && args.continuity_mode == ContinuityModeArg::OnDemand {
+    if args.local_listen.is_some()
+        && args.continuity_mode == ContinuityModeArg::OnDemand
+        && !subscription_resume.is_active()
+    {
         let events = machine_events
             .take()
             .map(|writer| Arc::new(tokio::sync::Mutex::new(writer)));
@@ -6292,7 +8003,7 @@ async fn run_buyer_inner(
         )
         .await;
     }
-    if !args.mock.mock_chain && registry_policy.is_none() {
+    if !args.mock.mock_chain && registry_policy.is_none() && shellnet_preflight.should_run() {
         shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
     }
     // Resolve the deal `TokenContract`: explicit(flag/manifest) or model-only (book -> choose -> buy -> fill
@@ -6301,8 +8012,20 @@ async fn run_buyer_inner(
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
+    #[cfg(feature = "shellnet")]
+    let resumed_from_ordinary_journal = args.resume && raised_money.is_some();
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let mut buyer_order_id = None;
+    #[cfg(feature = "shellnet")]
+    let mut subscription_route_budget = None;
+    #[cfg(not(feature = "shellnet"))]
+    let subscription_route_budget = Option::<u64>::default();
+    #[cfg(feature = "shellnet")]
+    let mut preserve_subscription = false;
+    #[cfg(not(feature = "shellnet"))]
+    let preserve_subscription = false;
+    #[cfg(feature = "shellnet")]
+    let mut historical_resume_fill = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         machine_context.set_token_contract(&outcome.token_contract);
         if let Some(events) = machine_events.as_mut() {
@@ -6335,6 +8058,72 @@ async fn run_buyer_inner(
             }
         }
         (outcome.token_contract, outcome.ticks)
+    } else if subscription_resume.is_active() {
+        #[cfg(feature = "shellnet")]
+        {
+            let BuyerSubscriptionResumeCandidate::Active(resumed) = std::mem::replace(
+                &mut subscription_resume,
+                BuyerSubscriptionResumeCandidate::None,
+            ) else {
+                unreachable!("is_active checked above")
+            };
+            let matched = resumed
+                .record
+                .matched
+                .as_ref()
+                .expect("matched resume record");
+            let tc = matched.token_contract.clone();
+            buyer_order_id = Some(resumed.record.order_id);
+            subscription_route_budget = Some(
+                u64::try_from(resumed.quota.remaining_current_week).map_err(|_| {
+                    anyhow::anyhow!(
+                        "subscription remaining weekly quota {} exceeds u64",
+                        resumed.quota.remaining_current_week
+                    )
+                })?,
+            );
+            preserve_subscription = true;
+            machine_context.order_book = Some(resumed.record.order_book.clone());
+            machine_context.set_token_contract(&tc);
+            if let Some(events) = machine_events.as_mut() {
+                events.event(
+                    "resume_selected",
+                    machine::OP_BUYER_START,
+                    json!({
+                        "token_contract": tc.clone(),
+                        "order_id": machine::amount(resumed.record.order_id),
+                        "role": "buyer",
+                        "source": "durable_subscription",
+                        "deal_handle": matched.deal_handle.clone(),
+                        "frame_model": frame_model.clone(),
+                        "week_index": resumed.facts.subscription.week_index,
+                        "week_base_tokens": machine::amount(
+                            resumed.facts.subscription.week_base_tokens
+                        ),
+                        "remaining_current_week": machine::amount(
+                            resumed.quota.remaining_current_week
+                        ),
+                        "buyer_bond_held": machine::amount(
+                            resumed.facts.buyer_bond.bond_held
+                        ),
+                        "buyer_bond_required": machine::amount(
+                            resumed.facts.buyer_bond.bond_required
+                        ),
+                        "buyer_locked_total": machine::amount(
+                            resumed.quota.buyer_locked_total
+                        )
+                    }),
+                )?;
+            } else {
+                println!(
+                    "resuming durable subscription {} without a new BUY/payment",
+                    matched.deal_handle
+                );
+            }
+            (tc, resumed.record.ticks)
+        }
+        #[cfg(not(feature = "shellnet"))]
+        unreachable!("subscription resume is only built with shellnet")
     } else {
         match explicit_tc {
             Some(tc) => {
@@ -6480,9 +8269,12 @@ async fn run_buyer_inner(
                     .ok_or_else(|| {
                         ChainError::Chain("buyer fill event returned no match".to_string())
                     })?;
-                let tc = fill.token_contract;
+                let tc = fill.token_contract.clone();
                 buyer_order_id = Some(fill.order_id);
-                chain.assert_model_only_resume_target(&tc).await?;
+                #[cfg(feature = "shellnet")]
+                {
+                    historical_resume_fill = Some(fill.clone());
+                }
                 machine_context.order_book = Some("model_order_book".to_string());
                 machine_context.set_token_contract(&tc);
                 if let Some(events) = machine_events.as_mut() {
@@ -6501,7 +8293,7 @@ async fn run_buyer_inner(
                 } else {
                     println!("recovered matched deal TokenContract from note event: {tc}");
                 }
-                (tc, args.ticks)
+                (tc, fill.ticks)
             }
             None => {
                 // Show the book, THEN let the buyer choose how many ticks and the per-tick price ceiling
@@ -6629,6 +8421,67 @@ async fn run_buyer_inner(
             }
         }
     };
+    #[cfg(feature = "shellnet")]
+    let mut buy_ticks = buy_ticks;
+    #[cfg(feature = "shellnet")]
+    if args.resume
+        && !args.mock.mock_chain
+        && !preserve_subscription
+        && !resumed_from_ordinary_journal
+    {
+        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("subscription resume requires --note-addr for ownership validation")
+        })?;
+        if let Some(subscription) = classify_subscription_resume_target(
+            chain.as_ref(),
+            note_addr,
+            &frame_model,
+            &token_contract,
+            historical_resume_fill.as_ref(),
+        )
+        .await?
+        {
+            buy_ticks = subscription.ticks;
+            buyer_order_id = buyer_order_id.or(subscription.order_id);
+            subscription_route_budget = Some(
+                u64::try_from(subscription.quota.remaining_current_week).map_err(|_| {
+                    anyhow::anyhow!(
+                        "subscription remaining weekly quota {} exceeds u64",
+                        subscription.quota.remaining_current_week
+                    )
+                })?,
+            );
+            preserve_subscription = true;
+            if let Some(events) = machine_events.as_mut() {
+                events.event(
+                    "subscription_resume_classified",
+                    machine::OP_BUYER_START,
+                    json!({
+                        "token_contract": token_contract.clone(),
+                        "source": if historical_resume_fill.is_some() {
+                            "note_fill_event"
+                        } else {
+                            "explicit_token_contract"
+                        },
+                        "week_index": subscription.facts.subscription.week_index,
+                        "week_base_tokens": machine::amount(
+                            subscription.facts.subscription.week_base_tokens
+                        ),
+                        "remaining_current_week": machine::amount(
+                            subscription.quota.remaining_current_week
+                        ),
+                        "buyer_locked_total": machine::amount(
+                            subscription.quota.buyer_locked_total
+                        )
+                    }),
+                )?;
+            }
+        } else if historical_resume_fill.is_some() {
+            chain
+                .assert_model_only_resume_target(&token_contract)
+                .await?;
+        }
+    }
     record_buyer_token_contract_after_money_move(&args, &token_contract);
     tracing::info!("buy placed; awaiting handover");
     // Wait for the seller to open the stream and write the handover. Issue: fail-closed on the deadline instead of
@@ -6645,7 +8498,7 @@ async fn run_buyer_inner(
                 json!({
                     "token_contract": token_contract.clone(),
                     "deadline_unix": hv_deadline_unix,
-                    "poll_interval_ms": 500
+                    "poll_interval_ms": BUYER_HANDOVER_POLL_INTERVAL.as_millis()
                 }),
             )?;
         }
@@ -6663,6 +8516,7 @@ async fn run_buyer_inner(
                                 &buyer,
                                 &token_contract,
                                 policy,
+                                preserve_subscription,
                                 &e,
                             )
                             .await?;
@@ -6685,6 +8539,7 @@ async fn run_buyer_inner(
                                 &buyer,
                                 &token_contract,
                                 policy,
+                                preserve_subscription,
                                 service_renewal,
                                 handover_attempt,
                                 &diagnostic,
@@ -6712,7 +8567,7 @@ async fn run_buyer_inner(
                         return Err(e.context(diagnostic));
                     }
                     tracing::debug!(error = %e, "buyer: no handover yet -- waiting for the seller's open_stream");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(BUYER_HANDOVER_POLL_INTERVAL).await;
                 }
             }
         }
@@ -6785,13 +8640,18 @@ async fn run_buyer_inner(
             "buyer continuity mode selected"
         );
         let buyer = Arc::new(buyer);
-        // Session-scoped settlement: one shared SessionSettle for the deal -- STOP once at session
-        // end(graceful shutdown) or on a verification-bail, NOT per request.
-        let session = Arc::new(api::SessionSettle::new_with_failure_policy(
+        // Ordinary deals retain their existing STOP-on-exit lifetime. A durable subscription is explicitly
+        // preserved across Ctrl-C, SIGTERM and application restarts.
+        let session = Arc::new(api::SessionSettle::new_with_failure_policy_and_lifetime(
             chain.clone(),
             token_contract.clone(),
             buyer.note.clone(),
             api_failure_policy,
+            if preserve_subscription {
+                api::SessionLifetimePolicy::Preserve
+            } else {
+                api::SessionLifetimePolicy::SettleOnExit
+            },
         ));
         let (content_check, models_cfg) = buyer_content_policy
             .expect("local-listen buyer content policy is preflighted before buy");
@@ -6801,10 +8661,11 @@ async fn run_buyer_inner(
             Route {
                 handover,
                 token_contract: token_contract.clone(),
-                max_tokens: consumer_api_token_budget(buy_ticks),
+                max_tokens: subscription_route_budget
+                    .unwrap_or_else(|| consumer_api_token_budget(buy_ticks)),
             },
             frame_model.clone(),
-            session,
+            session.clone(),
             std::sync::Arc::new(dexdo::buyer::api::ContentGate::new(
                 content_check,
                 models_cfg.clone(),
@@ -6829,9 +8690,8 @@ async fn run_buyer_inner(
                 api_failure_policy,
             );
         }
-        // The operator close: SIGINT(Ctrl-C) or SIGTERM(systemd/container) triggers graceful
-        // shutdown, after which `serve()` awaits the session STOP before exit -- the funds-safety terminal (not
-        // `Drop`). SIGTERM must NOT bypass it(review).
+        // SIGINT/SIGTERM drains in-flight responses and closes the listener. Ordinary deals retain the awaited
+        // STOP; a durable subscription performs no chain write and remains resumable.
         if let Some(events) = machine_events.as_mut() {
             events.event(
                 "endpoint_binding",
@@ -6844,17 +8704,11 @@ async fn run_buyer_inner(
                 }),
             )?;
         }
-        let (addr, task) = api::serve(
-            bind,
-            state,
-            args.anthropic_compat,
-            operator_shutdown_signal(),
-        )
-        .await?;
+        let (addr, task) = api::serve(bind, state, args.anthropic_compat, shutdown).await?;
         let base_url = format!("http://{addr}/v1");
         let models_url = format!("{base_url}/models");
         let models: serde_json::Value = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(BUYER_API_READINESS_TIMEOUT)
             .build()?
             .get(&models_url)
             .send()
@@ -6892,6 +8746,7 @@ async fn run_buyer_inner(
         tracing::info!(%addr, anthropic_compat = args.anthropic_compat, "consumer API listening (loopback)");
         task.await?;
         if let Some(events) = machine_events.as_mut() {
+            let shutdown_report = buyer_shutdown_report(Some(session.as_ref()));
             events.event(
                 "stopping",
                 machine::OP_BUYER_SHUTDOWN,
@@ -6901,36 +8756,64 @@ async fn run_buyer_inner(
                     "reason": "signal"
                 }),
             )?;
-            events.event(
-                "settlement_submitted",
-                machine::OP_BUYER_SHUTDOWN,
-                json!({
-                    "token_contract": token_contract.clone(),
-                    "deal_handle": deal_handle.clone(),
-                    "role": "buyer",
-                    "action": "streamStop",
-                    "submitted": true
-                }),
-            )?;
-            events.event(
-                "settled",
-                machine::OP_BUYER_SHUTDOWN,
-                json!({
-                    "token_contract": token_contract.clone(),
-                    "deal_handle": deal_handle.clone(),
-                    "role": "buyer",
-                    "action": "streamStop",
-                    "state": "stopped",
-                    "terminal": false
-                }),
-            )?;
+            match shutdown_report {
+                BuyerShutdownReport::SubscriptionPreserved => {
+                    events.event(
+                        "subscription_preserved",
+                        machine::OP_BUYER_SHUTDOWN,
+                        json!({
+                            "token_contract": token_contract.clone(),
+                            "deal_handle": deal_handle.clone(),
+                            "role": "buyer",
+                            "chain_write_submitted": shutdown_report.chain_write_submitted(),
+                            "terminal": false
+                        }),
+                    )?;
+                }
+                BuyerShutdownReport::Settlement {
+                    action,
+                    state,
+                    submitted,
+                    ..
+                } => {
+                    events.event(
+                        "settlement_submitted",
+                        machine::OP_BUYER_SHUTDOWN,
+                        json!({
+                            "token_contract": token_contract.clone(),
+                            "deal_handle": deal_handle.clone(),
+                            "role": "buyer",
+                            "action": action,
+                            "submitted": submitted
+                        }),
+                    )?;
+                    events.event(
+                        "settled",
+                        machine::OP_BUYER_SHUTDOWN,
+                        json!({
+                            "token_contract": token_contract.clone(),
+                            "deal_handle": deal_handle.clone(),
+                            "role": "buyer",
+                            "action": action,
+                            "state": state,
+                            "terminal": false
+                        }),
+                    )?;
+                }
+                BuyerShutdownReport::NoDeal => unreachable!("foreground buyer always has a deal"),
+            }
+            let outcome = match shutdown_report {
+                BuyerShutdownReport::SubscriptionPreserved => "subscription_preserved",
+                BuyerShutdownReport::Settlement { outcome, .. } => outcome,
+                BuyerShutdownReport::NoDeal => unreachable!("foreground buyer always has a deal"),
+            };
             events.event(
                 "exiting",
                 machine::OP_BUYER_SHUTDOWN,
                 json!({
                     "token_contract": token_contract.clone(),
                     "deal_handle": deal_handle.clone(),
-                    "outcome": "settled",
+                    "outcome": outcome,
                     "exit_code": 0
                 }),
             )?;
@@ -6938,16 +8821,23 @@ async fn run_buyer_inner(
         return Ok(());
     }
 
-    let oneshot_session = dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+    let oneshot_session = dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
         chain.clone(),
         token_contract.clone(),
         buyer.note.clone(),
         api_failure_policy,
+        if preserve_subscription {
+            dexdo::buyer::api::SessionLifetimePolicy::Preserve
+        } else {
+            dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit
+        },
     );
+    let stream_max_tokens =
+        subscription_oneshot_budget(args.max_tokens, subscription_route_budget)?;
     let mut stream_attempt = 1u64;
     let out = loop {
         match buyer
-            .connect_and_stream(&handover, &token_contract, args.max_tokens)
+            .connect_and_stream(&handover, &token_contract, stream_max_tokens)
             .await
         {
             Ok(out) => break out,
@@ -6978,8 +8868,15 @@ async fn run_buyer_inner(
         .await;
         bail!("{report}");
     }
-    tracing::info!(received = out.received, "received fake tokens; STOP");
-    settle_completed_oneshot(&oneshot_session).await?;
+    if preserve_subscription {
+        tracing::info!(
+            received = out.received,
+            "received fake tokens; preserving durable subscription"
+        );
+    } else {
+        tracing::info!(received = out.received, "received fake tokens; STOP");
+        settle_completed_oneshot(&oneshot_session).await?;
+    }
     Ok(())
 }
 
@@ -6993,46 +8890,43 @@ async fn settle_completed_oneshot(session: &dexdo::buyer::api::SessionSettle) ->
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::args::SubscriptionPlaceArgs;
     #[cfg(feature = "shellnet")]
     use crate::cli::args::{IdentityArgs, NoteDeployArgs};
 
     #[cfg(feature = "shellnet")]
-    struct CountingSubscriptionChain {
-        submit_calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[cfg(feature = "shellnet")]
-    impl CountingSubscriptionChain {
-        #[allow(clippy::too_many_arguments)]
-        async fn place_inference_subscription(
-            &self,
-            _note: &dexdo_core::Address,
-            _owner_keys: &dexdo_core::KeyPair,
-            _model_hash: &str,
-            _max_price_per_tick: u128,
-            _ticks: u128,
-            _escrow: u128,
-            _auto_renew: bool,
-        ) -> anyhow::Result<serde_json::Value> {
-            self.submit_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(serde_json::json!({}))
-        }
-    }
-
-    fn subscription_place_args(
-        max_price_per_tick: u128,
-        ticks: Option<u128>,
-        budget: Option<u128>,
-    ) -> SubscriptionPlaceArgs {
-        SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick,
-            ticks,
-            budget,
-            auto_renew: false,
-        }
+    fn ordinary_gateway_snapshot(
+        ticks: u64,
+    ) -> (dexdo_core::DealChainState, dexdo_core::DealSubscription) {
+        let funded_tokens = u128::from(ticks) * dexdo_core::TICK_SIZE;
+        (
+            dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                probe_accepted: false,
+                disputed: false,
+                deposit: 1,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
+                probe_tick: 1,
+                funded_time: Some(1),
+                probe_time: 1,
+                prev_claim_time: 0,
+                last_claim_time: 1,
+                dispute_time: 0,
+            },
+            dexdo_core::DealSubscription {
+                deal_flags: 0,
+                sub_weeks: 0,
+                week_index: 0,
+                tokens_per_week: funded_tokens,
+                funded_tokens,
+                tokens_paid: 0,
+                period_start: 0,
+                week_base_tokens: 0,
+            },
+        )
     }
 
     #[tokio::test]
@@ -7053,203 +8947,6 @@ mod tests {
         assert!(err.contains("chain read timed out after 1s"), "{err}");
         assert!(err.contains("retry"), "{err}");
         assert!(err.contains("dexdo market-data"), "{err}");
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn transient_read_retries_with_backoff_not_hard_fail() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let started = std::time::Instant::now();
-        let value = super::retry_executable_read("test executable read", {
-            let attempts = attempts.clone();
-            move || {
-                let attempts = attempts.clone();
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Err(anyhow::anyhow!("request timed out"))
-                    } else {
-                        Ok("ok")
-                    }
-                }
-            }
-        })
-        .await
-        .expect("transient failure must retry successfully");
-
-        assert_eq!(value, "ok");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(started.elapsed() >= super::EXECUTABLE_READ_BACKOFF[0]);
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn seller_open_probe_close_hint_waits_for_delivery_then_window() {
-        let target = super::DealTarget {
-            handle: None,
-            token_contract: "0:tc".to_string(),
-            role: Some(crate::cli::deals::DealHandleRole::Seller),
-            note_addr: Some("0:seller".to_string()),
-            market: None,
-        };
-        let summary = crate::cli::deals::DealStateSummary {
-            kind: crate::cli::deals::DealStateKind::Probe,
-            funded: true,
-            opened: true,
-            disputed: false,
-            probe_accepted: false,
-            deposit: 0,
-            prepaid: 0,
-            frozen: 0,
-            finalized_owed: 0,
-            funded_time: Some(1),
-            last_advance: 1,
-        };
-
-        let hint = super::close_hint(&target, &summary);
-
-        assert!(
-            hint.contains("next=seller_wait_delivery_then_advance_after_window"),
-            "{hint}"
-        );
-        assert!(hint.contains("first delivered canonical tick"), "{hint}");
-        assert!(hint.contains("only after PROBE_WINDOW"), "{hint}");
-        assert!(hint.contains("TokenContract.advance()"), "{hint}");
-        assert!(
-            !hint.contains("seller_advance_probe_after_timeout"),
-            "{hint}"
-        );
-        assert!(!hint.contains("wait_for_buyer_stop"), "{hint}");
-    }
-
-    #[test]
-    fn buyer_renewal_threshold_uses_env_override() {
-        let old = std::env::var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS").ok();
-        std::env::set_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS", "999999");
-        assert_eq!(super::buyer_renewal_threshold_tokens(), 999_999);
-        match old {
-            Some(v) => std::env::set_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS", v),
-            None => std::env::remove_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS"),
-        }
-    }
-
-    #[test]
-    fn subscription_place_plan_uses_exact_fee_inclusive_escrow() {
-        let ticks_plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
-            ticks: Some(8),
-            budget: None,
-            auto_renew: false,
-        })
-        .unwrap();
-        assert_eq!(ticks_plan.ticks, 8);
-        assert_eq!(ticks_plan.escrow, 8_200_000_000);
-        assert_eq!(ticks_plan.unused_budget, 0);
-
-        let budget_plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
-            ticks: None,
-            budget: Some(8_200_000_100),
-            auto_renew: false,
-        })
-        .unwrap();
-        assert_eq!(budget_plan.ticks, 8);
-        assert_eq!(budget_plan.escrow, 8_200_000_000);
-        assert_eq!(budget_plan.unused_budget, 100);
-        assert_eq!(ticks_plan.escrow, budget_plan.escrow);
-    }
-
-    #[test]
-    fn subscription_place_plan_rejects_zero_sized_money_moves() {
-        assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
-            ticks: Some(0),
-            budget: None,
-            auto_renew: false,
-        })
-        .is_err());
-        assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
-            ticks: None,
-            budget: Some(1),
-            auto_renew: false,
-        })
-        .is_err());
-        assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
-            note_key: None,
-            max_price_per_tick: 0,
-            ticks: Some(1),
-            budget: None,
-            auto_renew: false,
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn subscription_cycle_budget_preflight_matrix() {
-        let price = dexdo_core::PRICE_STEP;
-        let unit = dexdo_core::required_escrow_for_buy(1, price);
-        let minimum = dexdo_core::required_escrow_for_buy(8, price);
-
-        assert!(
-            super::subscription_place_plan(&subscription_place_args(price, Some(7), None)).is_err()
-        );
-        let below_budget = super::subscription_place_plan(&subscription_place_args(
-            price,
-            None,
-            Some(minimum - 1),
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            below_budget.contains(&format!("--budget {} raw SHELL", minimum - 1)),
-            "{below_budget}"
-        );
-        assert!(
-            below_budget.contains(&format!("derives ticks 7 and escrow {}", 7 * unit)),
-            "{below_budget}"
-        );
-        assert!(below_budget.contains("SUB_CYCLES=4"), "{below_budget}");
-        assert!(
-            below_budget.contains(&minimum.to_string()),
-            "{below_budget}"
-        );
-
-        let reproduced =
-            super::subscription_place_plan(&subscription_place_args(4 * price, Some(2), None))
-                .unwrap_err()
-                .to_string();
-
-        assert_eq!(
-            reproduced,
-            "subscription place --ticks 2 derives ticks 2 and escrow 8200000000 raw SHELL, \
-             giving cycleBudget 2050000000 raw SHELL below required per-cycle minimum \
-             8200000000 raw SHELL: escrow / SUB_CYCLES=4 must fund 2 fee-inclusive ticks per \
-             cycle at maxPricePerTick 4000000000; minimum total escrow 32800000000 raw SHELL \
-             and minimum ticks 8"
-        );
-
-        let largest_step_multiple = u128::MAX - (u128::MAX % price);
-        let cases = [
-            subscription_place_args(price - 1, Some(8), None),
-            subscription_place_args(largest_step_multiple, Some(8), None),
-            subscription_place_args(price, Some(u128::MAX), None),
-            subscription_place_args(price, Some(1), None),
-            subscription_place_args(price, None, Some(unit)),
-        ];
-
-        for args in cases {
-            assert!(
-                super::subscription_place_plan(&args).is_err(),
-                "invalid subscription must fail closed"
-            );
-        }
     }
 
     #[test]
@@ -7290,6 +8987,139 @@ mod tests {
             .is_none(),
             "the local placeholder block must not invent an external endpoint"
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn transient_read_retries_with_backoff_not_hard_fail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let started = std::time::Instant::now();
+        let value = super::retry_executable_read("test executable read", {
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(anyhow::anyhow!("request timed out"))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("transient failure must retry successfully");
+
+        assert_eq!(value, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() >= super::EXECUTABLE_READ_BACKOFF[0]);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn seller_open_probe_close_hint_names_current_accept_and_stop_methods() {
+        let target = super::DealTarget {
+            handle: None,
+            token_contract: "0:tc".to_string(),
+            role: Some(crate::cli::deals::DealHandleRole::Seller),
+            note_addr: Some("0:seller".to_string()),
+            market: None,
+        };
+        let summary = crate::cli::deals::DealStateSummary {
+            kind: crate::cli::deals::DealStateKind::Probe,
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            deposit: 0,
+            probe_tick: 0,
+            buyer_bond: 0,
+            buyer_bond_required: 0,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        };
+
+        let hint = super::close_hint(&target, &summary);
+
+        assert!(
+            hint.contains("next=seller_wait_delivery_then_accept_probe"),
+            "{hint}"
+        );
+        assert!(hint.contains("first delivered canonical tick"), "{hint}");
+        assert!(hint.contains("after PROBE_WINDOW"), "{hint}");
+        assert!(hint.contains("TokenContract.acceptProbe()"), "{hint}");
+        assert!(hint.contains("TokenContract.sellerStop()"), "{hint}");
+        assert!(!hint.contains("advance"), "{hint}");
+        assert!(!hint.contains("wait_for_buyer_stop"), "{hint}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn seller_streaming_close_hint_names_current_claim_and_settlement_methods() {
+        let target = super::DealTarget {
+            handle: None,
+            token_contract: "0:tc".to_string(),
+            role: Some(crate::cli::deals::DealHandleRole::Seller),
+            note_addr: Some("0:seller".to_string()),
+            market: None,
+        };
+        let summary = crate::cli::deals::DealStateSummary {
+            kind: crate::cli::deals::DealStateKind::Streaming,
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: true,
+            deposit: 0,
+            probe_tick: 0,
+            buyer_bond: 0,
+            buyer_bond_required: 0,
+            finalized_owed: 0,
+            tokens_final: dexdo_core::TICK_SIZE,
+            tokens_superseded: dexdo_core::TICK_SIZE,
+            tokens_pending: dexdo_core::TICK_SIZE,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        };
+
+        let hint = super::close_hint(&target, &summary);
+
+        assert!(
+            hint.contains("next=seller_claim_finalize_or_settle_week_or_seller_stop"),
+            "{hint}"
+        );
+        for method in [
+            "TokenContract.claimTokens(cumulativeTokens)",
+            "TokenContract.finalize()",
+            "TokenContract.settleWeek()",
+            "TokenContract.sellerStop()",
+        ] {
+            assert!(hint.contains(method), "missing {method}: {hint}");
+        }
+        assert!(!hint.contains("advance"), "{hint}");
+    }
+
+    #[test]
+    fn buyer_renewal_threshold_uses_env_override() {
+        let old = std::env::var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS").ok();
+        std::env::set_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS", "999999");
+        assert_eq!(super::buyer_renewal_threshold_tokens(), 999_999);
+        match old {
+            Some(v) => std::env::set_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS", v),
+            None => std::env::remove_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS"),
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -7368,6 +9198,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for QuotePreflightChain {
+        async fn claim_tokens(
+            &self,
+            _: &dexdo_core::TokenContract,
+            _: &dyn dexdo_core::Note,
+            _: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!()
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -7514,6 +9353,8 @@ mod tests {
             _ticks: u128,
             _max_price_per_tick: u128,
             _escrow: u128,
+            _flags: u8,
+            _deadline: u64,
         ) -> Result<(), dexdo_core::ChainError> {
             self.model_presubmit_preflight_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7545,32 +9386,10 @@ mod tests {
             unimplemented!("not needed by quote preflight tests")
         }
 
-        async fn advance_tick(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-            _note: &dyn dexdo_core::Note,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by quote preflight tests")
-        }
-
-        async fn accept_probe(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by quote preflight tests")
-        }
-
         async fn stop(
             &self,
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
-        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            unimplemented!("not needed by quote preflight tests")
-        }
-
-        async fn seller_timeout(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             unimplemented!("not needed by quote preflight tests")
         }
@@ -7839,7 +9658,7 @@ mod tests {
         let note = dexdo_core::LocalNote::from_seed(&[7_u8; 32]);
         let result = async {
             let _selection = super::buyer_quote_selection(&chain, None, 2, 1000, None).await?;
-            dexdo_core::ChainBackend::place_buy_by_model(&chain, &note, 2, 1000, 2050)
+            dexdo_core::ChainBackend::place_buy_by_model(&chain, &note, 2, 1000, 2050, 0, 9_999_999)
                 .await
                 .map_err(anyhow::Error::new)
         }
@@ -7883,7 +9702,7 @@ mod tests {
         let _selection = super::buyer_quote_selection(&chain, None, 2, 1000, None)
             .await
             .expect("the third quote-boundary preflight attempt must succeed");
-        dexdo_core::ChainBackend::place_buy_by_model(&chain, &note, 2, 1000, 2050)
+        dexdo_core::ChainBackend::place_buy_by_model(&chain, &note, 2, 1000, 2050, 0, 9_999_999)
             .await
             .expect("the single pre-submit preflight and money submit must succeed");
 
@@ -8103,111 +9922,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn subscription_status_marks_stale_sub_without_resting_order() {
-        let snapshot = dexdo_core::OrderBookSnapshot {
-            frame_model: "model".to_string(),
-            model_hash: "hash".to_string(),
-            order_book: "0:book".to_string(),
-            stats: Some(dexdo_core::OrderBookStats {
-                next_order_id: 2,
-                order_count: 0,
-                executed_notional: 0,
-                executed_ticks: 0,
-            }),
-            orders: Vec::new(),
-        };
-        let sub = dexdo_core::OrderBookSubscription {
-            order_id: 1,
-            exists: true,
-            period_start: 10,
-            cur_cycle: 0,
-            cycle_budget: 10250,
-            cycle_spent: 10250,
-            auto_renew: false,
-        };
-
-        let line = super::render_subscription_line(&snapshot, 1, None, Some(&sub));
-
-        assert!(line.contains("exists=true"));
-        assert!(line.contains("order_found=false"));
-        assert!(line.contains("stale_subscription=true"));
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn subscription_poke_validation_rejects_wrong_order_and_non_subscription() {
-        use super::validate_subscription_poke_postread as postread;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let live_sub = dexdo_core::OrderBookSubscription {
-            order_id: 9,
-            exists: true,
-            period_start: 10,
-            cur_cycle: 0,
-            cycle_budget: 100,
-            cycle_spent: 0,
-            auto_renew: false,
-        };
-        assert_eq!(
-            super::validate_subscription_poke("0:book", true, 9, Some(&live_sub))
-                .unwrap()
-                .order_id,
-            9
-        );
-        let error = super::validate_subscription_poke("0:book", false, 10, Some(&live_sub))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not resting"), "{error}");
-
-        let not_subscription = dexdo_core::OrderBookSubscription {
-            exists: false,
-            ..live_sub.clone()
-        };
-        let error = super::validate_subscription_poke("0:book", true, 9, Some(&not_subscription))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not a live subscription"), "{error}");
-
-        let advanced = dexdo_core::OrderBookSubscription {
-            cur_cycle: 1,
-            ..live_sub.clone()
-        };
-        assert!(postread(0, true, true, Some(&advanced)).unwrap());
-        assert!(!postread(0, true, true, Some(&live_sub)).unwrap());
-        assert!(postread(0, false, false, None).is_err());
-        assert!(postread(0, true, false, Some(&not_subscription)).unwrap());
-        assert!(postread(0, true, false, None).is_err());
-        let regressed = dexdo_core::OrderBookSubscription {
-            cur_cycle: 0,
-            ..advanced
-        };
-        assert!(postread(1, true, true, Some(&regressed)).is_err());
-
-        let posts = AtomicUsize::new(0);
-        let post = || async {
-            posts.fetch_add(1, Ordering::SeqCst);
-            Ok(serde_json::json!({}))
-        };
-        let rejected = super::submit_subscription_poke_after_validation(
-            Err(anyhow::anyhow!("wrong InferenceOrderBook identity")),
-            post(),
-        )
-        .await;
-        assert!(rejected.is_err());
-        assert_eq!(posts.load(Ordering::SeqCst), 0);
-
-        let (cycle, remaining) = super::submit_subscription_poke_after_validation(
-            super::validate_subscription_poke("0:book", true, 9, Some(&live_sub)),
-            post(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(posts.load(Ordering::SeqCst), 1);
-        assert_eq!((cycle, remaining), (0, 100));
-    }
-
     /// Demo(run with `--nocapture`): render the model-only order book through the REAL `render_inference_book`
     /// against a `MockChainBackend` seeded with a few asks -- shows exactly what the buyer sees before choosing.
     #[tokio::test]
@@ -8223,17 +9937,17 @@ mod tests {
         let asks = [
             (
                 "0:7c58eff6aa11b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b",
-                900u64,
+                dexdo_core::PRICE_STEP as u64,
                 512u64,
             ),
             (
                 "0:18a758c0bb22c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c",
-                1000,
+                2 * dexdo_core::PRICE_STEP as u64,
                 1024,
             ),
             (
                 "0:ab1572e0cc33d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d",
-                1500,
+                3 * dexdo_core::PRICE_STEP as u64,
                 256,
             ),
         ];
@@ -8243,6 +9957,7 @@ mod tests {
                     price_per_tick: price,
                     max_ticks: ticks,
                     token_contract: tc.into(),
+                    flags: 0,
                 },
                 &note,
             )
@@ -8254,8 +9969,8 @@ mod tests {
             3,
             "three asks seeded"
         );
-        // The buyer's view: model `qwen/qwen3-32b`, price ceiling 1000/tick, default 8 ticks.
-        super::render_inference_book(&mock, "qwen/qwen3-32b", 1000, 8)
+        // The buyer's view: model `qwen/qwen3-32b`, price ceiling 2 SHELL/tick, default 8 ticks.
+        super::render_inference_book(&mock, "qwen/qwen3-32b", 2 * dexdo_core::PRICE_STEP, 8)
             .await
             .unwrap();
     }
@@ -8406,6 +10121,92 @@ mod tests {
     }
 
     #[test]
+    fn subscription_reconciles_before_doctor_and_doctor_precedes_fresh_money() {
+        let source = include_str!("buyer.rs");
+        let start = source
+            .find("pub(crate) async fn run_subscription")
+            .expect("run_subscription present");
+        let end = source[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("shellnet run_subscription end marker present");
+        let body = &source[start..end];
+
+        let plan = body
+            .find("subscription_place_plan(place)?")
+            .expect("checked subscription reserve plan present");
+        let backend = body
+            .find("RealChainBackend::connect(")
+            .expect("subscription backend construction present");
+        let reconcile = body
+            .find("reconcile_existing_subscription_journal(")
+            .expect("durable subscription reconciliation present");
+        let doctor = body
+            .find("shellnet_doctor_preflight(")
+            .expect("subscription money doctor preflight present");
+        let exact_order = body
+            .find("inference_orderbook_parsed_order(")
+            .expect("one exact-order read present");
+        let place = body
+            .find("submit_subscription_with_journal(")
+            .expect("fresh subscription place present");
+        let cancel = body
+            .find(".cancel_inference_order(")
+            .expect("fresh subscription cancel present");
+
+        assert!(
+            plan < backend
+                && reconcile < doctor
+                && doctor < exact_order
+                && exact_order < place
+                && place < cancel,
+            "limit reserve/MARKET rejection must precede backend construction; durable \
+             reconciliation must precede doctor; doctor/exact reads must precede every fresh \
+             subscription money submit"
+        );
+    }
+
+    #[test]
+    fn subscription_exact_order_lookup_is_independent_of_historical_order_ids() {
+        let buyer = include_str!("buyer.rs");
+        let start = buyer
+            .find("pub(crate) async fn run_subscription")
+            .expect("run_subscription present");
+        let end = buyer[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("shellnet run_subscription end marker present");
+        let command = &buyer[start..end];
+        assert!(!command.contains("read_book_target("));
+        assert!(!command.contains("inference_orderbook_snapshot("));
+        assert_eq!(
+            command.matches("inference_orderbook_parsed_order(").count(),
+            1
+        );
+
+        let backend = include_str!("../../../core/src/shellnet/backends.rs");
+        let summary_start = backend
+            .find("pub async fn inference_orderbook_summary")
+            .expect("constant-cost summary reader present");
+        let exact_start = backend[summary_start..]
+            .find("pub async fn inference_orderbook_parsed_order")
+            .map(|offset| summary_start + offset)
+            .expect("constant-cost exact-order reader present");
+        let exact_end = backend[exact_start..]
+            .find("pub async fn inference_orderbook_snapshot_for_note")
+            .map(|offset| exact_start + offset)
+            .expect("exact-order reader end marker present");
+        let summary = &backend[summary_start..exact_start];
+        let exact = &backend[exact_start..exact_end];
+
+        assert_eq!(summary.matches("inference_orderbook_stats(").count(), 1);
+        assert!(!summary.contains("next_order_id"));
+        assert_eq!(exact.matches("inference_orderbook_order(").count(), 1);
+        assert!(!exact.contains("next_order_id"));
+        assert!(!exact.contains("for "));
+    }
+
+    #[test]
     fn final_interactive_buyer_price_is_validated_before_escrow_and_quote() {
         let step = dexdo_core::PRICE_STEP;
         for invalid in [0, step - 1, step + 1] {
@@ -8489,37 +10290,6 @@ mod tests {
         let oneshot = &source[oneshot_start..oneshot_end];
         assert_eq!(oneshot.matches("execute_buyer_quote_submit(").count(), 2);
         assert!(!oneshot.contains("buyer.place_buy(chain.as_ref(), &tc)"));
-    }
-
-    /// regression: subscription placement must fail closed before its escrow POST when the
-    /// recovery pool is unavailable.
-    #[cfg(feature = "shellnet")]
-    // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn subscription_missing_pool_blocks_money_moving_submit() {
-        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
-        let _env = EnvVarGuard::unset("DEXDO_PN_POOL");
-        let note_addr = format!("0:{}", "1".repeat(64));
-        let note = dexdo_core::Address::parse(&note_addr).unwrap();
-        let keys = dexdo_core::KeyPair::from_secret_hex(&"2a".repeat(32)).unwrap();
-        let chain = CountingSubscriptionChain {
-            submit_calls: std::sync::atomic::AtomicUsize::new(0),
-        };
-
-        let err = super::place_subscription_after_pool_preflight(
-            &note_addr,
-            chain.place_inference_subscription(&note, &keys, "model-hash", 10, 2, 20, true),
-        )
-        .await
-        .expect_err("subscription placement must reject a missing recovery pool")
-        .to_string();
-        assert!(err.contains("require DEXDO_PN_POOL"), "{err}");
-        assert_eq!(
-            chain.submit_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "missing DEXDO_PN_POOL must block the escrow submit"
-        );
     }
 
     /// regression: under buyer registry validation a raw `--token-contract` does not carry canonical
@@ -8909,8 +10679,8 @@ mod tests {
             .expect("malformed helper end marker present");
         let malformed_body = &source[malformed..cleanup];
         assert!(
-            malformed_body.contains("chain.seller_timeout(token_contract)"),
-            "malformed_handover=reclaim must invoke the reclaim lever"
+            malformed_body.contains("chain.stop(token_contract, buyer.note.as_ref())"),
+            "malformed_handover=reclaim must invoke the reclaim lever (a STOP recovers the escrow)"
         );
         assert!(
             malformed_body.contains("chain.dispute(token_contract, buyer.note.as_ref())"),
@@ -9904,7 +11674,6 @@ mod tests {
         assert!(body.contains("deal_state"), "{body}");
         assert!(body.contains("cleanup_unopened"), "{body}");
         assert!(body.contains("execute_buyer_monitor_recovery"), "{body}");
-        assert!(source.contains("chain.seller_timeout"), "{source}");
         assert!(body.contains("RENEWAL_FAILURE_BACKOFF_SECS"), "{body}");
         assert!(body.contains("prepare_retry"), "{body}");
         assert!(!body.contains("pending_for"), "{body}");
@@ -9960,22 +11729,15 @@ mod tests {
         next_match: Option<dexdo_core::TokenContract>,
         model_buy_failure: Option<ModelBuyFailure>,
         stop_error: Option<String>,
-        subscription_placements: Vec<dexdo_core::InferenceSubscriptionPlacement>,
-        subscription_fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
-        subscription_placement_calls: std::sync::atomic::AtomicUsize,
-        subscription_placement_error: bool,
-        subscription_order_active: bool,
-        subscription_inactive_order_id: Option<u128>,
-        subscription_order_read_error_id: Option<u128>,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<dexdo::buyer::api::ApiDeal>>,
         monitor_state_enabled: std::sync::atomic::AtomicBool,
         monitor_deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
         monitor_deal_state_calls: std::sync::atomic::AtomicUsize,
-        monitor_stream_timeout_secs: std::sync::atomic::AtomicU64,
         cleanup_failures_remaining: std::sync::atomic::AtomicUsize,
         reclaim_failures_remaining: std::sync::atomic::AtomicUsize,
         reclaim_transport_failures_remaining: std::sync::atomic::AtomicUsize,
         reclaim_ambiguous_remaining: std::sync::atomic::AtomicUsize,
+        reclaim_ambiguous_stays_open: std::sync::atomic::AtomicBool,
         reclaim_delay_ms: std::sync::atomic::AtomicU64,
     }
 
@@ -9992,7 +11754,6 @@ mod tests {
             Self {
                 monitor_state_enabled: std::sync::atomic::AtomicBool::new(true),
                 monitor_deal_state: std::sync::Mutex::new(Some(state)),
-                monitor_stream_timeout_secs: std::sync::atomic::AtomicU64::new(1),
                 next_match: Some("tc-fresh".to_string()),
                 ..Self::default()
             }
@@ -10016,15 +11777,23 @@ mod tests {
                 *self.monitor_deal_state.lock().unwrap() = Some(dexdo_core::DealChainState {
                     funded: false,
                     opened: false,
+                    probe_accepted: true,
                     disputed: false,
-                    probe_accepted: false,
+                    deposit: 1_000,
+                    finalized_owed: 0,
+                    tokens_final: 0,
+                    tokens_superseded: 0,
+                    tokens_pending: 0,
                     funded_time: None,
-                    last_advance: super::unix_now_secs(),
+                    probe_tick: 0,
+                    probe_time: 0,
+                    prev_claim_time: 0,
+                    last_claim_time: super::unix_now_secs(),
+                    dispute_time: 0,
                 });
             }
         }
 
-        #[cfg(feature = "shellnet")]
         fn set_monitor_deal_state(&self, state: dexdo_core::DealChainState) {
             *self.monitor_deal_state.lock().unwrap() = Some(state);
         }
@@ -10041,6 +11810,64 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for RecordingRecoveryChain {
+        async fn stop_if_heartbeat(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+            // Simulate a legitimate claim landing between the decision to exit and the money POST.
+            if let Some(deal) = self
+                .heartbeat_during_reclaim_preflight
+                .lock()
+                .expect("preflight heartbeat lock")
+                .take()
+            {
+                deal.record_accepted_output(super::unix_now_secs());
+            }
+            if !heartbeat.unchanged() {
+                return Ok(None);
+            }
+            self.reclaim_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wait_before_reclaim_result().await;
+            if Self::consume_failure(&self.reclaim_ambiguous_remaining) {
+                if !self
+                    .reclaim_ambiguous_stays_open
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.mark_monitor_reclaimed();
+                }
+                return Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected ambiguous reclaim result".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_failures_remaining) {
+                return Err(dexdo_core::ChainError::Contract(
+                    "injected early reclaim rejection".to_string(),
+                ));
+            }
+            if Self::consume_failure(&self.reclaim_transport_failures_remaining) {
+                return Err(dexdo_core::ChainError::Transport(
+                    "injected transient reclaim transport failure".to_string(),
+                ));
+            }
+            self.mark_monitor_reclaimed();
+            Ok(Some(dexdo_core::Settlement::SellerNoShow {
+                to_buyer_refund: 0,
+                seller_bond_returned: 0,
+            }))
+        }
+
+        async fn claim_tokens(
+            &self,
+            _: &dexdo_core::TokenContract,
+            _: &dyn dexdo_core::Note,
+            _: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!()
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -10086,21 +11913,6 @@ mod tests {
             unimplemented!("not needed by recovery monitor tests")
         }
 
-        async fn advance_tick(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-            _note: &dyn dexdo_core::Note,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by recovery monitor tests")
-        }
-
-        async fn accept_probe(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!("not needed by recovery monitor tests")
-        }
-
         async fn stop(
             &self,
             _token_contract: &dexdo_core::TokenContract,
@@ -10142,78 +11954,6 @@ mod tests {
             })
         }
 
-        async fn seller_timeout(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            self.reclaim_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.wait_before_reclaim_result().await;
-            if Self::consume_failure(&self.reclaim_ambiguous_remaining) {
-                self.mark_monitor_reclaimed();
-                return Err(dexdo_core::ChainError::Transport(
-                    "injected ambiguous reclaim result".to_string(),
-                ));
-            }
-            if Self::consume_failure(&self.reclaim_failures_remaining) {
-                return Err(dexdo_core::ChainError::Contract(
-                    "injected early reclaim rejection".to_string(),
-                ));
-            }
-            if Self::consume_failure(&self.reclaim_transport_failures_remaining) {
-                return Err(dexdo_core::ChainError::Transport(
-                    "injected transient reclaim transport failure".to_string(),
-                ));
-            }
-            self.mark_monitor_reclaimed();
-            Ok(dexdo_core::Settlement::SellerNoShow {
-                to_buyer_refund: 0,
-                seller_bond_returned: 0,
-            })
-        }
-
-        async fn seller_timeout_if_heartbeat(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-            heartbeat: &dexdo_core::chain::HeartbeatGuard,
-        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
-            if let Some(deal) = self
-                .heartbeat_during_reclaim_preflight
-                .lock()
-                .expect("preflight heartbeat lock")
-                .take()
-            {
-                deal.record_accepted_output(super::unix_now_secs());
-            }
-            if !heartbeat.unchanged() {
-                return Ok(None);
-            }
-            self.reclaim_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.wait_before_reclaim_result().await;
-            if Self::consume_failure(&self.reclaim_ambiguous_remaining) {
-                self.mark_monitor_reclaimed();
-                return Err(dexdo_core::ChainError::Transport(
-                    "injected ambiguous reclaim result".to_string(),
-                ));
-            }
-            if Self::consume_failure(&self.reclaim_failures_remaining) {
-                return Err(dexdo_core::ChainError::Contract(
-                    "injected early reclaim rejection".to_string(),
-                ));
-            }
-            if Self::consume_failure(&self.reclaim_transport_failures_remaining) {
-                return Err(dexdo_core::ChainError::Transport(
-                    "injected transient reclaim transport failure".to_string(),
-                ));
-            }
-            self.mark_monitor_reclaimed();
-            Ok(Some(dexdo_core::Settlement::SellerNoShow {
-                to_buyer_refund: 0,
-                seller_bond_returned: 0,
-            }))
-        }
-
         async fn cleanup_unopened(
             &self,
             _token_contract: &dexdo_core::TokenContract,
@@ -10243,6 +11983,8 @@ mod tests {
             _ticks: u128,
             _max_price_per_tick: u128,
             _escrow: u128,
+            _flags: u8,
+            _deadline: u64,
         ) -> Result<(), dexdo_core::ChainError> {
             self.place_next_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -10275,54 +12017,6 @@ mod tests {
             }))
         }
 
-        async fn poll_attributed_model_buys_for_order_book(
-            &self,
-            _order_book: &str,
-            _cursor: &mut dexdo_core::MatchWatchCursor,
-        ) -> Result<Vec<(u128, dexdo_core::MatchedFill)>, dexdo_core::ChainError> {
-            Ok(std::mem::take(
-                &mut *self.subscription_fills.lock().unwrap(),
-            ))
-        }
-
-        async fn subscription_placements_since(
-            &self,
-            _order_book: &str,
-            _buyer_note: &str,
-            _order_id_floor: u128,
-            _max_price_per_tick: u128,
-            _ticks: u128,
-            _cycle_budget: u128,
-            _auto_renew: bool,
-        ) -> Result<Vec<dexdo_core::InferenceSubscriptionPlacement>, dexdo_core::ChainError>
-        {
-            self.subscription_placement_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.subscription_placement_error {
-                return Err(dexdo_core::ChainError::Transport(
-                    "injected placement read ambiguity".to_string(),
-                ));
-            }
-            Ok(self.subscription_placements.clone())
-        }
-
-        async fn buyer_order_is_active_for_owner(
-            &self,
-            _order_book: &str,
-            order_id: u128,
-            _buyer_note: &str,
-        ) -> Result<bool, dexdo_core::ChainError> {
-            if self.subscription_order_read_error_id == Some(order_id) {
-                return Err(dexdo_core::ChainError::Chain(
-                    "malformed non-empty active getOrder row".to_string(),
-                ));
-            }
-            if self.subscription_inactive_order_id == Some(order_id) {
-                return Ok(false);
-            }
-            Ok(self.subscription_order_active)
-        }
-
         async fn deal_state(
             &self,
             token_contract: &dexdo_core::TokenContract,
@@ -10337,30 +12031,24 @@ mod tests {
                     return Ok(Some(dexdo_core::DealChainState {
                         funded: true,
                         opened: true,
+                        probe_accepted: true,
                         disputed: false,
-                        probe_accepted: false,
+                        deposit: 1_000,
+                        finalized_owed: 0,
+                        tokens_final: 0,
+                        tokens_superseded: 0,
+                        tokens_pending: 0,
                         funded_time: Some(1),
-                        last_advance: super::unix_now_secs(),
+                        probe_tick: 0,
+                        probe_time: 0,
+                        prev_claim_time: 0,
+                        last_claim_time: super::unix_now_secs(),
+                        dispute_time: 0,
                     }));
                 }
                 return Ok(*self.monitor_deal_state.lock().unwrap());
             }
             Ok(self.deal_state)
-        }
-
-        async fn deal_stream_timeout(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<u64, dexdo_core::ChainError> {
-            if self
-                .monitor_state_enabled
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(self
-                    .monitor_stream_timeout_secs
-                    .load(std::sync::atomic::Ordering::SeqCst));
-            }
-            Ok(600)
         }
 
         async fn snapshot(
@@ -10369,6 +12057,191 @@ mod tests {
         ) -> Option<dexdo_core::StreamSnapshot> {
             self.snapshot.clone()
         }
+    }
+
+    #[tokio::test]
+    async fn subscription_shutdown_reports_incident_stop_dispute_and_preserve_truthfully() {
+        async fn finish_shutdown(
+            chain: std::sync::Arc<RecordingRecoveryChain>,
+            lifetime: dexdo::buyer::api::SessionLifetimePolicy,
+            action: Option<dexdo::buyer::api::VerificationBailAction>,
+        ) -> (
+            std::sync::Arc<dexdo::buyer::api::SessionSettle>,
+            Option<bool>,
+        ) {
+            let note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
+            let session = std::sync::Arc::new(
+                dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
+                    chain,
+                    "tc-subscription".to_string(),
+                    note.clone(),
+                    dexdo::buyer::api::BuyerApiFailurePolicy {
+                        verification_bail: action
+                            .unwrap_or(dexdo::buyer::api::VerificationBailAction::Stop),
+                        ..dexdo::buyer::api::BuyerApiFailurePolicy::default()
+                    },
+                    lifetime,
+                ),
+            );
+            let incident_submitted = match action {
+                Some(_) => Some(
+                    session
+                        .settle_verification_bail("injected-subscription-incident")
+                        .await,
+                ),
+                None => None,
+            };
+            let state = dexdo::buyer::api::ApiState::single(
+                std::sync::Arc::new(dexdo::buyer::Buyer::from_note(note)),
+                dexdo::buyer::api::Route {
+                    handover: dexdo_core::Handover {
+                        endpoint: "https://127.0.0.1:1".to_string(),
+                        tls_fingerprint: "00".repeat(32),
+                    },
+                    token_contract: "tc-subscription".to_string(),
+                    max_tokens: 1,
+                },
+                "qwen--qwen3--32b".to_string(),
+                session.clone(),
+                std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
+            );
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (_, task) = dexdo::buyer::api::serve(
+                "127.0.0.1:0".parse().unwrap(),
+                state,
+                false,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .unwrap();
+            shutdown_tx.send(()).unwrap();
+            task.await.unwrap();
+            (session, incident_submitted)
+        }
+
+        fn assert_no_terminal_writes(chain: &RecordingRecoveryChain) {
+            use std::sync::atomic::Ordering;
+
+            assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 0);
+        }
+
+        let stop_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let (stop, stop_submitted) = finish_shutdown(
+            stop_chain.clone(),
+            dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit,
+            Some(dexdo::buyer::api::VerificationBailAction::Stop),
+        )
+        .await;
+        assert_eq!(stop_submitted, Some(true));
+        let stop_report = super::buyer_shutdown_report(Some(stop.as_ref()));
+        assert_eq!(
+            stop_report,
+            super::BuyerShutdownReport::Settlement {
+                action: "streamStop",
+                state: "stopped",
+                submitted: true,
+                outcome: "settled",
+            }
+        );
+        assert!(stop_report.chain_write_submitted());
+        assert_eq!(
+            stop_chain
+                .stop_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let dispute_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let (dispute, dispute_submitted) = finish_shutdown(
+            dispute_chain.clone(),
+            dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit,
+            Some(dexdo::buyer::api::VerificationBailAction::Dispute),
+        )
+        .await;
+        assert_eq!(dispute_submitted, Some(true));
+        let dispute_report = super::buyer_shutdown_report(Some(dispute.as_ref()));
+        assert_eq!(
+            dispute_report,
+            super::BuyerShutdownReport::Settlement {
+                action: "streamDispute",
+                state: "disputed",
+                submitted: true,
+                outcome: "disputed",
+            }
+        );
+        assert!(dispute_report.chain_write_submitted());
+        assert_eq!(
+            dispute_chain
+                .dispute_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let preserved_stop_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let (preserved_stop, stop_submitted) = finish_shutdown(
+            preserved_stop_chain.clone(),
+            dexdo::buyer::api::SessionLifetimePolicy::Preserve,
+            Some(dexdo::buyer::api::VerificationBailAction::Stop),
+        )
+        .await;
+        assert_eq!(stop_submitted, Some(false));
+        assert_eq!(
+            super::buyer_shutdown_report(Some(preserved_stop.as_ref())),
+            super::BuyerShutdownReport::SubscriptionPreserved
+        );
+        assert_no_terminal_writes(preserved_stop_chain.as_ref());
+
+        let preserved_dispute_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let (preserved_dispute, dispute_submitted) = finish_shutdown(
+            preserved_dispute_chain.clone(),
+            dexdo::buyer::api::SessionLifetimePolicy::Preserve,
+            Some(dexdo::buyer::api::VerificationBailAction::Dispute),
+        )
+        .await;
+        assert_eq!(dispute_submitted, Some(false));
+        assert_eq!(
+            super::buyer_shutdown_report(Some(preserved_dispute.as_ref())),
+            super::BuyerShutdownReport::SubscriptionPreserved
+        );
+        assert_no_terminal_writes(preserved_dispute_chain.as_ref());
+
+        let preserve_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let (preserved, incident_submitted) = finish_shutdown(
+            preserve_chain.clone(),
+            dexdo::buyer::api::SessionLifetimePolicy::Preserve,
+            None,
+        )
+        .await;
+        assert_eq!(incident_submitted, None);
+        let preserve_report = super::buyer_shutdown_report(Some(preserved.as_ref()));
+        assert_eq!(
+            preserve_report,
+            super::BuyerShutdownReport::SubscriptionPreserved
+        );
+        assert!(!preserve_report.chain_write_submitted());
+        assert_no_terminal_writes(preserve_chain.as_ref());
+
+        assert!(preserved.settle("explicit-user-stop").await.unwrap());
+        assert_eq!(
+            super::buyer_shutdown_report(Some(preserved.as_ref())),
+            super::BuyerShutdownReport::Settlement {
+                action: "streamStop",
+                state: "stopped",
+                submitted: true,
+                outcome: "settled",
+            }
+        );
+        assert_eq!(
+            preserve_chain
+                .stop_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     fn start_on_demand_recovery_runtime(
@@ -10424,6 +12297,8 @@ mod tests {
                             2,
                             1,
                             2,
+                            0,
+                            9_999_999,
                         )
                         .await
                         .map_err(|error| {
@@ -10601,13 +12476,11 @@ mod tests {
         })
         .await
         .expect(" TLS gateway binds");
-        seller.state.register_stream(
-            token_contract,
-            buyer.note.pubkey(),
-            8,
-            2,
-            dexdo_core::DobParams::canonical().tick_size,
-        );
+        let (state, deal) = ordinary_gateway_snapshot(2);
+        seller
+            .state
+            .register_stream(token_contract, buyer.note.pubkey(), 8, state, deal)
+            .expect("register strict ordinary test capacity");
         let handover = dexdo_core::Handover {
             endpoint: format!("https://{addr}"),
             tls_fingerprint: seller.tls_fingerprint.clone(),
@@ -10671,10 +12544,19 @@ mod tests {
             dexdo_core::DealChainState {
                 funded: true,
                 opened: true,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: now.saturating_sub(10),
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: now.saturating_sub(10),
+                dispute_time: 0,
             },
         ));
         let (_routes, session, init_calls) =
@@ -10691,14 +12573,14 @@ mod tests {
         assert_eq!(
             chain.reclaim_calls.load(Ordering::SeqCst),
             0,
-            "healthy on-demand session past streamTimeout must not be reclaimed between requests"
+            "healthy on-demand session past the old idle threshold must not be STOPped between requests"
         );
         assert_eq!(init_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn issue_547_closed_failed_session_reclaims_then_next_requests_buy_once() {
+    async fn issue_547_failed_policy_stop_is_not_retried_from_idle_or_replaced() {
         use std::sync::atomic::Ordering;
 
         let now = super::unix_now_secs();
@@ -10706,16 +12588,22 @@ mod tests {
             dexdo_core::DealChainState {
                 funded: true,
                 opened: true,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: now.saturating_sub(10),
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: now.saturating_sub(10),
+                dispute_time: 0,
             },
         ));
         chain.reclaim_failures_remaining.store(1, Ordering::SeqCst);
-        chain
-            .reclaim_transport_failures_remaining
-            .store(1, Ordering::SeqCst);
         let (routes, session, init_calls) =
             start_on_demand_recovery_monitor(chain.clone(), "tc-dead");
 
@@ -10731,83 +12619,69 @@ mod tests {
         assert!(!session.is_settled());
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
 
-        wait_for_counter(&chain.reclaim_calls, 2, "reclaim attempts").await;
-        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
+        wait_for_counter(
+            &chain.monitor_deal_state_calls,
+            1,
+            "policy reconciliation reads",
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             chain.reclaim_calls.load(Ordering::SeqCst),
-            2,
-            "monitor ticks inside recovery backoff must not POST"
+            1,
+            "fresh OPEN facts and idle time must not turn a failed policy attempt into another POST"
         );
-        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
-
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !session.is_settled() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("reclaim retry becomes terminal");
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 3);
         assert!(
-            chain.monitor_deal_state_calls.load(Ordering::SeqCst) >= 2,
-            "each retry must use fresh chain state"
+            chain.monitor_deal_state_calls.load(Ordering::SeqCst) >= 1,
+            "the failed policy result must still be reconciled from authoritative fresh facts"
         );
-        assert!(!session.mark_recovered("duplicate-terminal"));
+        assert!(session.is_closed());
+        assert!(!session.is_settled());
         assert_eq!(
             chain.place_next_calls.load(Ordering::SeqCst),
             0,
-            "terminal recovery alone must not BUY"
+            "a closed but nonterminal session must not create a replacement BUY"
         );
-        assert!(
-            super::on_demand_monitor_defers_buy(
-                true,
-                &dexdo::buyer::continuity::BuyerAction::PlaceNextDeal {
-                    reason: "closed-current",
-                },
-            ),
-            "on-demand monitor must suppress planner PlaceNextDeal"
+        assert_eq!(
+            routes.current().await.unwrap().route.token_contract,
+            "tc-dead"
         );
-        assert!(!super::on_demand_monitor_defers_buy(
-            false,
-            &dexdo::buyer::continuity::BuyerAction::PlaceNextDeal {
-                reason: "closed-current",
-            },
-        ));
-
-        let mut requests = Vec::new();
-        for _ in 0..16 {
-            let routes = routes.clone();
-            requests.push(tokio::spawn(async move {
-                routes
-                    .current_or_prepare()
-                    .await
-                    .unwrap()
-                    .route
-                    .token_contract
-            }));
-        }
-        for request in requests {
-            assert_eq!(request.await.unwrap(), "tc-fresh");
-        }
-        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn issue_547_cleanup_clears_stale_latch_and_retries() {
         use std::sync::atomic::Ordering;
 
-        let mut chain =
-            RecordingRecoveryChain::with_monitor_deal_state(dexdo_core::DealChainState {
-                funded: true,
-                opened: false,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(1),
-                last_advance: 0,
-            });
+        let funded_time = 1;
+        let never_opened_state = dexdo_core::DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(funded_time),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: funded_time,
+            last_claim_time: funded_time,
+            dispute_time: 0,
+        };
+        assert_eq!(
+            (
+                never_opened_state.probe_accepted,
+                never_opened_state.funded_time,
+                never_opened_state.prev_claim_time,
+                never_opened_state.last_claim_time,
+            ),
+            (false, Some(funded_time), funded_time, funded_time),
+            "cleanup retry must start from a canonical 4.0.32 funded-never-opened state"
+        );
+        let mut chain = RecordingRecoveryChain::with_monitor_deal_state(never_opened_state);
         chain.stop_error = Some("injected failed-request STOP".to_string());
         let chain = std::sync::Arc::new(chain);
         chain.cleanup_failures_remaining.store(1, Ordering::SeqCst);
@@ -10857,10 +12731,19 @@ mod tests {
             dexdo_core::DealChainState {
                 funded: true,
                 opened: true,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: now.saturating_sub(10),
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: now.saturating_sub(10),
+                dispute_time: 0,
             },
         ));
         chain.reclaim_ambiguous_remaining.store(1, Ordering::SeqCst);
@@ -10895,9 +12778,80 @@ mod tests {
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn ambiguous_reclaim_still_open_across_monitor_ticks_never_reposts() {
+        use std::sync::atomic::Ordering;
+
+        let now = super::unix_now_secs();
+        let opened = dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: true,
+            disputed: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(1),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: now.saturating_sub(10),
+            dispute_time: 0,
+        };
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::with_monitor_deal_state(opened));
+        chain.reclaim_ambiguous_remaining.store(1, Ordering::SeqCst);
+        chain
+            .reclaim_ambiguous_stays_open
+            .store(true, Ordering::SeqCst);
+        let (_routes, session, init_calls) =
+            start_on_demand_recovery_monitor(chain.clone(), "tc-ambiguous-open");
+        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+
+        assert!(
+            !session
+                .settle_dead_gateway("dead-gateway", &heartbeat)
+                .await
+        );
+        assert!(
+            session.recovery_submit_may_have_landed(dexdo::buyer::api::RecoveryKind::ReclaimOpened)
+        );
+        wait_for_counter(
+            &chain.monitor_deal_state_calls,
+            2,
+            "possibly-landed fresh-state reads",
+        )
+        .await;
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            1,
+            "fresh still-open facts may remain pending but must never authorize a second STOP"
+        );
+        assert!(!session.is_settled());
+
+        let mut terminal = opened;
+        terminal.funded = false;
+        terminal.opened = false;
+        terminal.deposit = 0;
+        terminal.funded_time = None;
+        chain.set_monitor_deal_state(terminal);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !session.is_settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh terminal fact closes possibly-landed recovery");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[cfg(feature = "shellnet")]
     #[tokio::test]
-    async fn issue_547_silent_openai_and_anthropic_requests_close_recover_and_replace_once() {
+    async fn issue_547_silent_openai_and_anthropic_requests_do_not_auto_stop_or_replace() {
         use std::sync::atomic::Ordering;
 
         const KEY_ENV: &str = "DEXDO_ISSUE_547_SILENT_PROVIDER_KEY";
@@ -10930,13 +12884,21 @@ mod tests {
             dexdo_core::DealChainState {
                 funded: true,
                 opened: true,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: now,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: now,
+                dispute_time: 0,
             },
         ));
-        chain.reclaim_failures_remaining.store(1, Ordering::SeqCst);
         let (state, _routes, session, init_calls) = start_on_demand_recovery_runtime(
             chain.clone(),
             buyer,
@@ -10972,68 +12934,55 @@ mod tests {
         chain.set_monitor_deal_state(dexdo_core::DealChainState {
             funded: true,
             opened: true,
+            probe_accepted: true,
             disputed: false,
-            probe_accepted: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: Some(1),
-            last_advance: now.saturating_sub(10),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: now.saturating_sub(10),
+            dispute_time: 0,
         });
 
-        let openai = openai.await.unwrap();
-        let anthropic = anthropic.await.unwrap();
-        assert_eq!(openai.status(), reqwest::StatusCode::BAD_GATEWAY);
-        assert_eq!(anthropic.status(), reqwest::StatusCode::BAD_GATEWAY);
-        assert!(session.is_closed());
+        let reads_before_idle = chain.monitor_deal_state_calls.load(Ordering::SeqCst);
+        wait_for_counter(
+            &chain.monitor_deal_state_calls,
+            reads_before_idle + 3,
+            "silent-provider idle reconciliation reads",
+        )
+        .await;
+        assert!(
+            !openai.is_finished() && !anthropic.is_finished(),
+            "provider silence alone must leave both in-flight requests pending"
+        );
+        assert!(!session.is_closed());
+        assert!(!session.is_settled());
+        assert_eq!(
+            chain.reclaim_calls.load(Ordering::SeqCst),
+            0,
+            "provider silence and an old claim timestamp must not trigger automatic STOP"
+        );
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            0,
+            "provider silence must not enter the explicit STOP path"
+        );
         assert_eq!(
             init_calls.load(Ordering::SeqCst),
             0,
-            "failed in-flight requests must not replace before terminal reclaim"
+            "silent in-flight requests must not initialize a replacement deal"
         );
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
 
-        wait_for_issue_547_terminal(session.as_ref()).await;
-        assert_eq!(
-            chain.reclaim_calls.load(Ordering::SeqCst),
-            2,
-            "the deadline seam must retry one early reclaim from fresh facts"
-        );
-        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            chain.place_next_calls.load(Ordering::SeqCst),
-            0,
-            "terminal recovery alone must not buy"
-        );
-
+        openai.abort();
+        anthropic.abort();
         dead_seller.server_task.abort();
         provider_task.abort();
-        let next_openai = tokio::spawn(issue_547_http_request(
-            client.clone(),
-            api_addr,
-            false,
-            "fresh OpenAI request",
-        ));
-        let next_anthropic = tokio::spawn(issue_547_http_request(
-            client,
-            api_addr,
-            true,
-            "fresh Anthropic request",
-        ));
-        let next_openai = next_openai.await.unwrap();
-        let next_anthropic = next_anthropic.await.unwrap();
-        assert_eq!(next_openai.status(), reqwest::StatusCode::OK);
-        assert_eq!(next_anthropic.status(), reqwest::StatusCode::OK);
-        let openai_body: serde_json::Value = next_openai.json().await.unwrap();
-        let anthropic_body: serde_json::Value = next_anthropic.json().await.unwrap();
-        assert!(openai_body["choices"].is_array(), "{openai_body}");
-        assert!(anthropic_body["content"].is_array(), "{anthropic_body}");
-        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            chain.place_next_calls.load(Ordering::SeqCst),
-            1,
-            "concurrent first requests after recovery must submit one BUY"
-        );
-
         let _ = shutdown_tx.send(());
         api_task.await.expect(" API joins");
         fresh_seller.server_task.abort();
@@ -11078,10 +13027,19 @@ mod tests {
             dexdo_core::DealChainState {
                 funded: true,
                 opened: true,
+                probe_accepted: true,
                 disputed: false,
-                probe_accepted: false,
+                deposit: 1_000,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_superseded: 0,
+                tokens_pending: 0,
                 funded_time: Some(1),
-                last_advance: now,
+                probe_tick: 0,
+                probe_time: 0,
+                prev_claim_time: 0,
+                last_claim_time: now,
+                dispute_time: 0,
             },
         ));
         chain.reclaim_ambiguous_remaining.store(1, Ordering::SeqCst);
@@ -11122,10 +13080,19 @@ mod tests {
         chain.set_monitor_deal_state(dexdo_core::DealChainState {
             funded: true,
             opened: true,
+            probe_accepted: true,
             disputed: false,
-            probe_accepted: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: Some(1),
-            last_advance: now.saturating_sub(10),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: now.saturating_sub(10),
+            dispute_time: 0,
         });
         let openai = openai.await.unwrap();
         let anthropic = anthropic.await.unwrap();
@@ -11318,14 +13285,52 @@ mod tests {
         disputed: bool,
         probe_accepted: bool,
     ) -> dexdo_core::DealChainState {
+        let funded_time = 100;
+        let canonical_never_opened = funded && !opened && !disputed && !probe_accepted;
         dexdo_core::DealChainState {
             funded,
             opened,
-            disputed,
             probe_accepted,
-            funded_time: Some(100),
-            last_advance: 0,
+            disputed,
+            deposit: if probe_accepted { 0 } else { 1_000 },
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(funded_time),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: if canonical_never_opened {
+                funded_time
+            } else {
+                0
+            },
+            last_claim_time: if canonical_never_opened {
+                funded_time
+            } else {
+                0
+            },
+            dispute_time: 0,
         }
+    }
+
+    #[test]
+    fn deal_state_fixture_preserves_probe_and_never_opened_anchors() {
+        let never_opened = deal_state(true, false, false, false);
+        assert_eq!(
+            (
+                never_opened.probe_accepted,
+                never_opened.funded_time,
+                never_opened.prev_claim_time,
+                never_opened.last_claim_time,
+            ),
+            (false, Some(100), 100, 100),
+            "funded-never-opened fixture must match the canonical 4.0.32 shape"
+        );
+        assert!(
+            deal_state(true, true, false, true).probe_accepted,
+            "the helper must preserve an accepted-probe fixture"
+        );
     }
 
     fn stream_snapshot(
@@ -11339,6 +13344,7 @@ mod tests {
             seller_locked: u128::from(seller_locked),
             buyer_locked: u128::from(buyer_locked),
             buyer_lead: u128::from(buyer_lead),
+            tokens_final: 0,
             seller_received: u128::from(seller_received),
             buyer_refunded: 0,
             burned: u128::from(burned),
@@ -11366,7 +13372,7 @@ mod tests {
             super::AdvanceFailureDisposition::BenignTerminal { reason } => {
                 assert!(reason.contains("reason=err_not_open_unopened_no_money"));
                 assert!(reason.contains("opened=false"));
-                assert!(reason.contains("probe_accepted=false"));
+                assert!(reason.contains("tokens_final=0"));
                 assert!(reason.contains("disputed=false"));
                 assert!(reason.contains("buyer_locked=0"));
                 assert!(reason.contains("buyer_lead=0"));
@@ -11446,10 +13452,19 @@ mod tests {
         dexdo_core::DealChainState {
             funded: true,
             opened: false,
-            disputed: false,
             probe_accepted: false,
+            disputed: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: Some(1),
-            last_advance: 0,
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
         }
     }
 
@@ -11457,10 +13472,19 @@ mod tests {
         dexdo_core::DealChainState {
             funded: true,
             opened: true,
-            disputed: true,
             probe_accepted: true,
+            disputed: true,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: Some(1),
-            last_advance: 100,
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: 100,
+            dispute_time: 0,
         }
     }
 
@@ -11474,6 +13498,31 @@ mod tests {
             buyer_no_show,
             dispute_against_me,
             max_open_deals: 1,
+        }
+    }
+
+    fn seller_terminal_policy_state(probe_accepted: bool) -> dexdo_core::DealChainState {
+        let accepted_tokens = if probe_accepted {
+            dexdo_core::TICK_SIZE
+        } else {
+            0
+        };
+        dexdo_core::DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted,
+            disputed: false,
+            deposit: 0,
+            finalized_owed: 0,
+            tokens_final: accepted_tokens,
+            tokens_superseded: accepted_tokens,
+            tokens_pending: accepted_tokens,
+            probe_tick: 0,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
         }
     }
 
@@ -11612,8 +13661,35 @@ mod tests {
             crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
         );
 
-        let outcome = super::apply_seller_terminal_policy(&"tc-done".to_string(), &policy, 1)
-            .expect("retire stops serving");
+        let outcome = super::apply_seller_terminal_policy(
+            &"tc-done".to_string(),
+            &policy,
+            1,
+            seller_terminal_policy_state(true),
+        )
+        .expect("retire stops serving");
+
+        assert!(matches!(
+            outcome,
+            super::SellerTerminalPolicyOutcome::StopServing
+        ));
+    }
+
+    #[test]
+    fn policy_seller_zero_delivery_after_accepted_probe_uses_after_done() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::CleanupAndRetire,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        let outcome = super::apply_seller_terminal_policy(
+            &"tc-accepted-probe".to_string(),
+            &policy,
+            0,
+            seller_terminal_policy_state(true),
+        )
+        .expect("an accepted probe is ordinary completed service even with zero later delivery");
 
         assert!(matches!(
             outcome,
@@ -11629,8 +13705,13 @@ mod tests {
             crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
         );
 
-        let outcome = super::apply_seller_terminal_policy(&"tc-noshow".to_string(), &policy, 0)
-            .expect("retire_gateway stops serving without cleanup");
+        let outcome = super::apply_seller_terminal_policy(
+            &"tc-noshow".to_string(),
+            &policy,
+            0,
+            seller_terminal_policy_state(false),
+        )
+        .expect("retire_gateway stops serving without cleanup");
 
         assert!(matches!(
             outcome,
@@ -11639,16 +13720,21 @@ mod tests {
     }
 
     #[test]
-    fn policy_seller_buyer_no_show_cleanup_and_retire_fails_closed_if_bypassed() {
+    fn policy_seller_true_buyer_no_show_cleanup_and_retire_fails_closed_if_bypassed() {
         let policy = seller_policy(
             crate::cli::policy::SellerAfterDealDoneAction::Retire,
             crate::cli::policy::SellerBuyerNoShowAction::CleanupAndRetire,
             crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
         );
 
-        let err = super::apply_seller_terminal_policy(&"tc-noshow".to_string(), &policy, 0)
-            .unwrap_err()
-            .to_string();
+        let err = super::apply_seller_terminal_policy(
+            &"tc-noshow".to_string(),
+            &policy,
+            0,
+            seller_terminal_policy_state(false),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("failure_class=buyer_no_show"), "{err}");
         assert!(err.contains("action=cleanup_and_retire"), "{err}");
@@ -11781,6 +13867,7 @@ mod tests {
             &buyer,
             &"tc-clean".to_string(),
             &policy,
+            false,
             None,
             1,
             "diagnostic",
@@ -11799,6 +13886,56 @@ mod tests {
         assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn matched_subscription_handover_failures_submit_no_terminal_writes() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(ready_funded_never_opened_state());
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let no_handover_policy =
+            policy_for_no_handover(crate::cli::policy::NoHandoverAfterMatchAction::WaitThenReclaim);
+
+        let no_handover = super::apply_no_handover_after_match_policy(
+            &chain,
+            &buyer,
+            &"tc-subscription".to_string(),
+            &no_handover_policy,
+            true,
+            None,
+            1,
+            "diagnostic",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(no_handover.contains("result=subscription_preserved"));
+        assert!(no_handover.contains("chain_write_submitted=false"));
+
+        let malformed_policy =
+            policy_for_malformed(crate::cli::policy::MalformedHandoverAction::Reclaim);
+        let malformed = super::apply_malformed_handover_policy(
+            &chain,
+            &buyer,
+            &"tc-subscription".to_string(),
+            &malformed_policy,
+            true,
+            &anyhow::anyhow!("malformed handover: invalid bytes"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(malformed.contains("result=subscription_preserved"));
+        assert!(malformed.contains("chain_write_submitted=false"));
+
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
     }
 
     // With shellnet enabled, this test serializes process-global DEXDO_PN_POOL for the full async scenario.
@@ -11857,6 +13994,7 @@ mod tests {
             &buyer,
             &"tc-current".to_string(),
             &policy,
+            false,
             Some((1, 1, 1)),
             1,
             "diagnostic",
@@ -11890,6 +14028,7 @@ mod tests {
             &buyer,
             &"tc-fail".to_string(),
             &policy,
+            false,
             None,
             1,
             "diagnostic",
@@ -11921,6 +14060,7 @@ mod tests {
             &buyer,
             &"tc-malformed".to_string(),
             &policy,
+            false,
             &handover_error,
         )
         .await
@@ -11930,7 +14070,10 @@ mod tests {
         assert!(err.contains("failure_class=malformed_handover"), "{err}");
         assert!(err.contains("action=reclaim"), "{err}");
         assert!(err.contains("result=reclaimed"), "{err}");
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        // The lever is a STOP now: there is no gated reclaim to call, and stopping recovers the escrow
+        // immediately rather than after an inactivity window.
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -11949,6 +14092,7 @@ mod tests {
             &buyer,
             &"tc-dispute".to_string(),
             &policy,
+            false,
             &handover_error,
         )
         .await
@@ -11984,6 +14128,7 @@ mod tests {
             &buyer,
             &"tc-fail".to_string(),
             &policy,
+            false,
             &handover_error,
         )
         .await
@@ -12040,6 +14185,53 @@ mod tests {
         assert!(report.contains("action=retry_then_reclaim"), "{report}");
         assert!(report.contains("result=reclaim_submitted"), "{report}");
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_oneshot_dead_gateway_preserves_deal() {
+        use std::sync::atomic::Ordering;
+
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::RetryThenReclaim,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+        );
+        let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
+            chain.clone(),
+            "tc-subscription-dead".to_string(),
+            std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            policy.as_api_failure_policy(),
+            dexdo::buyer::api::SessionLifetimePolicy::Preserve,
+        );
+
+        assert_eq!(
+            super::apply_oneshot_dead_gateway_policy(
+                &session,
+                &"tc-subscription-dead".to_string(),
+                Some(&policy),
+                1,
+            )
+            .await,
+            super::OneShotStreamPolicyOutcome::RetryCurrent
+        );
+        let report = match super::apply_oneshot_dead_gateway_policy(
+            &session,
+            &"tc-subscription-dead".to_string(),
+            Some(&policy),
+            2,
+        )
+        .await
+        {
+            super::OneShotStreamPolicyOutcome::TerminalReport(report) => report,
+            other => panic!("expected terminal report, got {other:?}"),
+        };
+
+        assert!(report.contains("result=reclaim_not_submitted"), "{report}");
+        drop(session);
+        tokio::task::yield_now().await;
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
     }
@@ -12141,18 +14333,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buyer_monitor_chain_facts_execute_recovery_once() {
+    async fn buyer_monitor_idle_opened_never_stops_or_buys_and_cleanup_still_runs() {
         use dexdo::buyer::continuity::{BuyerAction, BuyerContinuity, ContinuityConfig, DealFacts};
         use std::sync::atomic::Ordering;
 
         let cfg = ContinuityConfig {
             renewal_threshold_tokens: 10,
             match_open_timeout_secs: 600,
-            stream_timeout_secs: 600,
         };
         let chain = RecordingRecoveryChain::default();
 
-        for heartbeat in [101, 400, 699] {
+        for (now, heartbeat) in [(700, 101), (700, 400), (700, 699), (10_000, 0)] {
             let active = super::buyer_monitor_current_facts(
                 "tc-active".to_string(),
                 100,
@@ -12160,128 +14351,71 @@ mod tests {
                 Some(dexdo_core::DealChainState {
                     funded: true,
                     opened: true,
+                    probe_accepted: true,
                     disputed: false,
-                    probe_accepted: false,
+                    deposit: 1_000,
+                    finalized_owed: 0,
+                    tokens_final: 0,
+                    tokens_superseded: 0,
+                    tokens_pending: 0,
                     funded_time: Some(1),
-                    last_advance: 100,
+                    probe_tick: 0,
+                    probe_time: 0,
+                    prev_claim_time: 0,
+                    last_claim_time: 100,
+                    dispute_time: 0,
                 }),
-                700,
+                now,
                 heartbeat,
             );
-            assert!(matches!(
-                BuyerContinuity::default().tick(Some(active), None, cfg),
-                BuyerAction::ServeCurrent { .. }
-            ));
+            let action = BuyerContinuity::default().tick(Some(active), None, cfg);
+            assert!(
+                matches!(action, BuyerAction::ServeCurrent { .. }),
+                "OPEN idle facts must remain usable at now={now}, heartbeat={heartbeat}: {action:?}"
+            );
+            assert!(
+                super::execute_buyer_monitor_recovery(&chain, action, None)
+                    .await
+                    .is_none(),
+                "idle alone must not map to a money-moving recovery"
+            );
         }
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
 
-        let boundary = super::buyer_monitor_current_facts(
-            "tc-boundary".to_string(),
-            100,
-            false,
-            Some(dexdo_core::DealChainState {
-                funded: true,
-                opened: true,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(1),
-                last_advance: 100,
-            }),
-            700,
-            100,
-        );
-        assert!(matches!(
-            BuyerContinuity::default().tick(Some(boundary), None, cfg),
-            BuyerAction::ReclaimOpened { .. }
-        ));
-
-        let opened_idle = super::buyer_monitor_current_facts(
-            "tc-open".to_string(),
-            100,
-            false,
-            Some(dexdo_core::DealChainState {
-                funded: true,
-                opened: true,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(1),
-                last_advance: 100,
-            }),
-            700,
-            0,
-        );
-        let mut planner = BuyerContinuity::default();
-        let action = planner.tick(Some(opened_idle), None, cfg);
+        let funded_time = 100;
+        let never_opened_state = dexdo_core::DealChainState {
+            funded: true,
+            opened: false,
+            probe_accepted: false,
+            disputed: false,
+            deposit: 1_000,
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            funded_time: Some(funded_time),
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: funded_time,
+            last_claim_time: funded_time,
+            dispute_time: 0,
+        };
         assert_eq!(
-            action,
-            BuyerAction::ReclaimOpened {
-                token_contract: "tc-open".to_string()
-            }
+            (
+                never_opened_state.probe_accepted,
+                never_opened_state.funded_time,
+                never_opened_state.prev_claim_time,
+                never_opened_state.last_claim_time,
+            ),
+            (false, Some(funded_time), funded_time, funded_time),
+            "monitor cleanup must use a canonical 4.0.32 funded-never-opened state"
         );
-
-        let race_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
-        let race_deal = dexdo::buyer::api::ApiDeal::new(
-            dexdo::buyer::api::Route {
-                handover: dexdo_core::Handover {
-                    endpoint: "https://127.0.0.1:1".to_string(),
-                    tls_fingerprint: "00".repeat(32),
-                },
-                token_contract: "tc-open".to_string(),
-                max_tokens: 100,
-            },
-            std::sync::Arc::new(dexdo::buyer::api::SessionSettle::new(
-                race_chain.clone(),
-                "tc-open".to_string(),
-                std::sync::Arc::new(dexdo_core::LocalNote::generate()),
-            )),
-            std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
-        );
-        *race_chain
-            .heartbeat_during_reclaim_preflight
-            .lock()
-            .expect("preflight heartbeat lock") = Some(race_deal.clone());
-        let race_heartbeat = race_deal.accepted_output_guard();
-        assert!(
-            super::execute_buyer_monitor_recovery(
-                race_chain.as_ref(),
-                action.clone(),
-                Some(&race_heartbeat),
-                Some(race_deal.session.as_ref()),
-            )
-            .await
-            .is_some_and(|(_, _, result)| matches!(result, Ok(None))),
-            "newly accepted output must cancel reclaim immediately before submission"
-        );
-        assert_eq!(race_chain.reclaim_calls.load(Ordering::SeqCst), 0);
-
-        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
-            std::sync::atomic::AtomicU64::new(0),
-        ));
-        let (kind, tc, result) =
-            super::execute_buyer_monitor_recovery(&chain, action, Some(&heartbeat), None)
-                .await
-                .expect("reclaim action executes");
-        assert_eq!(kind, super::BuyerMonitorRecoveryKind::ReclaimOpened);
-        assert_eq!(tc, "tc-open");
-        assert!(result.is_ok());
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            planner.tick(Some(DealFacts::opened_idle("tc-open", 601)), None, cfg),
-            BuyerAction::IgnoreStale { token_contract } if token_contract == "tc-open"
-        ));
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
-
         let never_opened = super::buyer_monitor_current_facts(
             "tc-clean".to_string(),
             100,
             false,
-            Some(dexdo_core::DealChainState {
-                funded: true,
-                opened: false,
-                disputed: false,
-                probe_accepted: false,
-                funded_time: Some(100),
-                last_advance: 0,
-            }),
+            Some(never_opened_state),
             700,
             0,
         );
@@ -12293,7 +14427,7 @@ mod tests {
                 token_contract: "tc-clean".to_string()
             }
         );
-        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None, None)
+        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
             .await
             .expect("cleanup action executes");
         assert_eq!(kind, super::BuyerMonitorRecoveryKind::CleanupUnopened);
@@ -12311,51 +14445,23 @@ mod tests {
         assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn buyer_monitor_dynamic_stream_timeout_delays_reclaim_until_real_threshold() {
+    #[test]
+    fn legacy_idle_threshold_is_not_a_continuity_parameter_or_action() {
         use dexdo::buyer::continuity::{BuyerAction, BuyerContinuity, ContinuityConfig};
-        use std::sync::atomic::Ordering;
-
-        let cfg = ContinuityConfig {
-            stream_timeout_secs: 1_200,
-            ..ContinuityConfig::default()
-        };
-        let facts_at = |now| {
-            super::buyer_monitor_current_facts(
-                "tc-dynamic-timeout".to_string(),
-                100,
-                false,
-                Some(dexdo_core::DealChainState {
-                    funded: true,
-                    opened: true,
-                    disputed: false,
-                    probe_accepted: false,
-                    funded_time: Some(1),
-                    last_advance: 100,
-                }),
-                now,
-                0,
-            )
-        };
-        let chain = RecordingRecoveryChain::default();
-
+        let source = include_str!("../buyer/continuity.rs");
+        assert!(!source.contains("stream_timeout_secs"));
+        assert!(!source.contains("ReclaimOpened"));
         assert!(matches!(
-            BuyerContinuity::default().tick(Some(facts_at(700)), None, cfg),
+            BuyerContinuity::default().tick(
+                Some(dexdo::buyer::continuity::DealFacts::opened_idle(
+                    "tc-idle",
+                    u64::MAX
+                )),
+                None,
+                ContinuityConfig::default(),
+            ),
             BuyerAction::ServeCurrent { .. }
         ));
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
-
-        let action = BuyerContinuity::default().tick(Some(facts_at(1_300)), None, cfg);
-        assert!(matches!(action, BuyerAction::ReclaimOpened { .. }));
-        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
-            std::sync::atomic::AtomicU64::new(0),
-        ));
-        let (_, _, result) =
-            super::execute_buyer_monitor_recovery(&chain, action, Some(&heartbeat), None)
-                .await
-                .expect("real dynamic threshold submits reclaim");
-        result.expect("dynamic threshold reclaim succeeds");
-        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -12410,6 +14516,2633 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         (dir.clone(), TempDirCleanup(dir))
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SubscriptionSubmitCall {
+        order_book: String,
+        model_hash: String,
+        max_price_per_tick: u128,
+        ticks: u128,
+        escrow: u128,
+        flags: u8,
+        deadline: u64,
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct FakeSubscriptionOps {
+        calls: std::sync::Mutex<Vec<SubscriptionSubmitCall>>,
+        placements: std::sync::Mutex<Vec<dexdo_core::InferenceSubscriptionPlacement>>,
+        fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
+        facts_override: std::sync::Mutex<Option<super::SubscriptionDealFacts>>,
+        active: std::sync::atomic::AtomicBool,
+        ambiguous_after_post: std::sync::atomic::AtomicBool,
+        order_id_floor: u128,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl FakeSubscriptionOps {
+        fn new(order_id_floor: u128) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                placements: std::sync::Mutex::new(Vec::new()),
+                fills: std::sync::Mutex::new(Vec::new()),
+                facts_override: std::sync::Mutex::new(None),
+                active: std::sync::atomic::AtomicBool::new(false),
+                ambiguous_after_post: std::sync::atomic::AtomicBool::new(false),
+                order_id_floor,
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl super::SubscriptionOrderOps for FakeSubscriptionOps {
+        async fn submit_subscription_order(
+            &self,
+            _note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            order_book: &str,
+            model_hash: &str,
+            max_price_per_tick: u128,
+            ticks: u128,
+            escrow: u128,
+            order_flags: u8,
+            deadline: u64,
+            fill_cursor: &mut dexdo_core::MatchWatchCursor,
+            before_post: &mut (dyn FnMut(
+                String,
+                u128,
+                dexdo_core::MatchWatchCursor,
+                Vec<(u128, dexdo_core::MatchedFill)>,
+            ) -> anyhow::Result<()>
+                      + Send),
+        ) -> anyhow::Result<serde_json::Value> {
+            *fill_cursor = dexdo_core::MatchWatchCursor::new(1_000);
+            before_post(
+                format!("boc-sha256:{}", "a".repeat(64)),
+                self.order_id_floor,
+                fill_cursor.clone(),
+                Vec::new(),
+            )?;
+            self.calls.lock().unwrap().push(SubscriptionSubmitCall {
+                order_book: order_book.to_string(),
+                model_hash: model_hash.to_string(),
+                max_price_per_tick,
+                ticks,
+                escrow,
+                flags: order_flags,
+                deadline,
+            });
+            if self
+                .ambiguous_after_post
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow::Error::new(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected lost money POST response".to_string(),
+                )));
+            }
+            Ok(serde_json::json!({ "accepted": true }))
+        }
+
+        async fn subscription_placements(
+            &self,
+            _order_book: &str,
+            _buyer_note: &str,
+            _order_id_floor: u128,
+            _max_price_per_tick: u128,
+            _ticks: u128,
+        ) -> anyhow::Result<Vec<dexdo_core::InferenceSubscriptionPlacement>> {
+            Ok(self.placements.lock().unwrap().clone())
+        }
+
+        async fn attributed_subscription_fills(
+            &self,
+            _order_book: &str,
+            _buyer_note: &str,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> anyhow::Result<Vec<(u128, dexdo_core::MatchedFill)>> {
+            Ok(self.fills.lock().unwrap().clone())
+        }
+
+        async fn subscription_order_active(
+            &self,
+            _order_book: &str,
+            _order_id: u128,
+            _buyer_note: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(self.active.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn subscription_deal_facts(
+            &self,
+            expected_note_addr: &str,
+            order: &super::BuyerSubscriptionOrderRecord,
+            _matched: &super::BuyerJournalMatch,
+        ) -> anyhow::Result<super::SubscriptionDealFacts> {
+            if let Some(facts) = self.facts_override.lock().unwrap().clone() {
+                return Ok(facts);
+            }
+            Ok(subscription_test_facts(order, expected_note_addr))
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct SubscriptionResumeChain {
+        order_book: String,
+        snapshot: dexdo_core::DealChainSnapshot,
+        snapshot_overrides:
+            std::sync::Mutex<std::collections::BTreeMap<String, dexdo_core::DealChainSnapshot>>,
+        reject_target: Option<String>,
+        attributed_fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
+        money_posts: std::sync::atomic::AtomicUsize,
+        lookback_reads: std::sync::atomic::AtomicUsize,
+        target_checks: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl dexdo_core::ChainBackend for SubscriptionResumeChain {
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            panic!("durable subscription resume must not perform fresh discovery")
+        }
+
+        async fn post_offer(
+            &self,
+            _offer: dexdo_core::SellOffer,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer-only test backend")
+        }
+
+        async fn place_buy(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("durable subscription resume attempted a second BUY")
+        }
+
+        async fn place_buy_by_model(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            _flags: u8,
+            _deadline: u64,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("durable subscription resume attempted a second model BUY")
+        }
+
+        fn model_buy_order_book_identity(&self) -> Option<String> {
+            Some(self.order_book.clone())
+        }
+
+        async fn poll_attributed_model_buys_for_order_book(
+            &self,
+            _order_book: &str,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> Result<Vec<(u128, dexdo_core::MatchedFill)>, dexdo_core::ChainError> {
+            Ok(self.attributed_fills.lock().unwrap().clone())
+        }
+
+        async fn wait_matched_token_contract(
+            &self,
+            _since_unix: i64,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<dexdo_core::MatchedFill>, dexdo_core::ChainError> {
+            self.lookback_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "bounded event lookback must not run".to_string(),
+            ))
+        }
+
+        async fn assert_model_only_resume_target(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.target_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .reject_target
+                .as_ref()
+                .is_some_and(|rejected| rejected.eq_ignore_ascii_case(token_contract))
+            {
+                return Err(dexdo_core::ChainError::Chain(
+                    "injected active-target rejection".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn deal_snapshot(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
+            Ok(Some(
+                self.snapshot_overrides
+                    .lock()
+                    .unwrap()
+                    .get(token_contract)
+                    .cloned()
+                    .unwrap_or_else(|| self.snapshot.clone()),
+            ))
+        }
+
+        async fn claim_tokens(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+            _cumulative_tokens: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("resume never claims")
+        }
+
+        async fn read_match(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            unimplemented!("buyer resume reads handover later")
+        }
+
+        async fn open_stream(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _enc_endpoint: Vec<u8>,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer resume never opens seller stream")
+        }
+
+        async fn read_handover(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            Ok(None)
+        }
+
+        async fn stop(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            panic!("durable subscription resume must not STOP")
+        }
+
+        async fn snapshot(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            None
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_note() -> String {
+        format!("0:{}", "1".repeat(64))
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_book() -> String {
+        format!("0:{}", "2".repeat(64))
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_tc(digit: char) -> String {
+        format!("0:{}", digit.to_string().repeat(64))
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_reserve(
+        ticks: u128,
+        price_per_tick: u128,
+    ) -> dexdo_core::SubscriptionBuyReserve {
+        dexdo_core::subscription_buy_reserve(ticks, price_per_tick).unwrap()
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn persist_subscription_test_handle(
+        _order: &super::BuyerSubscriptionOrderRecord,
+        matched: &super::BuyerJournalMatch,
+    ) -> anyhow::Result<String> {
+        Ok(crate::cli::deals::make_handle_id(
+            &matched.token_contract,
+            crate::cli::deals::DealHandleRole::Buyer,
+        ))
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_facts(
+        order: &super::BuyerSubscriptionOrderRecord,
+        expected_note_addr: &str,
+    ) -> super::SubscriptionDealFacts {
+        let funded_tokens = order.ticks.checked_mul(dexdo_core::TICK_SIZE).unwrap();
+        let accepted_probe_tokens = dexdo_core::TICK_SIZE;
+        let reserve =
+            dexdo_core::subscription_buy_reserve(order.ticks, order.max_price_per_tick).unwrap();
+        super::SubscriptionDealFacts {
+            state: dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                probe_accepted: true,
+                disputed: false,
+                deposit: reserve.deposit,
+                finalized_owed: 0,
+                tokens_final: accepted_probe_tokens,
+                tokens_superseded: accepted_probe_tokens,
+                tokens_pending: accepted_probe_tokens,
+                probe_tick: 0,
+                funded_time: Some(1),
+                probe_time: 1,
+                prev_claim_time: 1,
+                last_claim_time: 1,
+                dispute_time: 0,
+            },
+            subscription: dexdo_core::DealSubscription {
+                deal_flags: dexdo_core::order_flags::SUBSCRIPTION,
+                sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+                week_index: 0,
+                tokens_per_week: funded_tokens / u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
+                funded_tokens,
+                tokens_paid: 0,
+                period_start: 1,
+                week_base_tokens: 0,
+            },
+            seller_bond: dexdo_core::DealSellerBond {
+                bond_funded: true,
+                bond_held: reserve.buyer_bond,
+                bond_required: reserve.buyer_bond,
+            },
+            buyer_bond: dexdo_core::DealBuyerBond {
+                bond_held: reserve.buyer_bond,
+                bond_required: reserve.buyer_bond,
+            },
+            model_name: order.frame_model.clone(),
+            model_hash: order.model_hash.clone(),
+            buyer_note: expected_note_addr.to_string(),
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_snapshot(
+        order: &super::BuyerSubscriptionOrderRecord,
+        expected_note_addr: &str,
+    ) -> dexdo_core::DealChainSnapshot {
+        let facts = subscription_test_facts(order, expected_note_addr);
+        dexdo_core::DealChainSnapshot {
+            account_code_hash: "code-hash".to_string(),
+            account_boc_hash: "boc-hash".to_string(),
+            state: facts.state,
+            subscription: facts.subscription,
+            seller_bond: facts.seller_bond,
+            buyer_bond: facts.buyer_bond,
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_placement(
+        order_id: u128,
+        deadline: u64,
+    ) -> dexdo_core::InferenceSubscriptionPlacement {
+        dexdo_core::InferenceSubscriptionPlacement {
+            order_id,
+            buyer_note: subscription_test_note(),
+            max_price_per_tick: dexdo_core::PRICE_STEP,
+            ticks: u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
+            sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+            deadline,
+            created_at: i64::try_from(deadline - 1).unwrap(),
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_journal(
+        order_id_floor: u128,
+        deadline: u64,
+    ) -> super::BuyerSubscriptionSubmitJournal {
+        let frame_model = "qwen--qwen3--32b".to_string();
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
+        super::BuyerSubscriptionSubmitJournal {
+            schema: super::BUYER_SUBSCRIPTION_SUBMIT_SCHEMA.to_string(),
+            note_addr: subscription_test_note(),
+            order_book: subscription_test_book(),
+            model_hash: dexdo_core::model_hash_for(&frame_model),
+            frame_model,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
+            ticks,
+            deposit: reserve.deposit,
+            buyer_bond: reserve.buyer_bond,
+            escrow: reserve.total_escrow,
+            flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+            deadline,
+            order_id_floor,
+            fill_cursor: dexdo_core::MatchWatchCursor::new(1_000),
+            submit_identity: format!("boc-sha256:{}", "a".repeat(64)),
+            created_at_unix: deadline - 10,
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn subscription_test_record(order_id: u128) -> super::BuyerSubscriptionOrderRecord {
+        let deadline = 2_000;
+        let journal = subscription_test_journal(order_id, deadline);
+        let placement = subscription_test_placement(order_id, deadline);
+        let mut state =
+            super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+        super::record_subscription_placement(&mut state, &journal, &placement)
+            .expect("canonical placement")
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn write_test_private_json(path: &std::path::Path, value: &serde_json::Value) {
+        let bytes = serde_json::to_vec_pretty(value).unwrap();
+        super::write_pool_private(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn subscription_mock_flags_are_all_or_nothing() {
+        use crate::cli::args::MockFlags;
+
+        assert!(!super::subscription_mock_mode(&MockFlags {
+            mock_model: false,
+            mock_chain: false,
+        })
+        .unwrap());
+        assert!(super::subscription_mock_mode(&MockFlags {
+            mock_model: true,
+            mock_chain: true,
+        })
+        .unwrap());
+        for mock in [
+            MockFlags {
+                mock_model: true,
+                mock_chain: false,
+            },
+            MockFlags {
+                mock_model: false,
+                mock_chain: true,
+            },
+        ] {
+            let error = super::subscription_mock_mode(&mock)
+                .expect_err("half-mock subscription must fail")
+                .to_string();
+            assert!(error.contains("--mock-model and --mock-chain together"));
+        }
+    }
+
+    #[test]
+    fn mock_subscription_place_status_cancel_persists_exact_reserve() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-subscription-mock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let endpoints = dir.join("endpoints.json");
+        let backend = dexdo_core::MockChainBackend::new(
+            endpoints.clone(),
+            dexdo_core::ProtocolConsts::canonical(),
+            dexdo_core::DobParams::canonical(),
+        );
+        let note = dexdo_core::LocalNote::from_seed(&[61; 32]);
+        let other_note = dexdo_core::LocalNote::from_seed(&[62; 32]);
+        let frame_model = "qwen--qwen3--32b";
+        let order_book = format!(
+            "0:{}",
+            dexdo_core::model_hash_for(frame_model)
+                .strip_prefix("0x")
+                .unwrap()
+        );
+        let place_args = crate::cli::args::SubscriptionPlaceArgs {
+            note_key: None,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
+            ticks: u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
+        };
+        let plan = super::subscription_place_plan(&place_args).unwrap();
+        assert!(backend
+            .place_subscription_order(
+                &order_book,
+                &note,
+                place_args.max_price_per_tick,
+                place_args.ticks,
+                plan.reserve.total_escrow - 1,
+                dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+                super::buy_order_deadline().unwrap(),
+            )
+            .is_err());
+        assert!(backend
+            .place_subscription_order(
+                &order_book,
+                &note,
+                place_args.max_price_per_tick,
+                place_args.ticks,
+                plan.reserve.total_escrow,
+                dexdo_core::order_flags::AON
+                    | dexdo_core::order_flags::SUBSCRIPTION
+                    | dexdo_core::order_flags::MARKET,
+                super::buy_order_deadline().unwrap(),
+            )
+            .is_err());
+        let place = crate::cli::args::SubscriptionCommand::Place(place_args);
+        let placed = super::execute_mock_subscription_command(
+            &backend,
+            &note,
+            frame_model,
+            &order_book,
+            &place,
+            Some(plan),
+        )
+        .unwrap();
+        assert!(placed.contains("network=mock"));
+        assert!(placed.contains("order_id=1"));
+        assert!(placed.contains(&format!("deposit={}", plan.reserve.deposit)));
+        assert!(placed.contains(&format!("buyer_bond={}", plan.reserve.buyer_bond)));
+        assert!(placed.contains(&format!("total_escrow={}", plan.reserve.total_escrow)));
+
+        let reloaded = dexdo_core::MockChainBackend::new(
+            endpoints,
+            dexdo_core::ProtocolConsts::canonical(),
+            dexdo_core::DobParams::canonical(),
+        );
+        assert!(reloaded
+            .subscription_order(&order_book, 1, &other_note)
+            .unwrap()
+            .is_none());
+        assert!(reloaded
+            .subscription_order("0:wrong-book", 1, &note)
+            .unwrap()
+            .is_none());
+
+        let status = crate::cli::args::SubscriptionCommand::Status { order_id: 1 };
+        let rendered = super::execute_mock_subscription_command(
+            &reloaded,
+            &note,
+            frame_model,
+            &order_book,
+            &status,
+            None,
+        )
+        .unwrap();
+        assert!(rendered.contains("resting=true"));
+        assert!(rendered.contains(&format!("total_escrow={}", plan.reserve.total_escrow)));
+
+        let cancel = crate::cli::args::SubscriptionCommand::Cancel { order_id: 1 };
+        let cancelled = super::execute_mock_subscription_command(
+            &reloaded,
+            &note,
+            frame_model,
+            &order_book,
+            &cancel,
+            None,
+        )
+        .unwrap();
+        assert!(cancelled.contains(&format!("refund={}", plan.reserve.total_escrow)));
+        assert!(super::execute_mock_subscription_command(
+            &reloaded,
+            &note,
+            frame_model,
+            &order_book,
+            &status,
+            None,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_term_and_balance_guards_fail_closed() {
+        assert_eq!(super::subscription_order_flags(), 0x60);
+        let price = dexdo_core::PRICE_STEP;
+        for ticks in [4u128, dexdo_core::SUBSCRIPTION_MAX_TICKS] {
+            let args = crate::cli::args::SubscriptionPlaceArgs {
+                note_key: None,
+                max_price_per_tick: price,
+                ticks,
+            };
+            let plan = super::subscription_place_plan(&args).expect("valid subscription");
+            let expected = subscription_test_reserve(ticks, price);
+            assert_eq!(plan.reserve, expected);
+            assert_eq!(
+                plan.reserve.deposit,
+                dexdo_core::required_escrow_for_buy(ticks, price),
+                "ordinary deposit remains bond-free"
+            );
+        }
+        for ticks in [0u128, 1, 3, 5, dexdo_core::SUBSCRIPTION_MAX_TICKS + 4] {
+            let args = crate::cli::args::SubscriptionPlaceArgs {
+                note_key: None,
+                max_price_per_tick: price,
+                ticks,
+            };
+            assert!(
+                super::subscription_place_plan(&args).is_err(),
+                "ticks={ticks}"
+            );
+        }
+        for invalid_price in [0, price - 1, price + 1] {
+            let args = crate::cli::args::SubscriptionPlaceArgs {
+                note_key: None,
+                max_price_per_tick: invalid_price,
+                ticks: 4,
+            };
+            assert!(
+                super::subscription_place_plan(&args).is_err(),
+                "price={invalid_price}"
+            );
+        }
+        let largest_step = u128::MAX - (u128::MAX % price);
+        let overflow = crate::cli::args::SubscriptionPlaceArgs {
+            note_key: None,
+            max_price_per_tick: largest_step,
+            ticks: 4,
+        };
+        assert!(super::subscription_place_plan(&overflow)
+            .expect_err("fee multiplication overflow")
+            .to_string()
+            .contains("overflows u128"));
+
+        let reserve = subscription_test_reserve(4, price);
+        assert!(super::ensure_subscription_note_balance(None, reserve).is_err());
+        assert!(
+            super::ensure_subscription_note_balance(Some(reserve.total_escrow - 1), reserve)
+                .is_err()
+        );
+        assert_eq!(
+            super::ensure_subscription_note_balance(Some(reserve.total_escrow), reserve).unwrap(),
+            reserve.total_escrow
+        );
+        assert_eq!(
+            super::ensure_subscription_note_balance(Some(reserve.total_escrow + 1), reserve)
+                .unwrap(),
+            reserve.total_escrow + 1
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_preflight_requires_exact_total_and_rejects_market_semantics() {
+        let price = dexdo_core::PRICE_STEP;
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let reserve = subscription_test_reserve(ticks, price);
+        let exact_flags = dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION;
+
+        assert!(super::validate_subscription_order_terms(
+            price,
+            ticks,
+            reserve.total_escrow,
+            exact_flags,
+            2,
+            1,
+        )
+        .is_ok());
+        assert!(super::validate_subscription_order_terms(
+            price,
+            ticks,
+            reserve.total_escrow - 1,
+            exact_flags,
+            2,
+            1,
+        )
+        .is_err());
+        assert!(super::validate_subscription_order_terms(
+            price,
+            ticks,
+            reserve.total_escrow + 1,
+            exact_flags,
+            2,
+            1,
+        )
+        .is_err());
+        let market_error = super::validate_subscription_order_terms(
+            price,
+            ticks,
+            reserve.total_escrow,
+            exact_flags | dexdo_core::order_flags::MARKET,
+            2,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            market_error
+                .to_string()
+                .contains("MARKET orders are unsupported"),
+            "{market_error:#}"
+        );
+        assert!(
+            dexdo_core::check_buy_deposit_headroom(reserve.deposit, ticks, price).is_ok(),
+            "ordinary BUY remains exactly deposit-only"
+        );
+        assert!(
+            dexdo_core::check_subscription_buy_reserve(reserve.deposit, ticks, price).is_err(),
+            "the same deposit cannot omit a subscription buyer bond"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_journal_rejects_every_money_field_mutation() {
+        let journal = subscription_test_journal(30, 2_000);
+        assert!(journal.validate(&journal.note_addr).is_ok());
+
+        let mut deposit = journal.clone();
+        deposit.deposit += 1;
+        let mut buyer_bond = journal.clone();
+        buyer_bond.buyer_bond += 1;
+        let mut total = journal.clone();
+        total.escrow += 1;
+        for mutated in [deposit, buyer_bond, total] {
+            assert!(mutated.validate(&mutated.note_addr).is_err());
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_lower_clearing_renders_exact_limit_remainder_refund() {
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let limit = 2 * dexdo_core::PRICE_STEP;
+        let clearing = dexdo_core::PRICE_STEP;
+        let reserve = subscription_test_reserve(ticks, limit);
+        let refund = dexdo_core::subscription_buy_clearing_refund(ticks, limit, clearing).unwrap();
+        let frame_model = "qwen--qwen3--32b".to_string();
+        let fill = super::BuyerJournalMatch {
+            token_contract: subscription_test_tc('3'),
+            order_id: 31,
+            ticks,
+            clearing_price: clearing,
+        };
+        let record = super::BuyerSubscriptionOrderRecord {
+            order_book: subscription_test_book(),
+            model_hash: dexdo_core::model_hash_for(&frame_model),
+            frame_model,
+            order_id: 31,
+            max_price_per_tick: limit,
+            ticks,
+            deposit: reserve.deposit,
+            buyer_bond: reserve.buyer_bond,
+            escrow: reserve.total_escrow,
+            flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+            deadline: 2_000,
+            fill_cursor: dexdo_core::MatchWatchCursor::new(0),
+            phase: super::BuyerSubscriptionPhase::Matched,
+            matched: Some(super::BuyerSubscriptionMatch::from_fill(&fill)),
+        };
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            order_book: record.order_book.clone(),
+            stats: None,
+            orders: Vec::new(),
+        };
+        let rendered = super::render_subscription_record(
+            &snapshot,
+            &record,
+            &subscription_test_note(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(rendered.contains(&format!("deposit={}", reserve.deposit)));
+        assert!(rendered.contains(&format!("buyer_bond={}", reserve.buyer_bond)));
+        assert!(rendered.contains(&format!("total_escrow={}", reserve.total_escrow)));
+        assert!(rendered.contains(&format!("price_improvement_refund={refund}")));
+    }
+
+    #[cfg(feature = "shellnet")]
+    proptest::proptest! {
+        #[test]
+        fn every_accepted_subscription_volume_is_four_equal_weeks(
+            ticks_per_week in 1u128..=(
+                dexdo_core::SUBSCRIPTION_MAX_TICKS
+                    / u128::from(dexdo_core::SUBSCRIPTION_WEEKS)
+            ),
+        ) {
+            let ticks = ticks_per_week * u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+            let escrow = dexdo_core::subscription_buy_reserve(
+                ticks,
+                dexdo_core::PRICE_STEP,
+            ).unwrap().total_escrow;
+            proptest::prop_assert!(super::validate_subscription_order_terms(
+                dexdo_core::PRICE_STEP,
+                ticks,
+                escrow,
+                dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+                2,
+                1,
+            ).is_ok());
+            let invalid = ticks + 1;
+            let invalid_escrow = dexdo_core::subscription_buy_reserve(
+                invalid,
+                dexdo_core::PRICE_STEP,
+            ).unwrap().total_escrow;
+            proptest::prop_assert!(super::validate_subscription_order_terms(
+                dexdo_core::PRICE_STEP,
+                invalid,
+                invalid_escrow,
+                dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+                2,
+                1,
+            ).is_err());
+        }
+
+        #[test]
+        fn subscription_quota_is_exactly_pending_minus_authoritative_week_base(
+            week_base in 0u128..=1_000_000_000_000,
+            claimed in 0u128..=1_000_000_000,
+            remaining in 0u128..=1_000_000_000,
+        ) {
+            let order = subscription_test_record(39);
+            let mut facts = subscription_test_facts(&order, &subscription_test_note());
+            facts.subscription.week_base_tokens = week_base;
+            facts.subscription.tokens_per_week = claimed + remaining;
+            facts.state.tokens_pending = week_base + claimed;
+            let view = super::subscription_quota_view(&facts).unwrap();
+            proptest::prop_assert_eq!(view.claimed_current_week, claimed);
+            proptest::prop_assert_eq!(view.remaining_current_week, remaining);
+        }
+
+        #[test]
+        fn subscription_oneshot_never_exceeds_remaining_week_quota(
+            requested in 1u64..=u32::MAX as u64,
+            remaining in 1u64..=u32::MAX as u64,
+        ) {
+            let allowed =
+                super::subscription_oneshot_budget(requested, Some(remaining)).unwrap();
+            proptest::prop_assert_eq!(allowed, requested.min(remaining));
+        }
+    }
+
+    #[test]
+    fn exhausted_subscription_week_sends_no_oneshot_request() {
+        let error = super::subscription_oneshot_budget(64, Some(0)).unwrap_err();
+        assert!(error.to_string().contains("quota is exhausted"));
+        assert_eq!(super::subscription_oneshot_budget(64, None).unwrap(), 64);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_quota_rejects_underflow_over_quota_and_locked_exposure_overflow() {
+        let order = subscription_test_record(39);
+        let mut facts = subscription_test_facts(&order, &subscription_test_note());
+        facts.subscription.week_base_tokens = 20;
+        facts.state.tokens_pending = 19;
+        assert!(super::subscription_quota_view(&facts)
+            .unwrap_err()
+            .to_string()
+            .contains("below weekBaseTokens"));
+
+        facts.state.tokens_pending = 31;
+        facts.subscription.tokens_per_week = 10;
+        assert!(super::subscription_quota_view(&facts)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds quota"));
+
+        facts.state.tokens_pending = 20;
+        facts.subscription.tokens_per_week = 10;
+        facts.state.deposit = u128::MAX;
+        facts.buyer_bond.bond_held = 1;
+        assert!(super::subscription_quota_view(&facts)
+            .unwrap_err()
+            .to_string()
+            .contains("overflows u128"));
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn terminal_subscription_has_zero_usable_week_quota_but_reports_locked_exposure() {
+        let order = subscription_test_record(39);
+        let mut facts = subscription_test_facts(&order, &subscription_test_note());
+        facts.state.disputed = true;
+        facts.state.tokens_pending = u128::MAX;
+        facts.subscription.week_base_tokens = 0;
+        let view = super::subscription_quota_view(&facts).unwrap();
+        assert_eq!(view.claimed_current_week, 0);
+        assert_eq!(view.remaining_current_week, 0);
+        assert_eq!(
+            view.buyer_locked_total,
+            facts.state.deposit + facts.state.probe_tick + facts.buyer_bond.bond_held
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn open_subscription_in_final_claim_grace_has_no_additional_week_quota() {
+        let order = subscription_test_record(39);
+        let mut facts = subscription_test_facts(&order, &subscription_test_note());
+        let recorded_base = 2 * dexdo_core::TICK_SIZE;
+        let recorded_after_boundary = 123;
+        facts.subscription.week_index = facts.subscription.sub_weeks;
+        facts.subscription.week_base_tokens = recorded_base;
+        facts.state.tokens_pending = recorded_base + recorded_after_boundary;
+
+        let view = super::subscription_quota_view(&facts).unwrap();
+        assert_eq!(view.claimed_current_week, recorded_after_boundary);
+        assert_eq!(view.remaining_current_week, 0);
+        assert_eq!(
+            view.buyer_locked_total,
+            facts.state.deposit + facts.state.probe_tick + facts.buyer_bond.bond_held
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_submit_posts_exact_shape_once_and_persists_resting_order() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-exact-submit");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let note_addr = subscription_test_note();
+        let note = dexdo_core::Address::parse(&note_addr).unwrap();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let order_id = 40;
+        let deadline = super::buy_order_deadline().unwrap();
+        let placement = subscription_test_placement(order_id, deadline);
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.placements.lock().unwrap().push(placement);
+        ops.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
+        let escrow = reserve.total_escrow;
+        let frame_model = "qwen--qwen3--32b";
+        let model_hash = dexdo_core::model_hash_for(frame_model);
+
+        let record = super::submit_subscription_with_journal(
+            &ops,
+            &note,
+            &keys,
+            &subscription_test_book(),
+            frame_model,
+            &model_hash,
+            dexdo_core::PRICE_STEP,
+            ticks,
+            escrow,
+            deadline,
+            &journal_path,
+            &state_path,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("one exact resting subscription");
+
+        assert_eq!(record.order_id, order_id);
+        assert_eq!(record.deposit, reserve.deposit);
+        assert_eq!(record.buyer_bond, reserve.buyer_bond);
+        assert_eq!(record.escrow, reserve.total_escrow);
+        assert!(record.matched.is_none());
+        assert!(
+            !journal_path.exists(),
+            "proved placement clears submit journal"
+        );
+        let calls = ops.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one money POST");
+        assert_eq!(
+            calls[0],
+            SubscriptionSubmitCall {
+                order_book: subscription_test_book(),
+                model_hash,
+                max_price_per_tick: dexdo_core::PRICE_STEP,
+                ticks,
+                escrow,
+                flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+                deadline,
+            }
+        );
+        let state =
+            super::load_buyer_subscription_state(&state_path, &note_addr).expect("v3 state");
+        assert_eq!(state.orders, vec![record]);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_submit_accepts_one_immediate_full_fill() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-immediate-fill");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let note_addr = subscription_test_note();
+        let note = dexdo_core::Address::parse(&note_addr).unwrap();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let order_id = 45;
+        let deadline = super::buy_order_deadline().unwrap();
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.placements
+            .lock()
+            .unwrap()
+            .push(subscription_test_placement(order_id, deadline));
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        ops.fills.lock().unwrap().push((
+            order_id,
+            dexdo_core::MatchedFill {
+                order_id,
+                token_contract: subscription_test_tc('3'),
+                ticks,
+                price_per_tick: dexdo_core::PRICE_STEP,
+            },
+        ));
+        let escrow = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP).total_escrow;
+        let model = "qwen--qwen3--32b";
+        let record = super::submit_subscription_with_journal(
+            &ops,
+            &note,
+            &keys,
+            &subscription_test_book(),
+            model,
+            &dexdo_core::model_hash_for(model),
+            dexdo_core::PRICE_STEP,
+            ticks,
+            escrow,
+            deadline,
+            &journal_path,
+            &state_path,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("one immediate full seller fill");
+        assert_eq!(
+            record.matched.unwrap().token_contract,
+            subscription_test_tc('3')
+        );
+        assert_eq!(ops.calls.lock().unwrap().len(), 1);
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn lost_subscription_response_reconciles_without_second_boc() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-lost-response");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let note_addr = subscription_test_note();
+        let note = dexdo_core::Address::parse(&note_addr).unwrap();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let order_id = 50;
+        let deadline = super::buy_order_deadline().unwrap();
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.ambiguous_after_post
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let escrow = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP).total_escrow;
+        let frame_model = "qwen--qwen3--32b";
+        let model_hash = dexdo_core::model_hash_for(frame_model);
+
+        let error = super::submit_subscription_with_journal(
+            &ops,
+            &note,
+            &keys,
+            &subscription_test_book(),
+            frame_model,
+            &model_hash,
+            dexdo_core::PRICE_STEP,
+            ticks,
+            escrow,
+            deadline,
+            &journal_path,
+            &state_path,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect_err("lost response remains ambiguous until a chain fact appears");
+        assert!(error.to_string().contains("journal retained"), "{error:#}");
+        assert!(journal_path.exists());
+        assert_eq!(ops.calls.lock().unwrap().len(), 1);
+
+        ops.placements
+            .lock()
+            .unwrap()
+            .push(subscription_test_placement(order_id, deadline));
+        ops.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        let journal = match super::load_buyer_money_journal(&journal_path, &note_addr).unwrap() {
+            Some(super::BuyerMoneyJournal::Subscription(journal)) => *journal,
+            other => panic!("expected retained subscription journal, got {other:?}"),
+        };
+        let record = super::reconcile_subscription_submit(
+            &ops,
+            &journal_path,
+            &state_path,
+            &journal,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("restart proves the original placement");
+        assert_eq!(record.order_id, order_id);
+        assert_eq!(
+            ops.calls.lock().unwrap().len(),
+            1,
+            "restart must not create a second signed BOC"
+        );
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_submit_reconciliation_coalesces_identical_placement_duplicates() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-identical-placements");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let order_id = 55;
+        let deadline = 2_000;
+        let journal = subscription_test_journal(order_id, deadline);
+        super::write_buyer_subscription_submit_journal(&journal_path, &journal)
+            .expect("durable journal");
+        let placement = subscription_test_placement(order_id, deadline);
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.placements
+            .lock()
+            .unwrap()
+            .extend([placement.clone(), placement]);
+        ops.active.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let record = super::reconcile_subscription_submit(
+            &ops,
+            &journal_path,
+            &state_path,
+            &journal,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("identical deliveries of one authenticated placement coalesce");
+        assert_eq!(record.order_id, order_id);
+        assert!(!journal_path.exists());
+        let state = super::load_buyer_subscription_state(&state_path, &journal.note_addr).unwrap();
+        assert_eq!(state.orders.len(), 1);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_submit_reconciliation_rejects_conflicting_same_id_and_retains_journal() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-conflicting-placements");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let order_id = 56;
+        let deadline = 2_000;
+        let journal = subscription_test_journal(order_id, deadline);
+        super::write_buyer_subscription_submit_journal(&journal_path, &journal)
+            .expect("durable journal");
+        let placement = subscription_test_placement(order_id, deadline);
+        let mut conflicting = placement.clone();
+        conflicting.deadline += 1;
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.placements
+            .lock()
+            .unwrap()
+            .extend([placement, conflicting]);
+
+        let error = super::reconcile_subscription_submit(
+            &ops,
+            &journal_path,
+            &state_path,
+            &journal,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect_err("same order id with conflicting authenticated facts must fail closed");
+        assert!(
+            error.to_string().contains("conflicting authenticated"),
+            "{error:#}"
+        );
+        assert!(journal_path.exists(), "contradiction retains the journal");
+        assert!(
+            !state_path.exists(),
+            "contradiction is detected before durable order state changes"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_match_crash_after_handle_keeps_journal_and_retry_converges() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-match-crash-order");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let state_backup = dir.join("state-before-match.json");
+        let handle_marker = dir.join("buyer-handle.persisted");
+        let order_id = 55;
+        let deadline = 2_000;
+        let journal = subscription_test_journal(order_id, deadline);
+        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
+        let ops = FakeSubscriptionOps::new(order_id);
+        ops.placements
+            .lock()
+            .unwrap()
+            .push(subscription_test_placement(order_id, deadline));
+        ops.fills.lock().unwrap().push((
+            order_id,
+            dexdo_core::MatchedFill {
+                order_id,
+                token_contract: subscription_test_tc('3'),
+                ticks: journal.ticks,
+                price_per_tick: journal.max_price_per_tick,
+            },
+        ));
+
+        let injected = std::sync::atomic::AtomicBool::new(false);
+        let crash_after_handle =
+            |_order: &super::BuyerSubscriptionOrderRecord, matched: &super::BuyerJournalMatch| {
+                std::fs::write(&handle_marker, matched.token_contract.as_bytes()).unwrap();
+                if !injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::fs::rename(&state_path, &state_backup).unwrap();
+                    std::fs::create_dir(&state_path).unwrap();
+                }
+                Ok(crate::cli::deals::make_handle_id(
+                    &matched.token_contract,
+                    crate::cli::deals::DealHandleRole::Buyer,
+                ))
+            };
+        super::reconcile_subscription_submit(
+            &ops,
+            &journal_path,
+            &state_path,
+            &journal,
+            std::time::Duration::ZERO,
+            &crash_after_handle,
+        )
+        .await
+        .expect_err("injected crash point must prevent state/cursor commit");
+        assert!(handle_marker.exists(), "handle persistence happens first");
+        assert!(journal_path.exists(), "money journal must remain retained");
+
+        std::fs::remove_dir(&state_path).unwrap();
+        std::fs::rename(&state_backup, &state_path).unwrap();
+        let before_retry =
+            super::load_buyer_subscription_state(&state_path, &journal.note_addr).unwrap();
+        assert_eq!(
+            before_retry.orders[0].phase,
+            super::BuyerSubscriptionPhase::Resting
+        );
+        assert!(before_retry.orders[0].matched.is_none());
+
+        let resumed = super::reconcile_subscription_submit(
+            &ops,
+            &journal_path,
+            &state_path,
+            &journal,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("retry adopts the same TC and handle without another payment");
+        assert_eq!(
+            resumed.matched.as_ref().unwrap().deal_handle,
+            crate::cli::deals::make_handle_id(
+                &subscription_test_tc('3'),
+                crate::cli::deals::DealHandleRole::Buyer,
+            )
+        );
+        assert_eq!(ops.calls.lock().unwrap().len(), 0, "no submit was retried");
+        assert!(
+            !journal_path.exists(),
+            "journal clears only after atomic state commit"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_fill_reconciliation_accepts_one_full_seller_only() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-fill-shape");
+        let state_path = dir.join("state.json");
+        let deadline = 2_000;
+        let journal = subscription_test_journal(60, deadline);
+        let placement = subscription_test_placement(60, deadline);
+        let mut state =
+            super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+        super::record_subscription_placement(&mut state, &journal, &placement).expect("placement");
+        super::write_buyer_subscription_state(&state_path, &state).unwrap();
+        let full = dexdo_core::MatchedFill {
+            order_id: 60,
+            token_contract: subscription_test_tc('3'),
+            ticks: journal.ticks,
+            price_per_tick: journal.max_price_per_tick,
+        };
+        let ops = FakeSubscriptionOps::new(60);
+        ops.fills
+            .lock()
+            .unwrap()
+            .extend([(60, full.clone()), (60, full.clone())]);
+        let record = super::sync_subscription_match_once(
+            &ops,
+            &state_path,
+            &journal.note_addr,
+            &journal.order_book,
+            60,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("duplicate delivery of one event is idempotent");
+        assert_eq!(record.matched.unwrap().token_contract, full.token_contract);
+
+        for (label, fills) in [
+            (
+                "partial",
+                vec![(
+                    60,
+                    dexdo_core::MatchedFill {
+                        ticks: journal.ticks - 1,
+                        ..full.clone()
+                    },
+                )],
+            ),
+            (
+                "multiple",
+                vec![
+                    (60, full.clone()),
+                    (
+                        60,
+                        dexdo_core::MatchedFill {
+                            token_contract: subscription_test_tc('4'),
+                            ..full.clone()
+                        },
+                    ),
+                ],
+            ),
+        ] {
+            let case_path = dir.join(format!("{label}.json"));
+            let mut state =
+                super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+            super::record_subscription_placement(&mut state, &journal, &placement)
+                .expect("placement");
+            super::write_buyer_subscription_state(&case_path, &state).unwrap();
+            let case = FakeSubscriptionOps::new(60);
+            *case.fills.lock().unwrap() = fills;
+            assert!(
+                super::sync_subscription_match_once(
+                    &case,
+                    &case_path,
+                    &journal.note_addr,
+                    &journal.order_book,
+                    60,
+                    &persist_subscription_test_handle,
+                )
+                .await
+                .is_err(),
+                "{label} fill must fail closed"
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_fill_rejects_wrong_order_owner_model_flags_and_funded_volume() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-fill-facts");
+        let deadline = 2_000;
+        let journal = subscription_test_journal(61, deadline);
+        let placement = subscription_test_placement(61, deadline);
+        let full = dexdo_core::MatchedFill {
+            order_id: 61,
+            token_contract: subscription_test_tc('3'),
+            ticks: journal.ticks,
+            price_per_tick: journal.max_price_per_tick,
+        };
+
+        let wrong_embedded_order_path = dir.join("wrong-embedded-order.json");
+        let mut state =
+            super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+        let record = super::record_subscription_placement(&mut state, &journal, &placement)
+            .expect("placement");
+        super::write_buyer_subscription_state(&wrong_embedded_order_path, &state).unwrap();
+        let wrong_order = FakeSubscriptionOps::new(61);
+        wrong_order.fills.lock().unwrap().push((
+            61,
+            dexdo_core::MatchedFill {
+                order_id: 62,
+                ..full.clone()
+            },
+        ));
+        let error = super::sync_subscription_match_once(
+            &wrong_order,
+            &wrong_embedded_order_path,
+            &journal.note_addr,
+            &journal.order_book,
+            61,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("embedded order id"), "{error:#}");
+
+        let canonical = subscription_test_facts(&record, &journal.note_addr);
+        let mut cases = Vec::new();
+        let mut wrong_owner = canonical.clone();
+        wrong_owner.buyer_note = subscription_test_tc('8');
+        cases.push(("wrong-owner", wrong_owner));
+        let mut wrong_model = canonical.clone();
+        wrong_model.model_name = "other--model--1".to_string();
+        wrong_model.model_hash = dexdo_core::model_hash_for(&wrong_model.model_name);
+        cases.push(("wrong-model", wrong_model));
+        let mut wrong_flags = canonical.clone();
+        wrong_flags.subscription.deal_flags = 0;
+        wrong_flags.subscription.sub_weeks = 0;
+        cases.push(("wrong-flags", wrong_flags));
+        let mut wrong_funded_volume = canonical.clone();
+        wrong_funded_volume.subscription.funded_tokens -= 1;
+        cases.push(("wrong-funded-volume", wrong_funded_volume));
+        let mut wrong_buyer_bond_required = canonical.clone();
+        wrong_buyer_bond_required.buyer_bond.bond_required += 1;
+        cases.push(("wrong-buyer-bond-required", wrong_buyer_bond_required));
+        let mut wrong_buyer_bond_held = canonical.clone();
+        wrong_buyer_bond_held.buyer_bond.bond_held -= 1;
+        cases.push(("wrong-buyer-bond-held", wrong_buyer_bond_held));
+        let mut wrong_seller_bond_required = canonical.clone();
+        wrong_seller_bond_required.seller_bond.bond_required += 1;
+        cases.push(("wrong-seller-bond-required", wrong_seller_bond_required));
+        let mut wrong_seller_bond_held = canonical.clone();
+        wrong_seller_bond_held.seller_bond.bond_held -= 1;
+        cases.push(("wrong-seller-bond-held", wrong_seller_bond_held));
+        let mut unfunded_seller_bond_with_money = canonical.clone();
+        unfunded_seller_bond_with_money.seller_bond.bond_funded = false;
+        cases.push((
+            "unfunded-seller-bond-with-money",
+            unfunded_seller_bond_with_money,
+        ));
+
+        for (label, facts) in cases {
+            let state_path = dir.join(format!("{label}.json"));
+            let mut state =
+                super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+            super::record_subscription_placement(&mut state, &journal, &placement)
+                .expect("placement");
+            super::write_buyer_subscription_state(&state_path, &state).unwrap();
+            let ops = FakeSubscriptionOps::new(61);
+            ops.fills.lock().unwrap().push((61, full.clone()));
+            *ops.facts_override.lock().unwrap() = Some(facts);
+            assert!(
+                super::sync_subscription_match_once(
+                    &ops,
+                    &state_path,
+                    &journal.note_addr,
+                    &journal.order_book,
+                    61,
+                    &persist_subscription_test_handle,
+                )
+                .await
+                .is_err(),
+                "{label} TC facts must fail closed"
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_deal_identity_requires_exact_order_and_contract_flags() {
+        let note_addr = subscription_test_note();
+        let canonical_order = subscription_test_record(63);
+        let matched = super::BuyerJournalMatch {
+            token_contract: subscription_test_tc('3'),
+            order_id: canonical_order.order_id,
+            ticks: canonical_order.ticks,
+            clearing_price: canonical_order.max_price_per_tick,
+        };
+        let canonical_facts = subscription_test_facts(&canonical_order, &note_addr);
+        let expected_order_flags =
+            dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION;
+
+        for order_flags in u8::MIN..=u8::MAX {
+            let mut order = canonical_order.clone();
+            order.flags = order_flags;
+            let accepted = super::validate_subscription_deal_facts(
+                &note_addr,
+                &order,
+                &matched,
+                &canonical_facts,
+            )
+            .is_ok();
+            assert_eq!(
+                accepted,
+                order_flags == expected_order_flags,
+                "book-side flags 0x{order_flags:02x}"
+            );
+        }
+
+        for deal_flags in u8::MIN..=u8::MAX {
+            let mut facts = canonical_facts.clone();
+            facts.subscription.deal_flags = deal_flags;
+            let accepted = super::validate_subscription_deal_facts(
+                &note_addr,
+                &canonical_order,
+                &matched,
+                &facts,
+            )
+            .is_ok();
+            assert_eq!(
+                accepted,
+                deal_flags == dexdo_core::order_flags::SUBSCRIPTION,
+                "TokenContract dealFlags 0x{deal_flags:02x}"
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn matched_unopened_subscription_accepts_zero_unfunded_seller_bond() {
+        let note_addr = subscription_test_note();
+        let order = subscription_test_record(64);
+        let matched = super::BuyerJournalMatch {
+            token_contract: subscription_test_tc('4'),
+            order_id: order.order_id,
+            ticks: order.ticks,
+            clearing_price: order.max_price_per_tick,
+        };
+        let mut facts = subscription_test_facts(&order, &note_addr);
+        facts.state.opened = false;
+        facts.state.probe_accepted = false;
+        facts.seller_bond.bond_funded = false;
+        facts.seller_bond.bond_held = 0;
+
+        super::validate_subscription_deal_facts(&note_addr, &order, &matched, &facts)
+            .expect("matched unopened subscription legitimately has no seller bond yet");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn explicit_and_historical_subscription_resume_share_quota_and_identity_checks() {
+        use std::sync::atomic::Ordering;
+
+        let note_addr = subscription_test_note();
+        let record = subscription_test_record(65);
+        let token_contract = subscription_test_tc('5');
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot: subscription_test_snapshot(&record, &note_addr),
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let explicit = super::classify_subscription_resume_target(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            &token_contract,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("explicit subscription classified");
+        let fill = dexdo_core::MatchedFill {
+            order_id: record.order_id,
+            token_contract: token_contract.clone(),
+            ticks: record.ticks,
+            price_per_tick: record.max_price_per_tick,
+        };
+        let historical = super::classify_subscription_resume_target(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            &token_contract,
+            Some(&fill),
+        )
+        .await
+        .unwrap()
+        .expect("historical subscription classified");
+
+        assert_eq!(explicit.ticks, historical.ticks);
+        assert_eq!(explicit.quota, historical.quota);
+        assert_eq!(explicit.facts, historical.facts);
+        assert_eq!(explicit.order_id, None);
+        assert_eq!(historical.order_id, Some(record.order_id));
+        assert_eq!(chain.target_checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn historical_subscription_terminal_is_rejected_before_active_target_check() {
+        use std::sync::atomic::Ordering;
+
+        let note_addr = subscription_test_note();
+        let record = subscription_test_record(66);
+        let token_contract = subscription_test_tc('6');
+        let mut snapshot = subscription_test_snapshot(&record, &note_addr);
+        snapshot.state.disputed = true;
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot,
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: Some(token_contract.clone()),
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let fill = dexdo_core::MatchedFill {
+            order_id: record.order_id,
+            token_contract: token_contract.clone(),
+            ticks: record.ticks,
+            price_per_tick: record.max_price_per_tick,
+        };
+
+        let error = super::classify_subscription_resume_target(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            &token_contract,
+            Some(&fill),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("terminal/disputed"), "{error:#}");
+        assert_eq!(
+            chain.target_checks.load(Ordering::SeqCst),
+            0,
+            "terminal reconciliation must precede every live-target assertion"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_status_and_cancel_validate_exact_owned_resting_buy() {
+        let owner = subscription_test_note();
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
+        let mut order = dexdo_core::OrderBookOrder {
+            order_id: 70,
+            owner_note: owner.clone(),
+            token_contract: None,
+            is_buy: true,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            ticks,
+            escrow: reserve.total_escrow,
+            deadline: 200,
+            flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+            timestamp: 100,
+        };
+        let snapshot = |order: dexdo_core::OrderBookOrder| dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            order_book: subscription_test_book(),
+            stats: Some(dexdo_core::OrderBookStats {
+                next_order_id: 71,
+                order_count: 1,
+                executed_notional: 0,
+                executed_ticks: 0,
+            }),
+            orders: vec![order],
+        };
+        assert!(super::validate_subscription_live_order(
+            &snapshot(order.clone()).order_book,
+            Some(&order),
+            70,
+            &owner
+        )
+        .is_ok());
+        let journal = subscription_test_journal(70, 2_000);
+        assert!(
+            super::validate_subscription_journal_target(&journal, &snapshot(order.clone())).is_ok()
+        );
+        let mut wrong_book = snapshot(order.clone());
+        wrong_book.order_book = subscription_test_tc('7');
+        assert!(
+            super::validate_subscription_journal_target(&journal, &wrong_book).is_err(),
+            "a retained BOC journal cannot be reconciled against another book"
+        );
+
+        order.owner_note = subscription_test_tc('8');
+        assert!(super::validate_subscription_live_order(
+            &snapshot(order.clone()).order_book,
+            Some(&order),
+            70,
+            &owner
+        )
+        .is_err());
+        order.owner_note = owner.clone();
+        order.flags = dexdo_core::order_flags::SUBSCRIPTION;
+        assert!(super::validate_subscription_live_order(
+            &snapshot(order.clone()).order_book,
+            Some(&order),
+            70,
+            &owner
+        )
+        .is_err());
+        order.flags = dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION;
+        order.deadline = order.timestamp;
+        assert!(super::validate_subscription_live_order(
+            &snapshot(order.clone()).order_book,
+            Some(&order),
+            70,
+            &owner
+        )
+        .is_err());
+        order.deadline = 200;
+        order.is_buy = false;
+        order.token_contract = Some(subscription_test_tc('9'));
+        assert!(super::validate_subscription_live_order(
+            &snapshot(order.clone()).order_book,
+            Some(&order),
+            70,
+            &owner
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_status_rejects_durable_terms_that_contradict_live_row() {
+        let owner = subscription_test_note();
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
+        let order = dexdo_core::OrderBookOrder {
+            order_id: 71,
+            owner_note: owner.clone(),
+            token_contract: None,
+            is_buy: true,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            ticks,
+            escrow: reserve.total_escrow,
+            deadline: 200,
+            flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+            timestamp: 100,
+        };
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            order_book: subscription_test_book(),
+            stats: None,
+            orders: vec![order.clone()],
+        };
+        let mut state = super::BuyerSubscriptionState::empty(&owner).unwrap();
+        let durable =
+            super::ensure_subscription_record_from_order(&mut state, &snapshot, &order).unwrap();
+
+        let mut contradictions = Vec::new();
+        let mut record = durable.clone();
+        record.max_price_per_tick += dexdo_core::PRICE_STEP;
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.ticks += u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.deposit += 1;
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.buyer_bond += 1;
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.escrow += 1;
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.flags = dexdo_core::order_flags::SUBSCRIPTION;
+        contradictions.push(record);
+        let mut record = durable.clone();
+        record.deadline += 1;
+        contradictions.push(record);
+        let mut record = durable;
+        let fill = super::BuyerJournalMatch {
+            token_contract: subscription_test_tc('3'),
+            order_id: order.order_id,
+            ticks: order.ticks,
+            clearing_price: order.price_per_tick,
+        };
+        record.matched = Some(super::BuyerSubscriptionMatch::from_fill(&fill));
+        contradictions.push(record);
+
+        for record in contradictions {
+            let error =
+                super::validate_subscription_record_matches_live_order(&record, &snapshot, &order)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("conflicts with durable state"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_cancel_requires_refund_and_fill_race_loses_closed() {
+        assert_eq!(
+            super::subscription_cancel_outcome(false, 100, 140, 40, None).unwrap(),
+            super::SubscriptionCancelOutcome::Refunded {
+                expected_balance: 140
+            }
+        );
+        assert!(matches!(
+            super::subscription_cancel_outcome(true, 100, 100, 40, None).unwrap(),
+            super::SubscriptionCancelOutcome::Unconfirmed { .. }
+        ));
+        assert!(matches!(
+            super::subscription_cancel_outcome(false, 100, 139, 40, None).unwrap(),
+            super::SubscriptionCancelOutcome::Unconfirmed { .. }
+        ));
+        let matched = super::BuyerSubscriptionMatch {
+            token_contract: subscription_test_tc('3'),
+            order_id: 70,
+            ticks: 4,
+            clearing_price: dexdo_core::PRICE_STEP,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &subscription_test_tc('3'),
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        };
+        assert!(matches!(
+            super::subscription_cancel_outcome(false, 100, 140, 40, Some(&matched)).unwrap(),
+            super::SubscriptionCancelOutcome::Filled { .. }
+        ));
+        assert!(matches!(
+            super::subscription_cancel_outcome(true, 100, 100, 40, Some(&matched)).unwrap(),
+            super::SubscriptionCancelOutcome::ContradictoryFill { .. }
+        ));
+        assert!(
+            super::subscription_cancel_outcome(false, u128::MAX, 0, 1, None).is_err(),
+            "balance arithmetic overflow must fail closed"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_cancel_polls_stale_read_until_refund_is_visible() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_reads = reads.clone();
+        let outcome = super::reconcile_subscription_cancel(
+            dexdo_core::SUBSCRIPTION_ORDER_RECONCILE_POLL.saturating_mul(2),
+            100,
+            40,
+            move || {
+                let read = observed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if read == 0 {
+                        Ok((true, 100, None))
+                    } else {
+                        Ok((false, 140, None))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            super::SubscriptionCancelOutcome::Refunded {
+                expected_balance: 140
+            }
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_cancel_polls_stale_read_until_delayed_fill_wins() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_reads = reads.clone();
+        let matched = super::BuyerSubscriptionMatch {
+            token_contract: subscription_test_tc('3'),
+            order_id: 70,
+            ticks: 4,
+            clearing_price: dexdo_core::PRICE_STEP,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &subscription_test_tc('3'),
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        };
+        let expected_token_contract = matched.token_contract.clone();
+        let outcome = super::reconcile_subscription_cancel(
+            dexdo_core::SUBSCRIPTION_ORDER_RECONCILE_POLL.saturating_mul(2),
+            100,
+            40,
+            move || {
+                let read = observed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let matched = matched.clone();
+                async move {
+                    if read == 0 {
+                        Ok((true, 100, None))
+                    } else {
+                        Ok((false, 100, Some(matched)))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            super::SubscriptionCancelOutcome::Filled {
+                token_contract: expected_token_contract
+            }
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn legacy_and_corrupt_subscription_state_are_rejected_explicitly() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-state-schemas");
+        let state_path = dir.join("state.json");
+        let journal_path = dir.join("journal.json");
+        let note_addr = subscription_test_note();
+
+        for schema in [
+            super::LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA,
+            super::LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA_V2,
+        ] {
+            write_test_private_json(
+                &state_path,
+                &serde_json::json!({
+                    "schema": schema
+                }),
+            );
+            let error = super::load_buyer_subscription_state(&state_path, &note_addr).unwrap_err();
+            assert!(error.to_string().contains("legacy"), "{error:#}");
+            assert!(
+                error.to_string().contains("manual reconciliation"),
+                "{error:#}"
+            );
+        }
+
+        write_test_private_json(
+            &journal_path,
+            &serde_json::json!({
+                "schema": super::LEGACY_BUYER_SUBSCRIPTION_SUBMIT_SCHEMA
+            }),
+        );
+        let error = super::load_buyer_money_journal(&journal_path, &note_addr).unwrap_err();
+        assert!(error.to_string().contains("legacy"), "{error:#}");
+
+        let mut state = super::BuyerSubscriptionState::empty(&note_addr).unwrap();
+        state.schema = super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string();
+        let mut value = serde_json::to_value(state).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!(true));
+        write_test_private_json(&state_path, &value);
+        let error = super::load_buyer_subscription_state(&state_path, &note_addr).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error:#}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn explicit_terminal_confirmation_marks_durable_subscription_exactly_once() {
+        let note_addr = format!("0:{}", "a".repeat(64));
+        let tc = subscription_test_tc('b');
+        let money_lock = super::BuyerMoneyLock::open(&note_addr).unwrap();
+        let _ = std::fs::remove_file(&money_lock.subscriptions_path);
+        let mut record = subscription_test_record(79);
+        record.phase = super::BuyerSubscriptionPhase::Matched;
+        record.matched = Some(super::BuyerSubscriptionMatch {
+            token_contract: tc.clone(),
+            order_id: record.order_id,
+            ticks: record.ticks,
+            clearing_price: record.max_price_per_tick,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &tc,
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        });
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![record],
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+
+        assert!(super::mark_buyer_subscription_terminal(&note_addr, &tc).unwrap());
+        assert!(!super::mark_buyer_subscription_terminal(&note_addr, &tc).unwrap());
+        let stored =
+            super::load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)
+                .unwrap();
+        assert_eq!(
+            stored.orders[0].phase,
+            super::BuyerSubscriptionPhase::Terminal
+        );
+        let _ = std::fs::remove_file(&money_lock.subscriptions_path);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn subscription_confirmed_pre_match_cancel_becomes_terminal_without_fallback_or_payment()
+    {
+        use std::sync::atomic::Ordering;
+
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-cancel-terminal");
+        let note_addr = subscription_test_note();
+        let record = subscription_test_record(84);
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![record.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+
+        assert!(super::mark_cancelled_buyer_subscription_terminal(
+            &money_lock.subscriptions_path,
+            &note_addr,
+            &record.order_book,
+            record.order_id,
+        )
+        .unwrap());
+        assert!(!super::mark_cancelled_buyer_subscription_terminal(
+            &money_lock.subscriptions_path,
+            &note_addr,
+            &record.order_book,
+            record.order_id,
+        )
+        .unwrap());
+        let stored =
+            super::load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)
+                .unwrap();
+        assert_eq!(
+            stored.orders[0].phase,
+            super::BuyerSubscriptionPhase::Terminal
+        );
+        assert!(stored.orders[0].matched.is_none());
+
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot: subscription_test_snapshot(&record, &note_addr),
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("terminal"), "{message}");
+        assert!(
+            message.contains(&format!("order#{}", record.order_id)),
+            "{message}"
+        );
+        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn durable_subscription_resume_precedes_lookback_and_never_pays_again() {
+        use std::sync::atomic::Ordering;
+
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-durable-resume");
+        let note_addr = subscription_test_note();
+        let mut record = subscription_test_record(80);
+        let tc = subscription_test_tc('3');
+        record.phase = super::BuyerSubscriptionPhase::Matched;
+        record.matched = Some(super::BuyerSubscriptionMatch {
+            token_contract: tc.clone(),
+            order_id: record.order_id,
+            ticks: record.ticks,
+            clearing_price: record.max_price_per_tick,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &tc,
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        });
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![record.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot: subscription_test_snapshot(&record, &note_addr),
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        for _ in 0..2 {
+            let selected = super::resolve_buyer_subscription_resume(
+                &chain,
+                &note_addr,
+                &record.frame_model,
+                None,
+                &money_lock,
+                std::time::Duration::ZERO,
+                &persist_subscription_test_handle,
+            )
+            .await
+            .unwrap()
+            .expect("durable subscription selected");
+            assert_eq!(selected.record.matched.as_ref().unwrap().token_contract, tc);
+            assert_eq!(
+                selected.record.matched.as_ref().unwrap().deal_handle,
+                record.matched.as_ref().unwrap().deal_handle
+            );
+        }
+        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            chain.lookback_reads.load(Ordering::SeqCst),
+            0,
+            "persisted TC must win even beyond RESUME_LOOKBACK_SECS"
+        );
+        assert_eq!(chain.target_checks.load(Ordering::SeqCst), 2);
+
+        let mut terminal = state.clone();
+        terminal.orders[0].phase = super::BuyerSubscriptionPhase::Terminal;
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &terminal).unwrap();
+        let error = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("terminal"), "{error:#}");
+        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
+
+        let mut active = subscription_test_record(83);
+        let active_tc = subscription_test_tc('4');
+        active.phase = super::BuyerSubscriptionPhase::Matched;
+        active.matched = Some(super::BuyerSubscriptionMatch {
+            token_contract: active_tc.clone(),
+            order_id: active.order_id,
+            ticks: active.ticks,
+            clearing_price: active.max_price_per_tick,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &active_tc,
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        });
+        terminal.orders.push(active);
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &terminal).unwrap();
+        let selected = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap()
+        .expect("one active subscription must win over retained terminal history");
+        assert_eq!(
+            selected.record.matched.as_ref().unwrap().token_contract,
+            active_tc
+        );
+        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn durable_subscription_resume_never_falls_back_while_order_is_resting() {
+        use std::sync::atomic::Ordering;
+
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-resting-resume");
+        let note_addr = subscription_test_note();
+        let record = subscription_test_record(81);
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![record.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot: subscription_test_snapshot(&record, &note_addr),
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let error = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("still resting"), "{error:#}");
+        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            chain.lookback_reads.load(Ordering::SeqCst),
+            0,
+            "durable resting state must block the legacy event fallback"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn durable_subscription_resume_rejects_ambiguous_candidate_handles() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-ambiguous-resume");
+        let note_addr = subscription_test_note();
+        let mut first = subscription_test_record(81);
+        let mut second = subscription_test_record(82);
+        for (record, tc) in [
+            (&mut first, subscription_test_tc('3')),
+            (&mut second, subscription_test_tc('4')),
+        ] {
+            record.phase = super::BuyerSubscriptionPhase::Matched;
+            record.matched = Some(super::BuyerSubscriptionMatch {
+                token_contract: tc.clone(),
+                order_id: record.order_id,
+                ticks: record.ticks,
+                clearing_price: record.max_price_per_tick,
+                deal_handle: crate::cli::deals::make_handle_id(
+                    &tc,
+                    crate::cli::deals::DealHandleRole::Buyer,
+                ),
+            });
+        }
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![first.clone(), second.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+        let chain = SubscriptionResumeChain {
+            order_book: first.order_book.clone(),
+            snapshot: subscription_test_snapshot(&first, &note_addr),
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &first.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(
+            message.contains(&first.matched.as_ref().unwrap().deal_handle),
+            "{message}"
+        );
+        assert!(
+            message.contains(&second.matched.as_ref().unwrap().deal_handle),
+            "{message}"
+        );
+
+        let selected = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &first.frame_model,
+            Some(&second.matched.as_ref().unwrap().token_contract),
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap()
+        .expect("explicit TokenContract selects its exact durable subscription");
+        assert_eq!(
+            selected.record.matched.as_ref().unwrap().token_contract,
+            second.matched.as_ref().unwrap().token_contract
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn durable_subscription_resume_refreshes_all_matches_before_ambiguity() {
+        use std::sync::atomic::Ordering;
+
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-refresh-before-ambiguity");
+        let note_addr = subscription_test_note();
+        let mut stale = subscription_test_record(85);
+        let mut live = subscription_test_record(86);
+        let stale_tc = subscription_test_tc('5');
+        let live_tc = subscription_test_tc('6');
+        for (record, tc) in [(&mut stale, &stale_tc), (&mut live, &live_tc)] {
+            record.phase = super::BuyerSubscriptionPhase::Matched;
+            record.matched = Some(super::BuyerSubscriptionMatch {
+                token_contract: tc.clone(),
+                order_id: record.order_id,
+                ticks: record.ticks,
+                clearing_price: record.max_price_per_tick,
+                deal_handle: crate::cli::deals::make_handle_id(
+                    tc,
+                    crate::cli::deals::DealHandleRole::Buyer,
+                ),
+            });
+        }
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![stale.clone(), live.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+
+        let mut stale_snapshot = subscription_test_snapshot(&stale, &note_addr);
+        stale_snapshot.state.disputed = true;
+        let live_snapshot = subscription_test_snapshot(&live, &note_addr);
+        let chain = SubscriptionResumeChain {
+            order_book: live.order_book.clone(),
+            snapshot: live_snapshot,
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::from([(
+                stale_tc.clone(),
+                stale_snapshot,
+            )])),
+            // A terminal deal can fail every active-target check; resume must first observe its
+            // authoritative terminal snapshot and must not run that live-only assertion.
+            reject_target: Some(stale_tc.clone()),
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let selected = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &live.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap()
+        .expect("the sole authoritatively live subscription must be selected");
+        assert_eq!(
+            selected.record.matched.as_ref().unwrap().token_contract,
+            live_tc
+        );
+        assert_eq!(
+            chain.target_checks.load(Ordering::SeqCst),
+            1,
+            "only the live candidate receives the active-target assertion"
+        );
+
+        let refreshed =
+            super::load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)
+                .unwrap();
+        assert_eq!(
+            refreshed
+                .orders
+                .iter()
+                .find(|record| record.order_id == stale.order_id)
+                .unwrap()
+                .phase,
+            super::BuyerSubscriptionPhase::Terminal
+        );
+        assert_eq!(
+            refreshed
+                .orders
+                .iter()
+                .find(|record| record.order_id == live.order_id)
+                .unwrap()
+                .phase,
+            super::BuyerSubscriptionPhase::Matched
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn subscription_terminal_wiring_exposes_no_removed_reclaim_selector_or_state() {
+        let recover = include_str!("recover.rs");
+        let close = include_str!("close.rs");
+        for (name, source) in [("recover", recover), ("close", close)] {
+            for removed in [
+                "streamReclaim",
+                "reclaimOnTimeout",
+                "pokeSubscription",
+                "lastAdvance",
+                "\"prepaid\"",
+                "\"frozen\"",
+            ] {
+                assert!(
+                    !source.contains(removed),
+                    "{name} mutation source must not expose removed {removed}"
+                );
+            }
+        }
+        let reclaim_start = recover
+            .find("pub(crate) async fn run_reclaim(args:")
+            .expect("current reclaim command");
+        let reclaim_end = recover[reclaim_start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| reclaim_start + offset)
+            .expect("end current reclaim command");
+        let reclaim = &recover[reclaim_start..reclaim_end];
+        for removed in ["streamReclaim", "reclaimOnTimeout", "lastAdvance"] {
+            assert!(
+                !reclaim.contains(removed),
+                "current reclaim mutation path must not expose removed {removed}"
+            );
+        }
+        assert!(!reclaim.contains("stream_stop"));
+        assert!(reclaim.contains("stream_cleanup"));
+        assert!(reclaim.contains("mark_buyer_subscription_terminal"));
+
+        let buyer = include_str!("buyer.rs");
+        let resume_start = buyer
+            .find("async fn resolve_buyer_subscription_resume")
+            .expect("durable subscription resume");
+        let resume_end = buyer[resume_start..]
+            .find("enum SubscriptionCancelOutcome")
+            .map(|offset| resume_start + offset)
+            .expect("end durable subscription resume");
+        let resume = &buyer[resume_start..resume_end];
+        for removed in [
+            "streamReclaim",
+            "reclaimOnTimeout",
+            "pokeSubscription",
+            "lastAdvance",
+            "\"prepaid\"",
+            "\"frozen\"",
+        ] {
+            assert!(
+                !resume.contains(removed),
+                "subscription resume must not make removed {removed} reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_subscription_selection_precedes_all_fresh_money_and_event_lookback() {
+        let source = include_str!("buyer.rs");
+        let run_start = source
+            .find("async fn run_buyer_inner")
+            .expect("buyer entry point");
+        let run_tail = &source[run_start..];
+        let run_end = run_tail
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("end buyer runtime");
+        let run = &run_tail[..run_end];
+        let durable = run
+            .find("resolve_buyer_subscription_resume(")
+            .expect("durable subscription selector");
+        let fresh_money = run
+            .find("raise_pending_buyer_money_before_fresh_reads(")
+            .expect("ordinary fresh-money path");
+        let lookback = run
+            .find(".wait_matched_token_contract(")
+            .expect("legacy bounded event fallback");
+        assert!(
+            durable < fresh_money,
+            "journal/state replay must happen first"
+        );
+        assert!(fresh_money < lookback);
+        assert!(
+            run.contains("if args.mock.mock_chain || subscription_resume.is_active()"),
+            "an active durable subscription must suppress every fresh buyer money action"
+        );
+        assert!(
+            run.contains("if args.resume && !args.mock.mock_chain {"),
+            "durable subscription resolution must run for model-only, --token-contract and --market resume"
+        );
+        assert!(
+            !run.contains("if args.resume && model_only && !args.mock.mock_chain"),
+            "explicit resume must not bypass durable subscription state"
+        );
+        let durable_selection = run
+            .find("} else if subscription_resume.is_active()")
+            .expect("durable subscription selection branch");
+        let explicit_selection = run
+            .find("match explicit_tc")
+            .expect("explicit TokenContract selection branch");
+        assert!(
+            durable_selection < explicit_selection,
+            "a durable subscription must win before explicit/historical ordinary resume routing"
+        );
+    }
+
+    #[test]
+    fn subscription_resume_semantics_are_wired_into_foreground_and_lazy_paths() {
+        let source = include_str!("buyer.rs");
+        let lazy_start = source
+            .find("async fn prepare_lazy_buyer_api_deal_once")
+            .expect("lazy buyer initializer");
+        let lazy_end = source[lazy_start..]
+            .find("fn build_on_demand_buyer_api_state")
+            .map(|offset| lazy_start + offset)
+            .expect("end lazy buyer initializer");
+        let lazy = &source[lazy_start..lazy_end];
+        for required in [
+            "classify_subscription_resume_target(",
+            "subscription_route_budget",
+            "SessionLifetimePolicy::Preserve",
+            "historical_resume_fill",
+        ] {
+            assert!(
+                lazy.contains(required),
+                "lazy explicit/historical resume is missing {required}"
+            );
+        }
+
+        let foreground_start = source
+            .find("async fn run_buyer_inner")
+            .expect("foreground buyer entry");
+        let foreground_tail = &source[foreground_start..];
+        let foreground_end = foreground_tail
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("end foreground buyer runtime");
+        let foreground = &foreground_tail[..foreground_end];
+        for required in [
+            "classify_subscription_resume_target(",
+            "subscription_route_budget",
+            "SessionLifetimePolicy::Preserve",
+            "historical_resume_fill",
+        ] {
+            assert!(
+                foreground.contains(required),
+                "foreground explicit/historical resume is missing {required}"
+            );
+        }
+        assert!(
+            !foreground.contains("if !preserve_subscription"),
+            "subscription preservation may gate graceful shutdown only, never incident recovery"
+        );
+
+        let on_demand_start = source
+            .find("async fn run_buyer_on_demand_local_api")
+            .expect("on-demand buyer API");
+        let on_demand_end = source[on_demand_start..]
+            .find("async fn run_buyer_inner")
+            .map(|offset| on_demand_start + offset)
+            .expect("end on-demand buyer API");
+        let on_demand = &source[on_demand_start..on_demand_end];
+        for required in [
+            "buyer_shutdown_report(active.as_ref()",
+            "BuyerShutdownReport::SubscriptionPreserved",
+            "BuyerShutdownReport::Settlement",
+            "\"subscription_preserved\"",
+            "\"chain_write_submitted\": shutdown_report.chain_write_submitted()",
+        ] {
+            assert!(
+                on_demand.contains(required),
+                "on-demand subscription shutdown reporting is missing {required}"
+            );
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -12794,6 +17527,15 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for JournalPipelineChain {
+        async fn claim_tokens(
+            &self,
+            _: &dexdo_core::TokenContract,
+            _: &dyn dexdo_core::Note,
+            _: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!()
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -12810,13 +17552,6 @@ mod tests {
             &self,
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
-        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            unimplemented!()
-        }
-
-        async fn seller_timeout(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             unimplemented!()
         }
@@ -12937,21 +17672,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn advance_tick(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-            _note: &dyn dexdo_core::Note,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!()
-        }
-
-        async fn accept_probe(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<(), dexdo_core::ChainError> {
-            unimplemented!()
-        }
-
         async fn deal_state(
             &self,
             _token_contract: &dexdo_core::TokenContract,
@@ -12980,6 +17700,15 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for ResumeCommandChain {
+        async fn claim_tokens(
+            &self,
+            _: &dexdo_core::TokenContract,
+            _: &dyn dexdo_core::Note,
+            _: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!()
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -13066,21 +17795,6 @@ mod tests {
             Ok(Some(self.handover.clone()))
         }
 
-        async fn advance_tick(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-            _note: &dyn dexdo_core::Note,
-        ) -> Result<(), dexdo_core::ChainError> {
-            Ok(())
-        }
-
-        async fn accept_probe(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<(), dexdo_core::ChainError> {
-            Ok(())
-        }
-
         async fn stop(
             &self,
             token_contract: &dexdo_core::TokenContract,
@@ -13095,13 +17809,6 @@ mod tests {
             })
         }
 
-        async fn seller_timeout(
-            &self,
-            _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            unimplemented!("healthy stream settles through buyer STOP")
-        }
-
         async fn deal_state(
             &self,
             token_contract: &dexdo_core::TokenContract,
@@ -13112,11 +17819,265 @@ mod tests {
             Ok(Some(deal_state(true, true, false, true)))
         }
 
-        async fn deal_stream_timeout(
+        async fn snapshot(
             &self,
             _token_contract: &dexdo_core::TokenContract,
-        ) -> Result<u64, dexdo_core::ChainError> {
-            Ok(600)
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            None
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct SubscriptionResumeCommandChain {
+        order_book: String,
+        placement: dexdo_core::InferenceSubscriptionPlacement,
+        fill: dexdo_core::MatchedFill,
+        snapshot: dexdo_core::DealChainSnapshot,
+        handover: Vec<u8>,
+        money_posts: std::sync::atomic::AtomicUsize,
+        placement_reads: std::sync::atomic::AtomicUsize,
+        fill_reads: std::sync::atomic::AtomicUsize,
+        lookback_reads: std::sync::atomic::AtomicUsize,
+        target_checks: std::sync::atomic::AtomicUsize,
+        stop_count: std::sync::atomic::AtomicUsize,
+        dispute_count: std::sync::atomic::AtomicUsize,
+        cleanup_count: std::sync::atomic::AtomicUsize,
+        deal_state_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl dexdo_core::ChainBackend for SubscriptionResumeCommandChain {
+        async fn claim_tokens(
+            &self,
+            _: &dexdo_core::TokenContract,
+            _: &dyn dexdo_core::Note,
+            _: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer subscription resume never claims seller tokens")
+        }
+
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            panic!("durable subscription resume must not perform fresh offer discovery")
+        }
+
+        async fn post_offer(
+            &self,
+            _offer: dexdo_core::SellOffer,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer-only test backend")
+        }
+
+        async fn place_buy(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription resume attempted a second BUY".to_string(),
+            ))
+        }
+
+        async fn place_buy_by_model(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            _flags: u8,
+            _deadline: u64,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription resume attempted a second model BUY".to_string(),
+            ))
+        }
+
+        async fn place_buy_by_model_with_submit_identity(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _quoted_order: Option<&dexdo_core::OrderBookOrder>,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+            _before_post: &mut (dyn FnMut(
+                String,
+                dexdo_core::MatchWatchCursor,
+                u128,
+            ) -> Result<(), dexdo_core::ChainError>
+                      + Send),
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription resume attempted a second model BUY".to_string(),
+            ))
+        }
+
+        fn model_buy_order_book_identity(&self) -> Option<String> {
+            Some(self.order_book.clone())
+        }
+
+        async fn poll_attributed_model_buys_for_order_book(
+            &self,
+            order_book: &str,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> Result<Vec<(u128, dexdo_core::MatchedFill)>, dexdo_core::ChainError> {
+            assert_eq!(order_book, self.order_book);
+            self.fill_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![(self.placement.order_id, self.fill.clone())])
+        }
+
+        async fn subscription_placements_since(
+            &self,
+            order_book: &str,
+            buyer_note: &str,
+            order_id_floor: u128,
+            max_price_per_tick: u128,
+            ticks: u128,
+        ) -> Result<Vec<dexdo_core::InferenceSubscriptionPlacement>, dexdo_core::ChainError>
+        {
+            assert_eq!(order_book, self.order_book);
+            assert_eq!(buyer_note, self.placement.buyer_note);
+            assert_eq!(order_id_floor, self.placement.order_id);
+            assert_eq!(max_price_per_tick, self.placement.max_price_per_tick);
+            assert_eq!(ticks, self.placement.ticks);
+            self.placement_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![self.placement.clone()])
+        }
+
+        async fn buyer_order_is_active_for_owner(
+            &self,
+            order_book: &str,
+            order_id: u128,
+            buyer_note: &str,
+        ) -> Result<bool, dexdo_core::ChainError> {
+            assert_eq!(order_book, self.order_book);
+            assert_eq!(order_id, self.placement.order_id);
+            assert_eq!(buyer_note, self.placement.buyer_note);
+            Ok(false)
+        }
+
+        async fn wait_matched_token_contract(
+            &self,
+            _since_unix: i64,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<dexdo_core::MatchedFill>, dexdo_core::ChainError> {
+            self.lookback_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription resume must precede historical lookback".to_string(),
+            ))
+        }
+
+        async fn assert_model_only_resume_target(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.target_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn deal_snapshot(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some(self.snapshot.clone()))
+        }
+
+        async fn read_match(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            unimplemented!("buyer subscription resume reads the handover")
+        }
+
+        async fn open_stream(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _enc_endpoint: Vec<u8>,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer subscription resume never opens a seller stream")
+        }
+
+        async fn read_handover(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some(self.handover.clone()))
+        }
+
+        async fn stop(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.stop_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
+        }
+
+        async fn dispute(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.dispute_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
+        }
+
+        async fn cleanup_unopened(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.cleanup_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::SellerNoShow {
+                to_buyer_refund: 0,
+                seller_bond_returned: 0,
+            })
+        }
+
+        async fn deal_state(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.deal_state_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.snapshot.state))
+        }
+
+        async fn deal_subscription(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealSubscription>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some(self.snapshot.subscription))
         }
 
         async fn snapshot(
@@ -13124,6 +18085,543 @@ mod tests {
             _token_contract: &dexdo_core::TokenContract,
         ) -> Option<dexdo_core::StreamSnapshot> {
             None
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct SameTcMockSubscriptionChain {
+        chain: std::sync::Arc<dexdo_core::MockChainBackend>,
+        buyer_note: std::sync::Arc<dexdo_core::LocalNote>,
+        token_contract: dexdo_core::TokenContract,
+        order_book: String,
+        order_id: std::sync::Mutex<Option<u128>>,
+        money_posts: std::sync::atomic::AtomicUsize,
+        placement_reads: std::sync::atomic::AtomicUsize,
+        fill_reads: std::sync::atomic::AtomicUsize,
+        lookback_reads: std::sync::atomic::AtomicUsize,
+        target_checks: std::sync::atomic::AtomicUsize,
+        claim_posts: std::sync::atomic::AtomicUsize,
+        finalize_posts: std::sync::atomic::AtomicUsize,
+        settle_week_posts: std::sync::atomic::AtomicUsize,
+        stop_posts: std::sync::atomic::AtomicUsize,
+        receipt_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl SameTcMockSubscriptionChain {
+        fn new(
+            chain: std::sync::Arc<dexdo_core::MockChainBackend>,
+            buyer_note: std::sync::Arc<dexdo_core::LocalNote>,
+            token_contract: dexdo_core::TokenContract,
+            order_book: String,
+            order_id: Option<u128>,
+        ) -> Self {
+            Self {
+                chain,
+                buyer_note,
+                token_contract,
+                order_book,
+                order_id: std::sync::Mutex::new(order_id),
+                money_posts: std::sync::atomic::AtomicUsize::new(0),
+                placement_reads: std::sync::atomic::AtomicUsize::new(0),
+                fill_reads: std::sync::atomic::AtomicUsize::new(0),
+                lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+                target_checks: std::sync::atomic::AtomicUsize::new(0),
+                claim_posts: std::sync::atomic::AtomicUsize::new(0),
+                finalize_posts: std::sync::atomic::AtomicUsize::new(0),
+                settle_week_posts: std::sync::atomic::AtomicUsize::new(0),
+                stop_posts: std::sync::atomic::AtomicUsize::new(0),
+                receipt_reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn buyer_note_addr(&self) -> String {
+            let pubkey = dexdo_core::Note::pubkey(self.buyer_note.as_ref());
+            let owner = pubkey
+                .ed
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("0:{owner}")
+        }
+
+        fn recorded_order_id(&self) -> Result<u128, dexdo_core::ChainError> {
+            self.order_id
+                .lock()
+                .unwrap()
+                .as_ref()
+                .copied()
+                .ok_or_else(|| {
+                    dexdo_core::ChainError::Chain(
+                        "mock subscription has no persisted order id".to_string(),
+                    )
+                })
+        }
+
+        fn placement(
+            &self,
+        ) -> Result<dexdo_core::InferenceSubscriptionPlacement, dexdo_core::ChainError> {
+            let order_id = self.recorded_order_id()?;
+            let order = self
+                .chain
+                .subscription_order(&self.order_book, order_id, self.buyer_note.as_ref())?
+                .ok_or_else(|| {
+                    dexdo_core::ChainError::Chain(format!(
+                        "mock subscription order {order_id} disappeared from persisted state"
+                    ))
+                })?;
+            Ok(dexdo_core::InferenceSubscriptionPlacement {
+                order_id,
+                buyer_note: order.owner_note,
+                max_price_per_tick: order.price_per_tick,
+                ticks: order.ticks,
+                sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+                deadline: order.deadline,
+                created_at: i64::try_from(order.timestamp).map_err(|_| {
+                    dexdo_core::ChainError::Chain(
+                        "mock subscription placement timestamp exceeds int64".to_string(),
+                    )
+                })?,
+            })
+        }
+
+        async fn fill(&self) -> Result<dexdo_core::MatchedFill, dexdo_core::ChainError> {
+            let order_id = self.recorded_order_id()?;
+            let matched =
+                dexdo_core::ChainBackend::read_match(self.chain.as_ref(), &self.token_contract)
+                    .await?;
+            if matched.token_contract != self.token_contract
+                || matched.buyer_pubkey != dexdo_core::Note::pubkey(self.buyer_note.as_ref())
+            {
+                return Err(dexdo_core::ChainError::Chain(format!(
+                    "mock fill identity for {} is not the persisted buyer match",
+                    self.token_contract
+                )));
+            }
+            let deal = dexdo_core::ChainBackend::deal_subscription(
+                self.chain.as_ref(),
+                &self.token_contract,
+            )
+            .await?
+            .ok_or_else(|| {
+                dexdo_core::ChainError::Chain(format!(
+                    "mock TokenContract {} has no persisted deal shape",
+                    self.token_contract
+                ))
+            })?;
+            let ticks = deal
+                .funded_tokens
+                .checked_div(dexdo_core::TICK_SIZE)
+                .filter(|_| deal.funded_tokens.is_multiple_of(dexdo_core::TICK_SIZE))
+                .ok_or_else(|| {
+                    dexdo_core::ChainError::Chain(format!(
+                        "mock TokenContract {} fundedTokens is not whole ticks",
+                        self.token_contract
+                    ))
+                })?;
+            Ok(dexdo_core::MatchedFill {
+                order_id,
+                token_contract: matched.token_contract,
+                ticks,
+                price_per_tick: u128::from(matched.price_per_tick),
+            })
+        }
+
+        async fn assert_same_target(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            if !token_contract.eq_ignore_ascii_case(&self.token_contract) {
+                return Err(dexdo_core::ChainError::Chain(format!(
+                    "resume requested TokenContract {token_contract}, but the persisted mock fill is {}",
+                    self.token_contract
+                )));
+            }
+            let fill = self.fill().await?;
+            if !fill.token_contract.eq_ignore_ascii_case(token_contract) {
+                return Err(dexdo_core::ChainError::Chain(format!(
+                    "mock fill names {}, expected {token_contract}",
+                    fill.token_contract
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl super::SubscriptionOrderOps for SameTcMockSubscriptionChain {
+        async fn submit_subscription_order(
+            &self,
+            note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            order_book: &str,
+            _model_hash: &str,
+            max_price_per_tick: u128,
+            ticks: u128,
+            escrow: u128,
+            order_flags: u8,
+            deadline: u64,
+            fill_cursor: &mut dexdo_core::MatchWatchCursor,
+            before_post: &mut (dyn FnMut(
+                String,
+                u128,
+                dexdo_core::MatchWatchCursor,
+                Vec<(u128, dexdo_core::MatchedFill)>,
+            ) -> anyhow::Result<()>
+                      + Send),
+        ) -> anyhow::Result<serde_json::Value> {
+            anyhow::ensure!(
+                note.with_workchain()
+                    .eq_ignore_ascii_case(&self.buyer_note_addr()),
+                "subscription submit note is not the mock buyer"
+            );
+            anyhow::ensure!(
+                order_book.eq_ignore_ascii_case(&self.order_book),
+                "subscription submit order book changed"
+            );
+            *fill_cursor = dexdo_core::MatchWatchCursor::new(0);
+            let order_id_floor = self.order_id.lock().unwrap().unwrap_or(1);
+            before_post(
+                format!("boc-sha256:{}", "a".repeat(64)),
+                order_id_floor,
+                fill_cursor.clone(),
+                Vec::new(),
+            )?;
+
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let order = self.chain.place_subscription_order(
+                order_book,
+                self.buyer_note.as_ref(),
+                max_price_per_tick,
+                ticks,
+                escrow,
+                order_flags,
+                deadline,
+            )?;
+            *self.order_id.lock().unwrap() = Some(order.order_id);
+            self.chain
+                .place_buy_ticks(
+                    &self.token_contract,
+                    self.buyer_note.as_ref(),
+                    u64::try_from(ticks)?,
+                )
+                .await?;
+            Ok(serde_json::json!({ "accepted": true, "order_id": order.order_id }))
+        }
+
+        async fn subscription_placements(
+            &self,
+            order_book: &str,
+            buyer_note: &str,
+            order_id_floor: u128,
+            max_price_per_tick: u128,
+            ticks: u128,
+        ) -> anyhow::Result<Vec<dexdo_core::InferenceSubscriptionPlacement>> {
+            anyhow::ensure!(order_book.eq_ignore_ascii_case(&self.order_book));
+            anyhow::ensure!(buyer_note.eq_ignore_ascii_case(&self.buyer_note_addr()));
+            let placement = self.placement()?;
+            anyhow::ensure!(placement.order_id >= order_id_floor);
+            anyhow::ensure!(placement.max_price_per_tick == max_price_per_tick);
+            anyhow::ensure!(placement.ticks == ticks);
+            self.placement_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![placement])
+        }
+
+        async fn attributed_subscription_fills(
+            &self,
+            order_book: &str,
+            buyer_note: &str,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> anyhow::Result<Vec<(u128, dexdo_core::MatchedFill)>> {
+            anyhow::ensure!(order_book.eq_ignore_ascii_case(&self.order_book));
+            anyhow::ensure!(buyer_note.eq_ignore_ascii_case(&self.buyer_note_addr()));
+            let fill = self.fill().await?;
+            self.fill_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![(fill.order_id, fill)])
+        }
+
+        async fn subscription_order_active(
+            &self,
+            order_book: &str,
+            order_id: u128,
+            buyer_note: &str,
+        ) -> anyhow::Result<bool> {
+            anyhow::ensure!(order_book.eq_ignore_ascii_case(&self.order_book));
+            anyhow::ensure!(buyer_note.eq_ignore_ascii_case(&self.buyer_note_addr()));
+            anyhow::ensure!(order_id == self.recorded_order_id()?);
+            self.fill().await?;
+            Ok(false)
+        }
+
+        async fn subscription_deal_facts(
+            &self,
+            expected_note_addr: &str,
+            order: &super::BuyerSubscriptionOrderRecord,
+            matched: &super::BuyerJournalMatch,
+        ) -> anyhow::Result<super::SubscriptionDealFacts> {
+            dexdo_core::ChainBackend::assert_model_only_resume_target(
+                self,
+                &matched.token_contract,
+            )
+            .await?;
+            let snapshot = dexdo_core::ChainBackend::deal_snapshot(
+                self.chain.as_ref(),
+                &matched.token_contract,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("matched mock TokenContract has no snapshot"))?;
+            Ok(super::SubscriptionDealFacts {
+                state: snapshot.state,
+                subscription: snapshot.subscription,
+                seller_bond: snapshot.seller_bond,
+                buyer_bond: snapshot.buyer_bond,
+                model_name: order.frame_model.clone(),
+                model_hash: order.model_hash.clone(),
+                buyer_note: expected_note_addr.to_string(),
+            })
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl dexdo_core::ChainBackend for SameTcMockSubscriptionChain {
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::discover_offers(self.chain.as_ref()).await
+        }
+
+        async fn post_offer(
+            &self,
+            offer: dexdo_core::SellOffer,
+            note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::post_offer(self.chain.as_ref(), offer, note).await
+        }
+
+        async fn place_buy(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(format!(
+                "durable subscription resume attempted a second BUY for {token_contract}"
+            )))
+        }
+
+        async fn place_buy_by_model(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            _flags: u8,
+            _deadline: u64,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.money_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription resume attempted a second model BUY".to_string(),
+            ))
+        }
+
+        fn model_buy_order_book_identity(&self) -> Option<String> {
+            Some(self.order_book.clone())
+        }
+
+        async fn poll_attributed_model_buys_for_order_book(
+            &self,
+            order_book: &str,
+            cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> Result<Vec<(u128, dexdo_core::MatchedFill)>, dexdo_core::ChainError> {
+            super::SubscriptionOrderOps::attributed_subscription_fills(
+                self,
+                order_book,
+                &self.buyer_note_addr(),
+                cursor,
+            )
+            .await
+            .map_err(|error| dexdo_core::ChainError::Chain(error.to_string()))
+        }
+
+        async fn subscription_placements_since(
+            &self,
+            order_book: &str,
+            buyer_note: &str,
+            order_id_floor: u128,
+            max_price_per_tick: u128,
+            ticks: u128,
+        ) -> Result<Vec<dexdo_core::InferenceSubscriptionPlacement>, dexdo_core::ChainError>
+        {
+            super::SubscriptionOrderOps::subscription_placements(
+                self,
+                order_book,
+                buyer_note,
+                order_id_floor,
+                max_price_per_tick,
+                ticks,
+            )
+            .await
+            .map_err(|error| dexdo_core::ChainError::Chain(error.to_string()))
+        }
+
+        async fn buyer_order_is_active_for_owner(
+            &self,
+            order_book: &str,
+            order_id: u128,
+            buyer_note: &str,
+        ) -> Result<bool, dexdo_core::ChainError> {
+            super::SubscriptionOrderOps::subscription_order_active(
+                self, order_book, order_id, buyer_note,
+            )
+            .await
+            .map_err(|error| dexdo_core::ChainError::Chain(error.to_string()))
+        }
+
+        async fn wait_matched_token_contract(
+            &self,
+            _since_unix: i64,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<dexdo_core::MatchedFill>, dexdo_core::ChainError> {
+            self.lookback_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "durable subscription must not fall back to event lookback".to_string(),
+            ))
+        }
+
+        async fn assert_model_only_resume_target(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.target_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.assert_same_target(token_contract).await
+        }
+
+        async fn read_match(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::read_match(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn open_stream(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            enc_endpoint: Vec<u8>,
+            note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::open_stream(
+                self.chain.as_ref(),
+                token_contract,
+                enc_endpoint,
+                note,
+            )
+            .await
+        }
+
+        async fn read_handover(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::read_handover(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn accept_probe(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::accept_probe(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn claim_tokens(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            note: &dyn dexdo_core::Note,
+            cumulative_tokens: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.claim_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            dexdo_core::ChainBackend::claim_tokens(
+                self.chain.as_ref(),
+                token_contract,
+                note,
+                cumulative_tokens,
+            )
+            .await
+        }
+
+        async fn finalize(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.finalize_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            dexdo_core::ChainBackend::finalize(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn settle_week(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.settle_week_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            dexdo_core::ChainBackend::settle_week(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn stop(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            self.stop_posts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            dexdo_core::ChainBackend::stop(self.chain.as_ref(), token_contract, note).await
+        }
+
+        async fn buyer_stop_settlement(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            self.receipt_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            dexdo_core::ChainBackend::buyer_stop_settlement(self.chain.as_ref(), token_contract)
+                .await
+        }
+
+        async fn deal_state(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::deal_state(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn deal_subscription(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealSubscription>, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::deal_subscription(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn deal_snapshot(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
+            dexdo_core::ChainBackend::deal_snapshot(self.chain.as_ref(), token_contract).await
+        }
+
+        async fn snapshot(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            dexdo_core::ChainBackend::snapshot(self.chain.as_ref(), token_contract).await
         }
     }
 
@@ -13521,13 +19019,11 @@ mod tests {
         }
         assert!(gateway_ready, "TLS mock-token gateway must bind");
         let buyer_pubkey = dexdo_core::Note::pubkey(buyer_note.as_ref());
-        seller.state.register_stream(
-            &fill.token_contract,
-            buyer_pubkey.clone(),
-            2,
-            fixture.ticks as u64,
-            dexdo_core::DobParams::canonical().tick_size,
-        );
+        let (state, deal) = ordinary_gateway_snapshot(fixture.ticks as u64);
+        seller
+            .state
+            .register_stream(&fill.token_contract, buyer_pubkey.clone(), 2, state, deal)
+            .expect("register strict ordinary resumed capacity");
         let handover = dexdo_core::Handover {
             endpoint: format!("https://{gateway_addr}"),
             tls_fingerprint: seller.tls_fingerprint.clone(),
@@ -13806,6 +19302,700 @@ mod tests {
             resume["submit_reconciliation"]["recovery_anchor"]["token_contract"],
             serde_json::json!(canonical_token_contract)
         );
+        seller.server_task.abort();
+    }
+
+    #[cfg(feature = "shellnet")]
+    // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn durable_subscription_resume_streams_and_preserves_without_second_buy_or_auto_terminal_write(
+    ) {
+        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-durable-subscription-command-resume");
+        let pool_path = dir.join("pool.json");
+        let order_id = 1_001;
+        let deadline = super::unix_now_secs().saturating_add(3_600);
+        let mut journal = subscription_test_journal(order_id, deadline);
+        journal.ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS) * 2;
+        let reserve = subscription_test_reserve(journal.ticks, journal.max_price_per_tick);
+        journal.deposit = reserve.deposit;
+        journal.buyer_bond = reserve.buyer_bond;
+        journal.escrow = reserve.total_escrow;
+        let mut placement = subscription_test_placement(order_id, deadline);
+        placement.ticks = journal.ticks;
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
+                "notes": [{
+                    "address": journal.note_addr,
+                    "owner_secret_key_hex": "00"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
+        let money_lock = super::BuyerMoneyLock::open(&journal.note_addr).unwrap();
+        let _ = std::fs::remove_file(&money_lock.journal_path);
+        let _ = std::fs::remove_file(&money_lock.subscriptions_path);
+        super::write_buyer_subscription_submit_journal(&money_lock.journal_path, &journal).unwrap();
+
+        let mut expected_state =
+            super::BuyerSubscriptionState::empty(&journal.note_addr).expect("empty state");
+        let expected_record =
+            super::record_subscription_placement(&mut expected_state, &journal, &placement)
+                .expect("canonical durable placement");
+        let fill = dexdo_core::MatchedFill {
+            order_id,
+            token_contract: subscription_test_tc('7'),
+            ticks: journal.ticks,
+            price_per_tick: journal.max_price_per_tick,
+        };
+        let snapshot = subscription_test_snapshot(&expected_record, &journal.note_addr);
+        let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve gateway port");
+        let gateway_addr = gateway_listener.local_addr().unwrap();
+        drop(gateway_listener);
+        let seller = dexdo::seller::start_gateway(gateway_addr)
+            .await
+            .expect("start TLS mock-token gateway");
+        let mut gateway_ready = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
+                gateway_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gateway_ready, "TLS mock-token gateway must bind");
+        let buyer_pubkey = dexdo_core::Note::pubkey(buyer_note.as_ref());
+        seller
+            .state
+            .register_stream(
+                &fill.token_contract,
+                buyer_pubkey.clone(),
+                2,
+                snapshot.state,
+                snapshot.subscription,
+            )
+            .unwrap();
+        let handover = dexdo_core::Handover {
+            endpoint: format!("https://{gateway_addr}"),
+            tls_fingerprint: seller.tls_fingerprint.clone(),
+        };
+        let encrypted_handover = seller.note.encrypt_to(&buyer_pubkey, &handover.to_bytes());
+        let resumed = std::sync::Arc::new(SubscriptionResumeCommandChain {
+            order_book: journal.order_book.clone(),
+            placement,
+            fill: fill.clone(),
+            snapshot,
+            handover: encrypted_handover,
+            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            placement_reads: std::sync::atomic::AtomicUsize::new(0),
+            fill_reads: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+            stop_count: std::sync::atomic::AtomicUsize::new(0),
+            dispute_count: std::sync::atomic::AtomicUsize::new(0),
+            cleanup_count: std::sync::atomic::AtomicUsize::new(0),
+            deal_state_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve local API port");
+        let api_addr = api_listener.local_addr().unwrap();
+        drop(api_listener);
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "buyer": {
+                    "on": {
+                        "no_handover_after_match": "fail_closed",
+                        "malformed_handover": "fail_closed",
+                        "dead_gateway": "fail_closed",
+                        "empty_stream": "fail_closed",
+                        "seller_stalls_mid_stream": "accept_delivered_then_reclaim",
+                        "bad_output_scam": "stop"
+                    },
+                    "failover": {
+                        "max_sellers_to_try": 1,
+                        "total_spend_cap_shells": 1000000000
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let args = super::BuyerArgs {
+            mock: super::MockFlags {
+                mock_model: false,
+                mock_chain: false,
+            },
+            identity: super::IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: Some(journal.note_addr.clone()),
+            },
+            registry: super::ModelRegistryValidationArgs::default(),
+            endpoints_file: None,
+            deals_dir: Some(dir.join("deals")),
+            token_contract: None,
+            resume: true,
+            market: None,
+            max_tokens: 8,
+            local_listen: Some(api_addr),
+            continuity_mode: super::ContinuityModeArg::OnDemand,
+            json: true,
+            anthropic_compat: false,
+            frame_model: Some(journal.frame_model.clone()),
+            allow_unverified_model: true,
+            models: dir.join("models.json"),
+            ticks: journal.ticks,
+            max_price_per_tick: journal.max_price_per_tick,
+            escrow: Some(journal.escrow),
+            contracts: dir.join("offline-contracts.json"),
+            policy: Some(policy_path),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let command_chain: std::sync::Arc<dyn dexdo_core::ChainBackend> = resumed.clone();
+        let command_note: std::sync::Arc<dyn dexdo_core::Note> = buyer_note;
+        let (machine_writer, captured_machine_events) =
+            crate::cli::machine::BuyerEventWriter::capturing();
+        let command = tokio::spawn(async move {
+            let mut machine_events = Some(machine_writer);
+            let mut machine_context = super::BuyerMachineErrorContext::default();
+            super::run_buyer_inner(
+                args,
+                &mut machine_events,
+                &mut machine_context,
+                super::BuyerCommandRuntime {
+                    backend: Some((command_chain, command_note)),
+                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    shutdown: Box::pin(async move {
+                        let _ = shutdown_rx.await;
+                    }),
+                },
+            )
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let models_url = format!("http://{api_addr}/v1/models");
+        let mut ready = false;
+        for _ in 0..100 {
+            if client
+                .get(&models_url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !ready {
+            let _ = shutdown_tx.send(());
+            let result = command.await.expect("run_buyer_inner task joins");
+            panic!("run_buyer_inner must bind the real local API: {result:#?}");
+        }
+        let response = client
+            .post(format!("http://{api_addr}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": journal.frame_model,
+                "messages": [{
+                    "role": "user",
+                    "content": "resume the durable subscription through the TLS gateway"
+                }],
+                "max_tokens": 1,
+                "stream": true
+            }))
+            .send()
+            .await
+            .expect("resumed subscription request reaches the gateway stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let stream = response.text().await.expect("SSE response body");
+        assert!(stream.contains("data:"), "{stream}");
+        assert!(stream.contains("[DONE]"), "{stream}");
+
+        let _ = shutdown_tx.send(());
+        command
+            .await
+            .expect("run_buyer_inner task joins")
+            .expect("durable subscription resume preserves the live deal");
+        assert_eq!(
+            resumed
+                .money_posts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "durable subscription resume must never submit a second BUY"
+        );
+        assert_eq!(
+            resumed
+                .placement_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the exact durable placement must reconcile once"
+        );
+        assert_eq!(
+            resumed.fill_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the durable placement must resolve through its attributable seller fill"
+        );
+        assert_eq!(
+            resumed
+                .lookback_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "durable subscription facts must precede and suppress historical lookback"
+        );
+        assert_eq!(
+            resumed
+                .target_checks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "match adoption and active resume must each prove ownership and model identity"
+        );
+        assert!(
+            resumed
+                .deal_state_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "the streamed response must pass the production by-fact open-deal gate"
+        );
+        assert_eq!(
+            resumed.stop_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "graceful subscription shutdown must not auto-STOP"
+        );
+        assert_eq!(
+            resumed
+                .dispute_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "successful subscription streaming must not dispute"
+        );
+        assert_eq!(
+            resumed
+                .cleanup_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an opened subscription must not run automatic reclaim/cleanup"
+        );
+        assert!(
+            super::load_buyer_money_journal(&money_lock.journal_path, &journal.note_addr)
+                .unwrap()
+                .is_none(),
+            "authoritatively matched subscription journal must clear"
+        );
+        let stored = super::load_buyer_subscription_state(
+            &money_lock.subscriptions_path,
+            &journal.note_addr,
+        )
+        .unwrap();
+        assert_eq!(stored.orders.len(), 1);
+        assert_eq!(
+            stored.orders[0].phase,
+            super::BuyerSubscriptionPhase::Matched,
+            "graceful application shutdown preserves the durable subscription as resumable"
+        );
+        let stored_match = stored.orders[0]
+            .matched
+            .as_ref()
+            .expect("durable subscription keeps its matched seller");
+        assert_eq!(stored_match.token_contract, fill.token_contract);
+
+        let captured = captured_machine_events
+            .lock()
+            .expect("captured buyer events lock poisoned");
+        let event_names = captured
+            .iter()
+            .filter_map(|event| event["event"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_names,
+            [
+                "starting",
+                "resume_selected",
+                "handover_waiting",
+                "handover_received",
+                "endpoint_binding",
+                "endpoint_ready",
+                "stopping",
+                "subscription_preserved",
+                "exiting",
+            ],
+            "subscription resume must emit preservation, never implicit settlement"
+        );
+        assert!(
+            !captured.iter().any(|event| matches!(
+                event["event"].as_str(),
+                Some("buy_submitted" | "settlement_submitted" | "settled")
+            )),
+            "subscription resume must not report a second BUY or terminal chain write"
+        );
+        let canonical_token_contract = dexdo_core::Address::parse(&fill.token_contract)
+            .unwrap()
+            .with_workchain();
+        let canonical_deal_handle = super::deals::make_handle_id(
+            &canonical_token_contract,
+            super::deals::DealHandleRole::Buyer,
+        );
+        let resume = captured
+            .iter()
+            .find(|event| event["event"] == "resume_selected")
+            .expect("resume_selected object");
+        assert_eq!(resume["source"], "durable_subscription");
+        assert_eq!(resume["order_id"], order_id.to_string());
+        assert_eq!(resume["token_contract"], canonical_token_contract);
+        assert_eq!(resume["deal_handle"], canonical_deal_handle);
+        let preserved = captured
+            .iter()
+            .find(|event| event["event"] == "subscription_preserved")
+            .expect("subscription_preserved object");
+        assert_eq!(preserved["token_contract"], canonical_token_contract);
+        assert_eq!(preserved["deal_handle"], canonical_deal_handle);
+        assert_eq!(preserved["chain_write_submitted"], false);
+        assert_eq!(preserved["terminal"], false);
+        let exiting = captured
+            .iter()
+            .find(|event| event["event"] == "exiting")
+            .expect("exiting object");
+        assert_eq!(exiting["outcome"], "subscription_preserved");
+        assert_eq!(exiting["exit_code"], 0);
+        seller.server_task.abort();
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn one_mock_subscription_tc_reaches_restart_gateway_claim_finalize_and_stop_receipt() {
+        use std::sync::atomic::Ordering;
+
+        let (dir, _cleanup) = buyer_journal_test_dir("one-mock-subscription-tc-e2e");
+        let endpoints_path = dir.join("endpoints.json");
+        let test_consts = dexdo_core::ProtocolConsts {
+            min_claim_interval: std::time::Duration::from_millis(1),
+            min_seconds_per_tick: std::time::Duration::ZERO,
+            claim_promote_window: std::time::Duration::from_millis(1),
+            probe_window: std::time::Duration::ZERO,
+            ..dexdo_core::ProtocolConsts::canonical()
+        };
+        let keeper_bounds = dexdo_core::ClaimBounds {
+            min_claim_interval: test_consts.min_claim_interval,
+            min_seconds_per_tick: test_consts.min_seconds_per_tick,
+            promote_window: test_consts.claim_promote_window,
+            probe_window: test_consts.probe_window,
+            dispute_window: test_consts.dispute_window,
+        };
+        let chain = std::sync::Arc::new(dexdo_core::MockChainBackend::new(
+            endpoints_path.clone(),
+            test_consts,
+            dexdo_core::DobParams::canonical(),
+        ));
+        let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
+        let token_contract = subscription_test_tc('7');
+        let order_book = subscription_test_book();
+        let frame_model = "qwen--qwen3--32b";
+        let model_hash = dexdo_core::model_hash_for(frame_model);
+        let initial = SameTcMockSubscriptionChain::new(
+            chain,
+            buyer_note.clone(),
+            token_contract.clone(),
+            order_book.clone(),
+            None,
+        );
+        let seller = dexdo::seller::start_gateway("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("start explicit mock-model gateway");
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS) * 2;
+        let price = dexdo_core::PRICE_STEP;
+        let cfg = dexdo::seller::SellerConfig {
+            token_contract: token_contract.clone(),
+            price_per_tick: u64::try_from(price).unwrap(),
+            max_ticks: u64::try_from(ticks).unwrap(),
+            subscription: true,
+            gateway_advertise: seller.listen_addr.to_string(),
+            mock_token_count: 2,
+        };
+        dexdo::seller::post_offer(&seller, &initial, &cfg)
+            .await
+            .expect("one subscription SELL rests on the mock chain");
+
+        let note_addr = dexdo_core::Address::parse(&initial.buyer_note_addr()).unwrap();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let reserve = subscription_test_reserve(ticks, price);
+        let deadline = super::buy_order_deadline().unwrap();
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.with_workchain(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        let placed = super::submit_subscription_with_journal(
+            &initial,
+            &note_addr,
+            &keys,
+            &order_book,
+            frame_model,
+            &model_hash,
+            price,
+            ticks,
+            reserve.total_escrow,
+            deadline,
+            &money_lock.journal_path,
+            &money_lock.subscriptions_path,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("the production journal adopts the actual mock-chain fill");
+        let matched = placed.matched.as_ref().expect("one full seller fill");
+        assert_eq!(matched.token_contract, token_contract);
+        assert_eq!(initial.money_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(initial.placement_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(initial.fill_reads.load(Ordering::SeqCst), 1);
+        assert!(
+            !money_lock.journal_path.exists(),
+            "the submit journal clears only after the actual match is durable"
+        );
+
+        let canonical_state = super::load_buyer_subscription_state(
+            &money_lock.subscriptions_path,
+            &note_addr.with_workchain(),
+        )
+        .unwrap();
+        let restarted_chain = std::sync::Arc::new(dexdo_core::MockChainBackend::new(
+            endpoints_path.clone(),
+            test_consts,
+            dexdo_core::DobParams::canonical(),
+        ));
+        let restarted = SameTcMockSubscriptionChain::new(
+            restarted_chain,
+            buyer_note.clone(),
+            token_contract.clone(),
+            order_book.clone(),
+            Some(placed.order_id),
+        );
+
+        let foreign_tc = subscription_test_tc('8');
+        let mut corrupted = canonical_state.clone();
+        let corrupted_match = corrupted.orders[0]
+            .matched
+            .as_mut()
+            .expect("canonical durable match");
+        corrupted_match.token_contract = foreign_tc.clone();
+        corrupted_match.deal_handle = crate::cli::deals::make_handle_id(
+            &foreign_tc,
+            crate::cli::deals::DealHandleRole::Buyer,
+        );
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &corrupted).unwrap();
+        let error = super::resolve_buyer_subscription_resume(
+            &restarted,
+            &note_addr.with_workchain(),
+            frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect_err("restart must not splice an unrelated durable TC onto the live mock deal");
+        assert!(
+            error
+                .to_string()
+                .contains("coherent snapshot is unavailable"),
+            "{error:#}"
+        );
+        assert_eq!(restarted.money_posts.load(Ordering::SeqCst), 0);
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &canonical_state)
+            .unwrap();
+
+        let resumed = super::resolve_buyer_subscription_resume(
+            &restarted,
+            &note_addr.with_workchain(),
+            frame_model,
+            Some(&token_contract),
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect("restart reads the persisted mock chain and durable buyer state")
+        .expect("the exact matched subscription remains active");
+        assert_eq!(
+            resumed.record.matched.as_ref().unwrap().token_contract,
+            token_contract
+        );
+        assert_eq!(
+            resumed.facts.subscription.funded_tokens,
+            ticks * dexdo_core::TICK_SIZE
+        );
+        assert_eq!(restarted.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(restarted.lookback_reads.load(Ordering::SeqCst), 0);
+
+        dexdo::seller::serve_match(&seller, &restarted, &cfg)
+            .await
+            .expect("the same restarted TC opens and registers gateway capacity");
+        let capacity_source =
+            dexdo_core::ChainBackend::deal_snapshot(restarted.chain.as_ref(), &token_contract)
+                .await
+                .unwrap()
+                .expect("same-TC capacity source");
+        let before_stream = seller
+            .state
+            .reconcile_subscription_capacity(
+                &token_contract,
+                capacity_source.state,
+                capacity_source.subscription,
+            )
+            .unwrap()
+            .expect("same-TC capacity entry");
+        assert_eq!(before_stream.funded_tokens, ticks * dexdo_core::TICK_SIZE);
+        assert_eq!(before_stream.local_delivered_after_anchor, 0);
+
+        let buyer: dexdo::buyer::Buyer = dexdo::buyer::Buyer::from_note(buyer_note.clone());
+        let handover = buyer
+            .resolve_endpoint(&restarted, &token_contract)
+            .await
+            .expect("the restarted buyer decrypts this TC's handover");
+        let output = buyer
+            .connect_and_stream(&handover, &token_contract, 2)
+            .await
+            .expect("the exact matched buyer reaches the same gateway capacity slot");
+        assert_eq!(output.received, 2);
+        let mut after_stream = None;
+        for _ in 0..100 {
+            let snapshot = seller
+                .state
+                .reconcile_subscription_capacity(
+                    &token_contract,
+                    capacity_source.state,
+                    capacity_source.subscription,
+                )
+                .unwrap();
+            if snapshot.is_some_and(|snapshot| snapshot.outstanding_reservation == 0) {
+                after_stream = snapshot;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let after_stream = after_stream.expect("gateway finishes the same-TC reservation");
+        assert_eq!(after_stream.local_delivered_after_anchor, 2);
+        assert_eq!(
+            seller
+                .state
+                .delivery(&token_contract)
+                .count
+                .load(Ordering::SeqCst),
+            2
+        );
+
+        dexdo_core::ChainBackend::accept_probe(&restarted, &token_contract)
+            .await
+            .expect("accept same-TC probe");
+        let cumulative_tokens = dexdo_core::TICK_SIZE + 2;
+        dexdo_core::ChainBackend::claim_tokens(
+            &restarted,
+            &token_contract,
+            seller.note.as_ref(),
+            cumulative_tokens,
+        )
+        .await
+        .expect("claim the same gateway's two raw provider tokens");
+
+        let state_path = endpoints_path.with_extension("chainstate.json");
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        let period_start = persisted["deal_subscriptions"][&token_contract]["period_start"]
+            .as_u64()
+            .expect("same-TC subscription periodStart");
+        persisted["deal_subscriptions"][&token_contract]["period_start"] =
+            serde_json::json!(period_start
+                .checked_sub(dexdo_core::SUB_WEEK_LEN.as_secs())
+                .expect("test subscription crosses exactly one weekly boundary"));
+        std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let keeper =
+            dexdo::seller::drive_subscription_keeper(&restarted, &token_contract, keeper_bounds);
+        let settle_then_stop = async {
+            loop {
+                if restarted.settle_week_posts.load(Ordering::SeqCst) == 1 {
+                    let snapshot =
+                        dexdo_core::ChainBackend::deal_snapshot(&restarted, &token_contract)
+                            .await
+                            .unwrap()
+                            .expect("same TC remains readable after keeper settlement");
+                    if snapshot.subscription.week_index == 1
+                        && snapshot.state.tokens_final == cumulative_tokens
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert_eq!(restarted.settle_week_posts.load(Ordering::SeqCst), 1);
+            dexdo_core::ChainBackend::stop(&restarted, &token_contract, buyer.note.as_ref())
+                .await
+                .expect("the matched buyer settles the same TC")
+        };
+        let (keeper_result, settlement) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(keeper, settle_then_stop)
+            })
+            .await
+            .expect("production subscription keeper must cross one weekly boundary");
+        assert_eq!(keeper_result.unwrap(), cumulative_tokens);
+        assert!(
+            matches!(settlement, dexdo_core::Settlement::AmicableSplit { .. }),
+            "{settlement:?}"
+        );
+        let receipt = dexdo_core::ChainBackend::buyer_stop_settlement(&restarted, &token_contract)
+            .await
+            .unwrap()
+            .expect("same-TC mock StreamStopped receipt");
+        let terminal = dexdo_core::ChainBackend::deal_snapshot(&restarted, &token_contract)
+            .await
+            .unwrap()
+            .expect("terminal same-TC snapshot");
+        assert!(terminal.state.is_stopped());
+        assert_eq!(receipt.0, terminal.state.finalized_owed);
+        let stream = dexdo_core::ChainBackend::snapshot(&restarted, &token_contract)
+            .await
+            .expect("terminal accounting snapshot");
+        assert_eq!(receipt.1, stream.buyer_refunded);
+        assert_eq!(restarted.claim_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted.finalize_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted.settle_week_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted.stop_posts.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted.receipt_reads.load(Ordering::SeqCst), 1);
+
+        let terminal_resume = super::resolve_buyer_subscription_resume(
+            &restarted,
+            &note_addr.with_workchain(),
+            frame_model,
+            Some(&token_contract),
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .expect_err("a later restart must reject the terminal same-TC subscription");
+        assert!(
+            terminal_resume.to_string().contains("terminal"),
+            "{terminal_resume:#}"
+        );
+        assert_eq!(restarted.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(restarted.stop_posts.load(Ordering::SeqCst), 1);
         seller.server_task.abort();
     }
 
@@ -14249,9 +20439,9 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn on_demand_attempt_two_reconciles_before_failing_fresh_preflight() {
-        // run_buyer_inner and run_subscription construct their real backends at the command
-        // boundary. Their coverage is intentionally deferred to the live shellnet proof; do not
-        // replace it with a fake command-boundary test.
+        // run_buyer_inner constructs its real backend at the command boundary. Its coverage is
+        // intentionally deferred to the live shellnet proof; do not replace it with a fake
+        // command-boundary test.
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-on-demand-attempt-two");
         let pool_path = dir.join("pool.json");
@@ -14687,337 +20877,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             "schema v2 field names must remain byte-shape compatible"
         );
-    }
-
-    #[cfg(feature = "shellnet")]
-    fn subscription_submit_test_journal() -> super::BuyerSubscriptionSubmitJournal {
-        let frame_model = "qwen--qwen3--32b";
-        let ticks = 2;
-        let max_price_per_tick = 1_000_000;
-        let escrow = dexdo_core::required_escrow_for_buy(ticks, max_price_per_tick);
-        super::BuyerSubscriptionSubmitJournal {
-            schema: super::BUYER_SUBSCRIPTION_SUBMIT_SCHEMA.to_string(),
-            note_addr: format!("0:{}", "5".repeat(64)),
-            order_book: format!("0:{}", "6".repeat(64)),
-            frame_model: frame_model.to_string(),
-            model_hash: dexdo_core::model_hash_for(frame_model),
-            max_price_per_tick,
-            ticks,
-            escrow,
-            cycle_budget: escrow / super::INFERENCE_SUBSCRIPTION_CYCLES,
-            auto_renew: true,
-            order_id_floor: 40,
-            fill_cursor: dexdo_core::MatchWatchCursor::new(1_000),
-            submit_identity: format!("boc-sha256:{}", "b".repeat(64)),
-            created_at_unix: 1_000,
-        }
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn subscription_journal_and_state_round_trip() {
-        let (dir, _cleanup) = buyer_journal_test_dir("subscription-journal-roundtrip");
-        let journal_path = dir.join("journal.json");
-        let state_path = dir.join("subscriptions.json");
-        let journal = subscription_submit_test_journal();
-        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
-        let loaded = super::load_buyer_money_journal(&journal_path, &journal.note_addr)
-            .unwrap()
-            .unwrap();
-        let super::BuyerMoneyJournal::Subscription(loaded) = loaded else {
-            panic!("subscription schema must dispatch to a subscription journal");
-        };
-        assert_eq!(*loaded, journal);
-
-        let mut state = super::BuyerSubscriptionState::empty(&journal.note_addr).unwrap();
-        super::ensure_subscription_book(
-            &mut state,
-            &journal.order_book,
-            &journal.frame_model,
-            &journal.model_hash,
-            &journal.fill_cursor,
-        )
-        .unwrap();
-        super::write_buyer_subscription_state(&state_path, &state).unwrap();
-        assert_eq!(
-            super::load_buyer_subscription_state(&state_path, &journal.note_addr).unwrap(),
-            state
-        );
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[test]
-    fn unattributed_fill_routes_to_matching_subscription_record() {
-        let journal = subscription_submit_test_journal();
-        let token_contract = format!("0:{}", "7".repeat(64));
-        let mut state = super::BuyerSubscriptionState::empty(&journal.note_addr).unwrap();
-        let book_index = super::ensure_subscription_book(
-            &mut state,
-            &journal.order_book,
-            &journal.frame_model,
-            &journal.model_hash,
-            &journal.fill_cursor,
-        )
-        .unwrap();
-        state.books[book_index]
-            .unattributed_matches
-            .push(super::BuyerJournalMatch {
-                token_contract: token_contract.clone(),
-                order_id: 41,
-                ticks: 1,
-                clearing_price: 900_000,
-            });
-        super::record_subscription_placements(
-            &mut state,
-            book_index,
-            &journal,
-            &[dexdo_core::InferenceSubscriptionPlacement {
-                order_id: 41,
-                buyer_note: journal.note_addr.clone(),
-                max_price_per_tick: journal.max_price_per_tick,
-                ticks: journal.ticks,
-                cycle_budget: journal.cycle_budget,
-                auto_renew: journal.auto_renew,
-                created_at: 1_001,
-            }],
-        )
-        .unwrap();
-        assert!(state.books[book_index].unattributed_matches.is_empty());
-        assert_eq!(
-            state.books[book_index].subscriptions[0].matches[0].token_contract,
-            token_contract
-        );
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn subscription_reconcile_accepts_second_order_after_cancelled_tombstone() {
-        let (dir, _cleanup) = buyer_journal_test_dir("subscription-cancelled-tombstone");
-        let journal_path = dir.join("journal.json");
-        let state_path = dir.join("subscriptions.json");
-        let mut journal = subscription_submit_test_journal();
-        journal.order_id_floor = 42;
-
-        let mut state = super::BuyerSubscriptionState::empty(&journal.note_addr).unwrap();
-        let book_index = super::ensure_subscription_book(
-            &mut state,
-            &journal.order_book,
-            &journal.frame_model,
-            &journal.model_hash,
-            &journal.fill_cursor,
-        )
-        .unwrap();
-        super::record_subscription_placements(
-            &mut state,
-            book_index,
-            &journal,
-            &[dexdo_core::InferenceSubscriptionPlacement {
-                order_id: 41,
-                buyer_note: journal.note_addr.clone(),
-                max_price_per_tick: journal.max_price_per_tick,
-                ticks: journal.ticks,
-                cycle_budget: journal.cycle_budget,
-                auto_renew: journal.auto_renew,
-                created_at: 1_001,
-            }],
-        )
-        .unwrap();
-        super::write_buyer_subscription_state(&state_path, &state).unwrap();
-        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
-
-        let second_placement = dexdo_core::InferenceSubscriptionPlacement {
-            order_id: 42,
-            buyer_note: journal.note_addr.clone(),
-            max_price_per_tick: journal.max_price_per_tick,
-            ticks: journal.ticks,
-            cycle_budget: journal.cycle_budget,
-            auto_renew: journal.auto_renew,
-            created_at: 1_002,
-        };
-        let malformed_history = RecordingRecoveryChain {
-            subscription_placements: vec![second_placement.clone()],
-            subscription_order_active: true,
-            subscription_order_read_error_id: Some(41),
-            ..Default::default()
-        };
-        let error = super::reconcile_subscription_submit_with_backend(
-            &malformed_history,
-            &journal_path,
-            &state_path,
-            &journal,
-            None,
-        )
-        .await
-        .expect_err("malformed non-empty history row must fail closed");
-        assert!(super::is_ambiguous_submit_error(&error), "{error:#}");
-        assert!(journal_path.exists());
-
-        let cancelled_history = RecordingRecoveryChain {
-            subscription_placements: vec![second_placement],
-            subscription_order_active: true,
-            subscription_inactive_order_id: Some(41),
-            ..Default::default()
-        };
-        let placements = super::reconcile_subscription_submit_with_backend(
-            &cancelled_history,
-            &journal_path,
-            &state_path,
-            &journal,
-            None,
-        )
-        .await
-        .expect("cancelled tombstone must not block the landed second order");
-        assert_eq!(placements.len(), 1);
-        assert_eq!(placements[0].order_id, 42);
-        assert!(!journal_path.exists());
-
-        let state = super::load_buyer_subscription_state(&state_path, &journal.note_addr).unwrap();
-        let subscriptions = &state.books[0].subscriptions;
-        assert!(
-            !subscriptions
-                .iter()
-                .find(|subscription| subscription.order_id == 41)
-                .unwrap()
-                .active
-        );
-        assert!(
-            subscriptions
-                .iter()
-                .find(|subscription| subscription.order_id == 42)
-                .unwrap()
-                .active
-        );
-    }
-
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn subscription_reconcile_retains_ambiguous_and_clears_proven_results() {
-        let (dir, _cleanup) = buyer_journal_test_dir("subscription-reconcile");
-        let journal_path = dir.join("journal.json");
-        let state_path = dir.join("subscriptions.json");
-        let journal = subscription_submit_test_journal();
-        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
-
-        let ambiguous_chain = RecordingRecoveryChain {
-            subscription_placement_error: true,
-            ..Default::default()
-        };
-        let error = super::reconcile_subscription_submit_with_backend(
-            &ambiguous_chain,
-            &journal_path,
-            &state_path,
-            &journal,
-            None,
-        )
-        .await
-        .expect_err("ambiguous placement read must retain the journal");
-        assert!(super::is_ambiguous_submit_error(&error), "{error:#}");
-        assert!(journal_path.exists());
-
-        let second_placement = dexdo_core::InferenceSubscriptionPlacement {
-            order_id: 42,
-            buyer_note: journal.note_addr.clone(),
-            max_price_per_tick: journal.max_price_per_tick,
-            ticks: journal.ticks,
-            cycle_budget: journal.cycle_budget,
-            auto_renew: journal.auto_renew,
-            created_at: 1_002,
-        };
-        let two_placements_chain = RecordingRecoveryChain {
-            subscription_placements: vec![
-                dexdo_core::InferenceSubscriptionPlacement {
-                    order_id: 41,
-                    buyer_note: journal.note_addr.clone(),
-                    max_price_per_tick: journal.max_price_per_tick,
-                    ticks: journal.ticks,
-                    cycle_budget: journal.cycle_budget,
-                    auto_renew: journal.auto_renew,
-                    created_at: 1_001,
-                },
-                second_placement,
-            ],
-            subscription_order_active: true,
-            ..Default::default()
-        };
-        for retry in 1..=2 {
-            let error = super::reconcile_subscription_submit_with_backend(
-                &two_placements_chain,
-                &journal_path,
-                &state_path,
-                &journal,
-                None,
-            )
-            .await
-            .expect_err("two correlated placements must fail closed");
-            assert!(super::is_ambiguous_submit_error(&error), "{error:#}");
-            assert!(
-                journal_path.exists(),
-                "retry {retry} must retain the journal and cannot reach a second POST"
-            );
-        }
-        assert_eq!(
-            two_placements_chain
-                .subscription_placement_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "both command retries must reconcile the retained journal"
-        );
-
-        let rejected: anyhow::Result<()> =
-            Err(anyhow::Error::new(dexdo_core::MoneySubmitError::Rejected {
-                source: anyhow::anyhow!("authoritative submit rejection"),
-            }));
-        assert!(
-            !super::retain_subscription_journal_after_submit_result(&journal_path, &rejected)
-                .unwrap()
-        );
-        assert!(!journal_path.exists());
-
-        super::write_buyer_subscription_submit_journal(&journal_path, &journal).unwrap();
-        let ambiguous: anyhow::Result<()> = Err(anyhow::Error::new(
-            dexdo_core::MoneySubmitError::Ambiguous {
-                source: anyhow::anyhow!("POST response lost"),
-            },
-        ));
-        assert!(
-            super::retain_subscription_journal_after_submit_result(&journal_path, &ambiguous)
-                .unwrap()
-        );
-        assert!(journal_path.exists());
-
-        let unclassified: anyhow::Result<()> = Err(anyhow::anyhow!("unknown submit outcome"));
-        assert!(super::retain_subscription_journal_after_submit_result(
-            &journal_path,
-            &unclassified
-        )
-        .unwrap());
-        assert!(journal_path.exists());
-
-        let placement = dexdo_core::InferenceSubscriptionPlacement {
-            order_id: 41,
-            buyer_note: journal.note_addr.clone(),
-            max_price_per_tick: journal.max_price_per_tick,
-            ticks: journal.ticks,
-            cycle_budget: journal.cycle_budget,
-            auto_renew: journal.auto_renew,
-            created_at: 1_001,
-        };
-        let proven_chain = RecordingRecoveryChain {
-            subscription_placements: vec![placement],
-            subscription_order_active: true,
-            ..Default::default()
-        };
-        let placements = super::reconcile_subscription_submit_with_backend(
-            &proven_chain,
-            &journal_path,
-            &state_path,
-            &journal,
-            None,
-        )
-        .await
-        .expect("authoritative placement reconciles");
-        assert_eq!(placements.len(), 1);
-        assert!(!journal_path.exists());
     }
 
     #[cfg(feature = "shellnet")]

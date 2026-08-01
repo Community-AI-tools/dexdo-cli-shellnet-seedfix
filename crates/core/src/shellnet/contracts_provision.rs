@@ -4,11 +4,6 @@ use gosh_ackinacki::sdk::{Account, Address, KeyPair};
 use tvm_block::{Deserializable, Serializable, StateInit};
 
 pub(super) const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-/// gas-health floor for active RootModel/TokenContract pokes. Balances are native vmshell
-/// nanotokens(`Account.balance`), after `fundDeployShell` flag:16 converts note SHELL/ECC[2].
-pub(super) const GAS_HEALTH_MIN: u128 = 5_000_000_000;
-/// Top active contracts back up to the accepted right-sized deploy level when they reach the floor.
-pub(super) const GAS_HEALTH_TARGET: u128 = 10_000_000_000;
 pub(super) fn gas_health_top_up_amount(balance: u128, min: u128, target: u128) -> Option<u128> {
     debug_assert!(target >= min);
     if balance <= min {
@@ -53,10 +48,10 @@ pub(super) const SUPERROOT_TVC: &[u8] =
 pub(super) const ROOTPN_TVC: &[u8] =
     include_bytes!("../../../../contracts/compiled/dex/RootPN.tvc");
 /// Shellnet RootPN is compiled with `sold_old`(v1 ext-out), which preserves the
-/// `VoucherGenerated` format consumed by the voucher prover. The deployed 4.0.29 image updates the
-/// TokenContract/RootModel derivation pins while retaining that event format.
+/// `VoucherGenerated` format consumed by the voucher prover. Multiple images identify as 4.0.32;
+/// this hash, rather than the version getter, identifies the live shellnet generation.
 pub(super) const SHELLNET_ROOTPN_V1_CODE_HASH: &str =
-    "fca7ffe07293b55fc31a6ffd0211f9461923563afa57141fa4e29f54d60d1ab3";
+    "8ba7776f8bd31654ecc3e6b19db6d4725943dfb1200b4e37c6b4246d5a1cb6f3";
 pub(super) const ROOTORACLE_TVC: &[u8] =
     include_bytes!("../../../../contracts/compiled/dex/RootOracle.tvc");
 /// `TokenContract` StateInit(`.tvc`) -- deployed via `build_deploy` (step 2: the seller provisions
@@ -72,17 +67,17 @@ pub(super) const ROOTMODEL_TVC: &[u8] =
 /// The `TOKEN_CONTRACT_CODE_HASH` pin from `contracts/airegistry/RootModel.sol` -- against it RootModel
 /// checks the TC code when registering a deal. The embedded `TokenContract.tvc` must yield this hash.
 pub(super) const ROOTMODEL_PINNED_TC_CODE_HASH: &str =
-    "d5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c";
+    "b866fde2d1a021d357b7fb75d7dd7dd39b125e101c3cfa32045a8a6f9e9ab8c0";
 /// The `ROOT_MODEL_CODE_HASH` pin from `contracts/airegistry/SuperRoot.sol` -- against it SuperRoot
 /// checks the RootModel code at `registerRoot`. The embedded `RootModel.tvc` must yield this hash.
 pub(super) const SUPERROOT_PINNED_RM_CODE_HASH: &str =
-    "88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a";
+    "8f14a5df64341d261dfd00ff996bf90ba750f78baa3104fba1a72279a6afb6ff";
 /// The deployed `PrivateNote` code-hash(`deployed.shellnet.json` `_note`). The orphaned-note
 /// guard(`assert_seller_note_current`) requires the seller note's on-chain `code_hash` to equal this; the
 /// `private_note_code_hash_matches_deployed_pin` test cross-checks it against the embedded `PRIVATENOTE_TVC`
 /// (test-only). Update on every PrivateNote redeploy(same cadence as `deployed.shellnet.json`).
 pub(super) const PRIVATENOTE_PINNED_CODE_HASH: &str =
-    "4712999eb88c096fef770755b21d3b6b3fde724967424a928507a5499767e812";
+    "87bd964e2170630f7e6cc18935a5751569b630aae1b80b0057604ffe64f21a5a";
 
 pub(super) fn normalize_code_hash(raw: &str) -> Option<String> {
     let h = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());

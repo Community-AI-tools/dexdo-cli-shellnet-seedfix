@@ -140,7 +140,7 @@ pub(crate) async fn provision_replacement_seller(
     price_per_tick: u64,
     max_ticks: u64,
 ) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
-    use dexdo_core::{Address, KeyPair, RealChainBackend, RealSellerBackend, MODEL_TICK_SIZE};
+    use dexdo_core::{Address, KeyPair, RealChainBackend, RealSellerBackend, TICK_SIZE};
 
     let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr is required for residual provisioning")
@@ -185,7 +185,7 @@ pub(crate) async fn provision_replacement_seller(
         dexdo_core::model_hash_for(frame_model),
         frame_model.to_string(),
         nonce,
-        MODEL_TICK_SIZE,
+        TICK_SIZE,
     ));
     Ok((market, backend))
 }
@@ -442,6 +442,13 @@ pub(crate) fn oneshot_real_upstream_guard(
 /// 1 SHELL = 1e9 raw ECC[2] nano(the note-side unit; `--deposit-shells N` = N **SHELL**, not vmshell).
 #[allow(dead_code)] // used by the shellnet `provision` path + the deposit-validation tests
 pub(crate) const SHELL_UNIT: u128 = 1_000_000_000;
+/// default note deposit(**SHELL/ECC[2]**, note-side) -- **fund-10, right-sized**, not padded.
+/// `deposit/2` funds the RootModel + per-deal `TokenContract` deploys, so the default gives `20/2 = 10` SHELL each
+/// (-> ~10 vmshell/deploy after flag:16) -- the `MIN_DEPLOY_SHELLS` floor. The held leftover burns at `destroy` but is
+/// ~a few vmshell(negligible). **NB:** a live deal on the current contract needs a higher `--deposit-shells` (the
+/// TC runtime sends drain ~10) until @SeHor05's send-`value:`->0.01 cut -- the AmicableSplit behaviour itself is
+/// proven offline(`positive_path_amicable_split`).
+pub(crate) use dexdo_core::params::DEFAULT_DEPOSIT_SHELLS;
 /// per-deploy **SHELL allocation** floor(note-side), sized to the deploy's **vmshell** gas need --
 /// **derived from contract constants**. **fund-10(per @SeHor05): `MIN_BALANCE`
 /// gates nothing** -- `ensureBalance()`'s `mintshellq` is a no-op for a self-dapp TC(no DappConfig), so the old
@@ -452,16 +459,7 @@ pub(crate) const SHELL_UNIT: u128 = 1_000_000_000;
 /// to the cross-dapp note is not credited -- by-fact x2) but at ~10/deploy is now ~a few vmshell(negligible).
 /// **NB(by-fact):** on the CURRENT contract a live deal's TC runtime cross-dapp sends(5 vmshell each) drain a
 /// ~10-funded TC, so a live deal needs a higher `--deposit-shells` until @SeHor05's send-`value:`->0.01 cut.
-#[allow(dead_code)]
-pub(crate) const MIN_DEPLOY_SHELLS: u128 = 5 /* REGISTER_FORWARD_VALUE */ + 5 /* compute margin (~0.07 burn + headroom) */;
-/// default note deposit(**SHELL/ECC[2]**, note-side) -- **fund-10, right-sized**, not padded.
-/// `deposit/2` funds the RootModel + per-deal `TokenContract` deploys, so the default gives `20/2 = 10` SHELL each
-/// (-> ~10 vmshell/deploy after flag:16) -- the `MIN_DEPLOY_SHELLS` floor. The held leftover burns at `destroy` but is
-/// ~a few vmshell(negligible). **NB:** a live deal on the current contract needs a higher `--deposit-shells` (the
-/// TC runtime sends drain ~10) until @SeHor05's send-`value:`->0.01 cut -- the AmicableSplit behaviour itself is
-/// proven offline(`positive_path_amicable_split`).
-#[allow(dead_code)]
-pub(crate) const DEFAULT_DEPOSIT_SHELLS: u128 = 20;
+pub(crate) use dexdo_core::params::MIN_DEPLOY_SHELLS;
 /// Contract constants mirrored from `contracts/airegistry/modifiers/modifiers.sol`.
 /// The seller mirror bond is `2P` (`TokenContract._bondAmount()`,) -- not a bps commission.
 #[allow(dead_code)]
@@ -737,16 +735,27 @@ fn write_role_breakdown(
 #[cfg(test)]
 mod monitor_render_tests {
     use super::render_tree_snapshot;
-    use dexdo_core::{DealChainState, DealRole, DealView, StreamSnapshot, TreeSnapshot};
+    use dexdo_core::{DealChainState, DealRole, DealView, StreamSnapshot, TreeSnapshot, TICK_SIZE};
 
-    fn state(funded: bool, opened: bool, disputed: bool, probe_accepted: bool) -> DealChainState {
+    /// `settled` marks a deal whose terminal path already drained the escrow -- the signal that replaced
+    /// the probe latch for telling a settled close from funded-but-never-opened.
+    fn state(funded: bool, opened: bool, disputed: bool, settled: bool) -> DealChainState {
         DealChainState {
             funded,
             opened,
+            probe_accepted: true,
             disputed,
-            probe_accepted,
+            deposit: if settled { 0 } else { 1_000 },
+            finalized_owed: 0,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
             funded_time: None,
-            last_advance: 0,
+            probe_tick: 0,
+            probe_time: 0,
+            prev_claim_time: 0,
+            last_claim_time: 0,
+            dispute_time: 0,
         }
     }
 
@@ -760,6 +769,7 @@ mod monitor_render_tests {
             seller_locked: u128::from(seller_locked),
             buyer_locked: u128::from(buyer_locked),
             buyer_lead: 0,
+            tokens_final: state.tokens_final,
             seller_received: u128::from(seller_received),
             buyer_refunded: 0,
             burned: 0,
@@ -835,9 +845,11 @@ seller accounting (by model):
 
     #[test]
     fn stopped_market_snapshot_with_locked_escrow_still_flags_18() {
+        let mut stopped = state(true, false, false, true);
+        stopped.tokens_final = 2 * TICK_SIZE;
         let rendered = rendered_market_monitor(
             "tc-stopped-locked",
-            snapshot_from_state(state(true, false, false, true), 810, 4100, 10),
+            snapshot_from_state(stopped, 810, 4100, 10),
         );
         let expected = "\
 identity note tree (1 sub-notes polled):

@@ -98,7 +98,7 @@ pub async fn run(
             }),
         };
         if tx
-            .send(Ok(chunk_with_structured_accounting(chunk)))
+            .send(chunk_with_structured_accounting(chunk))
             .await
             .is_err()
         {
@@ -153,8 +153,14 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         run(8, Some(&req), tx, false, None).await;
         let mut chunks = Vec::new();
+        let mut accounted = 0;
         while let Some(item) = rx.recv().await {
-            if let UpstreamEvent::Chunk { chunk, .. } = item.unwrap() {
+            if let UpstreamEvent::Chunk {
+                chunk,
+                accounted_tokens,
+            } = item.unwrap()
+            {
+                accounted += accounted_tokens;
                 chunks.push(chunk);
             }
         }
@@ -163,6 +169,10 @@ mod tests {
         let text: String = chunks.iter().map(|c| c.text.as_str()).collect();
         assert!(text.contains("mock-reply"));
         assert!(text.contains("ping") && text.contains("pong"));
+        assert_eq!(
+            accounted, 8,
+            "mock billing is exactly the emitted fake token-id count"
+        );
     }
 
     #[test]

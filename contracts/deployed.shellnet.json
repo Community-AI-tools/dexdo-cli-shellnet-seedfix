@@ -1,6 +1,6 @@
 {
   "network": "shellnet",
-  "version": "4.0.30",
+  "version": "4.0.32",
   "dapp_config": "",
   "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
   "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
@@ -10,20 +10,20 @@
   "rootoracle": "0:1515151515151515151515151515151515151515151515151515151515151515",
   "seller_bond": "2P mirror seller bond held in TokenContract (spec 4.2).",
   "contract_hashes": {
-    "_note": "4.0.30 final v0.0.18 code hashes from gosh-sh/acki-nacki@9e8a62880e95d2af802e066a4ec4dc1bbbc867f4. The MAX_PRECHECK_LEVELS exit now fails closed like the MAX_SCAN_PER_CALL exit, so a POST_ONLY order whose precheck gave up cannot be matched by _match on a deeper level. That changes InferenceOrderBook and therefore the ModelRegistry IOB pin; every other contract is byte-unchanged. RootPN was rebuilt with sold_old 0.80.0; every other contract with sold 0.81.0; all use --tvm-version gosh and the cascade was iterated to a pin fixpoint (9 pins consistent).",
-    "SuperRoot": "b24a1b2b2d969928d78e0b1645df293bbc296eff950f0389c8466935ce31e351",
-    "ModelRegistry": "23494eb9c14efbc3cdf68eed300cb82d32b43446784bd37ad6d15ac204060371",
-    "RootPN": "fca7ffe07293b55fc31a6ffd0211f9461923563afa57141fa4e29f54d60d1ab3",
-    "RootOracle": "5415cd020d7fcfa6f6b96121ea0af1aa423a75ea0ba11f4cddf2dfe974d44774",
-    "RootModel": "88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a",
-    "TokenContract": "d5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c",
-    "InferenceOrderBook": "f32d28ead150ba0832456d5f51f51d0e666463100baf27134e083e5fc5159649",
-    "PrivateNote": "4712999eb88c096fef770755b21d3b6b3fde724967424a928507a5499767e812",
-    "Oracle": "a3670be77f99f6b4ba94bb41efaffed4b9fa1871b914319003daaff20e8e152f",
-    "OracleEventList": "179d535528bfea84b44e0a91d7ca81b6ed729cfe10eb658f4141fa78085d1a4f",
-    "PMP": "1b73ae0c56d9500f6eb936174238e1bd641572b261ce520f0098a793158d8d37",
-    "OrderBook": "9451cdb65b670840b1ffc255e850651178ce447cbb0abed939848e444bd60b90",
-    "Nullifier": "56b5e24e997df5b151b64f1f075cbb13402fbf668ce92e31f559cf751c7a9706"
+    "_note": "Second-build 4.0.32 code hashes decoded from contracts/compiled/ with `tvm-cli decode stateinit --tvc`. The same version string is shared with the first build and is not identity. All nine pin edges were recomputed; the four fixed live roots and all twelve declared stored child-code cells agree with these artifacts.",
+    "SuperRoot": "e7c9e1365003d4ea6364a504f04a8d7ed669556f7fa6d175e35c1ae74b0828e4",
+    "ModelRegistry": "4c2fb70b23f7c59282029e67783241166c261eaa5159cf65f6096289fdb70e6c",
+    "RootPN": "8ba7776f8bd31654ecc3e6b19db6d4725943dfb1200b4e37c6b4246d5a1cb6f3",
+    "RootOracle": "674480a8cd28b3373bc0813590648d8f49818f64a5de9513daf1036c161dcb38",
+    "RootModel": "8f14a5df64341d261dfd00ff996bf90ba750f78baa3104fba1a72279a6afb6ff",
+    "TokenContract": "b866fde2d1a021d357b7fb75d7dd7dd39b125e101c3cfa32045a8a6f9e9ab8c0",
+    "InferenceOrderBook": "2d7391db445db2cb9a67d2a6f641934653fefb61c27c0863be8faa36fa548d76",
+    "PrivateNote": "87bd964e2170630f7e6cc18935a5751569b630aae1b80b0057604ffe64f21a5a",
+    "Oracle": "21a1e0a27fb1864a5ee219a472d52f370d76ff7bd7635e60932ceec13dd90eb9",
+    "OracleEventList": "db502d534011eb63f11c9a1287cfa73ece0d4a80fe00fb0d4b72867450d4114a",
+    "PMP": "37aa366c97b1cfa4a0b541ddcb58e3a622d73509e290a5da0247ef2befb9eba2",
+    "OrderBook": "0826b722d879cdecd6f09161b2633ae31ec88609fa8b9accd4fb413c980bfc6a",
+    "Nullifier": "b8df44fb83d3ff934a60d8a75daf6022fc0b440a9022c7edc8d9655d73c21d7b"
   },
-  "status": "DEPLOYED -- live shellnet == final v0.0.18 4.0.30 generation; final combined PR677/PR691/PR695 release gate pending."
+  "status": "DEPLOYED CANDIDATE -- live shellnet runs the SECOND 4.0.32 build (TokenContract b866fde2d1a021d3...), verified read-only. NOT accepted, and one gap is deliberate and named: THE DEPLOY PRECEDED THE EXECUTABLE PROOF OF ITS OWN FIXES. Neither the terminal-claim regression nor the new exit-economics part has been run against this build; they run next. A divergence there means a redeploy, and it will be reported by us rather than discovered."
 }

@@ -1523,6 +1523,7 @@ pub(crate) fn pool_with_note_added(
     Ok(pool)
 }
 
+#[cfg(any(test, feature = "shellnet"))]
 pub(crate) fn ensure_shell_pool_currency(pool: &Value) -> Result<()> {
     let token_type = pool
         .get("token_type")

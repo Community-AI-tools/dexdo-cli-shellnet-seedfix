@@ -19,23 +19,21 @@ mod live_tests;
 mod note_events;
 mod order_events;
 
+pub use crate::params::DEFAULT_SHELLNET_ENDPOINT;
 pub use backends::{
     real_market_deal_view, DealContext, RealBuyerBackend, RealDealBackend, RealNote,
-    RealSellerBackend, MODEL_TICK_SIZE,
+    RealSellerBackend,
 };
 pub use book_events::{
     fold_book_event_pages, BookEventFold, BookEventMessage, BookEventPage, LiveBookOrder,
 };
+#[cfg(feature = "test-giver")]
+pub use client::PlaceInferenceBuyReceipt;
 pub use client::{
     endpoint_urls, normalize_endpoint, observe_note_deploy_rootpn_action,
     observe_note_deploy_wallet_action, resolve_endpoint, shellnet_clock_skew_preflight, Deployed,
     MoneySubmitError, NoteDeployRootPnActionObservation, NoteDeployWalletActionObservation,
     RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport, ShellnetDoctorStatus,
-    DEFAULT_SHELLNET_ENDPOINT,
-};
-#[cfg(feature = "test-giver")]
-pub use client::{
-    PlaceInferenceBuyReceipt, TokenContractSettlementEvent, TokenContractSettlementReceipt,
-    TokenContractSettlementReceipts,
+    TokenContractSettlementEvent, TokenContractSettlementReceipt, TokenContractSettlementReceipts,
 };
 pub use contracts_provision::keypair_ed_pubkey;
