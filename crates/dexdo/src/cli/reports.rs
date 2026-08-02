@@ -14,6 +14,7 @@ use crate::operator_shutdown_signal;
 #[cfg(not(feature = "shellnet"))]
 use anyhow::bail;
 use anyhow::Result;
+use dexdo_core::address as addr;
 use dexdo_core::ChainBackend;
 
 pub(crate) async fn run_deals(args: DealsArgs) -> Result<()> {
@@ -29,10 +30,10 @@ pub(crate) async fn run_deals(args: DealsArgs) -> Result<()> {
             h.handle,
             h.role.as_str(),
             h.network,
-            h.note_addr,
+            addr::display(&h.note_addr),
             h.frame_model,
-            h.token_contract,
-            h.order_book.as_deref().unwrap_or("-"),
+            addr::display(&h.token_contract),
+            addr::display_opt(h.order_book.as_deref(), "-"),
             path.display()
         );
     }
@@ -53,11 +54,11 @@ pub(crate) async fn run_history(args: HistoryArgs) -> Result<()> {
             h.handle,
             h.role.as_str(),
             h.network,
-            h.note_addr,
+            addr::display(&h.note_addr),
             h.frame_model,
             h.model_hash.as_deref().unwrap_or("-"),
-            h.token_contract,
-            h.order_book.as_deref().unwrap_or("-"),
+            addr::display(&h.token_contract),
+            addr::display_opt(h.order_book.as_deref(), "-"),
             h.created_at_unix,
             if h.created_order_ids.is_empty() {
                 "-".to_string()
@@ -285,7 +286,7 @@ async fn run_status_mock(args: StatusArgs) -> Result<()> {
             let s = mock_summary_from_snapshot(&snapshot);
             println!(
                 "status handle=(raw) role=unknown token_contract={} state={} active=true funded={} opened={} disputed=false probe_accepted={}",
-                target.token_contract,
+                addr::display(&target.token_contract),
                 s.kind.as_str(),
                 s.funded,
                 s.opened,
@@ -294,7 +295,7 @@ async fn run_status_mock(args: StatusArgs) -> Result<()> {
         }
         _ => println!(
             "status handle=(raw) role=unknown token_contract={} state=closed active=false",
-            target.token_contract
+            addr::display(&target.token_contract)
         ),
     }
     Ok(())
@@ -305,7 +306,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     if args.mock_chain {
         return run_status_mock(args).await;
     }
-    use dexdo_core::{Address, RealChainBackend};
+    use dexdo_core::RealChainBackend;
     let target = load_deal_target(&args.deal, args.deals_dir.as_deref(), None, None)?;
     let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
     shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
@@ -316,7 +317,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
-    let tc = Address::parse(&target.token_contract)
+    let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
     let Some(snapshot) = chain.token_contract_deal_snapshot(&tc).await? else {
         if args.json {
@@ -336,7 +337,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
                 .map(|h| h.handle.as_str())
                 .unwrap_or("(raw)"),
             target.role.map(|r| r.as_str()).unwrap_or("unknown"),
-            target.token_contract
+            addr::display(&target.token_contract)
         );
         return Ok(());
     };
@@ -361,7 +362,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
             .map(|h| h.handle.as_str())
             .unwrap_or("(raw)"),
         target.role.map(|r| r.as_str()).unwrap_or("unknown"),
-        target.token_contract,
+        addr::display(&target.token_contract),
         s.kind.as_str(),
         s.funded,
         s.opened,
@@ -372,10 +373,10 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         println!(
             "context network={} note={} model={} order_book={} root_model={}",
             h.network,
-            h.note_addr,
+            addr::display(&h.note_addr),
             h.frame_model,
-            h.order_book.as_deref().unwrap_or("-"),
-            h.root_model.as_deref().unwrap_or("-")
+            addr::display_opt(h.order_book.as_deref(), "-"),
+            addr::display_opt(h.root_model.as_deref(), "-")
         );
     }
     println!(
@@ -414,7 +415,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
 
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
-    use dexdo_core::{Address, RealChainBackend};
+    use dexdo_core::RealChainBackend;
     let target = load_deal_target(&args.deal, args.deals_dir.as_deref(), None, None)?;
     let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
     shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
@@ -422,7 +423,7 @@ pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
-    let tc = Address::parse(&target.token_contract)
+    let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
     let snapshot = chain.token_contract_deal_snapshot(&tc).await?;
     let active = snapshot.is_some();

@@ -14,6 +14,7 @@ use anyhow::bail;
 use anyhow::Result;
 #[cfg(feature = "shellnet")]
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryBookAction, RegistryRole};
+use dexdo_core::address as addr;
 #[cfg(feature = "shellnet")]
 use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{model_hash_for, ChainBackend, DobParams, MockChainBackend};
@@ -55,7 +56,7 @@ async fn run_markets_mock(args: MarketsArgs) -> Result<()> {
     println!(
         "model={} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
         entry.frame_model,
-        entry.order_book,
+        addr::display(&entry.order_book),
         entry.active,
         entry.order_count,
         entry.ask_count,
@@ -187,7 +188,7 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
             println!(
                 "model={} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
                 snapshot.frame_model,
-                snapshot.order_book,
+                addr::display(&snapshot.order_book),
                 snapshot.active(),
                 order_count,
                 snapshot.resting_asks().count(),

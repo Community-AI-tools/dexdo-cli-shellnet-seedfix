@@ -140,7 +140,7 @@ pub(crate) async fn provision_replacement_seller(
     price_per_tick: u64,
     max_ticks: u64,
 ) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
-    use dexdo_core::{Address, KeyPair, RealChainBackend, RealSellerBackend, TICK_SIZE};
+    use dexdo_core::{KeyPair, RealChainBackend, RealSellerBackend, TICK_SIZE};
 
     let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr is required for residual provisioning")
@@ -156,8 +156,8 @@ pub(crate) async fn provision_replacement_seller(
     let chain = RealChainBackend::connect(manifest_path)?;
     let keys = KeyPair::from_secret_hex(secret.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let per_deploy = deposit_per_deploy(DEFAULT_DEPOSIT_SHELLS)?;
     chain.assert_seller_note_current(&note).await?;
     let note_ecc = chain
@@ -864,5 +864,89 @@ seller accounting (by model):
       -> buyer-pubkey -- tokens 2 * recv 810 raw ECC[2] * locked 10 raw ECC[2] * burned 0 raw ECC[2]
 ";
         assert_eq!(rendered, expected);
+    }
+}
+
+#[cfg(all(test, feature = "shellnet"))]
+mod buyer_backend_settle_week_tests {
+    use super::*;
+
+    /// `settleWeek()` is permissionless, and a buyer needs it to book his own crossed subscription
+    /// boundary -- otherwise the weekly quota can never advance under a running buyer.
+    /// The regression drives the PRODUCTION selection path: `buyer_real_backend` is exactly what
+    /// `run_buyer_inner` calls to build the real chain backend, and the assertion is made through the
+    /// returned `Arc<dyn ChainBackend>` -- i.e. through the same dynamic dispatch production uses, not
+    /// against a concrete `RealBuyerBackend`/`RealChainBackend` handle. Before the fix the selected backend
+    /// inherited the `ChainBackend::settle_week` default and answered `settle_week not supported`.
+    /// It stays offline and deterministic: `from_provisioned`/`connect` only load the manifest, and the
+    /// deliberately unparsable `token_contract` fails in the adapter's own `parse_tc` preflight -- the very
+    /// first statement of the override -- so no network read is ever attempted. The two assertions pin both
+    /// directions: the trait default is gone, AND control actually reached the buyer's own implementation.
+    #[tokio::test]
+    async fn buyer_real_backend_selection_supports_settle_week() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let note_key = dir.path().join("note.key");
+        // Throwaway test-only ed25519 secret: never used to sign, the call fails before any submit.
+        std::fs::write(
+            &note_key,
+            "3d1c8f5b2a704e6913c85af0d27b64e8915caf3072d6be4189305f7ac2b1de60",
+        )
+        .expect("write note key");
+
+        let args = BuyerArgs {
+            mock: MockFlags {
+                mock_model: false,
+                mock_chain: false,
+            },
+            identity: IdentityArgs {
+                note_key: Some(note_key),
+                note_index: 0,
+                note_addr: Some(
+                    "0:1111111111111111111111111111111111111111111111111111111111111111"
+                        .to_string(),
+                ),
+            },
+            registry: ModelRegistryValidationArgs::default(),
+            endpoints_file: None,
+            deals_dir: None,
+            token_contract: None,
+            resume: false,
+            market: None,
+            max_tokens: 8,
+            local_listen: None,
+            continuity_mode: ContinuityModeArg::OnDemand,
+            json: false,
+            anthropic_compat: false,
+            frame_model: Some("qwen--qwen3--32b".to_string()),
+            allow_unverified_model: true,
+            models: dir.path().join("models.json"),
+            ticks: 1,
+            max_price_per_tick: dexdo_core::PRICE_STEP,
+            // `None` => EXACTLY the required escrow, so the headroom preflight passes offline.
+            escrow: None,
+            contracts: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contracts/deployed.shellnet.json"
+            )),
+            policy: None,
+        };
+
+        let (chain, _note) = buyer_real_backend(&args, "qwen--qwen3--32b")
+            .expect("production buyer backend selection (offline manifest load)");
+
+        let error = chain
+            .settle_week(&"not-a-token-contract".to_string())
+            .await
+            .expect_err("an unparsable token_contract must fail in the adapter's own preflight");
+        let error = error.to_string();
+        assert!(
+            !error.contains("settle_week not supported"),
+            "the backend `dexdo buyer` selects must implement settle_week, not inherit the \
+             ChainBackend default: {error}"
+        );
+        assert!(
+            error.contains("bad token_contract not-a-token-contract"),
+            "the failure must come from the buyer adapter's own parse_tc preflight: {error}"
+        );
     }
 }

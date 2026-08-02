@@ -108,14 +108,14 @@ impl Buyer {
     /// Connect to the gateway over TLS, complete the
     /// challenge-response(B18) and receive the stream incrementally. On a fingerprint
     /// mismatch the connection does not come up -- the stream is not received(fail-closed).
-    /// `max_tokens` -- how many chunks to receive.
+    /// `max_tokens` -- how many accounted tokens to receive.
     pub async fn connect_and_stream(
         &self,
         handover: &Handover,
         token_contract: &TokenContract,
         max_tokens: u64,
     ) -> Result<StreamOutcome> {
-        self.connect_and_stream_request(handover, token_contract, max_tokens, None)
+        self.connect_and_stream_request(handover, token_contract, max_tokens, None, None)
             .await
     }
 
@@ -128,6 +128,7 @@ impl Buyer {
         token_contract: &TokenContract,
         max_tokens: u64,
         request: Option<CanonRequest>,
+        mut account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<StreamOutcome> {
         let mut client = self.connect(handover).await?;
         let signed = self.authorize(&mut client, token_contract, request).await?;
@@ -136,8 +137,27 @@ impl Buyer {
         let mut tokens = Vec::new();
         let mut reasoning = Vec::new();
         let mut received = 0u64;
+        let mut tokens_accounted = 0u64;
         while let Some(item) = stream.next().await {
-            let chunk = item?;
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(error) => return Err(error.into()),
+            };
+            // Counted before the text/reasoning fields are moved out of the chunk below.
+            let accounted = crate::buyer::api::accounted_tokens(&chunk);
+            let next_accounted = tokens_accounted
+                .checked_add(accounted)
+                .filter(|total| *total <= max_tokens)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "deal {token_contract}: probe chunk carries {accounted} tokens with \
+                         {tokens_accounted} of the {max_tokens}-token grant already accepted; \
+                         refusing the noncompliant chunk before it crosses the grant"
+                    )
+                })?;
+            if let Some(charge) = account_tokens.as_mut() {
+                (*charge)(accounted).map_err(anyhow::Error::msg)?;
+            }
             if !chunk.text.is_empty() {
                 tokens.push(chunk.text);
             }
@@ -145,10 +165,11 @@ impl Buyer {
                 reasoning.push(chunk.reasoning);
             }
             received += 1;
+            tokens_accounted = next_accounted;
             // The seller accounts cumulatively on-chain via claimTokens after acceptProbe, and
             // mature claims are promoted by finalize; here the buyer only counts received tokens
             // and may break off(STOP).
-            if received >= max_tokens {
+            if tokens_accounted >= max_tokens {
                 break; // buyer stops receiving -> STOP is submitted as a separate on-chain action
             }
         }
@@ -190,20 +211,46 @@ impl Buyer {
         model_id: &str,
         max_tokens: u64,
         models: &crate::seller::ModelsConfig,
+        account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify;
         let Some(probe_prompt) = verify::default_probe(model_id, models) else {
-            return Ok(verify::Verdict::Pass); // no exact-model fingerprint -> degradation(R3)
+            // Nothing was asked of the seller, so nothing was consumed.
+            return Ok(verify::Verdict::Pass);
         };
+        // the caller's grant is what bounds this probe. Zero means the reservation cannot pay
+        // for it, and issuing anyway would be worse than refusing: `max_tokens == 0` is "unset" on
+        // the wire and asks the seller for an unbounded generation.
+        if max_tokens == 0 {
+            anyhow::bail!(
+                "deal {token_contract}: the admitted grant cannot pay for the identity verification \
+                 this deal still owes; refusing rather than probing on credit"
+            );
+        }
+        // The seller derives its upstream token limit from `params.max_tokens`, so `None` here used
+        // to ask for an UNBOUNDED generation clipped only by the deal's whole remaining capacity.
+        // B7 has always set this; B8 must too. The receiver independently enforces the same
+        // figure against accounted tokens, even when a noncompliant seller chunks around it.
         let request = CanonRequest {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: probe_prompt.clone(),
             }],
-            params: None,
+            params: Some(SamplingParams {
+                temperature: 0.0,
+                max_tokens: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+                stop: Vec::new(),
+                greedy: false,
+            }),
         };
         let outcome = self
-            .connect_and_stream_request(handover, token_contract, max_tokens, Some(request))
+            .connect_and_stream_request(
+                handover,
+                token_contract,
+                max_tokens,
+                Some(request),
+                account_tokens,
+            )
             .await?;
         let response = outcome.tokens.join("");
         let reasoning = outcome.reasoning.join("");
@@ -232,6 +279,7 @@ impl Buyer {
         model_id: &str,
         max_tokens: u64,
         models: &crate::seller::ModelsConfig,
+        account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify::{
             self, prefix_agreement, reference_endpoint_for, spotcheck_verdict,
@@ -244,6 +292,15 @@ impl Buyer {
             _ => return Ok(verify::Verdict::Pass), // no reference key -> degradation(R3)
         };
 
+        // the caller's grant is what bounds this probe. Zero means the reservation cannot pay
+        // for it, and issuing anyway would be worse than refusing: `max_tokens == 0` is "unset" on
+        // the wire and asks the seller for an unbounded generation.
+        if max_tokens == 0 {
+            anyhow::bail!(
+                "deal {token_contract}: the admitted grant cannot pay for the identity verification \
+                 this deal still owes; refusing rather than probing on credit"
+            );
+        }
         // Deterministic probe: the claimed model's greedy output is characteristic and reproducible.
         let probe = DEFAULT_SPOTCHECK_PROBE;
         let request = CanonRequest {
@@ -259,12 +316,17 @@ impl Buyer {
             }),
         };
         let outcome = self
-            .connect_and_stream_request(handover, token_contract, max_tokens, Some(request))
+            .connect_and_stream_request(
+                handover,
+                token_contract,
+                max_tokens,
+                Some(request),
+                account_tokens,
+            )
             .await?;
         let seller_content = outcome.tokens.join("");
         let seller_reasoning = outcome.reasoning.join("");
         let seller_response = content_or_reasoning(&seller_content, &seller_reasoning);
-
         // Greedy probe to the reference. Network/endpoint failure -> degradation(our fault, not the seller's).
         let reference_response =
             match reference_completion(&endpoint, &api_key, probe, max_tokens as u32).await {
@@ -273,7 +335,10 @@ impl Buyer {
             };
 
         let agreement = prefix_agreement(&seller_response, &reference_response);
-        Ok(spotcheck_verdict(agreement, DEFAULT_SPOTCHECK_THRESHOLD))
+        Ok(spotcheck_verdict(
+            agreement,
+            DEFAULT_SPOTCHECK_THRESHOLD,
+        ))
     }
 
     /// Open a gRPC channel to the gateway over TLS, pinning the fingerprint from the handover.

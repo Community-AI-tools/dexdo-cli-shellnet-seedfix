@@ -729,7 +729,8 @@ mod tests {
     #[test]
     fn parser_accepts_explicit_seller_buyer_booleans() {
         let dir = temp_dir("registry-config-ok");
-        let contracts = write_contracts(&dir, ADDR1);
+        let dir = dir.path();
+        let contracts = write_contracts(dir, ADDR1);
         let cfg_path = dir.join("registry.json");
         std::fs::write(&cfg_path, config(true, false)).unwrap();
         let policy = RegistryValidationPolicy::load(
@@ -749,7 +750,8 @@ mod tests {
     #[test]
     fn parser_accepts_seller_deploy_missing_book_independently() {
         let dir = temp_dir("registry-config-deploy-missing");
-        let contracts = write_contracts(&dir, ADDR1);
+        let dir = dir.path();
+        let contracts = write_contracts(dir, ADDR1);
         let cfg_path = dir.join("registry.json");
         std::fs::write(
             &cfg_path,
@@ -793,7 +795,8 @@ mod tests {
     #[test]
     fn default_address_reads_contracts_manifest_when_enabled() {
         let dir = temp_dir("registry-config-default");
-        let contracts = write_contracts(&dir, ADDR2);
+        let dir = dir.path();
+        let contracts = write_contracts(dir, ADDR2);
         let cfg_path = dir.join("registry.json");
         std::fs::write(
             &cfg_path,
@@ -1484,17 +1487,12 @@ mod tests {
         path
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "dexdo-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        path
+    /// the previous `<pid>-<nanos>` directory was never removed -- 3 per workspace run.
+    fn temp_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(name)
+            .tempdir()
+            .expect("registry test directory")
     }
 
     fn repo_path(relative: &str) -> PathBuf {

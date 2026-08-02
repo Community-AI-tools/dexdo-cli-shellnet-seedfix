@@ -68,6 +68,17 @@ impl CanonStreamDriver {
         }
     }
 
+    /// Whether this chunk fits inside what is left of the grant, asked BEFORE it is rendered.
+    /// The grant is the request's reservation against the authoritative weekly ceiling, so it is a
+    /// hard cap on what may be shown, not a stopping condition to notice afterwards. A chunk carries
+    /// as many tokens as the seller chose to put in it: accounting first and rendering second would
+    /// let one fat chunk hand the consumer tokens nobody reserved, and `delivered_tokens` would then
+    /// carry an excess the next ceiling never sees. A chunk that does not fit is never exposed at
+    /// all - it cannot be split, because a partial render cannot be accounted honestly.
+    pub(super) fn admits(&self, chunk: &CanonChunk) -> bool {
+        self.received.saturating_add(accounted_tokens(chunk)) <= self.max_tokens
+    }
+
     pub(super) fn account_rendered(&mut self, chunk: &CanonChunk) -> bool {
         self.received = self.received.saturating_add(accounted_tokens(chunk));
         self.received >= self.max_tokens

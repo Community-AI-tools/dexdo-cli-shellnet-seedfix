@@ -25,10 +25,19 @@ curl -fsSL https://get.dex.do/install.sh | sh
 ```
 
 The installer downloads the latest release, verifies its SHA256 against the published `SHA256SUMS`,
-unpacks it, and places `dexdo` on PATH (`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\dexdo\bin` on
-Windows). The Linux binaries are static musl and run on any distro (Ubuntu 20.04+, Debian, RHEL,
-Alpine) with no glibc version requirement. If `dexdo` is not found after install, add its directory to
-PATH (Linux/macOS: `export PATH="$HOME/.local/bin:$PATH"`) and restart the shell.
+unpacks it, and installs `dexdo` into `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\dexdo\bin`
+(Windows). The Linux binaries are static musl and run on any distro (Ubuntu 20.04+, Debian, RHEL,
+Alpine) with no glibc version requirement.
+
+It then puts that directory on PATH by default. On Linux/macOS it appends one line, marked
+`# added by dexdo installer`, to the config of the shell named in `$SHELL` -- `~/.zshrc` (zsh),
+`~/.bashrc` (bash on Linux), `~/.bash_profile` (bash on macOS), or a `fish_add_path` line in
+`~/.config/fish/config.fish` (fish); on Windows it appends to the user `Path` variable. It prints the
+file it changed and the line it added, only ever writes inside `$HOME`, needs no `sudo`, and a repeat
+run does not duplicate the entry. An unrecognized shell is left untouched with a copy-paste
+instruction. The already-running shell keeps its old PATH, so `source` the printed file or open a new
+terminal before the next step. To skip the PATH edit, set `DEXDO_NO_MODIFY_PATH=1` (works with
+`curl | sh`) or pass `--no-modify-path` (`... | sh -s -- --no-modify-path`).
 
 Build from source (alternative, needs Rust):
 
@@ -102,12 +111,14 @@ flow does not stall:
 
    ```sh
    dexdo note deploy --multisig-address 0:<WALLET> --multisig-seed-file /path/to/wallet.seed \
-     --nominal N10000 --token-type nackl --endpoint shellnet.ackinacki.org --pool pn_pool.json
+     --nominal N10000 --token-type shell --endpoint shellnet.ackinacki.org --pool pn_pool.json
    ```
 
-   `dexdo note deploy` is the user note-creation path. It creates or appends `pn_pool.json`, which
-   holds the note owner secret. Keep it private, never commit it, and point later seller or buyer
-   commands at it:
+   Notes are funded in SHELL only, so `--token-type shell` is the only accepted currency, and
+   `--nominal` is required with no default (`N100`, `N1000`, or `N10000` -- a larger `N...` = more
+   SHELL). `dexdo note deploy` is the user note-creation path. It creates or appends
+   `pn_pool.json`, which holds the note owner secret. Keep it private, never commit it, and point
+   later seller or buyer commands at it:
 
    ```sh
    export DEXDO_PN_POOL="$PWD/pn_pool.json"
@@ -137,8 +148,14 @@ dexdo provision --note-addr "$NOTE_ADDR" --note-key note.secret.hex --frame-mode
 export GROQ_API_KEY=<your-key>
 dexdo seller --market market.json --model qwen --models models.json \
   --note-addr "$NOTE_ADDR" --note-key note.secret.hex --gateway-listen 0.0.0.0:8443 \
+  --gateway-advertise <public-host>:8443 \
   --contracts contracts/deployed.shellnet.json
 ```
+
+`--gateway-advertise` is the address a REMOTE buyer dials; it must be publicly reachable.
+Startup rejects a bind-all/loopback/private/link-local/CGNAT advertise with
+`error[E_ADVERTISE_NOT_PUBLIC]` before posting the offer. For same-host or LAN testing only,
+add `--allow-private-advertise`.
 
 Hand the buyer the deal address (`token_contract` in `market.json`) and the frame model
 `qwen--qwen3--32b`. Check revenue: `dexdo status 0:<TC> --contracts contracts/deployed.shellnet.json`
@@ -177,8 +194,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 
 ## Common install errors
 
-- `dexdo: command not found` after install -- the install directory is not on PATH; add it and restart
-  the shell (Linux/macOS: `~/.local/bin`).
+- `dexdo: command not found` right after install -- the installer edits the shell config, but a shell
+  that is already running keeps its old PATH; `source` the file the installer printed, or open a new
+  terminal. If the installer reported an unrecognized shell (or ran with `DEXDO_NO_MODIFY_PATH=1` /
+  `--no-modify-path`), add the printed line to your shell config by hand (Linux/macOS: `~/.local/bin`).
 - `unavailable: build with --features shellnet` -- a source build compiled without the feature; rebuild
   with `--features shellnet` (Phase 1). The released binary already includes it.
 - `dexdo doctor` reports manifest drift -- re-download `contracts/deployed.shellnet.json` (Phase 3).

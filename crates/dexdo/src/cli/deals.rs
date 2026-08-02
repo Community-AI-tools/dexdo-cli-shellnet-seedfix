@@ -38,11 +38,17 @@ pub(crate) struct DealHandle {
     pub(crate) handle: String,
     pub(crate) role: DealHandleRole,
     pub(crate) network: String,
+    // issue: addresses are written canonically and read in either form, so a handle file written
+    // by an older version keeps loading while a new one carries the DApp identity.
+    #[serde(with = "dexdo_core::address::serde_canonical")]
     pub(crate) token_contract: String,
+    #[serde(with = "dexdo_core::address::serde_canonical")]
     pub(crate) note_addr: String,
     pub(crate) frame_model: String,
     pub(crate) model_hash: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) order_book: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) root_model: Option<String>,
     pub(crate) market: Option<MarketManifest>,
     pub(crate) contracts: String,
@@ -580,6 +586,46 @@ mod tests {
             created_order_ids: vec![],
             created_at_unix: 1,
         }
+    }
+
+    /// Issue: a deal handle is written with canonical `<dapp_id>::<account_id>` addresses and is
+    /// read back from either that or a legacy `0:<account_id>` file, so an existing deals dir keeps
+    /// resolving to the same handle after the upgrade.
+    #[test]
+    fn deal_handle_writes_canonical_addresses_and_reads_legacy_ones() {
+        let account = |c: char| std::iter::repeat_n(c, 64).collect::<String>();
+        let mut handle = sample_handle();
+        handle.token_contract = format!("0:{}", account('3'));
+        handle.note_addr = format!("0:{}", account('4'));
+        handle.order_book = Some(format!("0:{}", account('1')));
+        handle.root_model = None;
+
+        let json = serde_json::to_string(&handle).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for (field, c) in [
+            ("token_contract", '3'),
+            ("note_addr", '4'),
+            ("order_book", '1'),
+        ] {
+            assert_eq!(
+                v[field].as_str().unwrap(),
+                format!("{}::{}", dexdo_core::DEXDO_DAPP_ID, account(c)),
+                "{field} was not written canonically"
+            );
+        }
+        assert!(
+            v["root_model"].is_null(),
+            "an absent address became a value"
+        );
+
+        // The canonical file and the legacy file it replaces load to the same handle.
+        let legacy_json = json.replace(&format!("{}::", dexdo_core::DEXDO_DAPP_ID), "0:");
+        assert_ne!(legacy_json, json);
+        assert_eq!(
+            serde_json::from_str::<DealHandle>(&legacy_json).unwrap(),
+            handle
+        );
+        assert_eq!(serde_json::from_str::<DealHandle>(&json).unwrap(), handle);
     }
 
     #[test]

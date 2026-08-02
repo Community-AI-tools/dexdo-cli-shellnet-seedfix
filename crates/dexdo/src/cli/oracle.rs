@@ -88,7 +88,7 @@ pub(crate) async fn run_oracle(_args: OracleArgs) -> Result<()> {
 
 #[cfg(feature = "shellnet")]
 async fn run_oracle_provision(args: OracleProvisionArgs) -> Result<()> {
-    use dexdo_core::{Address, KeyPair, RealChainBackend};
+    use dexdo_core::{KeyPair, RealChainBackend};
     if args.outcome_names.len() != args.bounds.len() + 1 {
         bail!(
             "oracle provision: pass exactly bounds.len()+1 --outcome values (got {}, expected {})",
@@ -123,8 +123,8 @@ async fn run_oracle_provision(args: OracleProvisionArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let oracle_keys = KeyPair::from_secret_hex(oracle_seed.trim())
         .map_err(|e| anyhow::anyhow!("--oracle-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let chain = RealChainBackend::connect(contracts)?;
     let manifest = chain
         .provision_oracle_market(

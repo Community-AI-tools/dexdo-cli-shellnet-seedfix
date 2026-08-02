@@ -53,6 +53,8 @@ shellnet = ["dep:gosh-ackinacki", "dep:anyhow", "dep:tvm_block", "dep:tvm_types"
 test-giver = ["shellnet"]
 
 [dev-dependencies]
+# Already vendored for the workspace(dev-dependency of `dexdo` and `dexdo-e2e`).
+tempfile = "3"
 anyhow.workspace = true
 proptest.workspace = true
 http.workspace = true

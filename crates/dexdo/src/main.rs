@@ -5,6 +5,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod cli;
+#[cfg(test)]
+mod test_refusing_endpoint;
 use cli::args::*;
 use cli::buyer::{run_buyer, run_subscription};
 use cli::commands::*;
@@ -62,6 +64,9 @@ enum Command {
     /// Reclaim: recover buyer escrow after seller no-show. OPEN deals use the explicit
     /// `close`/`recover` STOP path; funded-but-never-opened deals use `streamCleanup` after
     /// `MATCH_OPEN_TIMEOUT`. Buyer-signed; fails closed locally on state, ownership, and the cleanup timer.
+    /// with `--pool`/DEXDO_PN_POOL and no `--note-addr`/`--token-contract` it drives EVERY recorded
+    /// recovery entry, each as its own reclaim -- so one invocation can move money for several deals, one
+    /// per still-reclaimable recorded deal -- and refuses contradictory records instead of guessing.
     Reclaim(ReclaimArgs),
     /// ReleaseDispute: the SELLER concedes a disputed deal -- `TokenContract.releaseDispute()` returns
     /// this TC's contested amount to the buyer and the seller bond. Seller-signed; fails closed if the deal
@@ -250,6 +255,13 @@ async fn main() -> Result<()> {
             machine::print_error(operation, code, &err)?;
             std::process::exit(1);
         }
+        // a structured error renders itself -- code, kind, message, the preserved `cause:`
+        // chain, any `secondary:` consequence, and the `hint:`. Printing it through `anyhow`'s
+        // `Debug` on top of that would repeat every cause under a second `Caused by:` block.
+        if let Some(structured) = err.downcast_ref::<dexdo_core::DexdoError>() {
+            eprintln!("{structured}");
+            std::process::exit(1);
+        }
         return Err(err);
     }
     Ok(())
@@ -374,7 +386,8 @@ mod note_cli_tests {
     const DEST_HALF_2: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
     /// the existing passed-in multisig contract remains the `note deploy` default:
-    /// address plus exactly one key source, with the established deploy defaults.
+    /// address plus exactly one key source, with the established deploy defaults.: the
+    /// deposit nominal is now one of the required flags, never a silent default.
     #[test]
     fn note_deploy_subcommand_parses() {
         let c = Cli::try_parse_from([
@@ -386,6 +399,8 @@ mod note_cli_tests {
             "0:wallet",
             "--multisig-key",
             "w.keys.json",
+            "--nominal",
+            "N100",
             "--pool",
             "pn_pool.json",
         ])
@@ -418,6 +433,8 @@ mod note_cli_tests {
             "0:wallet",
             "--multisig-seed-file",
             r"C:\Users\operator\wallet.seed",
+            "--nominal",
+            "N100",
             "--pool",
             "pn_pool.json",
             "--recovery",
@@ -441,13 +458,17 @@ mod note_cli_tests {
             Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
         assert!(!d.json);
-        // The passed-in wallet address and one key input remain independently required.
+        // The passed-in wallet address and one key input remain independently required. Each of
+        // these supplies `--nominal` so the rejection is provably the flag under test, not the
+        // newly required nominal.
         assert!(Cli::try_parse_from([
             "dexdo",
             "note",
             "deploy",
             "--multisig-key",
             "w.keys.json",
+            "--nominal",
+            "N100",
             "--pool",
             "p.json",
         ])
@@ -458,6 +479,8 @@ mod note_cli_tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
+            "--nominal",
+            "N100",
             "--pool",
             "p.json",
         ])
@@ -472,6 +495,8 @@ mod note_cli_tests {
             "w.keys.json",
             "--multisig-seed-file",
             "wallet.seed",
+            "--nominal",
+            "N100",
             "--pool",
             "pn_pool.json",
         ])
@@ -484,6 +509,8 @@ mod note_cli_tests {
             "0:wallet",
             "--multisig-key",
             "w.keys.json",
+            "--nominal",
+            "N100",
             "--pool",
             "pn_pool.json",
             "--onboard-bin",
@@ -1417,6 +1444,126 @@ mod deal_handle_cli_tests {
         };
         assert_eq!(seller.gateway_listen.to_string(), "0.0.0.0:8443");
         assert_eq!(seller.gateway_advertise_addr(), "0.0.0.0:8443");
+        // a `--mock-chain` demo never posts to a real order book, so the local default stays usable.
+        assert_eq!(
+            seller.checked_gateway_advertise_addr().unwrap(),
+            "0.0.0.0:8443"
+        );
+    }
+
+    fn seller_args(extra: &[&str]) -> crate::SellerArgs {
+        let mut argv = vec![
+            "dexdo",
+            "seller",
+            "--note-addr",
+            "0:note",
+            "--token-contract",
+            "0:tc",
+            "--model",
+            "qwen",
+        ];
+        argv.extend_from_slice(extra);
+        let parsed = Cli::try_parse_from(argv).expect("seller parses");
+        let Command::Seller(seller) = parsed.command else {
+            panic!("expected Command::Seller");
+        };
+        seller
+    }
+
+    #[test]
+    fn seller_rejects_a_non_routable_advertise_on_the_real_path() {
+        // the silent advertise:= listen fallback, named as such in the message.
+        let error = seller_args(&[])
+            .checked_gateway_advertise_addr()
+            .expect_err("the listen default must not be advertised to remote buyers");
+        let structured = error
+            .downcast_ref::<dexdo_core::DexdoError>()
+            .expect(
+                "the SellerArgs anyhow boundary must preserve DexdoError for top-level rendering",
+            );
+        assert_eq!(
+            structured.code(),
+            dexdo_core::error_codes::E_ADVERTISE_NOT_PUBLIC.code()
+        );
+        assert_eq!(
+            error.to_string(),
+            "error[E_ADVERTISE_NOT_PUBLIC] (config): --gateway-advertise defaulted to \
+             --gateway-listen 127.0.0.1:8443, which is not reachable by remote buyers (loopback)\n  \
+             hint: pass a public host:port reachable from the internet, or run on a public host; \
+             for local/LAN testing only, use --allow-private-advertise"
+        );
+        // The bind-all listen socket reports as the footgun.
+        let error = seller_args(&["--gateway-listen", "0.0.0.0:8443"])
+            .checked_gateway_advertise_addr()
+            .expect_err("a bind-all wildcard is not a connect target");
+        assert_eq!(
+            error.to_string(),
+            "error[E_ADVERTISE_NOT_PUBLIC] (config): --gateway-advertise defaulted to \
+             --gateway-listen 0.0.0.0:8443, which is not reachable by remote buyers \
+             (bind-all wildcard)\n  \
+             hint: pass a public host:port reachable from the internet, or run on a public host; \
+             for local/LAN testing only, use --allow-private-advertise"
+        );
+
+        for advertise in [
+            "127.0.0.1:8443",
+            "192.168.1.10:8443",
+            "10.0.0.5:8443",
+            "169.254.1.1:8443",
+            "100.64.0.1:8443",
+            "localhost:8443",
+            "[::1]:8443",
+        ] {
+            let error = seller_args(&["--gateway-advertise", advertise])
+                .checked_gateway_advertise_addr()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("error[E_ADVERTISE_NOT_PUBLIC] (config)")
+                    && error.contains(advertise)
+                    && error.contains("--allow-private-advertise"),
+                "{advertise}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn seller_accepts_a_public_advertise_or_the_explicit_private_opt_in() {
+        assert_eq!(
+            seller_args(&["--gateway-advertise", "seller.example.net:443"])
+                .checked_gateway_advertise_addr()
+                .unwrap(),
+            "seller.example.net:443"
+        );
+        assert_eq!(
+            seller_args(&["--gateway-advertise", "94.156.178.14:8443"])
+                .checked_gateway_advertise_addr()
+                .unwrap(),
+            "94.156.178.14:8443"
+        );
+        assert_eq!(
+            seller_args(&[
+                "--allow-private-advertise",
+                "--gateway-listen",
+                "127.0.0.1:8443"
+            ])
+            .checked_gateway_advertise_addr()
+            .unwrap(),
+            "127.0.0.1:8443"
+        );
+    }
+
+    #[test]
+    fn seller_advertise_probe_policy_follows_the_flag() {
+        use dexdo::seller::liveness::AdvertiseProbePolicy;
+        assert_eq!(
+            seller_args(&[]).advertise_probe_policy(),
+            AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        );
+        assert_eq!(
+            seller_args(&["--require-advertise-probe"]).advertise_probe_policy(),
+            AdvertiseProbePolicy::Required
+        );
     }
 
     #[test]
@@ -1737,6 +1884,51 @@ mod tests {
         current.render_long_help().to_string()
     }
 
+    /// `reclaim --pool` can move money for more than one deal in a single invocation, so the
+    /// user-facing contract has to say so where an operator actually reads it.
+    #[test]
+    fn reclaim_help_states_that_a_pool_run_drives_every_recorded_entry() {
+        let help = subcommand_long_help("reclaim");
+        for fact in [
+            "EVERY recorded",
+            "one per still-reclaimable recorded deal",
+            "refuses contradictory records",
+        ] {
+            assert!(
+                help.contains(fact),
+                "missing {fact:?} in reclaim help:\n{help}"
+            );
+        }
+        assert!(
+            help.contains("drives EVERY recorded recovery entry as its own reclaim"),
+            "--pool must document the fan-out where the flag is described:\n{help}"
+        );
+        assert!(
+            !help.contains("last matched TokenContract"),
+            "the singular pool contract must not survive the  fan-out:\n{help}"
+        );
+    }
+
+    /// The pool-recovery commands act on a deal already recorded on chain and in the pool: there is no
+    /// sub-note to derive, so `--note-index` is not part of their surface and must be rejected rather
+    /// than accepted and ignored.
+    #[test]
+    fn pool_recovery_commands_reject_note_index_but_keep_their_identity_flags() {
+        for command in ["reclaim", "recover", "dispute"] {
+            let error = match Cli::try_parse_from(["dexdo", command, "--note-index", "3"]) {
+                Ok(_) => panic!("{command} must not accept --note-index"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command}: {error}"
+            );
+            assert!(Cli::try_parse_from(["dexdo", command, "--note-addr", "0:b"]).is_ok());
+            assert!(Cli::try_parse_from(["dexdo", command, "--note-key", "k.hex"]).is_ok());
+        }
+    }
+
     #[test]
     fn root_version_flag_is_available_for_release_smoke() {
         let err = Cli::command()
@@ -1868,6 +2060,8 @@ mod tests {
             "0:wallet",
             "--multisig-key",
             "wallet.key",
+            "--nominal",
+            "N10000",
             "--pool",
             "pn_pool.json",
         ])
@@ -1878,7 +2072,6 @@ mod tests {
         let NoteCommand::Deploy(note) = note.command else {
             panic!("note deploy")
         };
-        assert_eq!(note.nominal, p::DEFAULT_NOTE_DEPLOY_NOMINAL);
         assert_eq!(note.endpoint, p::DEFAULT_NOTE_DEPLOY_ENDPOINT);
         assert_eq!(note.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
 
@@ -2147,16 +2340,14 @@ mod tests {
     fn explicit_endpoints_file_used_and_parent_created() {
         // D6: an explicit path is used as is, and a missing parent directory is created
         // (otherwise the mock write of `endpoints`/`*.chainstate.json` would fail on a fresh machine).
-        let base = std::env::temp_dir().join(format!("dexdo-eps-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let nested = base.join("sub").join("eps.json");
+        let base = tempfile::tempdir().expect("endpoints test dir");
+        let nested = base.path().join("sub").join("eps.json");
         let got = resolve_endpoints_file(Some(nested.clone())).expect("resolve explicit");
         assert_eq!(got, nested, "explicit path is not rewritten");
         assert!(
             nested.parent().unwrap().is_dir(),
             "parent directory created"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2243,6 +2434,17 @@ mod tests {
     }
 
     #[test]
+    fn seller_help_documents_the_advertise_reachability_flags() {
+        let help = subcommand_long_help("seller");
+        assert!(help.contains("--allow-private-advertise"), "{help}");
+        assert!(help.contains("--require-advertise-probe"), "{help}");
+        assert!(
+            help.contains("must be reachable by a REMOTE buyer"),
+            "{help}"
+        );
+    }
+
+    #[test]
     fn listen_help_documents_seller_buyer_equivalence() {
         let seller = subcommand_long_help("seller");
         assert!(
@@ -2284,12 +2486,177 @@ mod tests {
                 "0:wallet",
                 "--multisig-key",
                 "w.keys.json",
+                "--nominal",
+                "N100",
                 "--pool",
                 "pn_pool.json",
                 "--token-type",
                 token_type,
             ]);
             assert!(parsed.is_err(), "{token_type} must be rejected");
+        }
+    }
+
+    /// the deposit is a spend from the funding wallet, so `note deploy` must never pick a
+    /// denomination on the operator's behalf. Without `--nominal` it fails at parse time, before
+    /// any wallet transaction is submitted.
+    #[test]
+    fn note_deploy_requires_an_explicit_nominal() {
+        let Err(err) = Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "deploy",
+            "--multisig-address",
+            "0:wallet",
+            "--multisig-key",
+            "w.keys.json",
+            "--pool",
+            "pn_pool.json",
+        ]) else {
+            panic!("note deploy without an explicit nominal must be rejected");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--nominal"), "{err}");
+
+        let help = nested_subcommand_long_help(&["note", "deploy"]);
+        assert!(!help.contains("[default: N100]"), "{help}");
+    }
+
+    /// The onboarding docs published with the release binary. `release/build-public-tree.sh`
+    /// allow-lists exactly these three skill directories, so they are what a new user reads.
+    const PUBLISHED_ONBOARDING_DOCS: [(&str, &str); 3] = [
+        (
+            ".claude/skills/dexdo-install/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-install/SKILL.md"),
+        ),
+        (
+            ".claude/skills/dexdo-buy-model/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-buy-model/SKILL.md"),
+        ),
+        (
+            ".claude/skills/dexdo-sell-model/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-sell-model/SKILL.md"),
+        ),
+    ];
+
+    /// Values a doc tells the reader to pass to `flag`, in `--flag value` or `--flag=value` form,
+    /// anywhere in the prose or in a fenced command block. Backticks are markdown, not argv.
+    fn documented_flag_values(doc: &str, flag: &str) -> Vec<String> {
+        let unquote = |t: &str| {
+            t.trim_matches(|c| c == '`' || c == '"' || c == '\'')
+                .to_string()
+        };
+        let inline = format!("{flag}=");
+        let tokens: Vec<&str> = doc.split_whitespace().collect();
+        let mut values = Vec::new();
+        for (i, raw) in tokens.iter().enumerate() {
+            let token = unquote(raw);
+            if let Some(value) = token.strip_prefix(&inline) {
+                values.push(value.to_string());
+            } else if token == flag {
+                if let Some(next) = tokens.get(i + 1) {
+                    values.push(unquote(next));
+                }
+            }
+        }
+        values
+    }
+
+    /// Command lines a doc tells the reader to run, joined across `\` continuations and split into
+    /// argv. Only lines that start with the bare binary name count; prose mentions such as
+    /// `` `dexdo note deploy` funds a note `` start with a backtick and are skipped.
+    fn documented_commands(doc: &str, subcommand: &[&str]) -> Vec<Vec<String>> {
+        let lines: Vec<&str> = doc.lines().collect();
+        let mut commands = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            if !lines[index].trim_start().starts_with("dexdo ") {
+                index += 1;
+                continue;
+            }
+            let mut joined = String::new();
+            loop {
+                let line = lines[index].trim();
+                let continued = line.ends_with('\\');
+                joined.push_str(line.trim_end_matches('\\').trim_end());
+                joined.push(' ');
+                index += 1;
+                if !continued || index >= lines.len() {
+                    break;
+                }
+            }
+            let argv: Vec<String> = joined
+                .split_whitespace()
+                .take_while(|token| !token.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            let matches_subcommand = subcommand
+                .iter()
+                .enumerate()
+                .all(|(offset, name)| argv.get(offset + 1).map(String::as_str) == Some(*name));
+            if matches_subcommand {
+                commands.push(argv);
+            }
+        }
+        commands
+    }
+
+    /// The value set the shipped parser itself enforces for a `note deploy` flag -- read off the
+    /// clap command, never a second copy of the list that could drift from the `value_parser`.
+    fn note_deploy_possible_values(command: &clap::Command, arg_id: &str) -> Vec<String> {
+        command
+            .find_subcommand("note")
+            .expect("note subcommand exists")
+            .find_subcommand("deploy")
+            .expect("note deploy subcommand exists")
+            .get_arguments()
+            .find(|arg| arg.get_id() == arg_id)
+            .unwrap_or_else(|| panic!("note deploy has a {arg_id} argument"))
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_string())
+            .collect()
+    }
+
+    /// Recurrence guard. v0.0.20 published onboarding skills instructing
+    /// `dexdo note deploy --token-type nackl`, a value the shipped binary's own `value_parser`
+    /// rejects: a new user's first money command was a hard parse error. Any documented value for
+    /// a restricted flag must be one the parser accepts.
+    #[test]
+    fn published_docs_only_document_accepted_flag_values() {
+        let accepted = note_deploy_possible_values(&Cli::command(), "token_type");
+        assert!(
+            !accepted.is_empty(),
+            "--token-type must keep a restricted value set for this guard to mean anything"
+        );
+        for (path, body) in PUBLISHED_ONBOARDING_DOCS {
+            for value in documented_flag_values(body, "--token-type") {
+                assert!(
+                    accepted.contains(&value),
+                    "{path} tells users to pass `--token-type {value}`, which the CLI rejects; \
+                     accepted values: {accepted:?}"
+                );
+            }
+        }
+    }
+
+    /// Recurrence guard, the whole-command half: every `dexdo note deploy` invocation the
+    /// published docs hand a user must parse with the shipped parser, so neither a rejected flag
+    /// value nor a missing required flag(such as `--nominal`) can reach a release again.
+    #[test]
+    fn published_docs_note_deploy_commands_parse() {
+        for (path, body) in PUBLISHED_ONBOARDING_DOCS {
+            let commands = documented_commands(body, &["note", "deploy"]);
+            assert!(
+                !commands.is_empty(),
+                "{path} no longer shows a runnable `dexdo note deploy` command"
+            );
+            for argv in commands {
+                if let Err(err) = Cli::try_parse_from(&argv) {
+                    let rendered = argv.join(" ");
+                    panic!("{path} documents a command the CLI rejects:\n  {rendered}\n{err}");
+                }
+            }
         }
     }
 
@@ -2354,8 +2721,8 @@ mod tests {
             price_per_tick: 1000,
             max_ticks: 8,
         };
-        let dir = std::env::temp_dir().join(format!("dexdo-market-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().expect("market manifest test dir");
+        let dir = dir.path();
         let write = |name: &str, m: &dexdo_core::MarketManifest| {
             let p = dir.join(name);
             std::fs::write(&p, m.to_json().unwrap()).unwrap();
@@ -2402,8 +2769,6 @@ mod tests {
         empty.token_contract = String::new();
         let pe = write("empty.json", &empty);
         assert!(resolve_market_fields(Some(&pe), None, None).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Issue(review): the seller fails closed when the `--market` manifest's model does not match

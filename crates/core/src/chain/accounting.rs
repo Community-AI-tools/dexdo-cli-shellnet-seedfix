@@ -553,11 +553,29 @@ pub fn check_recoverable(
     }
 }
 
+/// Why buyer ownership is required for a given action -- the two recovery preflights do not share one
+/// reason, and telling the operator the wrong one is telling them the money is protected by a check that
+/// does not exist.
+/// * `dispute` is authorized on chain: `TokenContract.dispute()` requires `msg.sender == _buyer`.
+/// * `reclaim` is **not**: `TokenContract.cleanupUnopened()` is permissionless, with payouts fixed by the
+/// contract(deposit refund to the recorded buyer, seller bond back to the seller note). What is gated
+/// is this client's submission path, the owner-keyed `PrivateNote.streamCleanup` wrapper, so the
+/// ownership check is a client/pool-integrity policy: a recovery record the chain contradicts is
+/// refused instead of being driven from some other note's key.
+const DISPUTE_BUYER_ENFORCEMENT: &str =
+    "the TokenContract enforces msg.sender == _buyer for this action";
+const RECLAIM_BUYER_ENFORCEMENT: &str =
+    "this client only submits the never-opened cleanup through the deal's own owner-keyed \
+     PrivateNote.streamCleanup wrapper, and refuses a recovery record the chain contradicts; \
+     TokenContract.cleanupUnopened() itself is permissionless with contract-fixed payouts, so no key \
+     of ours can redirect that money";
+
 /// Shared buyer-ownership gate for the recovery preflights(`dispute`/`reclaim`): the deal's recorded buyer
-/// note + ed-pubkey must be THIS note(`--note-addr`/`--note-key`). The on-chain `TokenContract` enforces
-/// `msg.sender == _buyer`; this mirrors it client-side so the operator gets an actionable error, not a bare revert.
+/// note + ed-pubkey must be THIS note(`--note-addr`/`--note-key`). `enforcement` states, per action, what
+/// actually backs that requirement, so the error never claims a contract check the contract does not make.
 fn check_buyer_owns(
     action: &str,
+    enforcement: &str,
     buyer_note: Option<&str>,
     note_addr: &str,
     buyer_pubkey: Option<&[u8; 32]>,
@@ -572,7 +590,7 @@ fn check_buyer_owns(
         Some(buyer) if buyer != note_addr => {
             return Err(format!(
                 "{action}: --note-addr is not the deal's buyer note -- only the buyer note can {action} \
-                 (the TokenContract enforces msg.sender == _buyer)"
+                 ({enforcement})"
             ))
         }
         Some(_) => {}
@@ -583,7 +601,7 @@ fn check_buyer_owns(
         )),
         Some(bpk) if bpk != note_ed_pubkey => Err(format!(
             "{action}: --note-key is not the deal's buyer key -- only the buyer can {action} \
-             (the TokenContract enforces msg.sender == _buyer)"
+             ({enforcement})"
         )),
         Some(_) => Ok(()),
     }
@@ -614,6 +632,7 @@ pub fn check_disputable(
     }
     check_buyer_owns(
         "dispute",
+        DISPUTE_BUYER_ENFORCEMENT,
         buyer_note,
         note_addr,
         buyer_pubkey,
@@ -621,20 +640,14 @@ pub fn check_disputable(
     )
 }
 
-/// The single contract write selected by a successful `dexdo reclaim` pre-flight.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReclaimAction {
-    /// `PrivateNote.streamCleanup` -> `TC.cleanupUnopened()`: recover a deal the seller never opened.
-    StreamCleanup,
-}
-
-/// `dexdo reclaim` pre-flight -- which single write recovers this deal, and whether it is
-/// admissible at all. Fails LOUD before sending rather than letting the contract revert:
+/// `dexdo reclaim` pre-flight -- whether the one write this command owns,
+/// `PrivateNote.streamCleanup` -> `TC.cleanupUnopened()`, is admissible at all. Fails LOUD before sending
+/// rather than letting the contract revert:
 /// - not disputed, matched, owned by THIS buyer(else reject);
 /// - funded(else nothing to reclaim);
 /// - OPENED -> reject: explicit STOP is selected by `close`/`recover`, never rewritten from `reclaim`;
 /// - funded, closed, and the exact never-opened state produced at funding +
-/// `now >= funded_time + match_open_timeout` -> `StreamCleanup`;
+/// `now >= funded_time + match_open_timeout` -> admissible;
 /// - funded but never opened before `MATCH_OPEN_TIMEOUT` -> reject(too early).
 /// Times are seconds(client `SystemTime` vs on-chain `lastClaimTime`/`fundedTime` + contract timeouts).
 /// Offline-regression-tested.
@@ -646,12 +659,13 @@ pub fn check_reclaimable(
     note_ed_pubkey: &[u8; 32],
     now: u64,
     match_open_timeout: u64,
-) -> Result<ReclaimAction, String> {
+) -> Result<(), String> {
     if state.disputed {
         return Err("reclaim: deal is DISPUTED -- resolve via the dispute path (releaseDispute/resolveDisputeTimeout), not reclaim".into());
     }
     check_buyer_owns(
         "reclaim",
+        RECLAIM_BUYER_ENFORCEMENT,
         buyer_note,
         note_addr,
         buyer_pubkey,
@@ -702,7 +716,7 @@ pub fn check_reclaimable(
             deadline.saturating_sub(now)
         ));
     }
-    Ok(ReclaimAction::StreamCleanup)
+    Ok(())
 }
 
 /// `dexdo release-dispute` pre-flight -- the seller can concede only an actually disputed deal.

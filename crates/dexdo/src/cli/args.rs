@@ -10,10 +10,10 @@ use dexdo_core::{
         DEFAULT_DASHBOARD_LISTEN, DEFAULT_DOCTOR_NETWORK, DEFAULT_EXECUTABLE_BOOK_TICKS,
         DEFAULT_EXPORT_FORMAT, DEFAULT_MARKETS_FRAME_MODEL, DEFAULT_MARKET_DATA_OUTPUT,
         DEFAULT_MARKET_DATA_TIMEOUT_MS, DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH,
-        DEFAULT_MONITOR_TREE_WIDTH, DEFAULT_NOTE_DEPLOY_ENDPOINT, DEFAULT_NOTE_DEPLOY_NOMINAL,
-        DEFAULT_NOTE_INDEX, DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION, DEFAULT_ORACLE_EVENT_LIST_INDEX,
-        DEFAULT_ORACLE_FEE, DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_ORACLE_PMP_DESCRIPTION,
-        DEFAULT_POLICY_ROLE, DEFAULT_PROVISION_MAX_TICKS, DEFAULT_SELLER_GATEWAY_LISTEN,
+        DEFAULT_MONITOR_TREE_WIDTH, DEFAULT_NOTE_DEPLOY_ENDPOINT, DEFAULT_NOTE_INDEX,
+        DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION, DEFAULT_ORACLE_EVENT_LIST_INDEX, DEFAULT_ORACLE_FEE,
+        DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_ORACLE_PMP_DESCRIPTION, DEFAULT_POLICY_ROLE,
+        DEFAULT_PROVISION_MAX_TICKS, DEFAULT_SELLER_GATEWAY_LISTEN,
         DEFAULT_SELLER_MOCK_TOKEN_COUNT, MARKET_DATA_DEPTH_LIMIT_MAX, MARKET_DATA_DEPTH_LIMIT_MIN,
         MARKET_DATA_LIST_LIMIT_MAX, MARKET_DATA_LIST_LIMIT_MIN, SHELL_CURRENCY_ID,
         SHELL_CURRENCY_LABEL,
@@ -139,6 +139,21 @@ pub(crate) struct IdentityArgs {
     pub(crate) note_addr: Option<String>,
 }
 
+/// Note identity for the pool-recovery commands(`reclaim`/`recover`/`dispute`). These act on a deal
+/// already recorded on chain and in the pool, so they take the note **address** and its owner key and
+/// nothing else -- there is no sub-note to derive and no `--note-index` to honour.
+#[derive(Args)]
+pub(crate) struct RecoveryIdentityArgs {
+    /// Path to a file with the note's owner secret hex(the SDK secret of the on-chain `PrivateNote`).
+    /// Optional: the recorded key next to the entry in `DEXDO_PN_POOL` is used when it is absent.
+    #[arg(long)]
+    pub(crate) note_key: Option<PathBuf>,
+    /// On-chain address of the actor's already provisioned `PrivateNote`. Optional: without it the
+    /// recorded pool metadata alone selects the deal(s).
+    #[arg(long)]
+    pub(crate) note_addr: Option<String>,
+}
+
 /// Issue: explicit client-side ModelRegistry validation config.
 #[derive(Args, Clone, Default)]
 pub(crate) struct ModelRegistryValidationArgs {
@@ -193,9 +208,23 @@ pub(crate) struct SellerArgs {
     /// Local bind/listen address for accepting buyer connections; seller-side equivalent of buyer --local-listen.
     #[arg(long, default_value = DEFAULT_SELLER_GATEWAY_LISTEN)]
     pub(crate) gateway_listen: SocketAddr,
-    /// Public gateway host:port written to the buyer handover. Defaults to --gateway-listen.
+    /// Public gateway host:port written to the buyer handover. Defaults to --gateway-listen, and on
+    /// real shellnet the resulting address must be reachable by a REMOTE buyer: a bind-all
+    /// (`0.0.0.0`/`::`), loopback, RFC1918/ULA, link-local or CGNAT address is rejected before any
+    /// offer is posted.
     #[arg(long, value_name = "HOST:PORT")]
     pub(crate) gateway_advertise: Option<GatewayAdvertiseAddr>,
+    /// Issue: allow a non-routable `--gateway-advertise`(bind-all/loopback/private/link-local/CGNAT)
+    /// for same-host or LAN testing. Buyers off this host will NOT be able to connect. `--mock-chain`
+    /// demos never post to a real order book and are exempt without this flag.
+    #[arg(long)]
+    pub(crate) allow_private_advertise: bool,
+    /// Issue: make a failed `advertised_gateway` self-probe fatal again. By default a
+    /// TRANSPORT-level probe failure against a public advertised address only warns (the offer still
+    /// posts), because behind NAT/VPN/a reverse tunnel the seller host's view of its own public
+    /// address is not the buyer's. A pinned-certificate mismatch stays fatal either way.
+    #[arg(long)]
+    pub(crate) require_advertise_probe: bool,
     /// Endpoints file -- the handover seam. By default, in the platform data directory
     /// (Linux `~/.local/share/dexdo`, macOS App Support, Windows `%APPDATA%`); `--endpoints-file`
     /// overrides it(D6, portability).
@@ -252,6 +281,65 @@ impl SellerArgs {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_else(|| self.gateway_listen.to_string())
+    }
+
+    /// Issue: the advertised address a remote buyer will dial, validated fail-closed BEFORE any
+    /// chain work or order placement. `--mock-chain` has no real order book and no remote buyer, so
+    /// the local demo addresses stay usable there.
+    pub(crate) fn checked_gateway_advertise_addr(&self) -> Result<String> {
+        let advertised = self.gateway_advertise_addr();
+        if !self.mock.mock_chain {
+            if self
+                .gateway_advertise
+                .as_ref()
+                .and_then(|address| address.0.port_u16())
+                == Some(0)
+            {
+                return Err(dexdo_core::DexdoError::new(
+                    dexdo_core::error_codes::E_ADVERTISE_NOT_PUBLIC,
+                    format!(
+                        "--gateway-advertise {advertised} uses port 0, which no remote buyer can dial"
+                    ),
+                )
+                .with_hint(dexdo_core::error_codes::E_ADVERTISE_NOT_PUBLIC.fix())
+                .into());
+            }
+            dexdo::seller::advertise::validate_advertise(
+                &advertised,
+                self.gateway_advertise.is_none(),
+                self.allow_private_advertise,
+            )?;
+        }
+        Ok(advertised)
+    }
+
+    /// Issue: the advertise inherited from `--gateway-listen <host>:0` still carries the
+    /// placeholder port `0`, because it is resolved at the command boundary, before the gateway has
+    /// bound anything. Port `0` means "ask the OS for a free port" -- it is not an address, and no
+    /// buyer(nor the self-probe) can ever dial it. Once the listener exists, its real port is the
+    /// address this seller is actually reachable on, so adopt it.
+    /// Only an INHERITED `:0` is rewritten. An explicit `--gateway-advertise` is the operator's own
+    /// word about what the world can reach, and is never rewritten behind their back -- nor is a
+    /// listen address that named a real port.
+    pub(crate) fn bound_gateway_advertise(&self, advertised: String, bound: SocketAddr) -> String {
+        if self.gateway_advertise.is_some() || bound.port() == 0 {
+            return advertised;
+        }
+        match advertised.parse::<SocketAddr>() {
+            Ok(requested) if requested.port() == 0 && requested.ip() == bound.ip() => {
+                bound.to_string()
+            }
+            _ => advertised,
+        }
+    }
+
+    /// Issue: `--require-advertise-probe` restores the pre- hard fail on any self-probe error.
+    pub(crate) fn advertise_probe_policy(&self) -> dexdo::seller::liveness::AdvertiseProbePolicy {
+        if self.require_advertise_probe {
+            dexdo::seller::liveness::AdvertiseProbePolicy::Required
+        } else {
+            dexdo::seller::liveness::AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        }
     }
 }
 
@@ -539,7 +627,7 @@ pub(crate) struct DestroyArgs {
 #[derive(Args)]
 pub(crate) struct RecoverArgs {
     #[command(flatten)]
-    pub(crate) identity: IdentityArgs,
+    pub(crate) identity: RecoveryIdentityArgs,
     /// The OPEN deal `TokenContract` to STOP(or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
@@ -560,7 +648,7 @@ pub(crate) struct RecoverArgs {
 #[derive(Args)]
 pub(crate) struct DisputeArgs {
     #[command(flatten)]
-    pub(crate) identity: IdentityArgs,
+    pub(crate) identity: RecoveryIdentityArgs,
     /// The OPEN deal `TokenContract` to dispute(or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
@@ -578,17 +666,21 @@ pub(crate) struct DisputeArgs {
 /// Args for `dexdo reclaim`: the BUYER reclaims escrow on seller no-show. OPEN deals use
 /// the explicit `close`/`recover` STOP path; funded-but-never-opened deals use `streamCleanup`
 /// after `MATCH_OPEN_TIMEOUT`. Fails closed locally on ownership, state, and the cleanup timer.
+/// driven from a pool alone it reclaims **every** recorded deal, one at a time.
 #[derive(Args)]
 pub(crate) struct ReclaimArgs {
     #[command(flatten)]
-    pub(crate) identity: IdentityArgs,
+    pub(crate) identity: RecoveryIdentityArgs,
     /// The funded/OPEN deal `TokenContract` to reclaim(or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
     /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
-    /// DEXDO_PN_POOL fallback carrying the note owner key and last matched TokenContract. Defaults to env DEXDO_PN_POOL.
+    /// DEXDO_PN_POOL carrying each note's owner key and the TokenContract recorded for it. Without
+    /// `--note-addr`/`--token-contract` this drives EVERY recorded recovery entry as its own reclaim --
+    /// one money move per still-reclaimable deal -- and refuses contradictory records. Defaults to env
+    /// DEXDO_PN_POOL.
     #[arg(long)]
     pub(crate) pool: Option<PathBuf>,
     /// Deployed-contracts manifest.
@@ -1148,8 +1240,9 @@ pub(crate) struct NoteDeployArgs {
         conflicts_with = "multisig_key"
     )]
     pub(crate) multisig_seed_file: Option<PathBuf>,
-    /// PN deposit nominal.
-    #[arg(long, default_value = DEFAULT_NOTE_DEPLOY_NOMINAL)]
+    /// PN deposit nominal: `N100`, `N1000`, or `N10000`. Required on purpose -- the deposit
+    /// is a spend from the funding wallet, so the CLI never picks a denomination for the operator.
+    #[arg(long)]
     pub(crate) nominal: String,
     /// Deposit currency. Dexdo markets use SHELL only.
     #[arg(
@@ -1337,7 +1430,6 @@ mod tests {
             "DEFAULT_MODELS_PATH",
             "DEFAULT_MONITOR_TREE_WIDTH",
             "DEFAULT_NOTE_DEPLOY_ENDPOINT",
-            "DEFAULT_NOTE_DEPLOY_NOMINAL",
             "DEFAULT_NOTE_INDEX",
             "DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION",
             "DEFAULT_ORACLE_EVENT_LIST_INDEX",

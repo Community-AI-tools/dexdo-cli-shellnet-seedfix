@@ -72,7 +72,11 @@ pub fn resolve_model_name(model_hash: Option<&str>, known_models: &[String]) -> 
 
 /// A provisioned per-deal market. `token_contract` is what `dexdo seller`/`buyer`
 /// take as `--token-contract`; the rest is the surrounding market identity (for transparency and
-/// `dexdo monitor`). Addresses are `workchain:hex` strings. No secrets -- public/derivable only.
+/// `dexdo monitor`). No secrets -- public/derivable only.
+/// **Addresses:** written as canonical `<dapp_id>::<account_id>`, read in either that or the
+/// legacy `0:<account_id>` form, and held in memory in the workchain form the chain client takes. A
+/// manifest written by an older version keeps loading unchanged; one written now carries the DApp
+/// identity. Render them with [`crate::address::display`], never by printing the field directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketManifest {
     /// Network the market is deployed on(e.g. `shellnet`).
@@ -82,12 +86,16 @@ pub struct MarketManifest {
     /// `sha256(frame_model)` -- the on-chain `modelHash` keying the order book.
     pub model_hash: String,
     /// Per-model `InferenceOrderBook` address.
+    #[serde(with = "crate::address::serde_canonical")]
     pub inference_order_book: String,
     /// Per-owner `RootModel` address.
+    #[serde(with = "crate::address::serde_canonical")]
     pub root_model: String,
     /// Per-deal `TokenContract` -- the **deployed, active** address.
+    #[serde(with = "crate::address::serde_canonical")]
     pub token_contract: String,
     /// The seller's provisioned `PrivateNote`(the market owner's note).
+    #[serde(with = "crate::address::serde_canonical")]
     pub seller_note: String,
     /// Deal nonce(disambiguates multiple `TokenContract`s under one `RootModel`).
     pub nonce: u64,
@@ -229,15 +237,19 @@ mod tests {
         );
     }
 
+    fn addr(c: char) -> String {
+        format!("0:{}", std::iter::repeat_n(c, 64).collect::<String>())
+    }
+
     fn sample() -> MarketManifest {
         MarketManifest {
             network: "shellnet".to_string(),
             frame_model: "qwen/qwen3-32b".to_string(),
             model_hash: model_hash_for("qwen/qwen3-32b"),
-            inference_order_book: "0:11".to_string(),
-            root_model: "0:22".to_string(),
-            token_contract: "0:33".to_string(),
-            seller_note: "0:44".to_string(),
+            inference_order_book: addr('1'),
+            root_model: addr('2'),
+            token_contract: addr('3'),
+            seller_note: addr('4'),
             nonce: 7,
             price_per_tick: 1000,
             max_ticks: 1024,
@@ -251,8 +263,41 @@ mod tests {
         let m = sample();
         let json = m.to_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["token_contract"], "0:33");
+        assert_eq!(v["token_contract"], crate::address::display(&addr('3')));
         assert_eq!(v["frame_model"], "qwen/qwen3-32b");
+        assert_eq!(MarketManifest::from_json(&json).unwrap(), m);
+    }
+
+    /// Issue: a manifest is **written** with canonical `<dapp_id>::<account_id>` addresses, and is
+    /// **read** from either that or a legacy `0:<account_id>` file written by an older version. Both load
+    /// to the same manifest, so an existing market.json keeps driving the same deal.
+    #[test]
+    fn manifest_writes_canonical_addresses_and_reads_legacy_ones() {
+        let m = sample();
+        let json = m.to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for (field, legacy) in [
+            ("inference_order_book", addr('1')),
+            ("root_model", addr('2')),
+            ("token_contract", addr('3')),
+            ("seller_note", addr('4')),
+        ] {
+            let written = v[field].as_str().unwrap();
+            assert_eq!(
+                written,
+                format!(
+                    "{}::{}",
+                    crate::address::DEXDO_DAPP_ID,
+                    legacy.strip_prefix("0:").unwrap()
+                ),
+                "{field} was not written canonically"
+            );
+            assert!(!written.starts_with("0:"), "{field} kept the legacy form");
+        }
+
+        // A legacy file loads to the same manifest a canonical one does.
+        let legacy_json = json.replace(&format!("{}::", crate::address::DEXDO_DAPP_ID), "0:");
+        assert_eq!(MarketManifest::from_json(&legacy_json).unwrap(), m);
         assert_eq!(MarketManifest::from_json(&json).unwrap(), m);
     }
 

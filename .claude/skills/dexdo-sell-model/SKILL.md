@@ -21,6 +21,14 @@ multisig.
 
 ---
 
+## Addresses
+
+dexdo prints and stores addresses in the canonical Acki Nacki form
+`<dapp_id>::<account_id>` (two 64-hex halves). Wherever an address is taken it
+accepts either that or the older `0:<account_id>` form, so paste back whatever
+the previous command printed. The `0:<...>` addresses in the examples below are
+shown that way only for brevity.
+
 ## Phase 1. Install the client
 
 One-line installer (primary):
@@ -52,15 +60,17 @@ curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/contracts/de
 ## Phase 2. Deploy a private note
 
 `dexdo note deploy` funds a fresh private note from your multisig wallet (no giver) and folds it
-into a pool file. The note's SHELL funds the per-deal market deploys, gas, and runtime, so pick a
-nominal with enough SHELL (a larger `N...` = more SHELL).
+into a pool file. Notes are funded in SHELL only -- SHELL is what pays the per-deal market deploys,
+gas, and runtime -- so `--token-type shell` is the only accepted currency. `--nominal` is required
+and has no default: pick the deposit size yourself, with enough SHELL for the deals you plan to run
+(`N100`, `N1000`, or `N10000`; a larger `N...` = more SHELL).
 
 ```sh
 dexdo note deploy \
   --multisig-address 0:<WALLET-ADDRESS> \
   --multisig-seed-file /path/to/wallet.seed \
   --nominal N10000 \
-  --token-type nackl \
+  --token-type shell \
   --endpoint shellnet.ackinacki.org \
   --pool pn_pool.json
 ```
@@ -250,14 +260,18 @@ dexdo seller \
   --note-addr "$NOTE_ADDR" \
   --note-key note.secret.hex \
   --gateway-listen 0.0.0.0:8443 \
+  --gateway-advertise <public-host>:8443 \
   --contracts contracts/deployed.shellnet.json
 ```
 
 The offer price and volume come from the provisioned deal in `market.json` (set in Phase 5). The
 seller's own `--price-per-tick` flag is **ignored on the `--market` path** -- to re-price, run a new
-`dexdo provision` with a fresh `--nonce` and serve that manifest. `--gateway-listen` must be
-reachable by the buyer; if the buyer is on another host, also pass `--gateway-advertise
-<public-host>:8443` (the public address written into the handover -- never `127.0.0.1`). With
+`dexdo provision` with a fresh `--nonce` and serve that manifest. `--gateway-listen` is the local
+bind address; `--gateway-advertise` is the address a REMOTE buyer dials (the public address written
+into the handover -- never `127.0.0.1`). It must be publicly reachable: startup rejects a bind-all
+(`0.0.0.0`/`::`), loopback, RFC1918, link-local or CGNAT advertise with
+`error[E_ADVERTISE_NOT_PUBLIC] (config)` BEFORE the offer is posted, so no resting ask ever points at
+an unreachable gateway. For same-host/LAN testing only, add `--allow-private-advertise`. With
 `--market`, do not also pass `--token-contract`/`--nonce` (they come from the file). On start the
 gateway posts the offer, then daemonizes: it polls for a match, opens the stream, and streams tick by
 tick. The wait for a buyer is open-ended -- the resting offer is not torn down.
@@ -354,6 +368,17 @@ dexdo note withdraw --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
   The released binary already includes shellnet; rebuild with `--features shellnet` (Phase 1).
 - buyer cannot connect -- check `--gateway-listen`/`--gateway-advertise` reachability and that both
   sides use the same `contracts/deployed.shellnet.json`. `dexdo doctor` diagnoses manifest drift.
+- `error[E_ADVERTISE_NOT_PUBLIC] (config)` -- `--gateway-advertise` (or the `--gateway-listen` it
+  defaulted to) is not an address a remote buyer can dial. Pass a public `host:port`, or
+  `--allow-private-advertise` for local/LAN testing only.
+- `advertised_gateway ... status="warn"` with `error[E_ADVERTISE_UNREACHABLE] (network)` -- the
+  startup self-probe to the public advertised address failed at the transport level and the offer
+  was posted anyway: behind NAT/a VPN/an SSH reverse tunnel the probe hairpins back into this
+  same process and can fail while a remote buyer connects fine. Verify from outside
+  (`curl -k https://<advertise>/`); `--require-advertise-probe` makes the probe fatal again.
+- `error[E_ADVERTISE_WRONG_GATEWAY] (tls)` -- something answered on the advertised address but it is
+  not this gateway (certificate-pin mismatch). This is always fatal; fix the address or the tunnel
+  target, never bypass it.
 
 ## Hard rules
 

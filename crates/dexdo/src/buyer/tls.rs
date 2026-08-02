@@ -20,7 +20,7 @@ use tokio_rustls::rustls::crypto::{
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
-    ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
 };
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint};
@@ -52,10 +52,9 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
             Ok(ServerCertVerified::assertion())
         } else {
             // Fail-closed: foreign certificate(MITM) -- rejection BEFORE receiving any stream.
-            Err(RustlsError::General(format!(
-                "pinned TLS fingerprint mismatch: expected {}, got {presented}",
-                self.expected
-            )))
+            Err(RustlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ))
         }
     }
 

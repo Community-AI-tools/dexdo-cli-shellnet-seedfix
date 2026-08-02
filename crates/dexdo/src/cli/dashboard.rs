@@ -137,10 +137,10 @@ struct ShellnetDashboardBackend;
 #[async_trait]
 impl DashboardBackend for ShellnetDashboardBackend {
     async fn facts(&self, handle: &DealHandle) -> Result<DashboardFacts> {
-        use dexdo_core::{Address, RealChainBackend};
+        use dexdo_core::RealChainBackend;
 
         let chain = RealChainBackend::connect(&handle.contracts)?;
-        let tc = Address::parse(&handle.token_contract)
+        let tc = dexdo_core::address::parse_chain_address(&handle.token_contract)
             .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", handle.token_contract))?;
         let snapshot = chain.token_contract_deal_snapshot(&tc).await?;
         let lifecycle = snapshot

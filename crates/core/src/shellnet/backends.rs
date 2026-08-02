@@ -6375,6 +6375,51 @@ impl ChainBackend for RealBuyerBackend {
         Err(wrong_role("claim_tokens", "seller"))
     }
 
+    /// `settleWeek()` is permissionless -- unlike `claimTokens`/`acceptProbe` above it carries no
+    /// `onlyOwnerPubkey` gate, so the buyer books his own crossed subscription boundary. Without this
+    /// the buyer inherited the `ChainBackend::settle_week` default("not supported") and a real subscription
+    /// could never advance a week: the on-chain weekly quota stayed frozen at whatever the seller happened to
+    /// have booked. Fail-closed exactly like the other two real `settleWeek` paths -- the pre-read must
+    /// succeed BEFORE any gas check or write, and the write is confirmed by a strict post-read of
+    /// `weekIndex`. Gas uses the buyer's own read-only health check: a buyer never tops the TC up.
+    async fn settle_week(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let pre = required_subscription_week_index(
+            token_contract,
+            "before settleWeek",
+            self.chain
+                .token_contract_subscription(&tc)
+                .await
+                .map_err(map_err)?,
+        )?;
+        self.require_tc_gas(&tc).await?;
+        self.chain.settle_week(&tc).await.map_err(map_err)?;
+        let confirmation = ClaimConfirmationParams::canonical();
+        for _ in 0..confirmation.max_reads {
+            let post = self
+                .chain
+                .token_contract_subscription(&tc)
+                .await
+                .map_err(map_err)?;
+            let active = if post.is_none() {
+                self.chain
+                    .account_active_code_hash(&tc)
+                    .await
+                    .map_err(map_err)?
+                    .0
+            } else {
+                true
+            };
+            if settle_week_post_confirmed(token_contract, pre, post, active)? {
+                return Ok(());
+            }
+            tokio::time::sleep(confirmation.poll_interval).await;
+        }
+        Err(ChainError::Chain(format!(
+            "TC {tc}: settleWeek did not advance weekIndex past {pre}"
+        )))
+    }
+
     async fn subscription_placements_since(
         &self,
         order_book: &str,

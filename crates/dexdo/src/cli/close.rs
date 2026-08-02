@@ -401,9 +401,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     if args.mock_chain {
         return run_close_mock(args).await;
     }
-    use dexdo_core::{
-        check_recoverable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend, ReclaimAction,
-    };
+    use dexdo_core::{check_recoverable, keypair_ed_pubkey, KeyPair, RealChainBackend};
     let target = load_deal_target(
         &args.deal,
         args.deals_dir.as_deref(),
@@ -431,10 +429,10 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
-    let tc = Address::parse(&target.token_contract)
+    let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
     if role == deals::DealHandleRole::Buyer {
-        let note = Address::parse(&note_addr)
+        let note = dexdo_core::address::parse_chain_address(&note_addr)
             .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
         let receipts = chain.token_contract_settlement_receipts(&tc).await?;
         if let Some(receipt) =
@@ -508,7 +506,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 let keys =
                     KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
                         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-                let note = Address::parse(&note_addr)
+                let note = dexdo_core::address::parse_chain_address(&note_addr)
                     .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
                 let receipt = submit_seller_stop(&chain, role, snapshot.state, &tc, &keys).await?;
                 let handle = target.handle.as_ref().map(|h| h.handle.clone());
@@ -540,7 +538,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             })?;
             let keys = KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
                 .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            let note = Address::parse(&note_addr)
+            let note = dexdo_core::address::parse_chain_address(&note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             chain.destroy_token_contract(&tc, &note, &keys).await?;
             if args.json {
@@ -597,7 +595,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             })?;
             let keys = KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
                 .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            let note = Address::parse(&note_addr)
+            let note = dexdo_core::address::parse_chain_address(&note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             let buyer_note = chain.token_contract_buyer_note(&tc).await?;
             let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
@@ -651,7 +649,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
                     .as_secs();
-                let action = check_reclaimable_state(
+                check_reclaimable_state(
                     snapshot.state,
                     buyer_note_s.as_deref(),
                     &note.with_workchain(),
@@ -666,9 +664,6 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                         args.deal
                     )
                 })?;
-                if action != ReclaimAction::StreamCleanup {
-                    bail!("close: strict never-opened preflight selected an unexpected action");
-                }
                 submit_then_observe_cleanup(
                     || async {
                         chain.stream_cleanup(&note, &keys, &tc).await?;

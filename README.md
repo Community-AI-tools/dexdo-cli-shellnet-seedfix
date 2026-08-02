@@ -22,7 +22,35 @@ irm https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.ps1 | 
 ```
 
 The installer detects your operating system and CPU architecture, downloads the
-matching release archive, verifies its checksum, and places `dexdo` on your PATH.
+matching release archive, verifies its checksum, and installs `dexdo` into
+`~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\dexdo\bin` (Windows). Override
+the directory with `DEXDO_BIN_DIR`.
+
+### PATH setup
+
+The installer then puts that directory on your PATH so `dexdo` works in new
+terminals. On Linux/macOS it appends one line, marked
+`# added by dexdo installer`, to the config of the shell in `$SHELL`:
+
+| Shell | File | Line |
+|-------|------|------|
+| zsh | `~/.zshrc` | `export PATH="$HOME/.local/bin:$PATH"` |
+| bash (Linux) | `~/.bashrc` | `export PATH="$HOME/.local/bin:$PATH"` |
+| bash (macOS) | `~/.bash_profile` | `export PATH="$HOME/.local/bin:$PATH"` |
+| fish | `~/.config/fish/config.fish` | `fish_add_path "$HOME/.local/bin"` |
+
+It prints the file it changed and the line it added, never writes outside
+`$HOME`, never needs `sudo`, and re-running it does not duplicate the entry. Any
+other shell is left untouched with a copy-paste instruction instead. A running
+shell keeps its old PATH, so `source` the file or open a new terminal.
+
+To skip PATH setup entirely and just get the instruction:
+
+```sh
+curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh | DEXDO_NO_MODIFY_PATH=1 sh
+# or, with an argument:
+curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh | sh -s -- --no-modify-path
+```
 
 ### Manual download
 
@@ -45,6 +73,23 @@ cargo build --release -p dexdo --features shellnet
 ```
 
 The release binary is written to `target/release/dexdo`.
+
+## Addresses
+
+Blockchain addresses are shown and stored in the canonical Acki Nacki form:
+
+```text
+<dapp_id>::<account_id>
+```
+
+Both halves are 64 hex characters. Every address dexdo prints, and every address
+it writes into `market.json` or a deal handle, uses that form.
+
+Wherever dexdo takes an address (`--token-contract`, `--note-addr`,
+`--multisig-address`, `--to`, a positional address, ...) it accepts either the
+canonical form or the older `0:<account_id>` form, so an address copied from an
+earlier run still works. Files written by an earlier version keep loading
+unchanged and are rewritten canonically the next time dexdo saves them.
 
 ## Commands
 

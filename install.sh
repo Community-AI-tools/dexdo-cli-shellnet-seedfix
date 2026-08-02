@@ -5,10 +5,37 @@
 #
 # Detects your OS and CPU, downloads the matching release archive, verifies its
 # checksum, and installs `dexdo` into ~/.local/bin (override with DEXDO_BIN_DIR).
+#
+# It then adds that directory to your PATH in your shell config, so `dexdo`
+# works in new terminals. To skip that step:
+#
+#   curl -fsSL .../install.sh | DEXDO_NO_MODIFY_PATH=1 sh
+#   sh install.sh --no-modify-path
+#   curl -fsSL .../install.sh | sh -s -- --no-modify-path
 set -eu
 
 REPO="gosh-sh/dexdo-cli"
 BINDIR="${DEXDO_BIN_DIR:-$HOME/.local/bin}"
+
+# PATH setup is on by default; DEXDO_NO_MODIFY_PATH is the opt-out that survives
+# `curl | sh` (where there is no argv), and --no-modify-path covers a downloaded
+# script or `sh -s --`.
+modify_path=1
+case "${DEXDO_NO_MODIFY_PATH:-}" in
+  ''|0|false|no) ;;
+  *) modify_path=0 ;;
+esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-modify-path) modify_path=0; shift ;;
+    -h|--help)
+      echo "usage: install.sh [--no-modify-path]"
+      echo "  --no-modify-path   do not touch your shell config (same as DEXDO_NO_MODIFY_PATH=1)"
+      exit 0
+      ;;
+    *) echo "dexdo: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -61,7 +88,76 @@ mkdir -p "$BINDIR"
 install -m 0755 "${tmp}/dexdo-${vern}-${archname}-${osname}/dexdo" "${BINDIR}/dexdo"
 echo "dexdo: installed ${ver} to ${BINDIR}/dexdo"
 
-case ":${PATH}:" in
-  *":${BINDIR}:"*) ;;
-  *) echo "dexdo: add ${BINDIR} to your PATH to run 'dexdo'" ;;
+# ---------------------------------------------------------------------------
+# PATH setup. A binary the shell cannot find is a failed install, so this runs
+# by default. The shell is taken from $SHELL (the user's login shell) and NOT
+# from the interpreter running this script: `curl | sh` always runs under sh
+# while the user lives in zsh/bash/fish.
+#
+# Only $HOME is ever touched, never /etc; no sudo; no `sed -i` (GNU/BSD differ).
+# ---------------------------------------------------------------------------
+marker="# added by dexdo installer"
+
+# Config file + the exact line for the user's login shell. Leaves both empty
+# when the shell is unknown or $SHELL is unset, which means "print the manual
+# instruction and write nothing".
+shell_name="${SHELL:-}"
+shell_name="${shell_name##*/}"
+config=""
+path_line=""
+case "$shell_name" in
+  zsh)
+    config="$HOME/.zshrc"
+    path_line="export PATH=\"${BINDIR}:\$PATH\""
+    ;;
+  bash)
+    # macOS Terminal starts bash as a login shell, which reads ~/.bash_profile
+    # and not ~/.bashrc; on Linux the interactive shell reads ~/.bashrc.
+    if [ "$osname" = "macos" ]; then
+      config="$HOME/.bash_profile"
+    else
+      config="$HOME/.bashrc"
+    fi
+    path_line="export PATH=\"${BINDIR}:\$PATH\""
+    ;;
+  fish)
+    config="$HOME/.config/fish/config.fish"
+    path_line="fish_add_path \"${BINDIR}\""
+    ;;
+  *) ;;
 esac
+
+# The line to paste by hand: the one for the detected shell when we know it,
+# otherwise the portable POSIX form.
+manual_hint() {
+  echo "dexdo: add ${BINDIR} to your PATH to run 'dexdo', e.g."
+  if [ -n "$path_line" ]; then
+    echo "dexdo:     ${path_line}"
+  else
+    echo "dexdo:     export PATH=\"${BINDIR}:\$PATH\""
+  fi
+}
+
+if [ "$modify_path" -eq 0 ]; then
+  echo "dexdo: PATH setup skipped (--no-modify-path / DEXDO_NO_MODIFY_PATH); no file was modified"
+  manual_hint
+elif [ -z "$config" ]; then
+  if [ -n "$shell_name" ]; then
+    echo "dexdo: unrecognized shell '${shell_name}'; no file was modified"
+  else
+    echo "dexdo: could not detect your shell (\$SHELL is not set); no file was modified"
+  fi
+  manual_hint
+else
+  if [ -f "$config" ] && grep -F -x "$path_line" "$config" >/dev/null 2>&1; then
+    echo "dexdo: ${BINDIR} is already in ${config}; no file was modified"
+  else
+    mkdir -p "$(dirname "$config")"
+    # Leading blank line so the entry cannot glue itself onto a last line that
+    # has no trailing newline.
+    printf '\n%s\n%s\n' "$marker" "$path_line" >> "$config"
+    echo "dexdo: updated ${config}"
+    echo "dexdo: added line: ${path_line}"
+    echo "dexdo: run 'source \"${config}\"' or open a new terminal to use dexdo now"
+  fi
+fi

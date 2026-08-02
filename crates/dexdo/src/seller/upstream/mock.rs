@@ -11,6 +11,9 @@ use tonic::Status;
 /// of the canonical request(R1) and send them incrementally into `tx`(R6, token-by-token). Each mock
 /// chunk carries one fake token id, so gateway accounting sees one delivered token. Both sides know the tokens are fake (`--mock-model` on
 /// both,). When there is no request -- neutral `mock-token-*`.
+/// Token ids per chunk in the `DEXDO_FIXTURE_FATCHUNK` fixture.
+pub const FAT_CHUNK_TOKENS: u32 = 4;
+
 pub async fn run(
     count: u64,
     req: Option<&CanonRequest>,
@@ -36,10 +39,35 @@ pub async fn run(
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_FOREIGN"))
         .unwrap_or(false);
-    let tokens = match req {
+    // one. A seller chooses how many tokens a chunk holds, so the buyer's per-request grant has to
+    // hold against a chunk that overshoots what is left of it rather than against a convenient
+    // one-token-per-chunk stream.
+    let fat_chunk = req
+        .map(last_user_message)
+        .map(|p| p.contains("DEXDO_FIXTURE_FATCHUNK"))
+        .unwrap_or(false);
+    // overshoots it by chunking around it: one token, then two. A buyer whose grant is two must
+    // refuse the second chunk BEFORE rendering it, not notice afterwards that it delivered three.
+    let straddle = req
+        .map(last_user_message)
+        .map(|p| p.contains("DEXDO_FIXTURE_STRADDLE"))
+        .unwrap_or(false);
+    // actually given, so a test can read off the wire what the buyer SENT rather than infer it from
+    // how much came back. `count` is the seller's resolved limit, which for an unconstrained mock is
+    // exactly the request's `params.max_tokens`.
+    let echo_limit = req
+        .map(last_user_message)
+        .map(|p| p.contains("DEXDO_FIXTURE_ECHOLIMIT"))
+        .unwrap_or(false);
+    let mut tokens = match req {
         Some(req) => derive_tokens(req, count),
         None => (0..count).map(|i| format!("mock-token-{i} ")).collect(),
     };
+    if echo_limit {
+        if let Some(first) = tokens.first_mut() {
+            *first = format!("limit={count} ");
+        }
+    }
     for (seq, text) in tokens.into_iter().enumerate() {
         let chunk = CanonChunk {
             text,
@@ -47,6 +75,16 @@ pub async fn run(
             // Fake token-ids: by seq; in "foreign tokenizer" -- outside the qwen vocabulary.
             token_ids: if foreign {
                 vec![999_999]
+            } else if fat_chunk {
+                let base = (seq as u32).saturating_mul(FAT_CHUNK_TOKENS);
+                (0..FAT_CHUNK_TOKENS).map(|offset| base + offset).collect()
+            } else if straddle {
+                let base = (seq as u32).saturating_mul(2);
+                if seq == 0 {
+                    vec![base]
+                } else {
+                    vec![base, base + 1]
+                }
             } else {
                 vec![seq as u32]
             },
@@ -97,6 +135,37 @@ pub async fn run(
                 }
             }),
         };
+        if fat_chunk || straddle {
+            let accounted_tokens = match u64::try_from(chunk.token_ids.len()) {
+                Ok(tokens) => tokens,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(Status::data_loss(
+                            "token-id count does not fit u64",
+                        )))
+                        .await;
+                    break;
+                }
+            };
+            if tx
+                .send(Ok(UpstreamEvent::Chunk {
+                    chunk,
+                    accounted_tokens: 0,
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if tx
+                .send(Ok(UpstreamEvent::Accounted(accounted_tokens)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
         if tx
             .send(chunk_with_structured_accounting(chunk))
             .await

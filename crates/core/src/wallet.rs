@@ -1,41 +1,24 @@
 //! Wallet-address handling. A single parse/normalize for the operator wallet address, so the
-//! `half1::half2` display form is not re-parsed at every call site and is rejected fail-loud on bad input.
+//! canonical display form is not re-parsed at every call site and is rejected fail-loud on bad input.
+//! The two accepted forms and the parsing itself live in [`crate::address`]; this stays the
+//! wallet-flavoured entry point that yields the contract-parameter form.
+
+use crate::address::CanonicalAddress;
 
 /// Normalize a wallet address to the contract-parameter form `0:<account>`. Accepts:
-/// - the GOSH `half1::half2` display form -- **two 64-hex(256-bit) halves**; the account is the **second**
-/// half, so `half1::half2` -> `0:<half2>`;
-/// - an already-canonical `0:<hex>` where the account is **exactly 64 hex chars**.
+/// - the canonical `<dapp_id>::<account_id>` display form -- **two 64-hex(256-bit) halves**; the account
+/// is the **second** half, so `<dapp_id>::<account_id>` -> `0:<account_id>`. The DApp id is not
+/// part of a contract address parameter and is dropped **here only**; output that a user reads goes
+/// through [`crate::address::display`], which puts it back;
+/// - the legacy `0:<hex>` where the account is **exactly 64 hex chars**.
 /// Anything else -- a short/over-long account(not a valid TVM `0:<account>`), a bare hex without a `0:`
 /// prefix, non-hex, missing/extra halves -- is a **fail-loud** error(the repo convention). The output is
 /// always lowercase `0:<64 hex>`, ready to drop into `dest`/address contract parameters; a malformed address
 /// is rejected here at the shared boundary rather than reaching money-path JSON.
 pub fn normalize_wallet_address(s: &str) -> Result<String, String> {
-    let s = s.trim();
-    if let Some((h1, h2)) = s.split_once("::") {
-        let (h1, h2) = (h1.trim(), h2.trim());
-        if !is_hex64(h1) || !is_hex64(h2) {
-            return Err(format!(
-                "invalid wallet address `{s}`: expected two 64-hex (256-bit) halves `half1::half2`"
-            ));
-        }
-        return Ok(format!("0:{}", h2.to_ascii_lowercase()));
-    }
-    if let Some(acct) = s.strip_prefix("0:") {
-        if !is_hex64(acct) {
-            return Err(format!(
-                "invalid wallet address `{s}`: the `0:<hex>` account must be exactly 64 hex chars"
-            ));
-        }
-        return Ok(format!("0:{}", acct.to_ascii_lowercase()));
-    }
-    Err(format!(
-        "invalid wallet address `{s}`: expected `half1::half2` (64-hex halves) or `0:<64 hex>`"
-    ))
-}
-
-/// Exactly 64 hex chars -- a 256-bit TVM account id half / `0:<account>` body.
-fn is_hex64(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    CanonicalAddress::parse(s)
+        .map(|addr| addr.legacy())
+        .map_err(|e| e.replacen("invalid address", "invalid wallet address", 1))
 }
 
 #[cfg(test)]
@@ -46,7 +29,8 @@ mod tests {
         std::iter::repeat_n(c, 64).collect()
     }
 
-    /// `half1::half2` with full 64-hex halves -> `0:<half2>`(the second half), lowercased; `::`-spaces trimmed.
+    /// `<dapp_id>::<account_id>` with full 64-hex halves -> `0:<account_id>`(the second half), lowercased;
+    /// `::`-spaces trimmed.
     #[test]
     fn half1_half2_takes_second_half_lowercased() {
         let h1 = h64('1');
@@ -110,6 +94,26 @@ mod tests {
         assert!(
             normalize_wallet_address(&format!("0:{h}ff")).is_err(),
             "66-hex account"
+        );
+    }
+
+    /// A canonical `<dapp_id>::<account_id>` is accepted wherever a wallet address is, and the DApp id it
+    /// carries is not lost: dropping it is a contract-parameter detail, and the display seam restores it.
+    #[test]
+    fn canonical_address_is_accepted_and_its_dapp_id_survives_display() {
+        let dapp = h64('9');
+        let account = h64('e');
+        let canonical = format!("{dapp}::{account}");
+        assert_eq!(
+            normalize_wallet_address(&canonical).unwrap(),
+            format!("0:{account}")
+        );
+        assert_eq!(crate::address::display(&canonical), canonical);
+        assert_eq!(
+            crate::address::CanonicalAddress::parse(&canonical)
+                .unwrap()
+                .dapp_id(),
+            dapp
         );
     }
 }

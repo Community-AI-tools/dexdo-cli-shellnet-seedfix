@@ -20,6 +20,14 @@ Phase 4 shows how to discover one.
 
 ---
 
+## Addresses
+
+dexdo prints and stores addresses in the canonical Acki Nacki form
+`<dapp_id>::<account_id>` (two 64-hex halves). Wherever an address is taken it
+accepts either that or the older `0:<account_id>` form, so paste back whatever
+the previous command printed. The `0:<...>` addresses in the examples below are
+shown that way only for brevity.
+
 ## Phase 1. Install the client
 
 One-line installer (primary):
@@ -51,15 +59,17 @@ curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/contracts/de
 ## Phase 2. Deploy a private note
 
 `dexdo note deploy` funds a fresh private note from your multisig wallet (no giver) and folds it
-into a pool file. The buyer note pays escrow plus gas, so pick a nominal with enough SHELL (a larger
-`N...` = more SHELL).
+into a pool file. Notes are funded in SHELL only, so `--token-type shell` is the only accepted
+currency. The buyer note pays escrow plus gas, and `--nominal` is required with no default: pick
+the deposit size yourself, with enough SHELL for what you plan to buy (`N100`, `N1000`, or
+`N10000`; a larger `N...` = more SHELL).
 
 ```sh
 dexdo note deploy \
   --multisig-address 0:<WALLET-ADDRESS> \
   --multisig-seed-file /path/to/wallet.seed \
   --nominal N10000 \
-  --token-type nackl \
+  --token-type shell \
   --endpoint shellnet.ackinacki.org \
   --pool pn_pool.json
 ```

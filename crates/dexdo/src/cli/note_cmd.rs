@@ -32,7 +32,7 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
         ensure_recovery_owner_matches_target_note, load_note_deploy_recovery,
         resolve_private_file_path,
     };
-    use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, Address, ChainClient};
+    use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, ChainClient};
 
     let pool_path = resolve_private_file_path(&args.pool, "--pool")?;
     let recovery_path = resolve_private_file_path(&args.recovery, "--recovery")?;
@@ -52,7 +52,7 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("note recover: recovery state has no pn_address"))?
         .to_string();
     let client = ChainClient::connect(&recovery.endpoint)?;
-    let note_address = Address::parse(&note_addr)
+    let note_address = dexdo_core::address::parse_chain_address(&note_addr)
         .map_err(|e| anyhow::anyhow!("recovered note {note_addr}: {e}"))?;
     let details = client
         .run_getter(
@@ -2729,7 +2729,7 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             derive_owner_pubkey_from_secret_hex, ensure_onchain_owner_matches_pool_key,
             refresh_note_deploy_recovery_after_success,
         };
-        use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, Address};
+        use dexdo_core::private_note::artifacts::PRIVATE_NOTE_ABI_JSON;
 
         let note_addr = state
             .pn_address
@@ -2742,7 +2742,7 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             anyhow::anyhow!("pn_state has no owner_secret_key_hex -- incomplete note deploy")
         })?;
         let derived_owner = derive_owner_pubkey_from_secret_hex(owner_secret)?;
-        let note_address = Address::parse(&note_addr)
+        let note_address = dexdo_core::address::parse_chain_address(&note_addr)
             .map_err(|e| anyhow::anyhow!("deployed note {note_addr}: {e}"))?;
         let details = self
             .client
@@ -2956,8 +2956,8 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let dest_addr = Address::parse(&dest).map_err(|e| anyhow::anyhow!("--to {dest}: {e}"))?;
     chain
         .assert_note_owner_matches("note withdraw", &note, &keys)

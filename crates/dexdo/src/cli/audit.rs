@@ -51,17 +51,29 @@ pub(crate) struct AuditSource {
     pub(crate) contracts: String,
 }
 
+/// The addresses of one deal, as `dexdo export --format json` reports them.
+/// Issue: every address here is **written** canonically. This export is not one of the wire
+/// schemas `runtime-machine-contract.md` pins to `0:<account_id>` - it is a current audit payload
+/// this client produces - so it carries the same canonical form as `market.json`, the deal handles
+/// and human output. The fields stay in the workchain form in memory, exactly like `DealHandle`
+/// and `MarketManifest`; only what is emitted changes.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AuditDeal {
     pub(crate) role: Option<String>,
     pub(crate) network: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical")]
     pub(crate) token_contract: String,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) actor_note: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) buyer_note: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) seller_note: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) model_hash: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) order_book: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) root_model: Option<String>,
     pub(crate) created_order_ids: Vec<String>,
     pub(crate) created_at_unix: Option<u64>,

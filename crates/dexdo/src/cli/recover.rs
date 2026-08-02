@@ -8,7 +8,10 @@ use crate::cli::args::{
 use anyhow::Result;
 
 #[cfg(feature = "shellnet")]
-use crate::cli::commands::{persist_pool_recovery_record, resolve_pool_recovery_inputs};
+use crate::cli::commands::{
+    persist_pool_recovery_record, resolve_persistable_pool_recovery_inputs,
+    resolve_pool_recovery_inputs, resolve_pool_recovery_plan, PoolRecoveryPlan, PoolRecoveryTarget,
+};
 #[cfg(feature = "shellnet")]
 use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
 #[cfg(not(feature = "shellnet"))]
@@ -220,10 +223,10 @@ fn recover_confirmation(
 }
 
 #[cfg(feature = "shellnet")]
-fn apply_recover_terminal_marker<T>(
+fn apply_recover_terminal_marker(
     confirmation: &str,
-    marker: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+    marker: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     marker().map_err(|error| {
         anyhow::anyhow!(
             "{confirmation}; local subscription marker failed after the authoritative receipt \
@@ -235,7 +238,9 @@ fn apply_recover_terminal_marker<T>(
 #[cfg(feature = "shellnet")]
 async fn run_recover_with_chain(args: RecoverArgs, chain: &dyn RecoverChain) -> Result<()> {
     run_recover_with_chain_and_marker(args, chain, &|note_addr, token_contract| {
-        super::buyer::mark_buyer_subscription_terminal(note_addr, token_contract)
+        // `recover` needs the marker to have run, not whether it changed a record: an ordinary deal
+        // without a durable subscription sidecar is an expected no-op here.
+        super::buyer::mark_buyer_subscription_terminal(note_addr, token_contract).map(drop)
     })
     .await
 }
@@ -244,11 +249,10 @@ async fn run_recover_with_chain(args: RecoverArgs, chain: &dyn RecoverChain) -> 
 async fn run_recover_with_chain_and_marker(
     args: RecoverArgs,
     chain: &dyn RecoverChain,
-    marker: &(dyn Fn(&str, &str) -> Result<bool> + Sync),
+    marker: &(dyn Fn(&str, &str) -> Result<()> + Sync),
 ) -> Result<()> {
     use dexdo_core::{check_recoverable, keypair_ed_pubkey, Address, KeyPair};
-    let resolved = resolve_pool_recovery_inputs(
-        "recover",
+    let resolved = resolve_persistable_pool_recovery_inputs(
         &args.identity,
         args.market.as_deref(),
         args.token_contract.as_deref(),
@@ -260,8 +264,8 @@ async fn run_recover_with_chain_and_marker(
     let seed = resolved.note_secret_hex;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
 
@@ -342,7 +346,6 @@ pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let resolved = resolve_pool_recovery_inputs(
-        "dispute",
         &args.identity,
         args.market.as_deref(),
         args.token_contract.as_deref(),
@@ -354,8 +357,8 @@ pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
 
@@ -400,8 +403,7 @@ pub(crate) async fn run_dispute(_args: DisputeArgs) -> Result<()> {
     bail!("dispute unavailable: build with `--features shellnet`")
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn check_reclaimable_state(
     state: dexdo_core::DealChainState,
     buyer_note: Option<&str>,
@@ -409,7 +411,7 @@ pub(crate) fn check_reclaimable_state(
     buyer_pubkey: Option<&[u8; 32]>,
     note_ed_pubkey: &[u8; 32],
     now: u64,
-) -> Result<dexdo_core::ReclaimAction, String> {
+) -> Result<(), String> {
     dexdo_core::check_reclaimable(
         state,
         buyer_note,
@@ -421,73 +423,191 @@ pub(crate) fn check_reclaimable_state(
     )
 }
 
+/// `reclaim` recovers never-opened deals **from recorded pool metadata alone**, because after a
+/// crash the pool file is all the operator has. The pool ordinarily records one entry per deal the notes
+/// took part in, so more than one recoverable entry is the normal case, not an error: every recorded deal
+/// is driven as its own separately decided, individually idempotent reclaim.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
-    use dexdo_core::{
-        keypair_ed_pubkey, Address, KeyPair, RealChainBackend, ReclaimAction,
-        MATCH_OPEN_TIMEOUT_SECS,
-    };
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    let resolved = resolve_pool_recovery_inputs(
-        "reclaim",
+    use dexdo_core::RealChainBackend;
+    let plan = resolve_pool_recovery_plan(
         &args.identity,
         args.market.as_deref(),
         args.token_contract.as_deref(),
         args.pool.as_deref(),
     )?;
-    let note_addr = resolved.note_addr;
-    let tc_str = resolved.token_contract;
-    let seed = resolved.note_secret_hex;
+    let manifest = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let chain = RealChainBackend::connect(manifest)?;
-    let keys = KeyPair::from_secret_hex(seed.trim())
+    drive_reclaim_plan(plan, &chain, &|note_addr, token_contract| {
+        super::buyer::mark_buyer_subscription_terminal(note_addr, token_contract)
+    })
+    .await
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+trait ReclaimChain: Sync {
+    async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
+    async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>>;
+    async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> Result<Option<[u8; 32]>>;
+    async fn submit_cleanup(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<()>;
+    async fn confirm_cleanup(&self, tc: &dexdo_core::Address) -> Result<()>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+impl ReclaimChain for dexdo_core::RealChainBackend {
+    async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>> {
+        Ok(self
+            .token_contract_deal_snapshot(tc)
+            .await?
+            .map(|snapshot| snapshot.state))
+    }
+
+    async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>> {
+        Ok(self.token_contract_buyer_note(tc).await?)
+    }
+
+    async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> Result<Option<[u8; 32]>> {
+        Ok(self.token_contract_buyer_pubkey(tc).await?)
+    }
+
+    async fn submit_cleanup(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<()> {
+        self.stream_cleanup(note, keys, tc).await?;
+        Ok(())
+    }
+
+    async fn confirm_cleanup(&self, tc: &dexdo_core::Address) -> Result<()> {
+        Ok(self.wait_cleanup_unopened(tc).await?)
+    }
+}
+
+/// What one recorded entry turned into. There is no third case: either this invocation moved that deal's
+/// money, or the chain itself proved there was nothing for `reclaim` to move.
+#[cfg(feature = "shellnet")]
+enum ReclaimEntryOutcome {
+    /// `cleanupUnopened` was submitted **and** confirmed by the bounded observer in this invocation.
+    Reclaimed,
+    /// No money was moved for this entry, with the chain-decoded reason why.
+    NotActionable(String),
+}
+
+/// A deal the chain proves is gone or unfunded moves no money -- and it is also exactly the state a
+/// confirmed `cleanupUnopened` leaves behind, so this is where a durable subscription marker that failed
+/// after an earlier confirmed cleanup gets repaired. The marker is idempotent and reports whether it
+/// actually changed anything; a marker that still fails keeps the entry loud rather than leaving local
+/// state permanently stale.
+#[cfg(feature = "shellnet")]
+fn terminal_entry(
+    reason: String,
+    note_s: &str,
+    tc: &dexdo_core::Address,
+    marker: &(dyn Fn(&str, &str) -> Result<bool> + Sync),
+) -> Result<ReclaimEntryOutcome> {
+    let repaired = marker(note_s, &tc.with_workchain())?;
+    Ok(ReclaimEntryOutcome::NotActionable(if repaired {
+        format!("{reason}; repaired the stale durable buyer subscription record for this deal")
+    } else {
+        reason
+    }))
+}
+
+/// One recorded deal's reclaim. This is the whole money path, and it is idempotent by construction: the
+/// strict never-opened preflight is re-decoded from the chain on every attempt, and a deal that was
+/// already reclaimed is no longer active/funded, so it can only come back `NotActionable`.
+#[cfg(feature = "shellnet")]
+async fn reclaim_one(
+    chain: &dyn ReclaimChain,
+    target: &PoolRecoveryTarget,
+    now: u64,
+    marker: &(dyn Fn(&str, &str) -> Result<bool> + Sync),
+) -> Result<ReclaimEntryOutcome> {
+    use dexdo_core::{keypair_ed_pubkey, Address, KeyPair, MATCH_OPEN_TIMEOUT_SECS};
+    let note_addr = &target.note_addr;
+    let tc_str = &target.token_contract;
+    let keys = KeyPair::from_secret_hex(target.note_secret_hex.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    let tc =
-        Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let tc = Address::parse(tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let note_s = note.with_workchain();
 
     // This command owns only the strictly decoded never-opened cleanup. An OPEN deal is stopped
     // explicitly through `dexdo close` or `dexdo recover`, never rewritten from this legacy name.
-    let state = chain
-        .token_contract_deal_snapshot(&tc)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("reclaim: TokenContract {tc} is not active (undeployed/closed)")
-        })?
-        .state;
-    let buyer_note = chain.token_contract_buyer_note(&tc).await?;
-    let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
-    let note_s = note.with_workchain();
-    let buyer_pubkey = chain.token_contract_buyer_pubkey(&tc).await?;
-    let note_ed = keypair_ed_pubkey(&keys)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
-        .as_secs();
-    if state.opened {
-        anyhow::bail!(
-            "reclaim: OPEN deal {tc} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
+    let Some(state) = chain.state(&tc).await? else {
+        return terminal_entry(
+            format!("reclaim: TokenContract {tc} is not active (undeployed/closed)"),
+            &note_s,
+            &tc,
+            marker,
         );
+    };
+    let buyer_note = chain.buyer_note(&tc).await?;
+    let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
+    let buyer_pubkey = chain.buyer_pubkey(&tc).await?;
+    let note_ed = keypair_ed_pubkey(&keys)?;
+    // A deal that exists and names a *different* buyer note or key is not a decided chain no-op: the
+    // pool claims this note owns the deal and the chain contradicts it. That is a corrupt or forged
+    // recovery record, so it fails loudly(and submits nothing) instead of being counted as "nothing to
+    // do". `check_reclaimable_state` below re-checks the same ownership as the admission gate; this
+    // decides how severe a mismatch is, not whether the cleanup may be submitted.
+    if let Some(buyer) = buyer_note_s.as_deref() {
+        if buyer != note_s {
+            anyhow::bail!(
+                "reclaim: the recovery record claims note {note_s} owns TokenContract {tc}, but the \
+                 deal's buyer note is {buyer}; refusing to treat a contradicted recovery record as a \
+                 decided no-op (nothing was submitted)"
+            );
+        }
+    }
+    if let Some(buyer_pubkey) = buyer_pubkey.as_ref() {
+        if buyer_pubkey != &note_ed {
+            anyhow::bail!(
+                "reclaim: the owner key recorded for note {note_s} is not the buyer key of \
+                 TokenContract {tc}; refusing to treat a contradicted recovery record as a decided \
+                 no-op (nothing was submitted)"
+            );
+        }
+    }
+    if state.opened {
+        return Ok(ReclaimEntryOutcome::NotActionable(format!(
+            "reclaim: OPEN deal {tc} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
+        )));
     }
     if state.probe_accepted {
-        anyhow::bail!(
+        return Ok(ReclaimEntryOutcome::NotActionable(
             "reclaim: deal is not OPEN and probeAccepted=true; it is not a never-opened cleanup candidate"
-        );
+                .to_string(),
+        ));
     }
-    let action = check_reclaimable_state(
+    if let Err(reason) = check_reclaimable_state(
         state,
         buyer_note_s.as_deref(),
         &note_s,
         buyer_pubkey.as_ref(),
         &note_ed,
         now,
-    )
-    .map_err(anyhow::Error::msg)?;
-    if action != ReclaimAction::StreamCleanup {
-        anyhow::bail!("reclaim: strict never-opened preflight selected an unexpected action");
+    ) {
+        // An unfunded deal is the other shape a confirmed cleanup can leave behind, so it repairs a
+        // stale marker too; every other refusal is a plain decided no-op.
+        return if !state.funded {
+            terminal_entry(reason, &note_s, &tc, marker)
+        } else {
+            Ok(ReclaimEntryOutcome::NotActionable(reason))
+        };
     }
 
     let funded_time = state
@@ -498,18 +618,153 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
          MATCH_OPEN_TIMEOUT met: fundedTime {funded_time} + matchOpenTimeout {MATCH_OPEN_TIMEOUT_SECS} <= \
          now {now}."
     );
-    chain.stream_cleanup(&note, &keys, &tc).await?;
-    chain.wait_cleanup_unopened(&tc).await.map_err(|error| {
+    if let Err(submit) = chain.submit_cleanup(&note, &keys, &tc).await {
+        // A failed submit is not proof that nothing landed: the action may have been delivered and only
+        // its response lost. This code drives no further cleanup for it -- the outcome is resolved with
+        // the same bounded observation that confirms an ordinary cleanup, and reported by fact.
+        // The guarantee is no second **money move**, not no second POST: the submit transport retries a
+        // BOC on transient errors, and the operator may re-run the command. Neither can pay twice,
+        // because `TokenContract.cleanupUnopened()` requires a funded, never-opened deal and destroys it
+        // as it refunds, so every later delivery of the same action finds nothing to move.
+        return match chain.confirm_cleanup(&tc).await {
+            Ok(()) => {
+                let marked = marker(&note_s, &tc.with_workchain())?;
+                println!(
+                    "reclaim confirmed -> streamCleanup(TokenContract {tc}) after an outcome-ambiguous \
+                     submit ({submit}); bounded on-chain observation found the TokenContract absent or no \
+                     longer funded, so the cleanup landed; this run drove no further cleanup for it, and \
+                     the destroyed deal cannot be paid out twice; subscription_marked={marked}"
+                );
+                Ok(ReclaimEntryOutcome::Reclaimed)
+            }
+            Err(observation) => Err(anyhow::anyhow!(
+                "reclaim: streamCleanup(TokenContract {tc}) submit failed and its outcome is \
+                 unresolved: {submit}; the bounded observation did not find the TokenContract absent \
+                 or unfunded either: {observation}; this run drove no further cleanup for it -- re-run \
+                 to re-decide this deal from the chain, which cannot pay it out twice because \
+                 cleanupUnopened only accepts a funded, never-opened deal"
+            )),
+        };
+    }
+    chain.confirm_cleanup(&tc).await.map_err(|error| {
         anyhow::anyhow!(
             "reclaim submitted -> streamCleanup(TokenContract {tc}); bounded cleanup \
                  confirmation failed: {error}; settlement is not confirmed"
         )
     })?;
-    super::buyer::mark_buyer_subscription_terminal(&note.with_workchain(), &tc.with_workchain())?;
+    let marked = marker(&note_s, &tc.with_workchain())?;
     println!(
         "reclaim confirmed -> streamCleanup(TokenContract {tc}); bounded on-chain observation \
-         found the TokenContract absent or no longer funded."
+         found the TokenContract absent or no longer funded; subscription_marked={marked}"
     );
+    Ok(ReclaimEntryOutcome::Reclaimed)
+}
+
+/// Drive every planned entry as its own reclaim, one at a time, reporting each by fact.
+/// Exactly-once per deal never depends on this loop, and it is a guarantee about **money moves**, not
+/// about network submissions: the transport retries a BOC and the operator may re-run the command, but
+/// `TokenContract.cleanupUnopened()` requires a funded, never-opened deal and destroys it as it refunds,
+/// so only the first delivery can pay. On top of that the strict never-opened preflight is re-decoded
+/// from the chain for every entry on every attempt. A mid-sequence failure therefore loses nothing: the
+/// remaining entries are still driven, the failed one is reported, and the command exits non-zero so a
+/// retry re-decides every entry from the chain.
+/// Authorization is a separate axis, and the two levels are not the same. `cleanupUnopened()` is
+/// permissionless on chain with fixed payouts -- refund to the recorded buyer, bond back to the seller
+/// note -- so no signature of ours decides where the money goes. What is owner-gated is the CLI's wrapper
+/// path, `PrivateNote.streamCleanup`: this client only ever submits it from the deal's own buyer
+/// note key, which is why a contradicted ownership record is refused rather than driven.
+#[cfg(feature = "shellnet")]
+async fn drive_reclaim_plan(
+    plan: PoolRecoveryPlan,
+    chain: &dyn ReclaimChain,
+    marker: &(dyn Fn(&str, &str) -> Result<bool> + Sync),
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
+        .as_secs();
+    if plan.targets.len() == 1 && plan.refused.is_empty() {
+        // One recorded deal: "this deal cannot be reclaimed" is the answer to the operator's question,
+        // so it stays exactly the loud failure it has always been.
+        return match reclaim_one(chain, &plan.targets[0], now, marker).await? {
+            ReclaimEntryOutcome::Reclaimed => Ok(()),
+            ReclaimEntryOutcome::NotActionable(reason) => Err(anyhow::anyhow!("{reason}")),
+        };
+    }
+
+    for refusal in &plan.refused {
+        println!(
+            "reclaim refused note={} token_contract={}: {}; no money was moved for it",
+            refusal.note_addr, refusal.token_contract, refusal.reason
+        );
+    }
+    let planned = plan.targets.len();
+    let mut reclaimed = 0usize;
+    let mut noop = 0usize;
+    let mut failed = Vec::new();
+    for (index, target) in plan.targets.iter().enumerate() {
+        let position = index + 1;
+        let note_addr = &target.note_addr;
+        let token_contract = &target.token_contract;
+        let recorded_at = target
+            .recorded_at_unix
+            .map_or_else(|| "unrecorded".to_string(), |at| at.to_string());
+        eprintln!(
+            "reclaim entry {position}/{planned}: note {note_addr} TokenContract {token_contract} \
+             recorded_at_unix={recorded_at}; each recorded deal is decided on its own chain state."
+        );
+        match reclaim_one(chain, target, now, marker).await {
+            Ok(ReclaimEntryOutcome::Reclaimed) => {
+                reclaimed += 1;
+                println!(
+                    "reclaim entry {position}/{planned} reclaimed note={note_addr} \
+                     token_contract={token_contract}"
+                );
+            }
+            Ok(ReclaimEntryOutcome::NotActionable(reason)) => {
+                noop += 1;
+                println!(
+                    "reclaim entry {position}/{planned} noop note={note_addr} \
+                     token_contract={token_contract}: {reason}; no money was moved for it"
+                );
+            }
+            Err(error) => {
+                println!(
+                    "reclaim entry {position}/{planned} failed note={note_addr} \
+                     token_contract={token_contract}: {error:#}"
+                );
+                failed.push(format!(
+                    "note={note_addr} token_contract={token_contract}: {error:#}"
+                ));
+            }
+        }
+    }
+    println!(
+        "reclaim summary: planned={planned} reclaimed={reclaimed} noop={noop} failed={} refused={}",
+        failed.len(),
+        plan.refused.len()
+    );
+    if !failed.is_empty() || !plan.refused.is_empty() {
+        // The error itself carries every reason: a caller that only sees the failure must still learn
+        // which recorded deals were left undecided and why.
+        anyhow::bail!(
+            "reclaim: {} of {} recorded entries were not decided ({} refused as contradictory); \
+             re-run after fixing them -- every entry is re-decided from the chain, so nothing is \
+             reclaimed twice. Refused: [{}]. Failures: [{}]",
+            failed.len() + plan.refused.len(),
+            planned + plan.refused.len(),
+            plan.refused.len(),
+            plan.refused
+                .iter()
+                .map(|refusal| format!(
+                    "note={} token_contract={}: {}",
+                    refusal.note_addr, refusal.token_contract, refusal.reason
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
+            failed.join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -540,8 +795,8 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
 
@@ -644,7 +899,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
             .await?
             .ok_or_else(|| anyhow::anyhow!("TokenContract {tc} getSeller unavailable"))?;
         let seller = serde_json::json!(format!("0x{seller:0>64}"));
-        let root = Address::parse(&market.root_model)?;
+        let root = dexdo_core::address::parse_chain_address(&market.root_model)?;
         identity_ok &= chain.token_contract_model_hash(&tc).await?.as_deref()
             == Some(market.model_hash.as_str())
             && chain
@@ -755,7 +1010,7 @@ pub(crate) async fn run_withdraw_shell(_args: WithdrawShellArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
-    use crate::cli::args::{IdentityArgs, RecoverArgs};
+    use crate::cli::args::{RecoverArgs, RecoveryIdentityArgs};
 
     #[cfg(feature = "shellnet")]
     #[test]
@@ -813,15 +1068,13 @@ mod tests {
             .expect("production/test boundary");
         let production = &source[..end];
         let submit = production
-            .find("chain.stream_cleanup(&note, &keys, &tc).await?")
+            .find("chain.submit_cleanup(&note, &keys, &tc).await")
             .expect("cleanup submit");
         let tail = &production[submit..];
         let observe = tail
-            .find(".wait_cleanup_unopened(&tc)")
+            .find("chain.confirm_cleanup(&tc)")
             .expect("bounded cleanup observer");
-        let marker = tail
-            .find("mark_buyer_subscription_terminal(")
-            .expect("terminal marker");
+        let marker = tail.find("marker(&note_s,").expect("terminal marker");
         let success = tail
             .find("reclaim confirmed -> streamCleanup")
             .expect("success rendering");
@@ -830,6 +1083,23 @@ mod tests {
             !tail.contains("single post-read"),
             "one pending/stale read must never be reported as a successful reclaim"
         );
+        // Scope note: this pins one submit **call site** -- that the reconciliation path does not drive
+        // a second cleanup itself. It is NOT a claim that the action is POSTed at most once: the submit
+        // transport retries a BOC, and a re-run submits again. The money guarantee is proved by fact in
+        // `a_duplicated_cleanup_post_moves_the_deals_money_only_once`.
+        assert_eq!(
+            production.matches("chain.submit_cleanup(").count(),
+            1,
+            "the ambiguous-outcome path must reconcile, not drive a second cleanup"
+        );
+        // The injected marker seam exists for the offline regressions only: the production command
+        // must still mark the durable buyer subscription terminal, and the real chain must still
+        // submit `streamCleanup` and wait on the bounded `cleanupUnopened` observer.
+        assert!(production.contains(
+            "drive_reclaim_plan(plan, &chain, &|note_addr, token_contract| {\n        super::buyer::mark_buyer_subscription_terminal(note_addr, token_contract)\n    })"
+        ));
+        assert!(production.contains("self.stream_cleanup(note, keys, tc).await?"));
+        assert!(production.contains("self.wait_cleanup_unopened(tc).await?"));
     }
 
     #[test]
@@ -848,7 +1118,7 @@ mod tests {
             1_000,
         );
         assert_eq!(usize::from(cleanup.is_ok()), 1, "cleanup POST count");
-        assert_eq!(cleanup.unwrap(), dexdo_core::ReclaimAction::StreamCleanup);
+        cleanup.expect("the exact never-opened shape past MATCH_OPEN_TIMEOUT is admissible");
 
         state.deposit = 0;
         state.last_claim_time = 2;
@@ -1043,26 +1313,23 @@ mod tests {
         let confirmation = super::recover_confirmation(&tc, &note, &receipt);
         let calls = AtomicUsize::new(0);
 
-        let marked = super::apply_recover_terminal_marker(&confirmation, || {
+        // `recover` consumes only "the marker ran without failing": a matched subscription and an
+        // ordinary deal without a sidecar are both a plain success here.
+        super::apply_recover_terminal_marker(&confirmation, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(true)
+            Ok(())
         })
-        .unwrap();
-        assert!(marked, "matched subscription must become terminal");
-        let ordinary = super::apply_recover_terminal_marker(&confirmation, || {
+        .expect("a marked subscription is a success");
+        super::apply_recover_terminal_marker(&confirmation, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(false)
+            Ok(())
         })
-        .unwrap();
-        assert!(
-            !ordinary,
-            "ordinary deal without a subscription sidecar is a no-op"
-        );
+        .expect("an ordinary deal without a subscription sidecar is a success too");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         let error = super::apply_recover_terminal_marker(&confirmation, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err::<(), _>(anyhow::anyhow!("marker disk failure"))
+            Err(anyhow::anyhow!("marker disk failure"))
         })
         .expect_err("marker failure must remain explicit after the landed receipt")
         .to_string();
@@ -1266,9 +1533,8 @@ mod tests {
         };
         super::run_recover_with_chain(
             RecoverArgs {
-                identity: IdentityArgs {
+                identity: RecoveryIdentityArgs {
                     note_key: None,
-                    note_index: 0,
                     note_addr: None,
                 },
                 token_contract: None,
@@ -1347,12 +1613,11 @@ mod tests {
             if call == 0 {
                 anyhow::bail!("transient marker failure")
             }
-            Ok(true)
+            Ok(())
         };
         let args = || RecoverArgs {
-            identity: IdentityArgs {
+            identity: RecoveryIdentityArgs {
                 note_key: None,
-                note_index: 0,
                 note_addr: None,
             },
             token_contract: None,
@@ -1421,9 +1686,8 @@ mod tests {
         };
         let error = super::run_recover_with_chain(
             RecoverArgs {
-                identity: IdentityArgs {
+                identity: RecoveryIdentityArgs {
                     note_key: None,
-                    note_index: 0,
                     note_addr: None,
                 },
                 token_contract: None,
@@ -1455,6 +1719,1588 @@ mod tests {
         assert_eq!(
             super::WITHDRAW_SHELL_GUIDANCE,
             "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active."
+        );
+    }
+
+    // ----: pool-only reclaim drives every recorded deal, exactly once each ----
+
+    /// One fake never-opened deal: the chain facts `reclaim` decodes, plus the submission outcomes a
+    /// real node can produce -- a clean failure, an **outcome-ambiguous** failure (the action landed and
+    /// only the response was lost), and a bounded observation that stays stale.
+    #[cfg(feature = "shellnet")]
+    struct PoolReclaimDeal {
+        buyer_note: String,
+        buyer_pubkey: [u8; 32],
+        state: Option<dexdo_core::DealChainState>,
+        fail_submits: usize,
+        ambiguous_submits: usize,
+        deferred_submits: usize,
+        duplicate_posts: usize,
+        fail_confirms: usize,
+    }
+
+    /// A fake chain keyed by TokenContract. `cleanupUnopened` is modelled exactly as the contract
+    /// behaves: it destroys the TC, so a second attempt on the same deal can find nothing to move.
+    #[cfg(feature = "shellnet")]
+    #[derive(Default)]
+    struct PoolReclaimChain {
+        deals: std::sync::Mutex<std::collections::BTreeMap<String, PoolReclaimDeal>>,
+        /// Deliveries of the cleanup action, including transport retries of the same BOC.
+        posts: std::sync::Mutex<Vec<String>>,
+        /// Deliveries the modelled contract actually paid out -- the money moves.
+        cleanups: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl PoolReclaimChain {
+        fn key(tc: &dexdo_core::Address) -> String {
+            tc.with_workchain()
+        }
+
+        fn with_deal(
+            self,
+            token_contract: &str,
+            buyer_note: &str,
+            secret_hex: &str,
+            state: Option<dexdo_core::DealChainState>,
+            fail_submits: usize,
+        ) -> Self {
+            let keys = dexdo_core::KeyPair::from_secret_hex(secret_hex).unwrap();
+            self.deals.lock().unwrap().insert(
+                dexdo_core::Address::parse(token_contract)
+                    .unwrap()
+                    .with_workchain(),
+                PoolReclaimDeal {
+                    buyer_note: dexdo_core::Address::parse(buyer_note)
+                        .unwrap()
+                        .with_workchain(),
+                    buyer_pubkey: dexdo_core::keypair_ed_pubkey(&keys).unwrap(),
+                    state,
+                    fail_submits,
+                    ambiguous_submits: 0,
+                    deferred_submits: 0,
+                    duplicate_posts: 0,
+                    fail_confirms: 0,
+                },
+            );
+            self
+        }
+
+        fn patch(self, token_contract: &str, patch: impl FnOnce(&mut PoolReclaimDeal)) -> Self {
+            let key = dexdo_core::Address::parse(token_contract)
+                .unwrap()
+                .with_workchain();
+            patch(
+                self.deals
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .expect("known deal"),
+            );
+            self
+        }
+
+        /// The submit applies the cleanup on chain and then fails: the CLI cannot tell whether it landed.
+        fn with_ambiguous_submit(self, token_contract: &str) -> Self {
+            self.patch(token_contract, |deal| deal.ambiguous_submits = 1)
+        }
+
+        /// The bounded observation window stays stale for the first attempt.
+        fn with_stale_observation(self, token_contract: &str) -> Self {
+            self.patch(token_contract, |deal| deal.fail_confirms = 1)
+        }
+
+        /// `send_with_retry` delivers the same BOC a second time on a transient error.
+        fn with_duplicate_post(self, token_contract: &str) -> Self {
+            self.patch(token_contract, |deal| deal.duplicate_posts = 1)
+        }
+
+        /// The submission goes out and then errors, and its BOC has not been applied yet: the outcome is
+        /// genuinely unknown to the client and the action can still land at any later moment.
+        fn with_deferred_submit(self, token_contract: &str) -> Self {
+            self.patch(token_contract, |deal| deal.deferred_submits = 1)
+        }
+
+        /// One delivery of `cleanupUnopened`, gated exactly as the contract gates it: it pays only a
+        /// funded, never-opened deal, and destroys it as it refunds. Every later delivery of the same
+        /// action therefore finds nothing to move.
+        fn deliver(
+            &self,
+            deals: &mut std::collections::BTreeMap<String, PoolReclaimDeal>,
+            key: &str,
+        ) {
+            self.posts.lock().unwrap().push(key.to_string());
+            let deal = deals.get_mut(key).expect("delivery to a known deal");
+            if deal
+                .state
+                .is_some_and(|state| state.funded && !state.opened)
+            {
+                self.cleanups.lock().unwrap().push(key.to_string());
+                deal.state = None;
+            }
+        }
+
+        /// A submission whose response was lost lands later, out of band, exactly like a retried BOC.
+        fn deliver_pending(&self, token_contract: &str) {
+            let key = dexdo_core::Address::parse(token_contract)
+                .unwrap()
+                .with_workchain();
+            let mut deals = self.deals.lock().unwrap();
+            self.deliver(&mut deals, &key);
+        }
+
+        fn posts(&self) -> Vec<String> {
+            self.posts.lock().unwrap().clone()
+        }
+
+        /// The deal is really owned by a different buyer note(a corrupt/forged recovery record).
+        fn owned_by_note(self, token_contract: &str, buyer_note: &str) -> Self {
+            let buyer_note = dexdo_core::Address::parse(buyer_note)
+                .unwrap()
+                .with_workchain();
+            self.patch(token_contract, move |deal| deal.buyer_note = buyer_note)
+        }
+
+        /// The deal is really owned by a different buyer key.
+        fn owned_by_key(self, token_contract: &str, secret_hex: &str) -> Self {
+            let keys = dexdo_core::KeyPair::from_secret_hex(secret_hex).unwrap();
+            let buyer_pubkey = dexdo_core::keypair_ed_pubkey(&keys).unwrap();
+            self.patch(token_contract, move |deal| deal.buyer_pubkey = buyer_pubkey)
+        }
+
+        fn cleanups(&self) -> Vec<String> {
+            self.cleanups.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl super::ReclaimChain for PoolReclaimChain {
+        async fn state(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::DealChainState>> {
+            Ok(self
+                .deals
+                .lock()
+                .unwrap()
+                .get(&Self::key(tc))
+                .and_then(|deal| deal.state))
+        }
+
+        async fn buyer_note(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::Address>> {
+            Ok(self
+                .deals
+                .lock()
+                .unwrap()
+                .get(&Self::key(tc))
+                .map(|deal| dexdo_core::Address::parse(&deal.buyer_note).unwrap()))
+        }
+
+        async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> anyhow::Result<Option<[u8; 32]>> {
+            Ok(self
+                .deals
+                .lock()
+                .unwrap()
+                .get(&Self::key(tc))
+                .map(|deal| deal.buyer_pubkey))
+        }
+
+        async fn submit_cleanup(
+            &self,
+            note: &dexdo_core::Address,
+            keys: &dexdo_core::KeyPair,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<()> {
+            let key = Self::key(tc);
+            let mut deals = self.deals.lock().unwrap();
+            let deal = deals
+                .get_mut(&key)
+                .expect("cleanup is only ever submitted for a deal the chain knows");
+            assert_eq!(
+                note.with_workchain(),
+                deal.buyer_note,
+                "each entry must be signed by its own recorded note"
+            );
+            assert_eq!(
+                dexdo_core::keypair_ed_pubkey(keys).unwrap(),
+                deal.buyer_pubkey,
+                "each entry must be signed by its own recorded owner key"
+            );
+            if deal.fail_submits > 0 {
+                deal.fail_submits -= 1;
+                anyhow::bail!("simulated cleanupUnopened submit failure for {key}");
+            }
+            if deal.ambiguous_submits > 0 {
+                deal.ambiguous_submits -= 1;
+                self.deliver(&mut deals, &key);
+                anyhow::bail!("simulated lost response after cleanupUnopened landed for {key}");
+            }
+            if deal.deferred_submits > 0 {
+                deal.deferred_submits -= 1;
+                // The BOC is out -- recorded as a delivery attempt -- but has not been applied yet.
+                self.posts.lock().unwrap().push(key.clone());
+                anyhow::bail!("simulated submission of {key} whose outcome is still unknown");
+            }
+            let retries = deal.duplicate_posts;
+            self.deliver(&mut deals, &key);
+            for _ in 0..retries {
+                self.deliver(&mut deals, &key);
+            }
+            Ok(())
+        }
+
+        async fn confirm_cleanup(&self, tc: &dexdo_core::Address) -> anyhow::Result<()> {
+            let key = Self::key(tc);
+            let mut deals = self.deals.lock().unwrap();
+            let deal = deals.get_mut(&key).expect("observation of a known deal");
+            if deal.fail_confirms > 0 {
+                deal.fail_confirms -= 1;
+                anyhow::bail!("simulated stale observation window for {key}");
+            }
+            // The real observer polls until the TokenContract is absent or no longer funded, and errors
+            // out otherwise; it never reports a still-funded deal as a confirmed cleanup.
+            match &deal.state {
+                None => Ok(()),
+                Some(state) if !state.funded => Ok(()),
+                Some(_) => {
+                    anyhow::bail!("simulated observation: TokenContract {key} is still funded")
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn reclaim_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn write_reclaim_pool(dir: &std::path::Path, notes: serde_json::Value) -> std::path::PathBuf {
+        let pool_path = dir.join("pn_pool.json");
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
+                "notes": notes,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        pool_path
+    }
+
+    /// The production entry point of `dexdo reclaim --pool <file>`: the real plan resolver over the real
+    /// pool file, then the real driver. Only the chain and the durable subscription marker are faked.
+    #[cfg(feature = "shellnet")]
+    async fn run_pool_only_reclaim(
+        pool_path: &std::path::Path,
+        chain: &PoolReclaimChain,
+    ) -> anyhow::Result<()> {
+        // `Ok(false)`: these fixtures carry no durable subscription record, so there is nothing to mark.
+        run_pool_only_reclaim_with_marker(pool_path, chain, &|_note, _tc| Ok(false)).await
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn run_pool_only_reclaim_with_marker(
+        pool_path: &std::path::Path,
+        chain: &PoolReclaimChain,
+        marker: &(dyn Fn(&str, &str) -> anyhow::Result<bool> + Sync),
+    ) -> anyhow::Result<()> {
+        let plan = crate::cli::commands::resolve_pool_recovery_plan(
+            &RecoveryIdentityArgs {
+                note_key: None,
+                note_addr: None,
+            },
+            None,
+            None,
+            Some(pool_path),
+        )?;
+        super::drive_reclaim_plan(plan, chain, marker).await
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn never_opened_state() -> dexdo_core::DealChainState {
+        chain_state(true, false, false, false, 100)
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn note_a() -> (String, String, String) {
+        (
+            format!("0:{}", "1".repeat(64)),
+            "2a".repeat(32),
+            format!("0:{}", "2".repeat(64)),
+        )
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn note_b() -> (String, String, String) {
+        (
+            format!("0:{}", "3".repeat(64)),
+            "3b".repeat(32),
+            format!("0:{}", "4".repeat(64)),
+        )
+    }
+
+    /// One recorded pool row, exactly as the buyer writes it.
+    #[cfg(feature = "shellnet")]
+    fn recorded_row(
+        note_addr: &str,
+        secret: &str,
+        token_contract: &str,
+        recorded_at_unix: u64,
+    ) -> serde_json::Value {
+        recorded_row_as(note_addr, secret, token_contract, recorded_at_unix, "buyer")
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn recorded_row_as(
+        note_addr: &str,
+        secret: &str,
+        token_contract: &str,
+        recorded_at_unix: u64,
+        role: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "address": note_addr,
+            "owner_secret_key_hex": secret,
+            "token_contract": token_contract,
+            "token_contract_role": role,
+            "token_contract_updated_at_unix": recorded_at_unix,
+        })
+    }
+
+    /// primary regression: an ordinary pool holding two recoverable entries is driven from pool
+    /// metadata alone -- no `--note-addr`, no `--token-contract` -- and the order comes from each entry's
+    /// own recorded `token_contract_updated_at_unix`, not from its position in the file.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_drives_every_recorded_entry_in_recorded_order() {
+        let dir = reclaim_test_dir("reclaim-two-entries");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        // The later-recorded deal is written first, so file order and recorded order disagree.
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                }
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("pool metadata alone must be enough to reclaim every recorded deal");
+
+        let tc_a = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_b, tc_a],
+            "both recorded deals are reclaimed, earliest recorded first"
+        );
+    }
+
+    /// Restart/idempotence: the very same invocation, run twice, moves no deal's money twice.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_repeated_invocation_moves_no_money_twice() {
+        let dir = reclaim_test_dir("reclaim-repeat");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+        run_pool_only_reclaim(&pool_path, &chain).await.unwrap();
+        let after_first = chain.cleanups();
+        assert_eq!(after_first.len(), 2);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("re-running the identical command is a decided no-op, not a failure");
+        assert_eq!(
+            chain.cleanups(),
+            after_first,
+            "an already-reclaimed deal must never be moved a second time"
+        );
+    }
+
+    /// An entry that was already reclaimed(its TokenContract is gone) and an entry that was never funded
+    /// are both decided as no-ops, while the one live recoverable entry is still recovered.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_skips_already_reclaimed_entries_without_a_second_move() {
+        let dir = reclaim_test_dir("reclaim-already-done");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let note_c = format!("0:{}", "5".repeat(64));
+        let secret_c = "4c".repeat(32);
+        let tc_c = format!("0:{}", "6".repeat(64));
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                },
+                {
+                    "address": note_c,
+                    "owner_secret_key_hex": secret_c,
+                    "token_contract": tc_c,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 300
+                }
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            // already reclaimed: the TokenContract selfdestructed
+            .with_deal(&tc_a, &note_a, &secret_a, None, 0)
+            // never funded: nothing to reclaim
+            .with_deal(
+                &tc_b,
+                &note_b,
+                &secret_b,
+                Some(chain_state(false, false, false, false, 0)),
+                0,
+            )
+            .with_deal(&tc_c, &note_c, &secret_c, Some(never_opened_state()), 0);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("decided no-ops must not fail the recovery of the other entries");
+        assert_eq!(
+            chain.cleanups(),
+            vec![dexdo_core::Address::parse(&tc_c).unwrap().with_workchain()],
+            "only the one live never-opened deal may move money"
+        );
+    }
+
+    /// Contradictory records still fail closed: a note recorded against two different TokenContracts, and
+    /// one TokenContract recorded against two different notes, are both refused outright -- the pool is
+    /// never guessed at -- while an unambiguous entry alongside them is still recovered.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_fails_closed_on_contradictory_records() {
+        let dir = reclaim_test_dir("reclaim-contradictory");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let contradicting_tc = format!("0:{}", "7".repeat(64));
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": contradicting_tc,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 150
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(
+                &contradicting_tc,
+                &note_a,
+                &secret_a,
+                Some(never_opened_state()),
+                0,
+            )
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("a contradictory record must keep the command failing closed")
+            .to_string();
+        assert!(
+            error.contains("2 of 3 recorded entries were not decided (2 refused as contradictory)"),
+            "{error}"
+        );
+        assert_eq!(
+            chain.cleanups(),
+            vec![dexdo_core::Address::parse(&tc_b).unwrap().with_workchain()],
+            "neither TokenContract of the contradictory note may be touched"
+        );
+    }
+
+    /// The same fail-closed rule for the mirror-image contradiction: two notes recorded as the buyer of
+    /// one TokenContract.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_fails_closed_when_two_notes_claim_one_deal() {
+        let dir = reclaim_test_dir("reclaim-two-notes-one-tc");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, ..) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }
+            ]),
+        );
+        let chain = PoolReclaimChain::default().with_deal(
+            &tc_a,
+            &note_a,
+            &secret_a,
+            Some(never_opened_state()),
+            0,
+        );
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("two notes claiming one deal must fail closed")
+            .to_string();
+        assert!(error.contains("2 refused as contradictory"), "{error}");
+        assert!(chain.cleanups().is_empty(), "no money may move");
+    }
+
+    /// A single recorded entry keeps its pre- behaviour exactly: it is reclaimed when it is
+    /// reclaimable, and a deal this command cannot move stays a loud, non-zero failure.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn single_recorded_entry_keeps_the_unchanged_loud_failure() {
+        let dir = reclaim_test_dir("reclaim-single");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([{
+                "address": note_a,
+                "owner_secret_key_hex": secret_a,
+                "token_contract": tc_a,
+                "token_contract_role": "buyer",
+                "token_contract_updated_at_unix": 100
+            }]),
+        );
+
+        let gone = PoolReclaimChain::default().with_deal(&tc_a, &note_a, &secret_a, None, 0);
+        let error = run_pool_only_reclaim(&pool_path, &gone)
+            .await
+            .expect_err("a single unreclaimable entry stays a loud failure")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "reclaim: TokenContract {} is not active (undeployed/closed)",
+                dexdo_core::Address::parse(&tc_a).unwrap()
+            )
+        );
+        assert!(gone.cleanups().is_empty());
+
+        let open = PoolReclaimChain::default().with_deal(
+            &tc_a,
+            &note_a,
+            &secret_a,
+            Some(chain_state(true, true, false, false, 100)),
+            0,
+        );
+        let error = run_pool_only_reclaim(&pool_path, &open)
+            .await
+            .expect_err("an OPEN deal still refuses the never-opened cleanup")
+            .to_string();
+        assert!(
+            error.contains("must use the explicit buyer STOP path"),
+            "{error}"
+        );
+        assert!(open.cleanups().is_empty());
+
+        let live = PoolReclaimChain::default().with_deal(
+            &tc_a,
+            &note_a,
+            &secret_a,
+            Some(never_opened_state()),
+            0,
+        );
+        run_pool_only_reclaim(&pool_path, &live)
+            .await
+            .expect("a single reclaimable entry is reclaimed as before");
+        assert_eq!(live.cleanups().len(), 1);
+    }
+
+    /// Option(1)'s own risk: a failure part-way through the sequence must neither lose the remaining
+    /// entries nor let a retry drive an already-reclaimed one a second time.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_only_reclaim_partial_failure_neither_loses_nor_double_drives_the_rest() {
+        let dir = reclaim_test_dir("reclaim-partial-failure");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let note_c = format!("0:{}", "5".repeat(64));
+        let secret_c = "4c".repeat(32);
+        let tc_c = format!("0:{}", "6".repeat(64));
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                },
+                {
+                    "address": note_c,
+                    "owner_secret_key_hex": secret_c,
+                    "token_contract": tc_c,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 300
+                }
+            ]),
+        );
+        // The middle entry's submit fails once, exactly as a transient submission failure would.
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 1)
+            .with_deal(&tc_c, &note_c, &secret_c, Some(never_opened_state()), 0);
+
+        let tc_a = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+        let tc_c = dexdo_core::Address::parse(&tc_c).unwrap().with_workchain();
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("a failed entry must surface as a non-zero exit")
+            .to_string();
+        assert!(
+            error.contains("simulated cleanupUnopened submit failure"),
+            "{error}"
+        );
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_a.clone(), tc_c.clone()],
+            "the entries after the failure are still driven"
+        );
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the retry recovers the remaining entry");
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_a, tc_c, tc_b],
+            "the retry moves only the entry that was never reclaimed"
+        );
+    }
+
+    /// `--note-key` names one note's owner key: applying it to several recorded notes is an ambiguous
+    /// instruction on a money path, so it fails closed instead of guessing.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_key_with_several_recorded_entries_fails_closed() {
+        let dir = reclaim_test_dir("reclaim-note-key-ambiguous");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                {
+                    "address": note_a,
+                    "owner_secret_key_hex": secret_a,
+                    "token_contract": tc_a,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 100
+                },
+                {
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }
+            ]),
+        );
+        let key_path = dir.join("note.key");
+        std::fs::write(&key_path, &secret_a).unwrap();
+
+        // Not `expect_err`: a plan carries note secrets, and nothing on this path may render them.
+        let error = match crate::cli::commands::resolve_pool_recovery_plan(
+            &RecoveryIdentityArgs {
+                note_key: Some(key_path),
+                note_addr: None,
+            },
+            None,
+            None,
+            Some(&pool_path),
+        ) {
+            Ok(_) => panic!("one key cannot stand for several recorded notes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--note-key names a single"), "{error}");
+    }
+
+    /// A recorded entry the chain contradicts on ownership is a corrupt or forged recovery record, not a
+    /// decided no-op: it must never be counted as a clean "nothing to do" beside a valid sibling.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn contradicted_buyer_note_or_key_fails_loud_with_no_submit() {
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let foreign_note = format!("0:{}", "9".repeat(64));
+        let foreign_secret = "5d".repeat(32);
+
+        for (name, expected) in [
+            ("wrong-note", "the deal's buyer note is"),
+            ("wrong-key", "is not the buyer key of"),
+        ] {
+            let dir = reclaim_test_dir(&format!("reclaim-contradicted-{name}"));
+            let _cleanup = TempDirCleanup(dir.clone());
+            let pool_path = write_reclaim_pool(
+                &dir,
+                serde_json::json!([
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                ]),
+            );
+            let chain = PoolReclaimChain::default()
+                .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+                .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+            let chain = if name == "wrong-note" {
+                chain.owned_by_note(&tc_a, &foreign_note)
+            } else {
+                chain.owned_by_key(&tc_a, &foreign_secret)
+            };
+
+            let error = run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect_err("a contradicted ownership record must not exit 0")
+                .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+            assert!(error.contains("nothing was submitted"), "{name}: {error}");
+            assert_eq!(
+                chain.cleanups(),
+                vec![dexdo_core::Address::parse(&tc_b).unwrap().with_workchain()],
+                "{name}: the contradicted entry must move no money while its valid sibling still does"
+            );
+        }
+    }
+
+    /// A submit whose outcome is ambiguous(the action landed, the response was lost) is reconciled by
+    /// the same bounded observation, never by submitting the money action again.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn ambiguous_submit_is_reconciled_by_observation_without_a_second_submit() {
+        let dir = reclaim_test_dir("reclaim-ambiguous-submit");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 100),
+                recorded_row(&note_b, &secret_b, &tc_b, 200),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0)
+            .with_ambiguous_submit(&tc_a);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("a cleanup proven landed by observation is a success, not a failure");
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b_key = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+        assert_eq!(chain.cleanups(), vec![tc_a_key.clone(), tc_b_key.clone()]);
+
+        // Restart: the reconciled deal is already terminal, so nothing is submitted for it again.
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the restart is a decided no-op");
+        assert_eq!(chain.cleanups(), vec![tc_a_key, tc_b_key]);
+    }
+
+    /// A submit that fails while the observation window stays stale is genuinely unresolved: it must be
+    /// loud, must not be re-submitted, and must still be recoverable on a later run.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn unresolved_submit_outcome_is_loud_and_still_reclaimable_later() {
+        let dir = reclaim_test_dir("reclaim-unresolved-submit");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 100),
+                recorded_row(&note_b, &secret_b, &tc_b, 200),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 1)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b_key = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("an unresolved submit outcome must exit non-zero")
+            .to_string();
+        assert!(error.contains("its outcome is unresolved"), "{error}");
+        assert!(
+            error.contains("this run drove no further cleanup for it"),
+            "{error}"
+        );
+        assert_eq!(chain.cleanups(), vec![tc_b_key.clone()]);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the retry recovers the entry whose submit had failed");
+        assert_eq!(chain.cleanups(), vec![tc_b_key, tc_a_key]);
+    }
+
+    /// The guarantee actually needs, stated and tested as itself: **no second money move**. The
+    /// transport may deliver the same cleanup BOC more than once, and an operator may re-run the command
+    /// after an unresolved outcome -- neither can pay the deal out twice, because `cleanupUnopened` only
+    /// accepts a funded, never-opened deal and destroys it as it refunds.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn a_duplicated_cleanup_post_moves_the_deals_money_only_once() {
+        let (note_a, secret_a, tc_a) = note_a();
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+
+        // 1. The transport retries the same BOC: two deliveries, one payout.
+        let dir = reclaim_test_dir("reclaim-duplicate-post");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([recorded_row(&note_a, &secret_a, &tc_a, 100)]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_duplicate_post(&tc_a);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("a retried delivery is still one successful reclaim");
+        assert_eq!(
+            chain.posts(),
+            vec![tc_a_key.clone(), tc_a_key.clone()],
+            "the transport delivered the action twice"
+        );
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_a_key.clone()],
+            "the contract paid the deal exactly once"
+        );
+
+        // 2. An unresolved submit that lands out of band BEFORE the operator re-runs: the re-run finds
+        // the deal already settled, so it submits nothing at all and no second payout is possible.
+        let dir = reclaim_test_dir("reclaim-late-landing");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 100),
+                recorded_row(&note_b, &secret_b, &tc_b, 200),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 1)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+        let tc_b_key = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("the first run cannot resolve the submitted outcome")
+            .to_string();
+        assert!(error.contains("its outcome is unresolved"), "{error}");
+        assert!(error.contains("cannot pay it out twice"), "{error}");
+        assert_eq!(chain.cleanups(), vec![tc_b_key.clone()]);
+
+        // The lost submission lands out of band, exactly like a retried BOC would.
+        chain.deliver_pending(&tc_a);
+        assert_eq!(chain.cleanups(), vec![tc_b_key.clone(), tc_a_key.clone()]);
+        let posts_before_rerun = chain.posts();
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the re-run finds both deals settled");
+        assert_eq!(
+            chain.posts(),
+            posts_before_rerun,
+            "a deal already settled on chain is not submitted again at all"
+        );
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_b_key, tc_a_key.clone()],
+            "the landed submission paid once and the re-run added nothing"
+        );
+
+        // 3. The case the guarantee is really about: the first run's BOC is still in flight when the
+        // operator re-runs, so the deal still looks funded and the re-run DOES submit a second time.
+        // Then the first submission lands too -- three deliveries of the same action, one payout.
+        let dir = reclaim_test_dir("reclaim-inflight-rerun");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([recorded_row(&note_a, &secret_a, &tc_a, 100)]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deferred_submit(&tc_a);
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("an in-flight submission is an unresolved outcome")
+            .to_string();
+        assert!(error.contains("its outcome is unresolved"), "{error}");
+        assert_eq!(chain.posts(), vec![tc_a_key.clone()], "one delivery so far");
+        assert!(chain.cleanups().is_empty(), "nothing has been paid yet");
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the re-run drives the still-funded deal");
+        assert_eq!(
+            chain.posts(),
+            vec![tc_a_key.clone(), tc_a_key.clone()],
+            "the re-run submitted the same action a second time"
+        );
+
+        // The first, in-flight submission finally lands on top of the settled deal.
+        chain.deliver_pending(&tc_a);
+        assert_eq!(
+            chain.posts(),
+            vec![tc_a_key.clone(), tc_a_key.clone(), tc_a_key.clone()],
+            "three deliveries of the same cleanup action"
+        );
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_a_key],
+            "the contract paid the deal exactly once across all three"
+        );
+    }
+
+    /// The other ambiguous shape: the submit is accepted but the bounded observation window stays
+    /// stale. That is not a settled cleanup, so it must be loud -- and the retry must not submit again.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn accepted_submit_with_a_stale_observation_is_never_reported_as_settled() {
+        let dir = reclaim_test_dir("reclaim-stale-observation");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 100),
+                recorded_row(&note_b, &secret_b, &tc_b, 200),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0)
+            .with_stale_observation(&tc_a);
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b_key = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("an unconfirmed cleanup must never be reported as settled")
+            .to_string();
+        assert!(error.contains("settlement is not confirmed"), "{error}");
+        assert_eq!(chain.cleanups(), vec![tc_a_key.clone(), tc_b_key.clone()]);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("the retry observes the settled deal and moves nothing");
+        assert_eq!(chain.cleanups(), vec![tc_a_key, tc_b_key]);
+    }
+
+    /// A confirmed cleanup whose local marker failed leaves durable subscription state stale. The next
+    /// run must repair it -- with zero submits -- instead of walking past it forever.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn failed_subscription_marker_is_repaired_on_the_next_run_without_a_second_submit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = reclaim_test_dir("reclaim-marker-repair");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 100),
+                recorded_row(&note_b, &secret_b, &tc_b, 200),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+            // The sibling is already terminal; only the marker keeps it interesting.
+            .with_deal(&tc_b, &note_b, &secret_b, None, 0);
+        let marker_calls = AtomicUsize::new(0);
+        let marker = |_note: &str, _tc: &str| {
+            if marker_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("simulated durable subscription write failure");
+            }
+            Ok(true)
+        };
+
+        let error = run_pool_only_reclaim_with_marker(&pool_path, &chain, &marker)
+            .await
+            .expect_err("a failed marker after a confirmed money move must be loud")
+            .to_string();
+        assert!(
+            error.contains("simulated durable subscription write failure"),
+            "{error}"
+        );
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        assert_eq!(chain.cleanups(), vec![tc_a_key.clone()]);
+
+        run_pool_only_reclaim_with_marker(&pool_path, &chain, &marker)
+            .await
+            .expect("the repair run succeeds");
+        assert_eq!(
+            chain.cleanups(),
+            vec![tc_a_key],
+            "the repair must not move money again"
+        );
+        assert_eq!(
+            marker_calls.load(Ordering::SeqCst),
+            4,
+            "run 1 marks the reclaimed deal (failing) and the terminal sibling; run 2 re-marks both, \
+             which is what repairs the record the first run could not write"
+        );
+    }
+
+    /// A pool row that claims recovery metadata but is missing or mistyping part of it is refused before
+    /// any chain contact -- never silently dropped from the plan while its escrow stays stranded.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn malformed_recovery_metadata_is_refused_before_any_chain_contact() {
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        for (name, malformed, expected) in [
+            (
+                "no-secret",
+                serde_json::json!({
+                    "address": note_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }),
+                "no string owner_secret_key_hex",
+            ),
+            (
+                "no-address",
+                serde_json::json!({
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 200
+                }),
+                "no string address",
+            ),
+            (
+                "non-string-tc",
+                serde_json::json!({
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": 7,
+                    "token_contract_role": "buyer"
+                }),
+                "token_contract is present but is not a string",
+            ),
+            (
+                "malformed-timestamp",
+                serde_json::json!({
+                    "address": note_b,
+                    "owner_secret_key_hex": secret_b,
+                    "token_contract": tc_b,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": "yesterday"
+                }),
+                "token_contract_updated_at_unix is not a unix second count",
+            ),
+        ] {
+            let dir = reclaim_test_dir(&format!("reclaim-malformed-{name}"));
+            let _cleanup = TempDirCleanup(dir.clone());
+            let pool_path = write_reclaim_pool(
+                &dir,
+                serde_json::json!([recorded_row(&note_a, &secret_a, &tc_a, 100), malformed]),
+            );
+            let chain = PoolReclaimChain::default().with_deal(
+                &tc_a,
+                &note_a,
+                &secret_a,
+                Some(never_opened_state()),
+                0,
+            );
+
+            let error = run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect_err("malformed recovery metadata must be refused")
+                .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+            assert!(
+                chain.cleanups().is_empty(),
+                "{name}: the refusal must happen before any chain contact"
+            );
+        }
+    }
+
+    /// The documented duplicate rule: rows for one recorded deal collapse only when every recorded fact
+    /// agrees. Exact duplicates are one deal; rows that disagree on the role or the recorded time are a
+    /// contradiction. Either way the outcome cannot depend on the order of rows in the file.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn rows_for_one_deal_collapse_only_when_every_recorded_fact_agrees() {
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let tc_a_key = dexdo_core::Address::parse(&tc_a).unwrap().with_workchain();
+        let tc_b_key = dexdo_core::Address::parse(&tc_b).unwrap().with_workchain();
+
+        // Exact duplicate rows are one deal recorded twice: one money move, in both file orders.
+        for (name, rows) in [
+            (
+                "duplicate-first",
+                serde_json::json!([
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                ]),
+            ),
+            (
+                "duplicate-last",
+                serde_json::json!([
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                ]),
+            ),
+        ] {
+            let dir = reclaim_test_dir(&format!("reclaim-{name}"));
+            let _cleanup = TempDirCleanup(dir.clone());
+            let pool_path = write_reclaim_pool(&dir, rows);
+            let chain = PoolReclaimChain::default()
+                .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+                .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+            run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect("exact duplicate rows are one deal, not a contradiction");
+            assert_eq!(
+                chain.cleanups(),
+                vec![tc_a_key.clone(), tc_b_key.clone()],
+                "{name}: one move per recorded deal, ordered by the recorded facts"
+            );
+        }
+
+        // Rows that agree on the deal but disagree on a recorded fact are refused, in either order.
+        let disagreeing_role = serde_json::json!({
+            "address": note_a,
+            "owner_secret_key_hex": secret_a,
+            "token_contract": tc_a,
+            "token_contract_role": "unknown",
+            "token_contract_updated_at_unix": 100
+        });
+        let disagreeing_time = recorded_row(&note_a, &secret_a, &tc_a, 101);
+        for (name, rows) in [
+            (
+                "role",
+                serde_json::json!([
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    disagreeing_role,
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                ]),
+            ),
+            (
+                "time",
+                serde_json::json!([
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                    disagreeing_time,
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                ]),
+            ),
+        ] {
+            let dir = reclaim_test_dir(&format!("reclaim-disagreeing-{name}"));
+            let _cleanup = TempDirCleanup(dir.clone());
+            let pool_path = write_reclaim_pool(&dir, rows);
+            let chain = PoolReclaimChain::default()
+                .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 0)
+                .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+            let error = run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect_err("rows that disagree on a recorded fact must fail closed")
+                .to_string();
+            assert!(
+                error.contains("whose recorded facts disagree"),
+                "{name}: {error}"
+            );
+            assert_eq!(
+                chain.cleanups(),
+                vec![tc_b_key.clone()],
+                "{name}: the contradicted deal must move no money"
+            );
+        }
+    }
+
+    /// A generated pool of recorded entries, with an index-derived identity per entry so every note,
+    /// key and TokenContract is distinct.
+    #[cfg(feature = "shellnet")]
+    fn generated_entry(index: usize) -> (String, String, String) {
+        let byte = format!("{:02x}", index as u8 + 1);
+        (
+            format!("0:{}", byte.repeat(32)),
+            format!("{:02x}", index as u8 + 128).repeat(32),
+            format!("0:{}", format!("{:02x}", index as u8 + 64).repeat(32)),
+        )
+    }
+
+    /// What the generated entry's deal looks like on chain.
+    #[cfg(feature = "shellnet")]
+    #[derive(Clone, Debug)]
+    enum GeneratedDeal {
+        Reclaimable,
+        Gone,
+        Unfunded,
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn generated_plan_run(
+        specs: &[(GeneratedDeal, u64, bool, bool)],
+        rotation: usize,
+    ) -> (Vec<String>, bool) {
+        let dir = reclaim_test_dir("reclaim-proptest");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let mut rows = Vec::new();
+        let chain = PoolReclaimChain::default();
+        let mut chain = chain;
+        for (index, (deal, recorded_at, fail_once, duplicated)) in specs.iter().enumerate() {
+            let (note, secret, tc) = generated_entry(index);
+            rows.push(recorded_row(&note, &secret, &tc, *recorded_at));
+            if *duplicated {
+                rows.push(recorded_row(&note, &secret, &tc, *recorded_at));
+            }
+            let state = match deal {
+                GeneratedDeal::Reclaimable => Some(never_opened_state()),
+                GeneratedDeal::Gone => None,
+                GeneratedDeal::Unfunded => Some(chain_state(false, false, false, false, 0)),
+            };
+            chain = chain.with_deal(&tc, &note, &secret, state, usize::from(*fail_once));
+        }
+        let rotate_by = rotation % rows.len().max(1);
+        rows.rotate_right(rotate_by);
+        let pool_path = write_reclaim_pool(&dir, serde_json::Value::Array(rows));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let first = runtime.block_on(run_pool_only_reclaim(&pool_path, &chain));
+        // Restart twice more: neither may move any deal a second time.
+        let second = runtime.block_on(run_pool_only_reclaim(&pool_path, &chain));
+        let after_second = chain.cleanups();
+        runtime
+            .block_on(run_pool_only_reclaim(&pool_path, &chain))
+            .expect("a settled pool is a decided no-op");
+        assert_eq!(
+            chain.cleanups(),
+            after_second,
+            "a settled pool must move nothing further"
+        );
+        assert!(
+            second.is_ok(),
+            "the retry after a transient submit failure must settle: {second:?}"
+        );
+        (chain.cleanups(), first.is_ok())
+    }
+
+    #[cfg(feature = "shellnet")]
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// invariant, over arbitrary pools: pool-only reclaim moves **each** recoverable deal
+        /// exactly once and no other deal at all, keeps going past a failing entry, exits non-zero
+        /// exactly when an entry failed, and never moves a deal again on a restart. Duplicate rows are
+        /// one deal, and the whole outcome is independent of the row order in the file.
+        /// Sizes start at two recorded deals on purpose: a pool holding exactly one recorded entry keeps
+        /// its deliberately different pre- contract, where a deal this command cannot move stays a
+        /// loud failure -- `single_recorded_entry_keeps_the_unchanged_loud_failure` owns that case.
+        #[test]
+        fn pool_only_reclaim_moves_each_recoverable_deal_exactly_once(
+            specs in proptest::collection::vec(
+                (
+                    proptest::prop_oneof![
+                        proptest::strategy::Just(GeneratedDeal::Reclaimable),
+                        proptest::strategy::Just(GeneratedDeal::Gone),
+                        proptest::strategy::Just(GeneratedDeal::Unfunded),
+                    ],
+                    0u64..4,
+                    proptest::bool::ANY,
+                    proptest::bool::ANY,
+                ),
+                2..5,
+            ),
+            rotation in 0usize..8,
+        ) {
+            let (cleanups, first_ok) = generated_plan_run(&specs, 0);
+            let expected: std::collections::BTreeSet<String> = specs
+                .iter()
+                .enumerate()
+                .filter(|(_, (deal, ..))| matches!(deal, GeneratedDeal::Reclaimable))
+                .map(|(index, _)| {
+                    let (_, _, tc) = generated_entry(index);
+                    dexdo_core::Address::parse(&tc).unwrap().with_workchain()
+                })
+                .collect();
+            let moved: std::collections::BTreeSet<String> = cleanups.iter().cloned().collect();
+            proptest::prop_assert_eq!(&moved, &expected, "every recoverable deal moves, nothing else does");
+            proptest::prop_assert_eq!(
+                cleanups.len(),
+                moved.len(),
+                "no deal may be moved twice across restarts"
+            );
+            let failed_first = specs
+                .iter()
+                .any(|(deal, _, fail_once, _)| matches!(deal, GeneratedDeal::Reclaimable) && *fail_once);
+            proptest::prop_assert_eq!(
+                first_ok,
+                !failed_first,
+                "the first run exits non-zero exactly when an entry failed"
+            );
+
+            // The same pool in a rotated row order settles on exactly the same moves, in the same order.
+            let (rotated, rotated_ok) = generated_plan_run(&specs, rotation);
+            proptest::prop_assert_eq!(&rotated, &cleanups, "row order must not change what runs");
+            proptest::prop_assert_eq!(rotated_ok, first_ok, "row order must not change the exit status");
+        }
+    }
+
+    /// re-review item 1: a contradicted deal must refuse every deal it touches. Counting the
+    /// note/TokenContract collisions only among the groups that survived contradiction removal let the
+    /// contradiction quietly clear the way for its own sibling, which then moved money.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn a_contradicted_deal_also_refuses_the_deals_it_collides_with() {
+        let (note_a, secret_a, tc_1) = generated_entry(0);
+        let (note_b, secret_b, tc_2) = generated_entry(1);
+        let (note_c, secret_c, tc_3) = generated_entry(2);
+        let other_secret = "5d".repeat(32);
+        let key = |tc: &str| dexdo_core::Address::parse(tc).unwrap().with_workchain();
+
+        // Same note, two recorded deals, one of them internally contradicted.
+        let dir = reclaim_test_dir("reclaim-contradiction-poisons-note");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_1, 100),
+                recorded_row(&note_a, &other_secret, &tc_1, 100),
+                recorded_row(&note_a, &secret_a, &tc_2, 110),
+                recorded_row(&note_c, &secret_c, &tc_3, 120),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_1, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_2, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_3, &note_c, &secret_c, Some(never_opened_state()), 0);
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("a contradicted note must not reclaim its other deal either")
+            .to_string();
+        assert!(error.contains("refused as contradictory"), "{error}");
+        assert_eq!(
+            chain.cleanups(),
+            vec![key(&tc_3)],
+            "only the unrelated note's deal may move money"
+        );
+
+        // Mirror image: one TokenContract recorded by two notes, one of those records contradicted.
+        let dir = reclaim_test_dir("reclaim-contradiction-poisons-tc");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_1, 100),
+                recorded_row(&note_a, &other_secret, &tc_1, 100),
+                recorded_row(&note_b, &secret_b, &tc_1, 110),
+                recorded_row(&note_c, &secret_c, &tc_3, 120),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_1, &note_b, &secret_b, Some(never_opened_state()), 0)
+            .with_deal(&tc_3, &note_c, &secret_c, Some(never_opened_state()), 0);
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("a contested TokenContract must not be reclaimed by the surviving claimant")
+            .to_string();
+        assert!(error.contains("refused as contradictory"), "{error}");
+        assert_eq!(
+            chain.cleanups(),
+            vec![key(&tc_3)],
+            "the contested TokenContract must move no money"
+        );
+    }
+
+    /// re-review item 2: one deal recorded as both buyer and seller is a contradiction about that
+    /// deal. The buyer-only pre-filter used to drop the seller row before anything could compare them.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn a_deal_recorded_as_both_buyer_and_seller_fails_closed() {
+        let dir = reclaim_test_dir("reclaim-role-contradiction");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_1) = generated_entry(0);
+        let (note_b, secret_b, tc_2) = generated_entry(1);
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                recorded_row_as(&note_a, &secret_a, &tc_1, 100, "buyer"),
+                recorded_row_as(&note_a, &secret_a, &tc_1, 100, "seller"),
+                recorded_row(&note_b, &secret_b, &tc_2, 110),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_1, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_2, &note_b, &secret_b, Some(never_opened_state()), 0);
+
+        let error = run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect_err("a same-deal role contradiction must fail closed")
+            .to_string();
+        assert!(error.contains("whose recorded facts disagree"), "{error}");
+        assert_eq!(
+            chain.cleanups(),
+            vec![dexdo_core::Address::parse(&tc_2).unwrap().with_workchain()],
+            "the contradicted deal must move no money"
+        );
+    }
+
+    /// The other half of the same rule, and the shape of every real pool: a note that sold one deal and
+    /// bought another is ordinary. Its seller record must neither join the buyer plan nor block it, and
+    /// a seller record for the deal another note bought must not look like two claimants.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn unrelated_seller_records_stay_outside_the_buyer_plan() {
+        let dir = reclaim_test_dir("reclaim-seller-records");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_1) = generated_entry(0);
+        let (_, _, tc_2) = generated_entry(1);
+        let (note_b, secret_b, tc_3) = generated_entry(2);
+        let (note_c, secret_c, _) = generated_entry(3);
+        let pool_path = write_reclaim_pool(
+            &dir,
+            serde_json::json!([
+                // note A sold tc_1 and bought tc_2
+                recorded_row_as(&note_a, &secret_a, &tc_1, 100, "seller"),
+                recorded_row_as(&note_a, &secret_a, &tc_2, 110, "buyer"),
+                // note B sold tc_3, which note C bought -- both sides of one deal in one pool
+                recorded_row_as(&note_b, &secret_b, &tc_3, 120, "seller"),
+                recorded_row_as(&note_c, &secret_c, &tc_3, 130, "buyer"),
+            ]),
+        );
+        let chain = PoolReclaimChain::default()
+            .with_deal(&tc_2, &note_a, &secret_a, Some(never_opened_state()), 0)
+            .with_deal(&tc_3, &note_c, &secret_c, Some(never_opened_state()), 0);
+
+        run_pool_only_reclaim(&pool_path, &chain)
+            .await
+            .expect("seller records are not contradictions");
+        assert_eq!(
+            chain.cleanups(),
+            vec![
+                dexdo_core::Address::parse(&tc_2).unwrap().with_workchain(),
+                dexdo_core::Address::parse(&tc_3).unwrap().with_workchain(),
+            ],
+            "both bought deals are reclaimed, in recorded order"
         );
     }
 }

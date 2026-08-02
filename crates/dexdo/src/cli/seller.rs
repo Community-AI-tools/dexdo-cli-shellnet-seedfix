@@ -143,10 +143,16 @@ fn seller_ready_line(
     };
     Some(format!(
         "seller_ready token_contract={} gateway={} gateway_listen={} order_id={} readiness={}",
-        token_contract, gateway_advertise, gateway_listen, identity.order_id, readiness
+        dexdo_core::address::display(token_contract),
+        gateway_advertise,
+        gateway_listen,
+        identity.order_id,
+        readiness
     ))
 }
 
+// The JSON lifecycle events keep their published `dexdo.*.event.v1` address representation until the
+// machine schemas are versioned together; only the human-readable seller lines carry the canonical form.
 fn seller_shutdown_event(token_contract: &str) -> serde_json::Value {
     json!({
         "event": "stopping",
@@ -390,11 +396,11 @@ where
                         return Err(error);
                     }
                     dexdo::seller::liveness::RestingStopReason::Health(
-                        dexdo::seller::liveness::HealthFailure {
-                            component: dexdo::seller::liveness::HealthComponent::GatewayTask,
-                            timed_out: false,
-                            detail: format!("gateway startup failed: {error}"),
-                        }
+                        dexdo::seller::liveness::HealthFailure::new(
+                            dexdo::seller::liveness::HealthComponent::GatewayTask,
+                            false,
+                            format!("gateway startup failed: {error}"),
+                        )
                     )
                 }
             }
@@ -698,6 +704,8 @@ struct SellerPoolContext<'a> {
     note_addr: &'a str,
     frame_model: &'a str,
     gateway_advertise: &'a str,
+    /// how a failed `advertised_gateway` self-probe is treated.
+    advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy,
 }
 
 fn save_pool_deal_handle(context: &SellerPoolContext<'_>, deal: &SellerPoolDeal) -> Result<()> {
@@ -933,6 +941,7 @@ where
         context.note_addr,
         inspected_identity.as_ref(),
         shutdown.as_mut(),
+        context.advertise_probe,
     )
     .await?
     {
@@ -1003,6 +1012,7 @@ async fn watch_pool_deal(
     deal: SellerPoolDeal,
     identity: Option<dexdo::seller::liveness::RestingOfferIdentity>,
     fill_tx: tokio::sync::mpsc::UnboundedSender<SellerPoolDeal>,
+    advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy,
 ) -> (
     SellerPoolDeal,
     Result<dexdo::seller::liveness::RestingSellerOutcome>,
@@ -1017,6 +1027,7 @@ async fn watch_pool_deal(
                 identity,
                 futures::future::pending(),
                 false,
+                advertise_probe,
             )
             .await?
             {
@@ -1048,6 +1059,51 @@ async fn watch_pool_deal(
     }
     .await;
     (deal, result)
+}
+
+/// example 2: an owner fill the pool cannot account for.
+/// This finding used to be recorded into `first_error` and, because the owner-fill audit runs
+/// BEFORE deal startup, it won the `get_or_insert` race and printed as the process `Error:` while
+/// the real root cause(a readiness failure) was only logged. It is now a *cascade note*: it is
+/// attached under `secondary` when anything else failed, and is only the reported error when
+/// nothing else did.
+fn unknown_owner_fill_note(token_contract: &str) -> dexdo_core::DexdoError {
+    dexdo_core::DexdoError::new(
+        dexdo_core::error_codes::E_POOL_UNKNOWN_OWNER_FILL,
+        format!(
+            "seller owner fill for TokenContract {token_contract} has no same-note deal \
+             handle/manifest; refusing to discard unknown capacity"
+        ),
+    )
+    .with_hint(
+        "an \"owner fill\" is a match against THIS note's own resting order; without that deal's \
+         handle/market.json the pool cannot account the capacity it just sold. Run the seller from \
+         the directory holding that deal's handle, or close the orphaned deal (`dexdo deals`, then \
+         `destroy`/`recover`). Attached as `secondary`, it is a CONSEQUENCE of the primary error \
+         above -- fix that first and re-run",
+    )
+}
+
+/// (issue example 2): the reported process error must be the ROOT cause. Consequence findings
+/// are attached under `secondary` instead of replacing it.
+fn attach_cascade_notes(
+    primary: anyhow::Error,
+    notes: Vec<dexdo_core::DexdoError>,
+) -> anyhow::Error {
+    if notes.is_empty() {
+        return primary;
+    }
+    // A primary that is already structured keeps its own code on the headline; anything else is
+    // adopted(its message stays the headline, its source chain is preserved, not flattened).
+    let structured = match primary.downcast::<dexdo_core::DexdoError>() {
+        Ok(structured) => structured,
+        Err(primary) => {
+            dexdo_core::DexdoError::adopt(dexdo_core::error_codes::E_SELLER_POOL_FAILED, primary)
+        }
+    };
+    anyhow::Error::new(notes.into_iter().fold(structured, |primary, note| {
+        primary.with_secondary("pool owner-fill audit", note)
+    }))
 }
 
 async fn run_seller_pool<S, F, Fut>(
@@ -1086,6 +1142,10 @@ where
     let mut known_tcs = std::collections::HashSet::new();
     let mut known_nonces = std::collections::HashMap::new();
     let mut first_error = None;
+    // findings that are consequences of another failure. They never win the `first_error`
+    // race; they are attached to whatever the primary error turns out to be.
+    let mut cascade_notes: Vec<dexdo_core::DexdoError> = Vec::new();
+    let mut noted_owner_fills = std::collections::HashSet::new();
     let mut candidates = Vec::new();
 
     for deal in deals {
@@ -1169,13 +1229,9 @@ where
                 .into_iter()
                 .find(|fill| !known_tcs.contains(&deals::normalize_addr(&fill.token_contract)))
             {
-                first_error.get_or_insert_with(|| {
-                    anyhow::anyhow!(
-                        "seller owner fill for TokenContract {} has no same-note deal \
-                     handle/manifest; refusing to discard unknown capacity",
-                        fill.token_contract
-                    )
-                });
+                if noted_owner_fills.insert(deals::normalize_addr(&fill.token_contract)) {
+                    cascade_notes.push(unknown_owner_fill_note(&fill.token_contract));
+                }
             }
         }
         Err(error) => {
@@ -1210,7 +1266,13 @@ where
                 (deal.chain.clone(), deal.cfg.clone(), identity.clone()),
             );
         }
-        watched.push(watch_pool_deal(seller, deal, identity, fill_tx.clone()));
+        watched.push(watch_pool_deal(
+            seller,
+            deal,
+            identity,
+            fill_tx.clone(),
+            context.advertise_probe,
+        ));
     }
 
     let mut gateway_poll =
@@ -1428,6 +1490,7 @@ where
                     replacement,
                     identity,
                     fill_tx.clone(),
+                    context.advertise_probe,
                 ));
                 Ok(())
             }
@@ -1464,13 +1527,16 @@ where
                         if let Some(fill) = fills.into_iter().find(|fill| {
                             !known_tcs.contains(&deals::normalize_addr(&fill.token_contract))
                         }) {
-                            let error = anyhow::anyhow!(
-                                "seller owner fill for TokenContract {} has no same-note deal \
-                                 handle/manifest; refusing to discard unknown capacity",
-                                fill.token_contract
-                            );
-                            tracing::error!(%error, "seller pool isolated unknown owner fill");
-                            first_error.get_or_insert(error);
+                            if noted_owner_fills
+                                .insert(deals::normalize_addr(&fill.token_contract))
+                            {
+                                let note = unknown_owner_fill_note(&fill.token_contract);
+                                tracing::error!(
+                                    error = %note,
+                                    "seller pool isolated unknown owner fill"
+                                );
+                                cascade_notes.push(note);
+                            }
                         }
                     }
                     Err(error) => {
@@ -1536,7 +1602,7 @@ where
                     dexdo::seller::liveness::RestingSellerOutcome::Matched(matched) => {
                         println!(
                             "seller_match_opened token_contract={} gateway={} gateway_listen={} cursor={}",
-                            matched.token_contract,
+                            dexdo_core::address::display(&matched.token_contract),
                             context.gateway_advertise,
                             seller.listen_addr,
                             deal.watch.cursor_path.display()
@@ -1727,13 +1793,18 @@ where
         }
     }
     seller.server_task.abort();
-    if stopped_by_operator && first_error.is_none() {
+    if stopped_by_operator && first_error.is_none() && cascade_notes.is_empty() {
         emit_seller_shutdown_event(&primary_token_contract);
         return Ok(());
     }
+    // the primary failure is the process error. A cascade note only becomes the process error
+    // when it is the ONLY thing that went wrong; otherwise it hangs off the primary as `secondary`.
     match stop_error.or(first_error) {
-        Some(error) => Err(error),
-        None => Ok(()),
+        Some(error) => Err(attach_cascade_notes(error, cascade_notes)),
+        None => match cascade_notes.into_iter().next() {
+            Some(note) => Err(anyhow::Error::new(note)),
+            None => Ok(()),
+        },
     }
 }
 
@@ -1772,6 +1843,10 @@ fn seller_upstream(
 pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     // reject an invalid limit SELL price at the command boundary, before any file or chain work.
     super::support::validate_price_step(args.price_per_tick as u128)?;
+    // the advertised gateway is what a REMOTE buyer dials out of the handover. Validate it at
+    // the command boundary -- before any file, chain or order-book work -- so a non-routable address
+    // can never reach `postSellOffer` and leave a resting ask no buyer can connect to.
+    let gateway_advertise = args.checked_gateway_advertise_addr()?;
     // Issue: the deal token_contract comes from `--market`(a provision manifest) or `--token-contract`.
     // The manifest's frame_model(if any) is validated against `--model` inside `seller_real_backend`.
     let (mut token_contract, mut market_frame_model, market_nonce) =
@@ -1866,7 +1941,6 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
             recovery_frame_model.as_deref(),
         )?
     };
-    let gateway_advertise = args.gateway_advertise_addr();
     let seller_owner = args.identity.note_addr.clone().unwrap_or_else(|| {
         format!(
             "0:{}",
@@ -2006,7 +2080,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     // The real path publishes the TC getter value, not the CLI fallback. Validate the actual
     // write-bound price as well, after read-only term discovery and before postSellOffer.
     super::support::validate_price_step(offer_price as u128)?;
-    let cfg = dexdo::seller::SellerConfig {
+    let mut cfg = dexdo::seller::SellerConfig {
         token_contract: token_contract.clone(),
         price_per_tick: offer_price,
         max_ticks: offer_ticks,
@@ -2301,6 +2375,13 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
             };
         }
     };
+    // `--gateway-listen <host>:0` asks the OS for a free port, and an advertise inherited from
+    // it was resolved before the listener existed, so it still says `:0` -- a port nobody can dial,
+    // neither the buyer out of the handover nor this seller's own self-probe. The gateway is bound
+    // now, so adopt the real port here: before readiness, before the deal handle and the handover
+    // are written, and before any order is posted.
+    let gateway_advertise = args.bound_gateway_advertise(gateway_advertise, seller.listen_addr);
+    cfg.gateway_advertise.clone_from(&gateway_advertise);
     let watch = dexdo::seller::SellerMatchWatchConfig {
         cursor_path: seller_watch_cursor_path(args.deals_dir.as_deref(), &token_contract)?,
         poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
@@ -2313,6 +2394,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         note_addr,
         frame_model,
         gateway_advertise: &gateway_advertise,
+        advertise_probe: args.advertise_probe_policy(),
     };
     let initial = SellerPoolDeal {
         chain,
@@ -2437,8 +2519,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let listen_addr = first.listen_addr;
-        dexdo::buyer::tls::connect_pinned(&format!("https://{listen_addr}"), &fingerprint)
+        dexdo::buyer::tls::connect_pinned(&format!("https://{}", first.listen_addr), &fingerprint)
             .await
             .expect("first pinned TLS connection");
         first.server_task.abort();
@@ -2446,8 +2527,12 @@ mod tests {
 
         let restored = load_or_create_gateway_tls(&pool_dir).unwrap();
         assert_eq!(restored.fingerprint, fingerprint);
+        // shape C: re-binding the first gateway's exact port races whoever the kernel hands it
+        // to in between(and the first gateway's own closed connections keep it in TIME_WAIT). What
+        // this test proves is that the PERSISTED certificate survives a restart, and the reconnect
+        // below already dials `second.listen_addr` -- so the restart takes a fresh ephemeral port.
         let second = dexdo::seller::start_gateway_with_note_tls(
-            listen_addr,
+            "127.0.0.1:0".parse().unwrap(),
             dexdo::seller::UpstreamConfig::Mock,
             note,
             restored,
@@ -2500,6 +2585,9 @@ mod tests {
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen: "127.0.0.1:0".parse().unwrap(),
             gateway_advertise: None,
+            // this test is about the pool lock, so opt into the loopback advertise explicitly.
+            allow_private_advertise: true,
+            require_advertise_probe: false,
             endpoints_file: Some(endpoints.clone()),
             deals_dir: Some(deals_dir),
             token_contract: Some(format!("0:{}", "b".repeat(64))),
@@ -2667,13 +2755,19 @@ mod tests {
         MockChainBackend,
         SellerConfig,
         RestingOfferIdentity,
-        std::path::PathBuf,
+        tempfile::TempDir,
     ) {
         let token_contract = signal_test_token_contract();
-        let root = std::env::temp_dir().join(format!("dexdo-668-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create seller test directory");
+        // `temp_dir()/dexdo-668-<name>-<pid>` is not unique -- a container's PID namespace
+        // hands the test process the same small pid every run, and to both CI pipelines at once --
+        // and nothing ever removed it. `tempfile` gives a random name and removes it on drop.
+        let root = tempfile::Builder::new()
+            .prefix(name)
+            .tempdir()
+            .expect("seller test directory");
+        let root_path = root.path();
         let chain = MockChainBackend::new(
-            root.join("endpoints.json"),
+            root_path.join("endpoints.json"),
             ProtocolConsts::canonical(),
             DobParams::canonical(),
         );
@@ -2717,7 +2811,7 @@ mod tests {
     #[tokio::test]
     async fn occupied_gateway_startup_cancels_existing_exact_sell_without_repost() {
         let note = Arc::new(LocalNote::generate());
-        let (chain, config, identity, _) =
+        let (chain, config, identity, _root) =
             existing_resting_offer("occupied-bind", note.clone(), "127.0.0.1:1".to_string()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2761,7 +2855,7 @@ mod tests {
     #[tokio::test]
     async fn startup_signal_cancels_existing_exact_sell_before_gateway_ready() {
         let note = Arc::new(LocalNote::generate());
-        let (chain, config, identity, _) =
+        let (chain, config, identity, _root) =
             existing_resting_offer("startup-signal", note, "127.0.0.1:1".to_string()).await;
 
         let outcome = start_seller_gateway_with_liveness(
@@ -2843,6 +2937,7 @@ mod tests {
         .expect("start signal-test gateway");
         let (chain, config, identity, root) =
             existing_resting_offer("signal", note, seller.listen_addr.to_string()).await;
+        let root = root.path();
         let buyer_note = LocalNote::generate();
         chain
             .place_buy(&token_contract, &buyer_note)
@@ -2863,11 +2958,12 @@ mod tests {
             market: None,
         };
         let context = SellerPoolContext {
-            deals_dir: Some(root.as_path()),
+            deals_dir: Some(root),
             contracts: &contracts,
             note_addr: &identity.owner_note,
             frame_model: "mock",
             gateway_advertise: &config.gateway_advertise,
+            advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
         };
         let mut provisioner = |_: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err::<
@@ -3102,8 +3198,9 @@ mod tests {
         )
         .await
         .expect("start startup-announcement gateway");
-        let root = std::env::temp_dir().join(format!("dexdo-798-{case}-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create seller test directory");
+        // `<name>-<pid>` is not unique across containers; `tempfile` is, and it cleans up.
+        let root = tempfile::tempdir().expect("seller test directory");
+        let root = root.path();
         let chain = MockChainBackend::new(
             root.join("endpoints.json"),
             ProtocolConsts::canonical(),
@@ -3162,11 +3259,12 @@ mod tests {
         };
         let contracts = root.join("unused-contracts.json");
         let context = SellerPoolContext {
-            deals_dir: Some(root.as_path()),
+            deals_dir: Some(root),
             contracts: &contracts,
             note_addr: &owner,
             frame_model: "mock",
             gateway_advertise: &gateway_advertise,
+            advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
         };
         let shutdown = futures::future::pending::<()>();
         tokio::pin!(shutdown);
@@ -3184,7 +3282,6 @@ mod tests {
         seller.server_task.abort();
         println!("{STARTUP_CHILD_DONE}{case}");
         let _ = std::io::stdout().flush();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn seller_offer_startup_child_output(case: &str) -> String {
@@ -3195,7 +3292,7 @@ mod tests {
                 "--exact",
                 "cli::seller::tests::seller_offer_startup_child",
                 "--ignored",
-                "--nocapture",
+                "--show-output",
             ])
             .env(STARTUP_CHILD_CASE, case)
             .output()
@@ -3363,6 +3460,7 @@ mod tests {
         );
         let (chain, config, identity, root) =
             existing_resting_offer(case, note.clone(), "127.0.0.1:0".to_string()).await;
+        let root = root.path();
         std::fs::write(root.join("note.key"), hex::encode(RESTART_NOTE_SEED)).unwrap();
         std::fs::write(
             root.join("models.json"),
@@ -3408,6 +3506,8 @@ mod tests {
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen: "127.0.0.1:0".parse().unwrap(),
             gateway_advertise: None,
+            allow_private_advertise: false,
+            require_advertise_probe: false,
             endpoints_file: Some(root.join("endpoints.json")),
             deals_dir: Some(root.join("deals")),
             token_contract: Some(config.token_contract.clone()),
@@ -3462,7 +3562,6 @@ mod tests {
                 .unwrap(),
             vec![control_row]
         );
-        let _ = std::fs::remove_dir_all(root);
         error
     }
 
@@ -4230,12 +4329,8 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn seller_pool_recursively_relists_exact_residuals_on_one_gateway() {
-        let root = std::env::temp_dir().join(format!(
-            "dexdo-211-pool-{}-{}",
-            std::process::id(),
-            deals::now_unix().unwrap()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = tempfile::tempdir().expect("seller pool test directory");
+        let root = root.path();
         let note = Arc::new(LocalNote::generate());
         let note_addr = format!("0:{}", "a".repeat(64));
         let frame_model = "openai/gpt-oss-20b";
@@ -4336,11 +4431,12 @@ mod tests {
             market: Some(market_for(independent.as_ref(), 20)),
         };
         let context = || SellerPoolContext {
-            deals_dir: Some(root.as_path()),
+            deals_dir: Some(root),
             contracts: std::path::Path::new("contracts/deployed.shellnet.json"),
             note_addr: &note_addr,
             frame_model,
             gateway_advertise: &gateway,
+            advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
         };
         let boundary_writes = Arc::new(AtomicU64::new(0));
         let mut boundary_provision = {
@@ -4628,7 +4724,7 @@ mod tests {
             Some(residual_five.token_contract.as_str())
         );
         let five_cursor =
-            super::seller_watch_cursor_path(Some(&root), &residual_five.token_contract).unwrap();
+            super::seller_watch_cursor_path(Some(root), &residual_five.token_contract).unwrap();
         let five_lineage =
             dexdo::seller::read_seller_fill_lineage(&five_cursor, &residual_five.token_contract)
                 .unwrap()
@@ -4639,7 +4735,7 @@ mod tests {
             Some(residual_three.token_contract.as_str())
         );
         let final_cursor =
-            super::seller_watch_cursor_path(Some(&root), &residual_three.token_contract).unwrap();
+            super::seller_watch_cursor_path(Some(root), &residual_three.token_contract).unwrap();
         let final_fill =
             dexdo::seller::read_seller_fill_lineage(&final_cursor, &residual_three.token_contract)
                 .unwrap()
@@ -4652,7 +4748,508 @@ mod tests {
             ),
             (3, 2, 1)
         );
-        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// (issue example 2), driven through the real `run_seller_pool` entry: a deal that cannot
+    /// start AND an owner fill the pool cannot
+    /// account for, in the same run.
+    /// Before this, the owner-fill audit ran first and won the `first_error` race, so the process
+    /// printed `Error: seller owner fill... refusing to discard unknown capacity` while the real
+    /// root cause was only logged -- which is what produced the wrong "the note is permanently
+    /// wedged" conclusion in. The primary must now be on the headline and the owner-fill
+    /// finding attached under `secondary`.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn pool_reports_the_startup_failure_and_attaches_the_owner_fill_finding() {
+        let root = tempfile::tempdir().expect("seller pool test directory");
+        let root = root.path();
+        let note = Arc::new(LocalNote::generate());
+        let note_addr = format!("0:{}", "a".repeat(64));
+        let frame_model = "openai/gpt-oss-20b";
+        let owner_fills = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(PoolTestBackend::new(
+            owner_fills.clone(),
+            format!("0:{}", "1".repeat(64)),
+            8,
+            3,
+            false,
+            i64::MAX - 4,
+        ));
+        // An address nothing listens on: the pinned-TLS self-probe fails, exactly as in. The
+        // reservation is HELD for the whole assertion -- a bind-and-drop hands the port
+        // straight back to the kernel and something else can answer on it.
+        let (_unreachable_hold, unreachable) = crate::test_refusing_endpoint::refusing_endpoint();
+        let seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            note.clone(),
+        )
+        .await
+        .unwrap();
+        let deal = SellerPoolDeal {
+            chain: backend.clone(),
+            cfg: SellerConfig {
+                token_contract: backend.token_contract.clone(),
+                price_per_tick: backend.price_per_tick,
+                max_ticks: backend.offered_ticks,
+                subscription: false,
+                gateway_advertise: unreachable.clone(),
+                mock_token_count: 8,
+            },
+            watch: dexdo::seller::SellerMatchWatchConfig {
+                cursor_path: root.join("cascade.cursor.json"),
+                poll_interval: std::time::Duration::from_millis(1),
+            },
+            upstream: dexdo::seller::UpstreamConfig::Mock,
+            nonce: 10,
+            market: Some(dexdo_core::MarketManifest {
+                network: "shellnet".to_string(),
+                frame_model: frame_model.to_string(),
+                model_hash: dexdo_core::model_hash_for(frame_model),
+                inference_order_book: format!("0:{}", "d".repeat(64)),
+                root_model: format!("0:{}", "e".repeat(64)),
+                token_contract: backend.token_contract.clone(),
+                seller_note: note_addr.clone(),
+                nonce: 10,
+                price_per_tick: u128::from(backend.price_per_tick),
+                max_ticks: u128::from(backend.offered_ticks),
+            }),
+        };
+        // An owner fill for a TokenContract this pool has no handle for.
+        let unknown_tc = format!("0:{}", "9".repeat(64));
+        owner_fills.lock().unwrap().push((
+            i64::MAX - 5,
+            MatchedFill {
+                order_id: 999,
+                token_contract: unknown_tc.clone(),
+                ticks: 2,
+                price_per_tick: 1_000_000_000,
+            },
+        ));
+        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+            futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
+        };
+        let shutdown = futures::future::pending::<()>().fuse();
+        tokio::pin!(shutdown);
+        let error = run_seller_pool(
+            &seller,
+            vec![deal],
+            SellerPoolContext {
+                deals_dir: Some(root),
+                contracts: std::path::Path::new("contracts/deployed.shellnet.json"),
+                note_addr: &note_addr,
+                frame_model,
+                gateway_advertise: &unreachable,
+                // `unreachable` is a closed loopback port, so it is not public and the
+                // production default is still fatal -- the cascade under test is reached.
+                advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+            },
+            &pool_test_policy(2),
+            &mut provision,
+            shutdown.as_mut(),
+        )
+        .await
+        .expect_err("a readiness failure plus an unaccounted owner fill must fail visibly");
+        let rendered = error.to_string();
+
+        // The PRIMARY is the concrete readiness error itself; the pool never wraps it in another
+        // structured error just to attach the cascade note.
+        let first_line = rendered.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("error[E_ADVERTISE_UNREACHABLE] (network): advertised gateway"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("error[E_ADVERTISE_UNREACHABLE]").count(),
+            1
+        );
+        assert!(rendered.contains(&unreachable), "{rendered}");
+        // The SECONDARY is attached, named, and never on the first line.
+        assert!(
+            !first_line.contains("unknown capacity"),
+            "the cascade masqueraded as the primary: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "secondary (pool owner-fill audit): error[E_POOL_UNKNOWN_OWNER_FILL] (pool):"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&unknown_tc), "{rendered}");
+        assert!(
+            rendered.contains("CONSEQUENCE of the primary error"),
+            "{rendered}"
+        );
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        seller.server_task.abort();
+    }
+
+    /// the exact CLI shape the live campaign ran: `--gateway-listen 127.0.0.1:0` with no
+    /// `--gateway-advertise`. The advertise is inherited from the listen address at the command
+    /// boundary -- before the gateway binds -- so it still carries the placeholder port `0`, which is
+    /// not an address anyone can dial. Driven through the real `run_seller` entry: the endpoint a
+    /// BUYER decrypts out of the handover must be the port the gateway actually bound, and a client
+    /// must be able to connect to it. Without the resolution the buyer is handed `127.0.0.1:0`.
+    #[tokio::test]
+    async fn inherited_ephemeral_advertise_reaches_the_buyer_as_the_bound_port() {
+        let root = tempfile::tempdir().unwrap();
+        let seller_seed = [0x63; 32];
+        std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+        let token_contract = format!("0:{}", "7".repeat(64));
+        let chain = MockChainBackend::new(
+            root.path().join("endpoints.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let buyer = Arc::new(LocalNote::generate());
+
+        let args = crate::cli::args::SellerArgs {
+            mock: crate::cli::args::MockFlags {
+                mock_model: true,
+                mock_chain: true,
+            },
+            identity: crate::cli::args::IdentityArgs {
+                note_key: Some(root.path().join("seller.key")),
+                note_index: 0,
+                note_addr: None,
+            },
+            registry: crate::cli::args::ModelRegistryValidationArgs::default(),
+            // The live shape: an ephemeral listen port, and no explicit advertise to inherit from.
+            gateway_listen: "127.0.0.1:0".parse().unwrap(),
+            gateway_advertise: None,
+            allow_private_advertise: true,
+            require_advertise_probe: false,
+            endpoints_file: Some(root.path().join("endpoints.json")),
+            deals_dir: Some(root.path().join("deals")),
+            token_contract: Some(token_contract.clone()),
+            market: None,
+            nonce: Some(7),
+            subscription: false,
+            price_per_tick: dexdo_core::PRICE_STEP as u64,
+            mock_token_count: 4,
+            model: None,
+            models: root.path().join("unused-models.json"),
+            contracts: root.path().join("unused-contracts.json"),
+            policy: None,
+        };
+        assert_eq!(
+            args.checked_gateway_advertise_addr().unwrap(),
+            "127.0.0.1:0",
+            "the boundary can only inherit the placeholder; the port is not chosen yet"
+        );
+
+        let seller = super::run_seller(args);
+        tokio::pin!(seller);
+        let scenario = async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if matches!(
+                        chain.confirm_offer_outcome(&token_contract).await,
+                        Ok(Some(SellOfferOutcome::Rested { .. }))
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("run_seller must rest the offer");
+            chain
+                .place_buy(&token_contract, buyer.as_ref())
+                .await
+                .unwrap();
+            let buyer_client = dexdo::buyer::Buyer::from_note(buyer.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if let Ok(handover) =
+                        buyer_client.resolve_endpoint(&chain, &token_contract).await
+                    {
+                        break handover;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("buyer handover")
+        };
+        tokio::pin!(scenario);
+        let handover = tokio::select! {
+            result = &mut seller => panic!("seller exited before the buyer resolved the handover: {result:?}"),
+            handover = &mut scenario => handover,
+        };
+
+        // By fact: the address the buyer would dial names a real port, and answers.
+        let advertised = handover
+            .endpoint
+            .strip_prefix("https://")
+            .expect("gateway endpoint")
+            .to_string();
+        assert!(
+            !advertised.ends_with(":0"),
+            "the buyer was handed the unusable placeholder port: {}",
+            handover.endpoint
+        );
+        let advertised: std::net::SocketAddr = advertised.parse().expect("host:port");
+        assert_ne!(advertised.port(), 0);
+        tokio::net::TcpStream::connect(advertised)
+            .await
+            .expect("the advertised address must be the gateway the seller actually bound");
+    }
+
+    /// Real `dexdo seller` argv, parsed by the real CLI parser -- so a regression proves what the
+    /// OPERATOR typed reaches the lifecycle, not what a struct literal asserted.
+    fn parsed_seller_args(extra: &[&str]) -> crate::cli::args::SellerArgs {
+        use clap::Parser as _;
+        let mut argv = vec![
+            "dexdo",
+            "seller",
+            "--note-addr",
+            "0:note",
+            "--token-contract",
+            "0:tc",
+            "--model",
+            "qwen",
+        ];
+        argv.extend_from_slice(extra);
+        let crate::Command::Seller(args) = crate::Cli::try_parse_from(argv)
+            .expect("seller argv parses")
+            .command
+        else {
+            panic!("expected Command::Seller");
+        };
+        args
+    }
+
+    fn advertise_pool_deal(
+        backend: Arc<PoolTestBackend>,
+        gateway_advertise: &str,
+        cursor_path: std::path::PathBuf,
+    ) -> SellerPoolDeal {
+        SellerPoolDeal {
+            cfg: SellerConfig {
+                token_contract: backend.token_contract.clone(),
+                price_per_tick: backend.price_per_tick,
+                max_ticks: backend.offered_ticks,
+                subscription: false,
+                gateway_advertise: gateway_advertise.to_string(),
+                mock_token_count: 4,
+            },
+            chain: backend,
+            watch: dexdo::seller::SellerMatchWatchConfig {
+                cursor_path,
+                poll_interval: std::time::Duration::from_millis(1),
+            },
+            upstream: dexdo::seller::UpstreamConfig::Mock,
+            nonce: 11,
+            market: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pr795_edge_explicit_zero_gateway_advertise_fails_as_config_and_posts_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let endpoints = root.path().join("endpoints.json");
+        let endpoints_arg = endpoints.to_string_lossy().into_owned();
+        let args = parsed_seller_args(&[
+            "--endpoints-file",
+            &endpoints_arg,
+            "--gateway-advertise",
+            "seller.example.net:0",
+        ]);
+
+        let error = super::run_seller(args)
+            .await
+            .expect_err("an explicit advertise port 0 must fail before seller setup")
+            .to_string();
+        assert_eq!(
+            error,
+            "error[E_ADVERTISE_NOT_PUBLIC] (config): --gateway-advertise \
+             seller.example.net:0 uses port 0, which no remote buyer can dial\n  \
+             hint: pass a public host:port reachable from the internet, or run on a public host; \
+             for local/LAN testing only, use --allow-private-advertise"
+        );
+        assert!(
+            !endpoints.exists() && !endpoints.with_extension("chainstate.json").exists(),
+            "the invalid explicit advertise must fail before any state or SELL can be written"
+        );
+    }
+
+    /// The real pool boundary must retain the canonical structured error and the concrete I/O
+    /// source from the fatal readiness probe; an ask behind that address must never be posted.
+    #[tokio::test]
+    async fn fatal_private_advertise_reaches_the_pool_boundary_with_its_typed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let (_reserved, advertise) = crate::test_refusing_endpoint::refusing_endpoint();
+        let args = parsed_seller_args(&["--gateway-advertise", &advertise]);
+        let boundary = args
+            .checked_gateway_advertise_addr()
+            .expect_err("without the opt-in a private advertise is refused at the boundary")
+            .to_string();
+        assert!(
+            boundary.contains("error[E_ADVERTISE_NOT_PUBLIC] (config)")
+                && boundary.contains(&advertise),
+            "{boundary}"
+        );
+        let seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let note_addr = format!("0:{}", "b".repeat(64));
+        let backend = Arc::new(PoolTestBackend::new(
+            Arc::new(Mutex::new(Vec::new())),
+            format!("0:{}", "2".repeat(64)),
+            8,
+            8,
+            false,
+            i64::MAX - 4,
+        ));
+        let deal = advertise_pool_deal(
+            backend.clone(),
+            &advertise,
+            root.path().join("no-optin.cursor.json"),
+        );
+        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+            futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
+        };
+        let shutdown = futures::future::pending::<()>().fuse();
+        tokio::pin!(shutdown);
+        let error = run_seller_pool(
+            &seller,
+            vec![deal],
+            SellerPoolContext {
+                deals_dir: Some(root.path()),
+                contracts: std::path::Path::new("contracts/deployed.shellnet.json"),
+                note_addr: &note_addr,
+                frame_model: "mock",
+                gateway_advertise: &advertise,
+                advertise_probe: args.advertise_probe_policy(),
+            },
+            &pool_test_policy(1),
+            &mut provision,
+            shutdown.as_mut(),
+        )
+        .await
+        .expect_err("a private advertise nobody opted into must still fail closed");
+        let structured = error
+            .downcast_ref::<dexdo_core::DexdoError>()
+            .expect("the pool boundary must expose the concrete DexdoError to main");
+        assert_eq!(
+            structured.code(),
+            dexdo_core::error_codes::E_ADVERTISE_UNREACHABLE.code()
+        );
+        let first_source = std::error::Error::source(structured)
+            .expect("the structured error must own the health failure");
+        assert!(
+            first_source
+                .downcast_ref::<dexdo::seller::liveness::HealthFailure>()
+                .is_some(),
+            "unexpected first source: {first_source:?}"
+        );
+        let mut source = Some(first_source);
+        let mut saw_io = false;
+        while let Some(current) = source {
+            saw_io |= current.downcast_ref::<std::io::Error>().is_some();
+            source = current.source();
+        }
+        assert!(saw_io, "the original typed I/O source was flattened away");
+        let rendered = structured.to_string();
+        assert!(
+            rendered.contains("error[E_ADVERTISE_UNREACHABLE] (network)")
+                && rendered.contains(&advertise),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("error[E_ADVERTISE_UNREACHABLE]").count(),
+            1
+        );
+        assert_eq!(rendered.matches("\n  hint: ").count(), 1);
+        assert_eq!(
+            backend.post_calls.load(Ordering::Relaxed),
+            0,
+            "nothing may be posted behind a fatal readiness failure"
+        );
+        seller.server_task.abort();
+    }
+
+    /// `--allow-private-advertise` admits a private address CLASS; it never vouches for what is
+    /// listening there. An address that ANSWERS with a foreign certificate is proof of the WRONG
+    /// endpoint, never a tolerable transport artifact -- so through the real lifecycle, with that
+    /// flag passed, readiness stays fatal and the backend records nothing.
+    #[tokio::test]
+    async fn the_opt_in_still_fails_closed_on_a_wrong_gateway() {
+        let root = tempfile::tempdir().unwrap();
+        let seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let foreign = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(seller.tls_fingerprint, foreign.tls_fingerprint);
+        let advertise = foreign.listen_addr.to_string();
+        let args = parsed_seller_args(&[
+            "--allow-private-advertise",
+            "--gateway-advertise",
+            &advertise,
+        ]);
+        let note_addr = format!("0:{}", "c".repeat(64));
+        let backend = Arc::new(PoolTestBackend::new(
+            Arc::new(Mutex::new(Vec::new())),
+            format!("0:{}", "3".repeat(64)),
+            8,
+            8,
+            false,
+            i64::MAX - 4,
+        ));
+        let deal = advertise_pool_deal(
+            backend.clone(),
+            &advertise,
+            root.path().join("foreign.cursor.json"),
+        );
+        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+            futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
+        };
+        let shutdown = futures::future::pending::<()>().fuse();
+        tokio::pin!(shutdown);
+        let error = run_seller_pool(
+            &seller,
+            vec![deal],
+            SellerPoolContext {
+                deals_dir: Some(root.path()),
+                contracts: std::path::Path::new("contracts/deployed.shellnet.json"),
+                note_addr: &note_addr,
+                frame_model: "mock",
+                gateway_advertise: &advertise,
+                advertise_probe: args.advertise_probe_policy(),
+            },
+            &pool_test_policy(1),
+            &mut provision,
+            shutdown.as_mut(),
+        )
+        .await
+        .expect_err("a foreign gateway on the advertised address must stay fatal")
+        .to_string();
+        assert!(
+            error.contains("error[E_ADVERTISE_WRONG_GATEWAY] (tls)"),
+            "{error}"
+        );
+        assert_eq!(
+            backend.post_calls.load(Ordering::Relaxed),
+            0,
+            "a wrong-endpoint proof must never post"
+        );
+        seller.server_task.abort();
+        foreign.server_task.abort();
     }
 
     #[cfg(feature = "shellnet")]
@@ -4675,6 +5272,8 @@ mod tests {
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen,
             gateway_advertise: None,
+            allow_private_advertise: false,
+            require_advertise_probe: false,
             endpoints_file: Some(root.join("endpoints.json")),
             deals_dir: Some(root.join("deals")),
             token_contract: Some(token_contract),
@@ -4717,9 +5316,10 @@ mod tests {
             ProtocolConsts::canonical(),
             DobParams::canonical(),
         );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let gateway = listener.local_addr().unwrap();
-        drop(listener);
+        // shape B: `run_seller` makes the ONE bind and resolves the inherited `:0` advertise to
+        // the port it actually got. Reserving a port here and releasing it before `run_seller`
+        // binds hands it back to the kernel for the whole of `prepare_seller_offer` below.
+        let gateway: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let cfg = SellerConfig {
             token_contract: initial_tc.clone(),
             price_per_tick: dexdo_core::PRICE_STEP as u64,

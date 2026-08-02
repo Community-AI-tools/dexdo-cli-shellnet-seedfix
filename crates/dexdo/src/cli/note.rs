@@ -1547,7 +1547,7 @@ fn ensure_shell_currency_id(token_type: u32, source: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn pool_with_note_token_contract_recorded(
     mut pool: Value,
     note_addr: &str,
@@ -1592,7 +1592,7 @@ pub(crate) fn pool_with_note_token_contract_recorded(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Result<()> {
     let note_addr = dexdo_core::normalize_wallet_address(note_addr)
         .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
@@ -1615,38 +1615,85 @@ pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Resul
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn pool_note_recovery_records(
-    pool: &Value,
-) -> Result<Vec<(String, String, String, String)>> {
+/// One recovery-capable pool note entry: the durable recorded facts a pool-only recovery
+/// (`reclaim`/`recover`/`dispute`) is allowed to act on. `recorded_at_unix` is the entry's own
+/// `token_contract_updated_at_unix` -- a recorded fact written when the deal metadata was persisted,
+/// never re-derived from the reader's wall clock or from the entry's position in the file.
+/// Deliberately derives nothing: this struct holds a bare 64-hex owner secret, and a `Debug` impl is a
+/// formatting footgun that costs nothing until the day something logs the struct or folds it into an
+/// error message. Tests compare it by destructuring instead, which is exhaustive in the same way an
+/// `assert_eq!` on the whole value is.
+#[cfg(any(feature = "shellnet", test))]
+pub(crate) struct PoolNoteRecoveryRecord {
+    pub(crate) note_addr: String,
+    pub(crate) owner_secret_hex: String,
+    pub(crate) token_contract: String,
+    pub(crate) role: String,
+    pub(crate) recorded_at_unix: Option<u64>,
+}
+
+/// Read every recovery entry the pool records.
+/// A note that records no `token_contract` has simply never been in a deal and is not a recovery entry
+/// at all. A note that **does** claim recovery metadata must carry all of it, well formed: a pool-only
+/// recovery moves money on these recorded facts alone, so a half-recorded or wrong-typed entry is
+/// refused loudly here, before any chain contact, instead of being silently dropped from the plan while
+/// its escrow stays stranded.
+#[cfg(any(feature = "shellnet", test))]
+pub(crate) fn pool_note_recovery_records(pool: &Value) -> Result<Vec<PoolNoteRecoveryRecord>> {
     let notes = pool["notes"]
         .as_array()
         .ok_or_else(|| anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
     let mut out = Vec::new();
-    for note in notes {
-        let Some(note_addr) = note["address"].as_str() else {
+    for (index, note) in notes.iter().enumerate() {
+        if note["token_contract"].is_null() {
             continue;
+        }
+        let token_contract = note["token_contract"].as_str().ok_or_else(|| {
+            anyhow!("DEXDO_PN_POOL notes[{index}]: token_contract is present but is not a string")
+        })?;
+        let note_addr = note["address"].as_str().ok_or_else(|| {
+            anyhow!(
+                "DEXDO_PN_POOL notes[{index}] records TokenContract {token_contract} but has no \
+                 string address; refusing to recover from an incomplete recovery record"
+            )
+        })?;
+        let owner_secret = note["owner_secret_key_hex"].as_str().ok_or_else(|| {
+            anyhow!(
+                "DEXDO_PN_POOL notes[{index}] ({note_addr}) records TokenContract {token_contract} \
+                 but has no string owner_secret_key_hex; its escrow cannot be recovered from this pool"
+            )
+        })?;
+        let role = match &note["token_contract_role"] {
+            Value::Null => "unknown",
+            role => role.as_str().ok_or_else(|| {
+                anyhow!(
+                    "DEXDO_PN_POOL notes[{index}] ({note_addr}): token_contract_role is not a string"
+                )
+            })?,
         };
-        let Some(owner_secret) = note["owner_secret_key_hex"].as_str() else {
-            continue;
-        };
-        let Some(token_contract) = note["token_contract"].as_str() else {
-            continue;
-        };
-        let role = note["token_contract_role"].as_str().unwrap_or("unknown");
         if role != "buyer" && role != "seller" && role != "unknown" {
             bail!(
                 "DEXDO_PN_POOL token_contract_role must be buyer, seller, or unknown, got `{role}`"
             );
         }
-        out.push((
-            dexdo_core::normalize_wallet_address(note_addr)
+        let recorded_at_unix = match &note["token_contract_updated_at_unix"] {
+            Value::Null => None,
+            recorded => Some(recorded.as_u64().ok_or_else(|| {
+                anyhow!(
+                    "DEXDO_PN_POOL notes[{index}] ({note_addr}): token_contract_updated_at_unix is \
+                     not a unix second count"
+                )
+            })?),
+        };
+        out.push(PoolNoteRecoveryRecord {
+            note_addr: dexdo_core::normalize_wallet_address(note_addr)
                 .map_err(|e| anyhow!("DEXDO_PN_POOL note address {note_addr}: {e}"))?,
-            owner_secret.to_string(),
-            dexdo_core::normalize_wallet_address(token_contract)
+            owner_secret_hex: owner_secret.to_string(),
+            token_contract: dexdo_core::normalize_wallet_address(token_contract)
                 .map_err(|e| anyhow!("DEXDO_PN_POOL token_contract {token_contract}: {e}"))?,
-            role.to_string(),
-        ));
+            role: role.to_string(),
+            recorded_at_unix,
+        });
     }
     Ok(out)
 }
@@ -2330,15 +2377,25 @@ mod note_deploy_tests {
         assert_eq!(note["token_contract"], tc);
         assert_eq!(note["token_contract_role"], "buyer");
         assert_eq!(note["token_contract_updated_at_unix"], 99);
+        let records = pool_note_recovery_records(&pool).unwrap();
+        assert_eq!(records.len(), 1);
+        // Destructured, not `assert_eq!`d: a new recorded field breaks this pattern exactly as it would
+        // break a whole-value comparison, and nothing here can render the secret.
+        let PoolNoteRecoveryRecord {
+            note_addr: recorded_note_addr,
+            owner_secret_hex,
+            token_contract,
+            role,
+            recorded_at_unix,
+        } = &records[0];
+        assert_eq!(recorded_note_addr, note_addr);
         assert_eq!(
-            pool_note_recovery_records(&pool).unwrap(),
-            vec![(
-                note_addr.to_string(),
-                s.owner_secret_key_hex.clone().unwrap().to_string(),
-                tc,
-                "buyer".to_string(),
-            )]
+            owner_secret_hex.as_str(),
+            s.owner_secret_key_hex.clone().unwrap().as_str()
         );
+        assert_eq!(token_contract, &tc);
+        assert_eq!(role, "buyer");
+        assert_eq!(recorded_at_unix, &Some(99));
     }
 
     /// negative: do not silently claim recovery metadata was persisted if the active pool is not the note's

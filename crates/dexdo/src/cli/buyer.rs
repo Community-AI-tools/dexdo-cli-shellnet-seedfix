@@ -15,8 +15,8 @@ use crate::cli::commands::{
     note_deploy_fold_state_into_pool, note_deploy_fold_state_into_pool_locked,
     note_deploy_multisig_secret_hex, note_deploy_recovery_pool_guard,
     note_deploy_same_file_pool_guard, note_endpoint_url, persist_pool_recovery_record,
-    resolve_pool_recovery_inputs, retry_executable_read, target_from_market_for_model,
-    write_pool_private_via_temp, DealTarget, PoolRecoveryRecord,
+    resolve_persistable_pool_recovery_inputs, resolve_pool_recovery_inputs, retry_executable_read,
+    target_from_market_for_model, write_pool_private_via_temp, DealTarget, PoolRecoveryRecord,
 };
 use crate::cli::commands::{
     enforce_model_registry_policy, expected_order_book_for_note,
@@ -1302,6 +1302,21 @@ struct SubscriptionRuntimeView {
     quota: SubscriptionQuotaView,
 }
 
+/// What a resumed subscription hands the running route.
+/// `remaining_current_week` is the allowance of the BOOKED week the deal stands on; `subscription` is
+/// the coherent shape it was read from, so the route knows which week that allowance belongs to and
+/// when that week runs out - and can go and book the next boundary instead of holding this scalar for
+/// the rest of the term.
+#[derive(Clone, Copy)]
+struct SubscriptionRouteBudget {
+    remaining_current_week: u64,
+    /// The authoritative state `remaining_current_week` was computed from. The route's live budget
+    /// anchors its local counter on this snapshot's `tokensPending`, so the two must be one read
+    /// .
+    state: dexdo_core::DealChainState,
+    subscription: dexdo_core::DealSubscription,
+}
+
 fn subscription_oneshot_budget(requested: u64, remaining_current_week: Option<u64>) -> Result<u64> {
     let allowed = remaining_current_week
         .map(|remaining| requested.min(remaining))
@@ -1315,6 +1330,13 @@ fn subscription_oneshot_budget(requested: u64, remaining_current_week: Option<u6
     Ok(allowed)
 }
 
+/// The current-week quota this deal stands on, read from the RECORDED weekly books.
+/// Both halves come from the same recorded `weekBaseTokens`, so what the status reports as claimed and
+/// what it reports as remaining always belong to the same week. How that figure stands to the ceiling
+/// the contract applies has three phases - exact, understated, or an upper bound (see
+/// [`dexdo_core::subscription_claim_cap_at`]) - and which one holds cannot be read off the books
+/// alone. So a caller that needs it to be an authorization books the boundary first and reads again,
+/// rather than guessing the phase.
 #[cfg(feature = "shellnet")]
 fn subscription_quota_view(facts: &SubscriptionDealFacts) -> Result<SubscriptionQuotaView> {
     let buyer_locked_total = facts
@@ -1350,22 +1372,51 @@ fn subscription_quota_view(facts: &SubscriptionDealFacts) -> Result<Subscription
             buyer_locked_total,
         });
     }
-    let remaining_current_week = facts
-        .subscription
-        .tokens_per_week
-        .checked_sub(claimed_current_week)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "subscription current-week claim {} exceeds quota {}",
-                claimed_current_week,
-                facts.subscription.tokens_per_week
-            )
-        })?;
+    let remaining_current_week =
+        dexdo_core::subscription_current_week_headroom(&facts.state, &facts.subscription)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(SubscriptionQuotaView {
         claimed_current_week,
         remaining_current_week,
         buyer_locked_total,
     })
+}
+
+/// Whether a boundary booking must be attempted before this deal's quota may be treated as an
+/// allowance.
+/// Two triggers, and the second is the one a stale positive remainder hides behind: the recorded week
+/// shows nothing left, OR it has run out on the wall clock. Booking only on a zero remainder would
+/// serve the previous week's unspent tokens straight across its boundary, which is exactly the
+/// roll-over the term does not have.
+#[cfg(feature = "shellnet")]
+fn subscription_boundary_is_due(facts: &SubscriptionDealFacts) -> bool {
+    if facts.subscription.term_is_over() || !facts.subscription.is_subscription() {
+        return false;
+    }
+    let quota_spent =
+        dexdo_core::subscription_current_week_headroom(&facts.state, &facts.subscription)
+            .map(|headroom| headroom == 0)
+            .unwrap_or(true);
+    quota_spent || facts.subscription.recorded_week_expires_at() <= unix_now_secs()
+}
+
+/// The part of a recorded quota that may actually be handed to a route.
+/// After a booking attempt the books are as authoritative as they are going to get. If the week they
+/// describe has still run out on the wall clock, no boundary was booked, and what is on record belongs
+/// to a week that has ended: report nothing rather than a figure that would resume onto a spent week.
+/// The running route reconciles again on its first request and picks the new week up from the chain.
+#[cfg(feature = "shellnet")]
+fn subscription_authorized_remaining(
+    facts: &SubscriptionDealFacts,
+    quota: &SubscriptionQuotaView,
+) -> u128 {
+    if facts.subscription.is_subscription()
+        && !facts.subscription.term_is_over()
+        && facts.subscription.recorded_week_expires_at() <= unix_now_secs()
+    {
+        return 0;
+    }
+    quota.remaining_current_week
 }
 
 #[cfg(feature = "shellnet")]
@@ -1622,7 +1673,32 @@ async fn classify_subscription_resume_target(
         model_hash: model_hash_for(frame_model),
         buyer_note: expected_note_addr.to_string(),
     };
-    let quota = validate_subscription_deal_facts(expected_note_addr, &order, &matched, &facts)?;
+    let mut facts = facts;
+    let mut quota = validate_subscription_deal_facts(expected_note_addr, &order, &matched, &facts)?;
+    // the recorded books are not an authorization. A resume that lands after a boundary and
+    // before anyone booked it reads the PREVIOUS week's spent quota, and refusing on that would strand
+    // the subscription at zero for the rest of its term.
+    if subscription_boundary_is_due(&facts) {
+        // The booking's response is not evidence either way: a submission whose response was lost
+        // still moved the chain. So attempt it, then ALWAYS re-read and let the booked state decide.
+        let _ = chain.settle_week(&token_contract.to_string()).await;
+        let booked = chain
+            .deal_snapshot(&token_contract.to_string())
+            .await
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "TokenContract {token_contract}: no coherent snapshot after booking the weekly \
+                     boundary"
+                )
+            })?;
+        facts.state = booked.state;
+        facts.subscription = booked.subscription;
+        facts.seller_bond = booked.seller_bond;
+        facts.buyer_bond = booked.buyer_bond;
+        quota = validate_subscription_deal_facts(expected_note_addr, &order, &matched, &facts)?;
+        quota.remaining_current_week = subscription_authorized_remaining(&facts, &quota);
+    }
     Ok(Some(SubscriptionRuntimeView {
         ticks,
         order_id: historical_fill.map(|fill| fill.order_id),
@@ -1680,6 +1756,14 @@ trait SubscriptionOrderOps: Send + Sync {
         order: &BuyerSubscriptionOrderRecord,
         matched: &BuyerJournalMatch,
     ) -> Result<SubscriptionDealFacts>;
+
+    /// Attempt the permissionless weekly boundary booking.
+    /// Returns nothing on purpose: the submission's ANSWER is not evidence either way. A booking
+    /// whose response was lost still moved the chain, and one the contract refused leaves the books
+    /// exactly where they stood - so every caller re-reads the authoritative snapshot afterwards and
+    /// decides from the booked state. It is a money path: it charges weeks the term already owes out
+    /// of escrow(`_deposit -= pay + fee`), while committing nothing new.
+    async fn book_subscription_week(&self, token_contract: &str);
 }
 
 #[cfg(feature = "shellnet")]
@@ -1813,6 +1897,12 @@ impl SubscriptionOrderOps for dexdo_core::RealChainBackend {
             buyer_note,
         })
     }
+
+    async fn book_subscription_week(&self, token_contract: &str) {
+        if let Ok(tc) = dexdo_core::Address::parse(token_contract) {
+            let _ = self.settle_week(&tc).await;
+        }
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -1918,6 +2008,10 @@ impl SubscriptionOrderOps for BuyerSubscriptionResumeOps<'_> {
             model_hash: order.model_hash.clone(),
             buyer_note: expected_note_addr.to_string(),
         })
+    }
+
+    async fn book_subscription_week(&self, token_contract: &str) {
+        let _ = self.chain.settle_week(&token_contract.to_string()).await;
     }
 }
 
@@ -2207,10 +2301,23 @@ async fn refresh_subscription_match(
         anyhow::anyhow!("subscription order #{order_id} has no matched TokenContract")
     })?;
     let fill = matched.as_fill();
-    let facts = ops
+    let mut facts = ops
         .subscription_deal_facts(note_addr, &current, &fill)
         .await?;
-    let quota = validate_subscription_deal_facts(note_addr, &current, &fill, &facts)?;
+    let mut quota = validate_subscription_deal_facts(note_addr, &current, &fill, &facts)?;
+    // the recorded books are not an authorization. A restart that lands after a boundary and
+    // before anyone booked it reads the PREVIOUS week's spent quota, and resuming on that would
+    // strand the subscription at zero for the rest of its term.
+    if subscription_boundary_is_due(&facts) {
+        // The booking's response is not evidence: a submission whose response was lost still moved
+        // the chain. Attempt it, then ALWAYS re-read and let the booked state decide.
+        ops.book_subscription_week(&matched.token_contract).await;
+        facts = ops
+            .subscription_deal_facts(note_addr, &current, &fill)
+            .await?;
+        quota = validate_subscription_deal_facts(note_addr, &current, &fill, &facts)?;
+        quota.remaining_current_week = subscription_authorized_remaining(&facts, &quota);
+    }
     let terminal = facts.state.disputed || facts.state.is_stopped();
     let record = subscription_order_record_mut(&mut state, order_book, order_id)
         .expect("record was resolved above");
@@ -6770,7 +6877,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     #[cfg(feature = "shellnet")]
     let mut subscription_route_budget = None;
     #[cfg(not(feature = "shellnet"))]
-    let subscription_route_budget = Option::<u64>::default();
+    let subscription_route_budget = Option::<SubscriptionRouteBudget>::default();
     #[cfg(feature = "shellnet")]
     let mut preserve_subscription = false;
     #[cfg(not(feature = "shellnet"))]
@@ -7038,14 +7145,17 @@ async fn prepare_lazy_buyer_api_deal_once(
         {
             buy_ticks = subscription.ticks;
             buyer_order_id = buyer_order_id.or(subscription.order_id);
-            subscription_route_budget = Some(
-                u64::try_from(subscription.quota.remaining_current_week).map_err(|_| {
-                    anyhow::anyhow!(
-                        "subscription remaining weekly quota {} exceeds u64",
-                        subscription.quota.remaining_current_week
-                    )
-                })?,
-            );
+            subscription_route_budget = Some(SubscriptionRouteBudget {
+                remaining_current_week: u64::try_from(subscription.quota.remaining_current_week)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "subscription remaining weekly quota {} exceeds u64",
+                            subscription.quota.remaining_current_week
+                        )
+                    })?,
+                state: subscription.facts.state,
+                subscription: subscription.facts.subscription,
+            });
             preserve_subscription = true;
             emit_shared_buyer_event(
                 &events,
@@ -7220,7 +7330,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     )?;
     let session = Arc::new(
         dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
-            chain,
+            chain.clone(),
             token_contract.clone(),
             buyer.note.clone(),
             api_failure_policy,
@@ -7231,11 +7341,13 @@ async fn prepare_lazy_buyer_api_deal_once(
             },
         ),
     );
-    Ok(dexdo::buyer::api::ApiDeal::new(
+    let weekly = subscription_weekly_budget(&chain, &token_contract, subscription_route_budget);
+    let deal = dexdo::buyer::api::ApiDeal::new(
         dexdo::buyer::api::Route {
             handover,
             token_contract,
             max_tokens: subscription_route_budget
+                .map(|budget| budget.remaining_current_week)
                 .unwrap_or_else(|| consumer_api_token_budget(buy_ticks)),
         },
         session,
@@ -7243,7 +7355,28 @@ async fn prepare_lazy_buyer_api_deal_once(
             content_check,
             models_cfg,
         )),
-    ))
+    );
+    Ok(match weekly {
+        Some(weekly) => deal.with_weekly_budget(weekly),
+        None => deal,
+    })
+}
+
+/// A subscription route's live weekly allowance; `None` for an ordinary by-fact deal, whose
+/// funded budget is the whole term's volume and never moves.
+fn subscription_weekly_budget(
+    chain: &Arc<dyn ChainBackend>,
+    token_contract: &str,
+    budget: Option<SubscriptionRouteBudget>,
+) -> Option<Arc<dexdo::buyer::api::SubscriptionWeeklyBudget>> {
+    budget.map(|budget| {
+        Arc::new(dexdo::buyer::api::SubscriptionWeeklyBudget::new(
+            chain.clone(),
+            token_contract.to_string(),
+            &budget.state,
+            &budget.subscription,
+        ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8019,7 +8152,7 @@ async fn run_buyer_inner(
     #[cfg(feature = "shellnet")]
     let mut subscription_route_budget = None;
     #[cfg(not(feature = "shellnet"))]
-    let subscription_route_budget = Option::<u64>::default();
+    let subscription_route_budget = Option::<SubscriptionRouteBudget>::default();
     #[cfg(feature = "shellnet")]
     let mut preserve_subscription = false;
     #[cfg(not(feature = "shellnet"))]
@@ -8074,14 +8207,17 @@ async fn run_buyer_inner(
                 .expect("matched resume record");
             let tc = matched.token_contract.clone();
             buyer_order_id = Some(resumed.record.order_id);
-            subscription_route_budget = Some(
-                u64::try_from(resumed.quota.remaining_current_week).map_err(|_| {
-                    anyhow::anyhow!(
-                        "subscription remaining weekly quota {} exceeds u64",
-                        resumed.quota.remaining_current_week
-                    )
-                })?,
-            );
+            subscription_route_budget = Some(SubscriptionRouteBudget {
+                remaining_current_week: u64::try_from(resumed.quota.remaining_current_week)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "subscription remaining weekly quota {} exceeds u64",
+                            resumed.quota.remaining_current_week
+                        )
+                    })?,
+                state: resumed.facts.state,
+                subscription: resumed.facts.subscription,
+            });
             preserve_subscription = true;
             machine_context.order_book = Some(resumed.record.order_book.clone());
             machine_context.set_token_contract(&tc);
@@ -8443,14 +8579,17 @@ async fn run_buyer_inner(
         {
             buy_ticks = subscription.ticks;
             buyer_order_id = buyer_order_id.or(subscription.order_id);
-            subscription_route_budget = Some(
-                u64::try_from(subscription.quota.remaining_current_week).map_err(|_| {
-                    anyhow::anyhow!(
-                        "subscription remaining weekly quota {} exceeds u64",
-                        subscription.quota.remaining_current_week
-                    )
-                })?,
-            );
+            subscription_route_budget = Some(SubscriptionRouteBudget {
+                remaining_current_week: u64::try_from(subscription.quota.remaining_current_week)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "subscription remaining weekly quota {} exceeds u64",
+                            subscription.quota.remaining_current_week
+                        )
+                    })?,
+                state: subscription.facts.state,
+                subscription: subscription.facts.subscription,
+            });
             preserve_subscription = true;
             if let Some(events) = machine_events.as_mut() {
                 events.event(
@@ -8656,20 +8795,28 @@ async fn run_buyer_inner(
         let (content_check, models_cfg) = buyer_content_policy
             .expect("local-listen buyer content policy is preflighted before buy");
         let renewal_content_check = content_check.clone();
-        let state = ApiState::single(
-            buyer,
+        let weekly = subscription_weekly_budget(&chain, &token_contract, subscription_route_budget);
+        let deal = dexdo::buyer::api::ApiDeal::new(
             Route {
                 handover,
                 token_contract: token_contract.clone(),
                 max_tokens: subscription_route_budget
+                    .map(|budget| budget.remaining_current_week)
                     .unwrap_or_else(|| consumer_api_token_budget(buy_ticks)),
             },
-            frame_model.clone(),
             session.clone(),
             std::sync::Arc::new(dexdo::buyer::api::ContentGate::new(
                 content_check,
                 models_cfg.clone(),
             )),
+        );
+        let state = ApiState::single_deal(
+            buyer,
+            frame_model.clone(),
+            match weekly {
+                Some(weekly) => deal.with_weekly_budget(weekly),
+                None => deal,
+            },
         );
         if let Some((ticks, max_price, escrow)) = service_renewal {
             spawn_buyer_service_renewal(
@@ -8832,8 +8979,13 @@ async fn run_buyer_inner(
             dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit
         },
     );
-    let stream_max_tokens =
-        subscription_oneshot_budget(args.max_tokens, subscription_route_budget)?;
+    // the figure this refuses on is recomputed from the fresh resume snapshot against the clock,
+    // never a cached scalar -- a stored `weekBaseTokens` that no boundary has booked yet cannot turn a
+    // live subscription into a permanent one-shot refusal.
+    let stream_max_tokens = subscription_oneshot_budget(
+        args.max_tokens,
+        subscription_route_budget.map(|budget| budget.remaining_current_week),
+    )?;
     let mut stream_attempt = 1u64;
     let out = loop {
         match buyer
@@ -8891,7 +9043,7 @@ async fn settle_completed_oneshot(session: &dexdo::buyer::api::SessionSettle) ->
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
-    use crate::cli::args::{IdentityArgs, NoteDeployArgs};
+    use crate::cli::args::{NoteDeployArgs, RecoveryIdentityArgs};
 
     #[cfg(feature = "shellnet")]
     fn ordinary_gateway_snapshot(
@@ -9929,9 +10081,10 @@ mod tests {
         use dexdo_core::{
             ChainBackend, DobParams, LocalNote, MockChainBackend, ProtocolConsts, SellOffer,
         };
-        let path = std::env::temp_dir().join("dexdo_book_demo_endpoints.json");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("chainstate.json"));
+        // this was a FIXED name under the shared temp directory, with no pid and no random
+        // component, so two test processes on the same builder used and deleted the same file.
+        let dir = tempfile::tempdir().expect("book demo temp dir");
+        let path = dir.path().join("endpoints.json");
         let mock = MockChainBackend::new(path, ProtocolConsts::canonical(), DobParams::canonical());
         let note = LocalNote::generate();
         let asks = [
@@ -11219,11 +11372,10 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = super::resolve_pool_recovery_inputs(
-            "reclaim",
-            &IdentityArgs {
+        // `pool_record` exists only on the path that persists it, so this is `recover`'s resolver.
+        let resolved = super::resolve_persistable_pool_recovery_inputs(
+            &RecoveryIdentityArgs {
                 note_key: None,
-                note_index: 0,
                 note_addr: None,
             },
             None,
@@ -11281,11 +11433,9 @@ mod tests {
         std::fs::write(&retargeted_pool, &pool_bytes).unwrap();
         std::os::unix::fs::symlink(&original_pool, &pool_alias).unwrap();
 
-        let resolved = super::resolve_pool_recovery_inputs(
-            "recover",
-            &IdentityArgs {
+        let resolved = super::resolve_persistable_pool_recovery_inputs(
+            &RecoveryIdentityArgs {
                 note_key: None,
-                note_index: 0,
                 note_addr: None,
             },
             None,
@@ -11403,10 +11553,8 @@ mod tests {
             .unwrap();
 
             let resolved = super::resolve_pool_recovery_inputs(
-                "reclaim",
-                &IdentityArgs {
+                &RecoveryIdentityArgs {
                     note_key: None,
-                    note_index: 0,
                     note_addr: None,
                 },
                 None,
@@ -11455,19 +11603,19 @@ mod tests {
         )
         .unwrap();
 
-        let err = super::resolve_pool_recovery_inputs(
-            "recover",
-            &IdentityArgs {
+        // Not `unwrap_err`: resolved inputs carry a note secret and nothing may render them.
+        let err = match super::resolve_pool_recovery_inputs(
+            &RecoveryIdentityArgs {
                 note_key: None,
-                note_index: 0,
                 note_addr: None,
             },
             None,
             None,
             Some(pool_path.as_path()),
-        )
-        .unwrap_err()
-        .to_string();
+        ) {
+            Ok(_) => panic!("two matching recovery entries must not resolve to one"),
+            Err(error) => error.to_string(),
+        };
 
         assert!(err.contains("disambiguate"), "{err}");
     }
@@ -12458,14 +12606,13 @@ mod tests {
         buyer: &dexdo::buyer::Buyer,
         token_contract: &str,
     ) -> (dexdo::seller::RunningSeller, dexdo_core::Handover) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve  gateway port");
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let seller = dexdo::seller::start_gateway_with(addr, upstream)
+        // shape B: the gateway makes the ONE bind. Reserving a port here and releasing it
+        // before `start_gateway_with` re-binds hands it back to the kernel, and any concurrent
+        // `bind(0)` can be given that exact port in between.
+        let seller = dexdo::seller::start_gateway_with("127.0.0.1:0".parse().unwrap(), upstream)
             .await
             .expect("start  TLS gateway");
+        let addr = seller.listen_addr;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if tokio::net::TcpStream::connect(addr).await.is_ok() {
@@ -14646,6 +14793,10 @@ mod tests {
             }
             Ok(subscription_test_facts(order, expected_note_addr))
         }
+
+        /// These fixtures stand inside a recorded week, so no boundary is ever due -- the contract
+        /// refuses the booking and the recorded books stand.
+        async fn book_subscription_week(&self, _token_contract: &str) {}
     }
 
     #[cfg(feature = "shellnet")]
@@ -14655,8 +14806,14 @@ mod tests {
         snapshot_overrides:
             std::sync::Mutex<std::collections::BTreeMap<String, dexdo_core::DealChainSnapshot>>,
         reject_target: Option<String>,
+        /// Weekly boundaries the CHAIN has crossed and nobody has booked; `settle_week` books them.
+        due_boundaries: std::sync::Mutex<u8>,
+        settle_bookings: std::sync::atomic::AtomicUsize,
         attributed_fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
-        money_posts: std::sync::atomic::AtomicUsize,
+        /// BUY submissions only(`place_buy`/`place_buy_by_model`). It says nothing about value
+        /// that MOVES: a boundary booking charges weeks the term already owes out of escrow. What
+        /// zero here proves is that resume posted no second BUY.
+        buy_posts: std::sync::atomic::AtomicUsize,
         lookback_reads: std::sync::atomic::AtomicUsize,
         target_checks: std::sync::atomic::AtomicUsize,
     }
@@ -14664,6 +14821,34 @@ mod tests {
     #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SubscriptionResumeChain {
+        /// The permissionless boundary booking, as the contract implements it: it settles only what
+        /// the CHAIN has crossed and refuses when the window is still open.
+        async fn settle_week(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            let mut due = self.due_boundaries.lock().unwrap();
+            let mut overrides = self.snapshot_overrides.lock().unwrap();
+            let booked = overrides
+                .entry(token_contract.clone())
+                .or_insert_with(|| self.snapshot.clone());
+            if *due == 0 || booked.subscription.term_is_over() {
+                return Err(dexdo_core::ChainError::Chain(
+                    "ERR_SETTLE_WINDOW_OPEN".to_string(),
+                ));
+            }
+            while *due > 0 && !booked.subscription.term_is_over() {
+                booked.subscription.week_index += 1;
+                booked.subscription.tokens_paid = u128::from(booked.subscription.week_index)
+                    * booked.subscription.tokens_per_week;
+                booked.subscription.week_base_tokens = booked.state.tokens_pending;
+                *due -= 1;
+            }
+            self.settle_bookings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -14683,7 +14868,7 @@ mod tests {
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
         ) -> Result<(), dexdo_core::ChainError> {
-            self.money_posts
+            self.buy_posts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("durable subscription resume attempted a second BUY")
         }
@@ -14697,7 +14882,7 @@ mod tests {
             _flags: u8,
             _deadline: u64,
         ) -> Result<(), dexdo_core::ChainError> {
-            self.money_posts
+            self.buy_posts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("durable subscription resume attempted a second model BUY")
         }
@@ -14874,7 +15059,10 @@ mod tests {
                 tokens_per_week: funded_tokens / u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
                 funded_tokens,
                 tokens_paid: 0,
-                period_start: 1,
+                // The weekly clock is anchored at the accepted probe. A subscription fixture must
+                // carry a real anchor: the current-week allowance is derived from how far the clock
+                // has run past it, so `1` would read as a four-week-old, finished term.
+                period_start: super::unix_now_secs(),
                 week_base_tokens: 0,
             },
             seller_bond: dexdo_core::DealSellerBond {
@@ -15359,20 +15547,104 @@ mod tests {
             ).is_err());
         }
 
+        /// The status pair over CONTRACT-REACHABLE books only, proved reachable by the exact getter
+        /// decoders rather than asserted to be.
+        /// Every figure is derived from one canonical shape: the volume is a whole number of ticks
+        /// divisible by `SUB_WEEKS`(`InferenceOrderBook.sol:1309`), `fundedTokens` is exactly
+        /// `tokensPerWeek * SUB_WEEKS`, the claim pipeline is monotonic and never below the tick
+        /// `acceptProbe` seeded, and the cumulative claim never passes the week's `_claimCap`. A
+        /// generator free to violate those relations proves arithmetic about a chain that cannot
+        /// exist.
         #[test]
-        fn subscription_quota_is_exactly_pending_minus_authoritative_week_base(
-            week_base in 0u128..=1_000_000_000_000,
-            claimed in 0u128..=1_000_000_000,
-            remaining in 0u128..=1_000_000_000,
+        fn subscription_quota_is_exactly_the_contract_ceiling_minus_pending_inside_the_week(
+            weeks_of_ticks in 1u128..=4,
+            week_index in 0u8..dexdo_core::SUBSCRIPTION_WEEKS,
+            claimed_ticks in 0u128..=4,
+            settled_lag in 0u128..=1,
         ) {
+            let tick = dexdo_core::TICK_SIZE;
+            let weeks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+            let tokens_per_week = weeks_of_ticks * tick;
+            let funded_tokens = tokens_per_week * weeks;
+            // Where the last booked boundary re-based the week: the cumulative claim at that point,
+            // which is at least the probe's tick and at most everything the term funds.
+            let week_base_tokens =
+                (u128::from(week_index) * tokens_per_week).max(tick).min(funded_tokens);
+            let cap = (week_base_tokens + tokens_per_week).min(funded_tokens);
+            // Consumption inside the recorded week never passes that ceiling.
+            let claimed_in_week = (claimed_ticks * tick).min(cap - week_base_tokens);
+            let tokens_pending = week_base_tokens + claimed_in_week;
+            // The pipeline is monotonic: `tokensFinal <= tokensSuperseded <= tokensPending`.
+            let tokens_final = tokens_pending.saturating_sub(settled_lag * tick).max(tick);
+            let tokens_superseded = tokens_final
+                .max(tokens_pending.saturating_sub(tick))
+                .min(tokens_pending);
+
             let order = subscription_test_record(39);
             let mut facts = subscription_test_facts(&order, &subscription_test_note());
-            facts.subscription.week_base_tokens = week_base;
-            facts.subscription.tokens_per_week = claimed + remaining;
-            facts.state.tokens_pending = week_base + claimed;
+            // Prove the shape decodes through the EXACT production getter decoders before any
+            // behaviour is asserted on it.
+            facts.state = dexdo_core::DealChainState::decode_getter(&serde_json::json!({
+                "funded": true,
+                "opened": true,
+                "probeAccepted": true,
+                "disputed": false,
+                "deposit": facts.state.deposit.to_string(),
+                "probeTick": "0",
+                "finalizedOwed": "0",
+                "tokensFinal": tokens_final.to_string(),
+                "tokensSuperseded": tokens_superseded.to_string(),
+                "tokensPending": tokens_pending.to_string(),
+                "probeTime": "1",
+                "prevClaimTime": "1",
+                "lastClaimTime": "1",
+                "disputeTime": "0",
+                "fundedTime": "1"
+            }))
+            .expect("a canonical claim pipeline decodes");
+            facts.subscription = dexdo_core::DealSubscription::decode_getter(&serde_json::json!({
+                "dealFlags": dexdo_core::order_flags::SUBSCRIPTION.to_string(),
+                "subWeeks": dexdo_core::SUBSCRIPTION_WEEKS.to_string(),
+                "weekIndex": week_index.to_string(),
+                "tokensPerWeek": tokens_per_week.to_string(),
+                "fundedTokens": funded_tokens.to_string(),
+                "tokensPaid": (u128::from(week_index) * tokens_per_week).max(tick).to_string(),
+                "periodStart": "1",
+                "weekBaseTokens": week_base_tokens.to_string()
+            }))
+            .expect("canonical weekly books decode");
+
             let view = super::subscription_quota_view(&facts).unwrap();
-            proptest::prop_assert_eq!(view.claimed_current_week, claimed);
-            proptest::prop_assert_eq!(view.remaining_current_week, remaining);
+            proptest::prop_assert_eq!(view.claimed_current_week, claimed_in_week);
+            proptest::prop_assert_eq!(view.remaining_current_week, cap - tokens_pending);
+        }
+
+        /// The same shape with ONE relation broken must fail closed, not compute.
+        #[test]
+        fn malformed_getter_relations_are_rejected_before_any_quota_is_computed(
+            regress in 1u128..=4,
+        ) {
+            let tick = dexdo_core::TICK_SIZE;
+            // `tokensPending` below `tokensFinal` reverses the claim pipeline: the strict decoder
+            // must refuse it outright rather than let a quota be derived from it.
+            let broken = dexdo_core::DealChainState::decode_getter(&serde_json::json!({
+                "funded": true,
+                "opened": true,
+                "probeAccepted": true,
+                "disputed": false,
+                "deposit": "1000",
+                "probeTick": "0",
+                "finalizedOwed": "0",
+                "tokensFinal": ((regress + 1) * tick).to_string(),
+                "tokensSuperseded": ((regress + 1) * tick).to_string(),
+                "tokensPending": (regress * tick).to_string(),
+                "probeTime": "1",
+                "prevClaimTime": "1",
+                "lastClaimTime": "1",
+                "disputeTime": "0",
+                "fundedTime": "1"
+            }));
+            proptest::prop_assert!(broken.is_err());
         }
 
         #[test]
@@ -15406,13 +15678,17 @@ mod tests {
             .contains("below weekBaseTokens"));
 
         facts.state.tokens_pending = 31;
+        facts.state.tokens_final = 31;
+        facts.state.tokens_superseded = 31;
         facts.subscription.tokens_per_week = 10;
         assert!(super::subscription_quota_view(&facts)
             .unwrap_err()
             .to_string()
-            .contains("exceeds quota"));
+            .contains("exceeds the recorded week claim ceiling"));
 
         facts.state.tokens_pending = 20;
+        facts.state.tokens_final = 20;
+        facts.state.tokens_superseded = 20;
         facts.subscription.tokens_per_week = 10;
         facts.state.deposit = u128::MAX;
         facts.buyer_bond.bond_held = 1;
@@ -16082,8 +16358,10 @@ mod tests {
             snapshot: subscription_test_snapshot(&record, &note_addr),
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: None,
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16122,6 +16400,112 @@ mod tests {
         assert_eq!(chain.target_checks.load(Ordering::SeqCst), 2);
     }
 
+    /// a restart mid-term must reconstruct the allowance the CONTRACT is on, not the one the
+    /// stored getter still remembers. `weekBaseTokens`/`weekIndex` move when a week is BOOKED; a
+    /// restart that lands after a boundary and before anyone settles reads week one's books and would
+    /// otherwise resume onto a quota that was already spent -- permanently, for the rest of the term.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn restart_after_an_unbooked_boundary_reconstructs_the_new_week_allowance() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-restart-weekly-allowance");
+        let note_addr = subscription_test_note();
+        let mut record = subscription_test_record(84);
+        let tc = subscription_test_tc('a');
+        record.phase = super::BuyerSubscriptionPhase::Matched;
+        record.matched = Some(super::BuyerSubscriptionMatch {
+            token_contract: tc.clone(),
+            order_id: record.order_id,
+            ticks: record.ticks,
+            clearing_price: record.max_price_per_tick,
+            deal_handle: crate::cli::deals::make_handle_id(
+                &tc,
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+        });
+        let state = super::BuyerSubscriptionState {
+            schema: super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+            note_addr: note_addr.clone(),
+            orders: vec![record.clone()],
+        };
+        let money_lock = super::BuyerMoneyLock {
+            note_addr: note_addr.clone(),
+            path: dir.join("money.lock"),
+            journal_path: dir.join("money.json"),
+            subscriptions_path: dir.join("subscriptions.json"),
+            lock: None,
+        };
+        super::write_buyer_subscription_state(&money_lock.subscriptions_path, &state).unwrap();
+
+        // Week one was drawn down and the seller claimed it. Nobody has booked the boundary the clock
+        // has since crossed, so the getter still reports weekIndex=0 / weekBaseTokens=0.
+        let mut snapshot = subscription_test_snapshot(&record, &note_addr);
+        let weekly_quota = snapshot.subscription.tokens_per_week;
+        snapshot.state.tokens_final = weekly_quota;
+        snapshot.state.tokens_superseded = weekly_quota;
+        snapshot.state.tokens_pending = weekly_quota;
+        assert_eq!(snapshot.subscription.week_index, 0);
+        assert_eq!(snapshot.subscription.week_base_tokens, 0);
+
+        let chain = SubscriptionResumeChain {
+            order_book: record.order_book.clone(),
+            snapshot,
+            snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            reject_target: None,
+            // The chain has crossed one boundary; nobody has booked it, which is why the getter the
+            // restart reads still reports week one's spent quota.
+            due_boundaries: std::sync::Mutex::new(1),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
+            attributed_fills: std::sync::Mutex::new(Vec::new()),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
+            lookback_reads: std::sync::atomic::AtomicUsize::new(0),
+            target_checks: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let selected = super::resolve_buyer_subscription_resume(
+            &chain,
+            &note_addr,
+            &record.frame_model,
+            None,
+            &money_lock,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap()
+        .expect("the durable subscription resumes mid-term");
+
+        assert_eq!(
+            chain
+                .settle_bookings
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restart must BOOK the due boundary, never predict it from the local clock"
+        );
+        assert_eq!(
+            selected.quota.remaining_current_week, weekly_quota,
+            "a restart across an unbooked boundary must resume onto the NEW week's whole quota"
+        );
+        assert_eq!(
+            selected.quota.claimed_current_week, 0,
+            "after booking, claimed and remaining must be read from the SAME fresh week base"
+        );
+        assert_eq!(
+            super::subscription_oneshot_budget(
+                64,
+                Some(u64::try_from(selected.quota.remaining_current_week).unwrap()),
+            )
+            .unwrap(),
+            64,
+            "one-shot must not refuse on a stored zero the contract would have accepted"
+        );
+        assert_eq!(
+            chain.buy_posts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "reconstructing an allowance posts no second BUY - which is all this counter can say: \
+             the boundary booking it performs DOES move already-escrowed value"
+        );
+    }
+
     #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn historical_subscription_terminal_is_rejected_before_active_target_check() {
@@ -16137,8 +16521,10 @@ mod tests {
             snapshot,
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: Some(token_contract.clone()),
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16575,8 +16961,10 @@ mod tests {
             snapshot: subscription_test_snapshot(&record, &note_addr),
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: None,
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16597,7 +16985,7 @@ mod tests {
             message.contains(&format!("order#{}", record.order_id)),
             "{message}"
         );
-        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.buy_posts.load(Ordering::SeqCst), 0);
         assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
     }
 
@@ -16639,8 +17027,10 @@ mod tests {
             snapshot: subscription_test_snapshot(&record, &note_addr),
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: None,
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16664,13 +17054,16 @@ mod tests {
                 record.matched.as_ref().unwrap().deal_handle
             );
         }
-        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.buy_posts.load(Ordering::SeqCst), 0);
         assert_eq!(
             chain.lookback_reads.load(Ordering::SeqCst),
             0,
             "persisted TC must win even beyond RESUME_LOOKBACK_SECS"
         );
-        assert_eq!(chain.target_checks.load(Ordering::SeqCst), 2);
+        // Two candidates, each read twice: once for the recorded books and once for the state
+        // the boundary-booking attempt published. The booking's response is not evidence, so the
+        // second read is not optional.
+        assert_eq!(chain.target_checks.load(Ordering::SeqCst), 4);
 
         let mut terminal = state.clone();
         terminal.orders[0].phase = super::BuyerSubscriptionPhase::Terminal;
@@ -16687,7 +17080,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("terminal"), "{error:#}");
-        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.buy_posts.load(Ordering::SeqCst), 0);
         assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
 
         let mut active = subscription_test_record(83);
@@ -16721,7 +17114,7 @@ mod tests {
             selected.record.matched.as_ref().unwrap().token_contract,
             active_tc
         );
-        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.buy_posts.load(Ordering::SeqCst), 0);
         assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
     }
 
@@ -16751,8 +17144,10 @@ mod tests {
             snapshot: subscription_test_snapshot(&record, &note_addr),
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: None,
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16769,7 +17164,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("still resting"), "{error:#}");
-        assert_eq!(chain.money_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.buy_posts.load(Ordering::SeqCst), 0);
         assert_eq!(
             chain.lookback_reads.load(Ordering::SeqCst),
             0,
@@ -16818,8 +17213,10 @@ mod tests {
             snapshot: subscription_test_snapshot(&first, &note_addr),
             snapshot_overrides: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             reject_target: None,
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16914,8 +17311,10 @@ mod tests {
             // A terminal deal can fail every active-target check; resume must first observe its
             // authoritative terminal snapshot and must not run that live-only assertion.
             reject_target: Some(stale_tc.clone()),
+            due_boundaries: std::sync::Mutex::new(0),
+            settle_bookings: std::sync::atomic::AtomicUsize::new(0),
             attributed_fills: std::sync::Mutex::new(Vec::new()),
-            money_posts: std::sync::atomic::AtomicUsize::new(0),
+            buy_posts: std::sync::atomic::AtomicUsize::new(0),
             lookback_reads: std::sync::atomic::AtomicUsize::new(0),
             target_checks: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -16938,8 +17337,9 @@ mod tests {
         );
         assert_eq!(
             chain.target_checks.load(Ordering::SeqCst),
-            1,
-            "only the live candidate receives the active-target assertion"
+            2,
+            "only the live candidate receives the active-target assertion - twice, because its books \
+             are re-read after the boundary-booking attempt, and never the terminal one"
         );
 
         let refreshed =
@@ -18384,6 +18784,12 @@ mod tests {
                 buyer_note: expected_note_addr.to_string(),
             })
         }
+
+        /// Through this mock's own counted `settle_week`, so a booking the resume submits is
+        /// indistinguishable from any other and shows up in `settle_week_posts`.
+        async fn book_subscription_week(&self, token_contract: &str) {
+            let _ = dexdo_core::ChainBackend::settle_week(self, &token_contract.to_string()).await;
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -19001,14 +19407,11 @@ mod tests {
             price_per_tick: fixture.quoted_order.price_per_tick,
         };
         let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
-        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve gateway port");
-        let gateway_addr = gateway_listener.local_addr().unwrap();
-        drop(gateway_listener);
-        let seller = dexdo::seller::start_gateway(gateway_addr)
+        // shape B: the gateway makes the ONE bind, and reports the port it actually got.
+        let seller = dexdo::seller::start_gateway("127.0.0.1:0".parse().unwrap())
             .await
             .expect("start TLS mock-token gateway");
+        let gateway_addr = seller.listen_addr;
         let mut gateway_ready = false;
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
@@ -19038,11 +19441,6 @@ mod tests {
             deal_state_count: std::sync::atomic::AtomicUsize::new(0),
         });
 
-        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve local API port");
-        let api_addr = api_listener.local_addr().unwrap();
-        drop(api_listener);
         let policy_path = dir.join("policy.json");
         std::fs::write(
             &policy_path,
@@ -19083,7 +19481,7 @@ mod tests {
             resume: true,
             market: None,
             max_tokens: 8,
-            local_listen: Some(api_addr),
+            local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
             anthropic_compat: false,
@@ -19118,6 +19516,25 @@ mod tests {
             )
             .await
         });
+        // shape B: production makes the ONE bind. Reserving a port here and releasing it
+        // before `run_buyer_inner` re-binds hands it back to the kernel, and any concurrent
+        // `bind(0)` can be given that exact port in between. `--local-listen 127.0.0.1:0` lets the
+        // kernel choose, and `endpoint_ready.bind_addr` is where production reports what it got.
+        let mut bound = None;
+        for _ in 0..100 {
+            bound = captured_machine_events
+                .lock()
+                .expect("captured buyer events lock poisoned")
+                .iter()
+                .find(|event| event["event"] == "endpoint_ready")
+                .and_then(|event| event["bind_addr"].as_str())
+                .map(str::to_string);
+            if bound.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let api_addr = bound.expect("run_buyer_inner must report the local API it bound");
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -19355,14 +19772,11 @@ mod tests {
         };
         let snapshot = subscription_test_snapshot(&expected_record, &journal.note_addr);
         let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
-        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve gateway port");
-        let gateway_addr = gateway_listener.local_addr().unwrap();
-        drop(gateway_listener);
-        let seller = dexdo::seller::start_gateway(gateway_addr)
+        // shape B: the gateway makes the ONE bind, and reports the port it actually got.
+        let seller = dexdo::seller::start_gateway("127.0.0.1:0".parse().unwrap())
             .await
             .expect("start TLS mock-token gateway");
+        let gateway_addr = seller.listen_addr;
         let mut gateway_ready = false;
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
@@ -19405,11 +19819,6 @@ mod tests {
             deal_state_count: std::sync::atomic::AtomicUsize::new(0),
         });
 
-        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve local API port");
-        let api_addr = api_listener.local_addr().unwrap();
-        drop(api_listener);
         let policy_path = dir.join("policy.json");
         std::fs::write(
             &policy_path,
@@ -19450,7 +19859,7 @@ mod tests {
             resume: true,
             market: None,
             max_tokens: 8,
-            local_listen: Some(api_addr),
+            local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
             anthropic_compat: false,
@@ -19485,6 +19894,25 @@ mod tests {
             )
             .await
         });
+        // shape B: production makes the ONE bind. Reserving a port here and releasing it
+        // before `run_buyer_inner` re-binds hands it back to the kernel, and any concurrent
+        // `bind(0)` can be given that exact port in between. `--local-listen 127.0.0.1:0` lets the
+        // kernel choose, and `endpoint_ready.bind_addr` is where production reports what it got.
+        let mut bound = None;
+        for _ in 0..100 {
+            bound = captured_machine_events
+                .lock()
+                .expect("captured buyer events lock poisoned")
+                .iter()
+                .find(|event| event["event"] == "endpoint_ready")
+                .and_then(|event| event["bind_addr"].as_str())
+                .map(str::to_string);
+            if bound.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let api_addr = bound.expect("run_buyer_inner must report the local API it bound");
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()

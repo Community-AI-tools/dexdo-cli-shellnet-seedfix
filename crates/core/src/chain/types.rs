@@ -1,6 +1,6 @@
 //! `chain` data types -- offers/match, deal/stream snapshots, accounting tallies, errors(PR4 move-only).
 use crate::note::NotePubkey;
-use crate::params::{Shell, SUBSCRIPTION_WEEKS};
+use crate::params::{Shell, SUBSCRIPTION_WEEKS, SUB_WEEK_LEN};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -354,6 +354,87 @@ impl DealSubscription {
     pub fn weeks_remaining(&self) -> u8 {
         self.sub_weeks.saturating_sub(self.week_index)
     }
+
+    /// Unix second at which the week recorded in [`Self::week_index`] runs out.
+    /// Informational: it says when a client should go and BOOK the boundary, never that the boundary
+    /// has been crossed. The contract measures `block.timestamp`; a client measures its own clock.
+    pub fn recorded_week_expires_at(&self) -> u64 {
+        if !self.is_subscription() || self.week_index >= self.sub_weeks {
+            return u64::MAX;
+        }
+        self.period_start
+            .saturating_add(u64::from(self.week_index).saturating_add(1) * SUB_WEEK_LEN.as_secs())
+    }
+
+    /// Whether the term is over according to the BOOKED weeks. Authoritative: `weekIndex` only moves
+    /// when a week is actually charged.
+    pub fn term_is_over(&self) -> bool {
+        self.is_subscription() && self.week_index >= self.sub_weeks
+    }
+}
+
+/// The cumulative claim ceiling implied by a SUBSCRIPTION's recorded weekly books -- `TokenContract._claimCap()`
+/// evaluated against the state as stored, with no boundary of its own.
+/// This is computed outside the contract, and how it stands to the ceiling the contract actually
+/// applies has THREE phases -- not a sign:
+/// 1. **No boundary crossed since the last booking -- EXACT.** The stored `weekBaseTokens` is the very
+/// one the contract would use and the formula is the same, `weekBaseTokens + tokensPerWeek` clamped
+/// by `fundedTokens`. There is no divergence at all in this phase.
+/// 2. **A boundary crossed but not booked, term still running -- MAY UNDERSTATE.**
+/// `_chargeWeeksThrough` raises `weekBaseTokens` to `max(tokensFinal, tokensPending)` at the
+/// boundary, monotonically upward, and `claimTokens` books the crossed boundaries itself before it
+/// measures the ceiling. Until someone books, this reads the smaller, older base. Non-strict:
+/// booking a week nobody used re-bases onto the same cumulative and raises nothing.
+/// 3. **Past the final boundary(`weekIndex >= subWeeks`) -- UPPER BOUND, may overstate.** The contract
+/// stops deriving the ceiling from a quota and returns the cumulative total already declared; the
+/// quota formula yields at least that, and a claim above it is refused. Non-strict: the two are
+/// equal when the final week's quota was fully consumed.
+/// One caveat, without which phase 2 reads too strong: inside the term the ceiling is also clamped by
+/// `fundedTokens`, so near the end of a term the understated and the exact figures can coincide by
+/// hitting that same clamp. That is not a fourth phase -- it is why the divergence disappears where the
+/// phase alone would not predict it. Neither phase 2 nor phase 3 is ever a STRICT inequality.
+/// The practical conclusion is the same in every phase: this may not be treated as a bound in either
+/// direction without comparing `weekIndex` against `subWeeks`, and a client that needs something to
+/// stand on calls the permissionless `settleWeek` and computes from the state that comes back rather
+/// than guessing which phase it is in. The rule must be fail-closed: past the final boundary, refresh
+/// the authoritative state and never carry a stale pre-boundary quota forward as authorization.
+pub fn subscription_claim_cap_at(
+    state: &DealChainState,
+    subscription: &DealSubscription,
+) -> Result<u128, String> {
+    if !subscription.is_subscription() {
+        // An ordinary deal has no weekly books: `weekBaseTokens`/`tokensPerWeek` are not fields it
+        // maintains, so a figure computed from them would be a number rather than a ceiling. There is
+        // no caller that wants one, and answering anyway is how a wrong one gets used.
+        return Err(
+            "deal is not a subscription; it has no weekly claim ceiling to compute".to_string(),
+        );
+    }
+    if subscription.term_is_over() {
+        // Past the final boundary the term sells no further capacity: the ceiling is the recorded
+        // cumulative and admits no new claim. There is no fifth week of a four-week term.
+        return Ok(state.tokens_pending);
+    }
+    subscription
+        .week_base_tokens
+        .checked_add(subscription.tokens_per_week)
+        .map(|cap| cap.min(subscription.funded_tokens))
+        .ok_or_else(|| "subscription weekBaseTokens + tokensPerWeek overflows uint128".to_string())
+}
+
+/// Tokens the recorded books still admit on top of the cumulative claim already declared. Zero means
+/// the RECORDED week is drawn down -- not, on its own, that the deal is finished.
+pub fn subscription_current_week_headroom(
+    state: &DealChainState,
+    subscription: &DealSubscription,
+) -> Result<u128, String> {
+    let cap = subscription_claim_cap_at(state, subscription)?;
+    cap.checked_sub(state.tokens_pending).ok_or_else(|| {
+        format!(
+            "subscription cumulative claim {} exceeds the recorded week claim ceiling {cap}",
+            state.tokens_pending
+        )
+    })
 }
 
 /// A single maker order consumed by an executable quote.
@@ -1050,6 +1131,7 @@ mod tests {
         SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
         SettlementActionReceipt, SUBSCRIPTION_WEEKS,
     };
+    use crate::TICK_SIZE;
     use proptest::prelude::*;
     use serde_json::{json, Value};
 
@@ -1164,6 +1246,203 @@ mod tests {
             "periodStart": "70",
             "weekBaseTokens": "80"
         })
+    }
+
+    /// One canonical week: two ticks. The book sells subscriptions in whole ticks divisible by
+    /// `SUB_WEEKS`(`InferenceOrderBook.sol:1309`), so four ticks is the true minimum and eight -- two
+    /// a week over four weeks -- is the smallest shape in which the probe's tick is part of a week
+    /// rather than the whole of it.
+    const WEEK: u128 = 2 * TICK_SIZE;
+    /// The whole term's volume: `tokensPerWeek * SUB_WEEKS`, the only relation the contract funds.
+    const FUNDED: u128 = WEEK * SUBSCRIPTION_WEEKS as u128;
+
+    /// A four-week subscription in CANONICAL units -- real ticks, not a miniature scale of its own.
+    /// `tokens_paid` is the money mark, not a consumption figure. `acceptProbe` seeds it with one
+    /// `TICK_SIZE` and `_chargeWeeksThrough` raises it to `(weekIndex + 1) * tokensPerWeek` at every
+    /// boundary it books, so after booking to week `k` it stands at `k * tokensPerWeek`. Zero is
+    /// unreachable because no assignment can produce it -- every one of them is at least a tick -- so
+    /// week zero carries the probe's tick rather than nothing. Nothing here reads it; it is written
+    /// this way so the fixture stays a deal the chain could actually report.
+    fn weekly_deal(week_index: u8, week_base_tokens: u128) -> DealSubscription {
+        DealSubscription {
+            deal_flags: flags::SUBSCRIPTION,
+            sub_weeks: SUBSCRIPTION_WEEKS,
+            week_index,
+            tokens_per_week: WEEK,
+            funded_tokens: FUNDED,
+            tokens_paid: (u128::from(week_index) * WEEK).max(TICK_SIZE),
+            period_start: 0,
+            week_base_tokens,
+        }
+    }
+
+    /// The claim pipeline is monotonic, so a state that has settled at one cumulative figure carries
+    /// it in all three stages.
+    fn claimed(cumulative: u128) -> DealChainState {
+        let mut state = state(true, true, false, 1_000);
+        state.tokens_final = cumulative;
+        state.tokens_superseded = cumulative;
+        state.tokens_pending = cumulative;
+        state
+    }
+
+    #[test]
+    fn recorded_week_expiry_marks_when_to_book_not_that_it_was_booked() {
+        let week = super::SUB_WEEK_LEN.as_secs();
+        assert_eq!(weekly_deal(0, 0).recorded_week_expires_at(), week);
+        assert_eq!(weekly_deal(2, 2 * WEEK).recorded_week_expires_at(), 3 * week);
+        // Past the final booked boundary nothing further is due: the term is over, not pending.
+        let finished = weekly_deal(SUBSCRIPTION_WEEKS, FUNDED);
+        assert!(finished.term_is_over());
+        assert_eq!(finished.recorded_week_expires_at(), u64::MAX);
+    }
+
+    /// An ordinary deal has no weekly books at all, so there is nothing here to answer with.
+    #[test]
+    fn an_ordinary_deal_has_no_weekly_claim_ceiling() {
+        let ordinary = DealSubscription {
+            deal_flags: 0,
+            sub_weeks: 0,
+            ..weekly_deal(0, 0)
+        };
+        assert!(!ordinary.is_subscription());
+        let error =
+            super::subscription_claim_cap_at(&claimed(TICK_SIZE), &ordinary).unwrap_err();
+        assert!(error.contains("not a subscription"), "{error}");
+        let error =
+            super::subscription_current_week_headroom(&claimed(TICK_SIZE), &ordinary)
+                .unwrap_err();
+        assert!(error.contains("not a subscription"), "{error}");
+    }
+
+    /// PHASE 1 of three: no boundary has been crossed since the last booking. The recorded
+    /// `weekBaseTokens` is the one the contract itself would use and the formula is the same, so the
+    /// figure is EXACT - there is no error to have a sign. A client that assumes a divergence here is
+    /// as wrong as one that assumes a bound.
+    #[test]
+    fn recorded_ceiling_is_exact_while_no_boundary_has_been_crossed() {
+        // Week two is current and partly consumed; the books are up to date.
+        let deal = weekly_deal(1, WEEK);
+        let state = claimed(WEEK + TICK_SIZE / 2);
+        assert_eq!(
+            super::subscription_claim_cap_at(&state, &deal).unwrap(),
+            2 * WEEK,
+            "`_claimCap`: weekBaseTokens + tokensPerWeek, clamped by fundedTokens"
+        );
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &deal).unwrap(),
+            WEEK - TICK_SIZE / 2
+        );
+    }
+
+    /// PHASE 2 of three: a boundary the clock has crossed that nobody has booked, term still running.
+    /// `_chargeWeeksThrough` raises the base to `max(tokensFinal, tokensPending)` at the boundary and
+    /// `claimTokens` books it before measuring, so the recorded figure MAY be understated - a
+    /// non-strict "may". Booking a week nobody used re-bases onto the same cumulative and moves
+    /// nothing, and where funding allows it both figures can settle on the same `fundedTokens` clamp.
+    /// Both witnesses are constructed here rather than left to a generator.
+    #[test]
+    fn recorded_ceiling_is_understated_across_an_unbooked_boundary() {
+        // STRICT witness, clear of the funded clamp. Week one drawn down against a base of 0: the
+        // recorded books say nothing is left...
+        let deal = weekly_deal(0, 0);
+        let state = claimed(WEEK);
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &deal).unwrap(),
+            0
+        );
+        // ...but the contract, once the crossed boundary is BOOKED, re-bases on the cumulative claim
+        // and admits a whole further quota. The recorded figure was low, which is why booking - not
+        // guessing - is the client's move.
+        let booked = weekly_deal(1, WEEK);
+        assert_eq!(
+            super::subscription_claim_cap_at(&state, &booked).unwrap(),
+            2 * WEEK
+        );
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &booked).unwrap(),
+            WEEK
+        );
+
+        // NON-STRICT witness: a week NOBODY used. The boundary is equally due, but booking it re-bases
+        // onto the same cumulative claim, so the recorded figure was already the contract's own. The
+        // understatement is a "may", never a guarantee - and this is also why an unused week is
+        // forfeited rather than carried across its boundary.
+        let untouched = weekly_deal(1, WEEK);
+        let unused = claimed(WEEK);
+        assert_eq!(
+            super::subscription_claim_cap_at(&unused, &untouched).unwrap(),
+            super::subscription_claim_cap_at(&unused, &weekly_deal(2, WEEK)).unwrap(),
+            "booking a week nobody used raises nothing: phase 2 admits equality"
+        );
+    }
+
+    /// PHASE 3 of three: past the final boundary the contract stops deriving a ceiling from the quota
+    /// and returns the cumulative total already declared, so the recorded figure only UPPER-BOUNDS it.
+    /// Strictly above when the last week was not fully used; exactly equal when it was.
+    #[test]
+    fn recorded_ceiling_only_upper_bounds_the_contract_past_the_final_boundary() {
+        // The books still show week four open with an unused quota...
+        let stale = weekly_deal(3, 3 * WEEK);
+        let state = claimed(3 * WEEK + TICK_SIZE);
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &stale).unwrap(),
+            WEEK - TICK_SIZE,
+            "the pre-boundary quota looks spendable"
+        );
+        // ...but once the final boundary is booked the ceiling is the declared cumulative total and
+        // every larger claim is refused. Carrying the stale figure forward would authorize a fifth
+        // week of a four-week term.
+        let booked = weekly_deal(SUBSCRIPTION_WEEKS, 3 * WEEK + TICK_SIZE);
+        assert_eq!(
+            super::subscription_claim_cap_at(&state, &booked).unwrap(),
+            3 * WEEK + TICK_SIZE
+        );
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &booked).unwrap(),
+            0
+        );
+
+        // Fully consume that final week and the overstatement vanishes: both figures are the declared
+        // cumulative total. "Overstated" is an upper bound, never a strict one.
+        let spent = claimed(FUNDED);
+        assert_eq!(
+            super::subscription_claim_cap_at(&spent, &stale).unwrap(),
+            FUNDED,
+            "the pre-boundary quota, clamped by the funded volume"
+        );
+        assert_eq!(
+            super::subscription_claim_cap_at(&spent, &weekly_deal(SUBSCRIPTION_WEEKS, FUNDED))
+                .unwrap(),
+            FUNDED,
+            "and the terminal ceiling the contract applies: equal, not above"
+        );
+    }
+
+    #[test]
+    fn weekly_ceiling_is_clamped_by_the_funded_volume() {
+        let deal = weekly_deal(3, 3 * WEEK + TICK_SIZE);
+        let state = claimed(3 * WEEK + TICK_SIZE);
+        assert_eq!(
+            super::subscription_claim_cap_at(&state, &deal).unwrap(),
+            FUNDED,
+            "the final week may not reach past the funded volume"
+        );
+        assert_eq!(
+            super::subscription_current_week_headroom(&state, &deal).unwrap(),
+            WEEK - TICK_SIZE
+        );
+    }
+
+    #[test]
+    fn a_cumulative_claim_above_the_recorded_week_ceiling_fails_closed() {
+        let deal = weekly_deal(0, 0);
+        let state = claimed(WEEK + 1);
+        let error = super::subscription_current_week_headroom(&state, &deal).unwrap_err();
+        assert!(
+            error.contains("exceeds the recorded week claim ceiling"),
+            "{error}"
+        );
     }
 
     fn exact_ordinary_subscription() -> Value {
@@ -1408,6 +1687,70 @@ mod tests {
             let decoded = DealChainState::decode_getter(&state).expect("monotonic pipeline");
             prop_assert!(decoded.tokens_final <= decoded.tokens_superseded);
             prop_assert!(decoded.tokens_superseded <= decoded.tokens_pending);
+        }
+
+        /// over arbitrary weekly books: the three-phase rule, as inequalities that hold in
+        /// every phase. Phase 1 is the exact formula the contract itself evaluates; phase 2 is a
+        /// crossed-but-unbooked boundary, where booking never admits LESS; phase 3 is past the final
+        /// boundary, where the recorded quota only upper-bounds the declared cumulative. None of the
+        /// three is a strict inequality, which is exactly why no sign may be assumed.
+        #[test]
+        fn recorded_ceiling_obeys_the_three_phase_rule_over_arbitrary_books(
+            week_index in 0u8..=SUBSCRIPTION_WEEKS,
+            claimed_in_week in 0u128..=WEEK,
+        ) {
+            let base = u128::from(week_index.min(SUBSCRIPTION_WEEKS)) * WEEK;
+            let deal = weekly_deal(week_index, base);
+            // Every claim the contract accepts is clamped by `fundedTokens`, so a cumulative claim
+            // above the funded volume is a state no chain can report: generating one would prove a
+            // property about an unreachable deal.
+            let pending = (base + claimed_in_week).min(deal.funded_tokens);
+            let state = claimed(pending);
+
+            let cap = super::subscription_claim_cap_at(&state, &deal).unwrap();
+            let headroom = super::subscription_current_week_headroom(&state, &deal).unwrap();
+
+            // 1. The funded volume is never exceeded, in any phase.
+            prop_assert!(cap <= deal.funded_tokens);
+            // 2. One week's capacity at a time: a boundary opens a quota, quotas never accumulate.
+            prop_assert!(headroom <= deal.tokens_per_week);
+            // 3. PHASE 1, whenever no boundary is due: the figure IS the contract's `_claimCap` -
+            // `weekBaseTokens + tokensPerWeek` clamped by `fundedTokens` - with no divergence to
+            // correct. Past the final boundary that formula no longer governs(phase 3 below).
+            if !deal.term_is_over() {
+                prop_assert_eq!(
+                    cap,
+                    (deal.week_base_tokens + deal.tokens_per_week).min(deal.funded_tokens)
+                );
+            }
+
+            let booked_next = DealSubscription {
+                week_index: week_index.saturating_add(1).min(SUBSCRIPTION_WEEKS),
+                week_base_tokens: pending,
+                tokens_paid: u128::from(week_index.saturating_add(1).min(SUBSCRIPTION_WEEKS))
+                    * deal.tokens_per_week,
+                ..deal
+            };
+            let after_booking =
+                super::subscription_claim_cap_at(&state, &booked_next).unwrap();
+            if deal.term_is_over() {
+                // 4a. PHASE 3, already past the final boundary: the ceiling IS the declared cumulative
+                // total, and no booking can raise it. Nothing carries forward from before it.
+                prop_assert_eq!(cap, pending);
+                prop_assert_eq!(headroom, 0);
+                prop_assert_eq!(after_booking, pending);
+            } else if week_index + 1 < SUBSCRIPTION_WEEKS {
+                // 4b. PHASE 2, a crossed-but-unbooked boundary: booking it never admits LESS than the
+                // books already showed. Equal when the recorded week went untouched, or when both
+                // figures hit the funded clamp; greater otherwise. Never a strict understatement.
+                prop_assert!(after_booking >= cap);
+            } else {
+                // 4c. Booking the FINAL boundary is where the relation flips: the ceiling collapses to
+                // the declared cumulative, so the pre-boundary quota UPPER-BOUNDS it - equal when
+                // that last quota was fully consumed.
+                prop_assert_eq!(after_booking, pending);
+                prop_assert!(cap >= after_booking);
+            }
         }
     }
 

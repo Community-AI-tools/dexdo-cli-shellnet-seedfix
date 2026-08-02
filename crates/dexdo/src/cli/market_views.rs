@@ -16,6 +16,7 @@ use crate::cli::machine;
 use anyhow::{bail, Result};
 #[cfg(feature = "shellnet")]
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+use dexdo_core::address as addr;
 #[cfg(feature = "shellnet")]
 use dexdo_core::params::INDEXER_FAST_TIMEOUT;
 use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
@@ -42,6 +43,9 @@ struct ExecutableMarketView {
     active: bool,
     source: &'static str,
     last_update_id: String,
+    /// where the displayed ROWS came from, which is not always where `source`/`last_update_id`
+    /// came from -- the freshness marker can be the indexer's while the rows are the chain's.
+    rows: &'static str,
 }
 
 #[cfg(feature = "shellnet")]
@@ -110,6 +114,7 @@ where
                 active: true,
                 source,
                 last_update_id,
+                rows: crate::cli::provenance::ROWS_CHAIN_EVENTS,
             })
         }
         Err(error) => {
@@ -122,6 +127,7 @@ where
                 active,
                 source: "chain",
                 last_update_id: "-".to_string(),
+                rows: crate::cli::provenance::ROWS_CHAIN_GETTERS,
             })
         }
     }
@@ -230,7 +236,11 @@ async fn run_quote_mock(args: QuoteArgs) -> Result<()> {
     for fill in q.fills {
         println!(
             "fill order_id={} token_contract={} ticks={} price_per_tick={} cost_with_fee={}",
-            fill.order_id, fill.token_contract, fill.ticks, fill.price_per_tick, fill.cost_with_fee
+            fill.order_id,
+            addr::display(&fill.token_contract),
+            fill.ticks,
+            fill.price_per_tick,
+            fill.cost_with_fee
         );
     }
     Ok(())
@@ -252,9 +262,20 @@ fn executable_market_rows(snapshot: &OrderBookSnapshot) -> Vec<BookRow> {
         .collect()
 }
 
+/// say where these rows came from and how fresh they are, so a divergence from
+/// `dexdo orders list` reads as indexer lag / a different scope, not as contradictory truth.
 #[cfg(feature = "shellnet")]
-fn render_market_context(source: &str, last_update_id: &str) -> String {
-    format!("market source={source} lastUpdateId={last_update_id}")
+fn render_market_context(source: &str, last_update_id: &str, as_of: u64, rows: &str) -> String {
+    format!(
+        "market {}",
+        crate::cli::provenance::render(
+            source,
+            last_update_id,
+            as_of,
+            rows,
+            crate::cli::provenance::SCOPE_EXECUTABLE_ASKS,
+        )
+    )
 }
 
 #[cfg(feature = "shellnet")]
@@ -267,13 +288,16 @@ fn render_quote_summary(
     if quote.filled_ticks == 0 {
         return format!(
             "quote model={} order_book={} source={} lastUpdateId={} no_liquidity=true",
-            snapshot.frame_model, snapshot.order_book, source, last_update_id
+            snapshot.frame_model,
+            addr::display(&snapshot.order_book),
+            source,
+            last_update_id
         );
     }
     format!(
         "quote model={} order_book={} source={} lastUpdateId={} filled_ticks={} total_with_fee={} complete={}",
         snapshot.frame_model,
-        snapshot.order_book,
+        addr::display(&snapshot.order_book),
         source,
         last_update_id,
         quote.filled_ticks,
@@ -358,7 +382,12 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     let rows = executable_market_rows(snapshot);
     println!(
         "{}",
-        render_market_context(view.source, &view.last_update_id)
+        render_market_context(
+            view.source,
+            &view.last_update_id,
+            crate::cli::provenance::now_unix(),
+            view.rows,
+        )
     );
     if rows.is_empty() {
         let raw_order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
@@ -406,9 +435,9 @@ fn render_executable_book_line(
     format!(
         "executable_ask model={} order_book={} order_id={} token_contract={} price_per_tick={} ticks={} requested_ticks={} max_price_per_tick={}",
         snapshot.frame_model,
-        snapshot.order_book,
+        addr::display(&snapshot.order_book),
         order.order_id,
-        order.token_contract.as_deref().unwrap_or("-"),
+        addr::display_opt(order.token_contract.as_deref(), "-"),
         order.price_per_tick,
         order.ticks,
         ticks,
@@ -426,7 +455,7 @@ fn render_no_executable_book_line(
     format!(
         "executable_ask model={} order_book={} none=true no_executable_ask=true requested_ticks={} max_price_per_tick={} reason={}",
         snapshot.frame_model,
-        snapshot.order_book,
+        addr::display(&snapshot.order_book),
         ticks,
         max_price_per_tick,
         reason.replace('\n', " ")
@@ -661,7 +690,11 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
     for fill in q.fills {
         println!(
             "fill order_id={} token_contract={} ticks={} price_per_tick={} cost_with_fee={}",
-            fill.order_id, fill.token_contract, fill.ticks, fill.price_per_tick, fill.cost_with_fee
+            fill.order_id,
+            addr::display(&fill.token_contract),
+            fill.ticks,
+            fill.price_per_tick,
+            fill.cost_with_fee
         );
     }
     Ok(())
@@ -898,9 +931,18 @@ mod tests {
         assert_eq!(indexer_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fold_calls.load(Ordering::SeqCst), 1);
         assert_eq!(getorder_walk_calls.load(Ordering::SeqCst), 0);
+        // the rows are the chain's even when the freshness marker is the indexer's -- the
+        // annotation must say both, or an indexer lag reads as a contradiction against `orders`.
+        assert_eq!(view.rows, crate::cli::provenance::ROWS_CHAIN_EVENTS);
         assert_eq!(
-            super::render_market_context(view.source, &view.last_update_id),
-            "market source=indexer lastUpdateId=indexer-77"
+            super::render_market_context(
+                view.source,
+                &view.last_update_id,
+                1_754_006_400,
+                view.rows
+            ),
+            "market source=indexer lastUpdateId=indexer-77 as_of=1754006400 \
+             rows=chain:order-book-events scope=executable-asks"
         );
     }
 
@@ -958,9 +1000,16 @@ mod tests {
         assert_eq!(indexer_calls.load(Ordering::SeqCst), 3);
         assert_eq!(fold_calls.load(Ordering::SeqCst), 1);
         assert_eq!(getorder_walk_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(view.rows, crate::cli::provenance::ROWS_CHAIN_EVENTS);
         assert_eq!(
-            super::render_market_context(view.source, &view.last_update_id),
-            "market source=chain lastUpdateId=fold-13"
+            super::render_market_context(
+                view.source,
+                &view.last_update_id,
+                1_754_006_400,
+                view.rows
+            ),
+            "market source=chain lastUpdateId=fold-13 as_of=1754006400 \
+             rows=chain:order-book-events scope=executable-asks"
         );
     }
 

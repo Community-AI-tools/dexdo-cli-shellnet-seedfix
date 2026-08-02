@@ -2,7 +2,7 @@ use super::{
     inspect_seller_offer, prepare_seller_offer, validate_resting_offer, wait_for_match,
     RunningSeller, SellerConfig, SellerMatchWatchConfig, SellerOfferInspection, SellerOfferStartup,
 };
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use dexdo_core::{params::SellerLivenessParams, ChainBackend, Match};
 use dexdo_proto::{ChallengeRequest, GatewayClient};
 use std::future::Future;
@@ -27,11 +27,45 @@ impl HealthComponent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct HealthFailure {
     pub component: HealthComponent,
     pub timed_out: bool,
     pub detail: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+impl HealthFailure {
+    pub fn new(component: HealthComponent, timed_out: bool, detail: impl Into<String>) -> Self {
+        Self {
+            component,
+            timed_out,
+            detail: detail.into(),
+            source: None,
+        }
+    }
+
+    fn with_source(
+        mut self,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    fn into_startup_error(self, advertised: &str) -> anyhow::Error {
+        let probe = self
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<ProbeFault>())
+            .map(|fault| (fault.stage, fault.wrong_endpoint));
+        match probe {
+            Some((stage, wrong_endpoint)) => anyhow::Error::new(
+                advertise_probe_fault(advertised, stage, wrong_endpoint).with_source(self),
+            ),
+            None => anyhow::Error::new(self).context("seller readiness failed before SELL"),
+        }
+    }
 }
 
 impl std::fmt::Display for HealthFailure {
@@ -50,7 +84,13 @@ impl std::fmt::Display for HealthFailure {
     }
 }
 
-impl std::error::Error for HealthFailure {}
+impl std::error::Error for HealthFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestingOfferIdentity {
@@ -121,18 +161,6 @@ pub enum SellerStartupOutcome {
     },
 }
 
-fn health_failure(
-    component: HealthComponent,
-    timed_out: bool,
-    detail: impl Into<String>,
-) -> HealthFailure {
-    HealthFailure {
-        component,
-        timed_out,
-        detail: detail.into(),
-    }
-}
-
 fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -160,19 +188,215 @@ fn trace_health(
     );
 }
 
-async fn probe_advertised_gateway(seller: &RunningSeller, advertised: &str) -> Result<()> {
+/// What the operator demands of the `advertised_gateway` self-probe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdvertiseProbePolicy {
+    /// Default. A TRANSPORT-level self-probe failure against a **public** advertised address
+    /// degrades to a loud warning and the offer still posts: from the seller host the advertised
+    /// address is a known-limited observation point. A probe
+    /// that proves the address is the WRONG endpoint(pinned-certificate mismatch, foreign gateway)
+    /// stays fatal, and so does any failure against a non-public advertised address.
+    #[default]
+    TolerateTunneledTransportFailure,
+    /// `--require-advertise-probe`: every self-probe failure is fatal, as before.
+    Required,
+}
+
+/// A failed stage of the pinned-TLS(h2) self-probe, with the preserved source chain.
+#[derive(Debug)]
+struct ProbeFault {
+    /// `tcp_connect` / `tls_handshake` / `http2_handshake` / `grpc_challenge` / `challenge_response`.
+    stage: &'static str,
+    /// `true` when the address answered but is provably not this gateway -- never a tunnel artifact.
+    wrong_endpoint: bool,
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl ProbeFault {
+    fn transport(
+        stage: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            stage,
+            wrong_endpoint: false,
+            source: source.into(),
+        }
+    }
+
+    fn wrong_endpoint(
+        stage: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            stage,
+            wrong_endpoint: true,
+            source: source.into(),
+        }
+    }
+
+    /// shape, rendered by `DexdoError`: `error[CODE](kind): message(stage:...)` + one
+    /// `cause:` line per preserved source + the `hint:`.
+    /// The stage is the one the probe ACTUALLY reached -- `probe_advertised_gateway` stages itself
+    /// explicitly -- never one guessed by string-sniffing the cause chain.
+    fn structured(self, advertised: &str) -> dexdo_core::DexdoError {
+        advertise_probe_fault(advertised, self.stage, self.wrong_endpoint).with_source(self)
+    }
+}
+
+impl std::fmt::Display for ProbeFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "advertised gateway self-probe {} at {}",
+            if self.wrong_endpoint {
+                "reached the wrong endpoint"
+            } else {
+                "failed"
+            },
+            self.stage
+        )
+    }
+}
+
+impl std::error::Error for ProbeFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// The structured shell shared by every `advertised_gateway` fault, so the timeout path and the
+/// error path render identically apart from their stage and cause lines.
+/// Before this, the probe's failure reached the operator as `advertised_gateway failed: transport
+/// error` -- `tonic::transport::Error`'s `Display` is that literal string, and `error.to_string()`
+/// at the boundary discarded everything under it. lost hours to exactly that.
+fn advertise_probe_fault(
+    advertised: &str,
+    stage: &'static str,
+    wrong_endpoint: bool,
+) -> dexdo_core::DexdoError {
+    if wrong_endpoint {
+        dexdo_core::DexdoError::new(
+            dexdo_core::error_codes::E_ADVERTISE_WRONG_GATEWAY,
+            format!(
+                "advertised gateway {advertised} answered the pinned-TLS (h2) self-probe, but it \
+                 is not this gateway"
+            ),
+        )
+        .with_stage(stage)
+        .with_hint(format!(
+            "point --gateway-advertise at this gateway's own address, or free {advertised} from \
+             the other service; the certificate pin is never relaxed"
+        ))
+    } else {
+        let error = dexdo_core::DexdoError::new(
+            dexdo_core::error_codes::E_ADVERTISE_UNREACHABLE,
+            format!(
+                "advertised gateway {advertised} did not complete the pinned-TLS (h2) self-probe"
+            ),
+        )
+        .with_stage(stage);
+        if crate::seller::advertise::advertise_is_public(advertised) {
+            error.with_hint(format!(
+                "the advertised address must be reachable from THIS host and forward back to this \
+                 gateway; verify externally with `curl -k https://{advertised}/`, and note that a \
+                 NAT/VPN/reverse-tunnel hairpin can fail this in-process self-probe while a remote \
+                 buyer connects fine ()"
+            ))
+        } else {
+            error.with_hint(
+                "the advertised address is not public, so the self-probe is authoritative here: \
+                 make it reachable from this host, or advertise the address a remote buyer must \
+                 dial",
+            )
+        }
+    }
+}
+
+fn probe_should_degrade(
+    fault: &ProbeFault,
+    advertised: &str,
+    policy: AdvertiseProbePolicy,
+) -> bool {
+    policy == AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        && !fault.wrong_endpoint
+        && crate::seller::advertise::advertise_is_public(advertised)
+}
+
+/// the self-probe is only an observation point on the seller host; say so where it matters.
+fn tunneled_probe_hint(advertised: &str) -> String {
+    format!(
+        "the advertised address is public, so this in-process self-probe is a known-limited \
+         observation point: a NAT/VPN/reverse-tunnel path hairpins back to this same process and \
+         can fail from the seller host while a remote buyer connects fine (). The offer is \
+         posted anyway -- verify externally, e.g. `curl -k https://{advertised}/`, and pass \
+         --require-advertise-probe to make this fatal instead"
+    )
+}
+
+async fn probe_advertised_gateway(
+    seller: &RunningSeller,
+    advertised: &str,
+) -> std::result::Result<(), ProbeFault> {
+    // Stage 1 -- plain TCP reachability, so "refused/unroutable" is never reported as an opaque
+    // `transport error` from the TLS/h2 stack above it.
+    if let Err(error) = tokio::net::TcpStream::connect(advertised).await {
+        return Err(ProbeFault::transport("tcp_connect", error));
+    }
+    // Stage 2 -- pinned TLS + h2. Pinning is NOT relaxed: a fingerprint mismatch is a wrong-endpoint
+    // proof and stays fatal.
     let endpoint = format!("https://{advertised}");
-    let channel = crate::buyer::tls::connect_pinned(&endpoint, &seller.tls_fingerprint).await?;
+    let channel = match crate::buyer::tls::connect_pinned(&endpoint, &seller.tls_fingerprint).await
+    {
+        Ok(channel) => channel,
+        Err(error) => {
+            let wrong_endpoint = error.chain().any(|source| {
+                matches!(
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|source| {
+                            source.downcast_ref::<tokio_rustls::rustls::Error>()
+                        }),
+                    Some(tokio_rustls::rustls::Error::InvalidCertificate(
+                        tokio_rustls::rustls::CertificateError::ApplicationVerificationFailure
+                    ))
+                )
+            });
+            return Err(if wrong_endpoint {
+                ProbeFault::wrong_endpoint("tls_certificate_pin", error)
+            } else if error
+                .chain()
+                .any(|source| source.downcast_ref::<std::io::Error>().is_some())
+            {
+                ProbeFault::transport("tls_handshake", error)
+            } else {
+                ProbeFault::transport("http2_handshake", error)
+            });
+        }
+    };
+    // Stage 3 -- the gateway's own gRPC surface.
     let mut client = GatewayClient::new(channel);
-    let challenge = client
+    let challenge = match client
         .get_challenge(ChallengeRequest {
             token_contract: HEALTH_CHALLENGE_TC.to_string(),
         })
-        .await?
-        .into_inner();
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            // A server-returned gRPC status proves the connection completed. No application status
+            // is a transport failure that a NAT/VPN/reverse-tunnel hairpin can explain away.
+            return Err(ProbeFault::wrong_endpoint("grpc_challenge", status));
+        }
+    };
     if challenge.token_contract != HEALTH_CHALLENGE_TC || challenge.nonce.len() != 32 {
-        return Err(anyhow!(
-            "gateway readiness challenge returned an invalid response"
+        return Err(ProbeFault::wrong_endpoint(
+            "challenge_response",
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "gateway readiness challenge returned an invalid response",
+            ),
         ));
     }
     Ok(())
@@ -184,6 +408,28 @@ pub async fn check_readiness(
     timeout: Duration,
     identity: Option<&RestingOfferIdentity>,
     token_contract: &str,
+    advertise_probe: AdvertiseProbePolicy,
+) -> std::result::Result<(), HealthFailure> {
+    check_readiness_with_probe(
+        seller,
+        advertised,
+        timeout,
+        identity,
+        token_contract,
+        advertise_probe,
+        probe_advertised_gateway(seller, advertised),
+    )
+    .await
+}
+
+async fn check_readiness_with_probe(
+    seller: &RunningSeller,
+    advertised: &str,
+    timeout: Duration,
+    identity: Option<&RestingOfferIdentity>,
+    token_contract: &str,
+    advertise_probe: AdvertiseProbePolicy,
+    probe: impl Future<Output = std::result::Result<(), ProbeFault>>,
 ) -> std::result::Result<(), HealthFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
     if seller.server_task.is_finished() {
@@ -193,7 +439,7 @@ pub async fn check_readiness(
             HealthComponent::GatewayTask,
             "fail",
         );
-        return Err(health_failure(
+        return Err(HealthFailure::new(
             HealthComponent::GatewayTask,
             false,
             "gateway server task stopped",
@@ -206,43 +452,79 @@ pub async fn check_readiness(
         "pass",
     );
 
-    match tokio::time::timeout_at(deadline, probe_advertised_gateway(seller, advertised)).await {
-        Ok(Ok(())) => trace_health(
-            identity,
-            token_contract,
-            HealthComponent::AdvertisedGateway,
-            "pass",
-        ),
-        Ok(Err(error)) => {
+    // Both readiness components share the canonical per-cycle deadline. Poll them concurrently so
+    // a tolerated stalled self-probe cannot starve an already-healthy exact-model check.
+    let upstream = seller.state.upstream(token_contract);
+    let (probe_result, upstream_result) = tokio::join!(
+        tokio::time::timeout_at(deadline, probe),
+        tokio::time::timeout_at(deadline, upstream.check_health()),
+    );
+    let probe = match probe_result {
+        Ok(Ok(())) => None,
+        Ok(Err(fault)) => Some((fault, false)),
+        Err(_) => Some((
+            ProbeFault::transport(
+                "handshake_timeout",
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "bounded gateway probe expired",
+                ),
+            ),
+            true,
+        )),
+    };
+    match probe {
+        None => {
             trace_health(
                 identity,
                 token_contract,
                 HealthComponent::AdvertisedGateway,
-                "fail",
+                "pass",
             );
-            return Err(health_failure(
-                HealthComponent::AdvertisedGateway,
-                false,
-                error.to_string(),
-            ));
         }
-        Err(_) => {
+        Some((fault, timed_out)) if probe_should_degrade(&fault, advertised, advertise_probe) => {
             trace_health(
                 identity,
                 token_contract,
                 HealthComponent::AdvertisedGateway,
-                "timeout",
+                "warn",
             );
-            return Err(health_failure(
+            let stage = fault.stage;
+            let detail = fault.structured(advertised);
+            tracing::warn!(
+                event = "seller_health_degraded",
+                timestamp = unix_timestamp(),
+                token_contract,
+                component = HealthComponent::AdvertisedGateway.as_str(),
+                advertised,
+                stage,
+                timed_out,
+                issue = 749,
+                // the structured error(address + stage + preserved cause chain) instead of
+                // `error.to_string()`, which collapsed the whole chain into `transport error`.
+                detail = %detail,
+                hint = %tunneled_probe_hint(advertised),
+                "advertised gateway self-probe failed at the transport level against a public \
+                 address; posting the offer anyway ()"
+            );
+        }
+        Some((fault, timed_out)) => {
+            trace_health(
+                identity,
+                token_contract,
                 HealthComponent::AdvertisedGateway,
-                true,
-                "bounded gateway probe expired",
-            ));
+                if timed_out { "timeout" } else { "fail" },
+            );
+            return Err(HealthFailure::new(
+                HealthComponent::AdvertisedGateway,
+                timed_out,
+                format!("pinned-TLS (h2) self-probe of {advertised}"),
+            )
+            .with_source(fault));
         }
     }
 
-    let upstream = seller.state.upstream(token_contract);
-    match tokio::time::timeout_at(deadline, upstream.check_health()).await {
+    match upstream_result {
         Ok(Ok(())) => trace_health(
             identity,
             token_contract,
@@ -256,7 +538,7 @@ pub async fn check_readiness(
                 HealthComponent::UpstreamModel,
                 "fail",
             );
-            return Err(health_failure(
+            return Err(HealthFailure::new(
                 HealthComponent::UpstreamModel,
                 false,
                 error.to_string(),
@@ -269,7 +551,7 @@ pub async fn check_readiness(
                 HealthComponent::UpstreamModel,
                 "timeout",
             );
-            return Err(health_failure(
+            return Err(HealthFailure::new(
                 HealthComponent::UpstreamModel,
                 true,
                 "bounded upstream model probe expired",
@@ -284,7 +566,7 @@ pub async fn check_readiness(
             HealthComponent::GatewayTask,
             "fail",
         );
-        return Err(health_failure(
+        return Err(HealthFailure::new(
             HealthComponent::GatewayTask,
             false,
             "gateway server task stopped during readiness",
@@ -539,7 +821,7 @@ async fn wait_for_gateway_task_stop(seller: &RunningSeller) {
 }
 
 fn gateway_task_failure(detail: &str) -> HealthFailure {
-    health_failure(HealthComponent::GatewayTask, false, detail)
+    HealthFailure::new(HealthComponent::GatewayTask, false, detail)
 }
 
 async fn stop_exact_offer(
@@ -718,6 +1000,7 @@ where
         timing.health_timeout,
         existing_identity,
         &cfg.token_contract,
+        timing.advertise_probe,
     );
     let gateway_stopped = wait_for_gateway_task_stop(seller);
     tokio::pin!(readiness);
@@ -753,7 +1036,7 @@ where
                 disposition: CancellationDisposition::AlreadyAbsent,
             }),
             RestingStopReason::Health(failure) => {
-                Err(anyhow!("seller readiness failed before SELL: {failure}"))
+                Err(failure.into_startup_error(&cfg.gateway_advertise))
             }
             RestingStopReason::Watcher(_) => unreachable!("no watcher exists before SELL"),
         };
@@ -803,6 +1086,7 @@ where
                         std::cmp::min(timing.health_timeout, remaining),
                         Some(&identity),
                         &cfg.token_contract,
+                        timing.advertise_probe,
                     );
                     tokio::pin!(readiness);
                     let stop = tokio::select! {
@@ -887,6 +1171,7 @@ pub async fn prepare_seller_offer_with_liveness<S>(
     expected_owner: &str,
     existing_identity: Option<&RestingOfferIdentity>,
     shutdown: S,
+    advertise_probe: AdvertiseProbePolicy,
 ) -> Result<SellerStartupOutcome>
 where
     S: Future<Output = ()>,
@@ -905,6 +1190,7 @@ where
             cycle_timeout: params.health_cycle_timeout,
             cancel_poll: params.cancel_confirmation_poll,
             abort_gateway_on_stop: true,
+            advertise_probe,
         },
     )
     .await
@@ -917,6 +1203,8 @@ struct SupervisionTiming {
     cycle_timeout: Duration,
     cancel_poll: Duration,
     abort_gateway_on_stop: bool,
+    /// how a failed `advertised_gateway` self-probe is treated.
+    advertise_probe: AdvertiseProbePolicy,
 }
 
 async fn supervise_with_timing<S>(
@@ -971,6 +1259,7 @@ where
                         check_timeout,
                         Some(identity),
                         &identity.token_contract,
+                        timing.advertise_probe,
                     ).await {
                         break Err((Trigger::Health(failure), deadline));
                     }
@@ -1015,6 +1304,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn supervise_resting_offer<S>(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -1023,6 +1313,7 @@ pub async fn supervise_resting_offer<S>(
     identity: &RestingOfferIdentity,
     shutdown: S,
     abort_gateway_on_stop: bool,
+    advertise_probe: AdvertiseProbePolicy,
 ) -> Result<RestingSellerOutcome>
 where
     S: Future<Output = ()>,
@@ -1041,6 +1332,7 @@ where
             cycle_timeout: params.health_cycle_timeout,
             cancel_poll: params.cancel_confirmation_poll,
             abort_gateway_on_stop,
+            advertise_probe,
         },
     )
     .await
@@ -1469,15 +1761,64 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"logprobs\":{\"content\":[{\"token\":\"OK\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\ndata: [DONE]\n\n".to_string()
     }
 
-    fn watch(name: &str) -> SellerMatchWatchConfig {
-        SellerMatchWatchConfig {
-            cursor_path: std::env::temp_dir().join(format!(
-                "dexdo-668-{name}-{}-{}.json",
-                std::process::id(),
-                unix_timestamp()
-            )),
-            poll_interval: Duration::from_millis(50),
-        }
+    async fn status_seller(status: tonic::Status) -> (RunningSeller, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the local status gateway");
+        let advertised = listener.local_addr().unwrap().to_string();
+        let listen_addr = listener.local_addr().unwrap();
+        let tls = crate::seller::tls::GatewayTls::generate().unwrap();
+        crate::seller::tls::ensure_crypto_provider();
+        let tls_fingerprint = tls.fingerprint.clone();
+        let identity = tonic::transport::Identity::from_pem(tls.cert_pem, tls.key_pem);
+        let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+        let state = Arc::new(crate::seller::gateway::GatewayState::new());
+        let service = crate::seller::gateway::GatewayService::new(state.clone());
+        let intercepted = dexdo_proto::GatewayServer::with_interceptor(
+            service,
+            move |_request: tonic::Request<()>| Err(status.clone()),
+        );
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let mut builder = tonic::transport::Server::builder()
+            .tls_config(tls_config)
+            .expect("configure status gateway TLS");
+        let task = tokio::spawn(async move {
+            if let Err(error) = builder
+                .add_service(intercepted)
+                .serve_with_incoming(incoming)
+                .await
+            {
+                panic!("status gateway stopped: {error}");
+            }
+        });
+        (
+            RunningSeller {
+                state,
+                note: Arc::new(LocalNote::generate()),
+                server_task: task,
+                listen_addr,
+                tls_fingerprint,
+            },
+            advertised,
+        )
+    }
+
+    /// the cursor used to be written straight into the shared temp directory under a
+    /// `<pid>-<seconds>` name and was never removed -- 38 files per workspace run, measured. The
+    /// directory is returned with it and must be held for as long as the cursor is read or written.
+    fn watch(name: &str) -> (tempfile::TempDir, SellerMatchWatchConfig) {
+        let dir = tempfile::Builder::new()
+            .prefix(name)
+            .tempdir()
+            .expect("match watch cursor directory");
+        let cursor_path = dir.path().join("cursor.json");
+        (
+            dir,
+            SellerMatchWatchConfig {
+                cursor_path,
+                poll_interval: Duration::from_millis(50),
+            },
+        )
     }
 
     fn fast_timing() -> SupervisionTiming {
@@ -1487,16 +1828,16 @@ mod tests {
             cycle_timeout: Duration::from_millis(600),
             cancel_poll: Duration::from_millis(1),
             abort_gateway_on_stop: true,
+            advertise_probe: AdvertiseProbePolicy::default(),
         }
     }
 
     #[tokio::test]
     async fn unreachable_advertised_gateway_fails_before_any_sell_post() {
-        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // The address has to be genuinely REFUSED (the assertions below pin the probe to
+        // `stage: tcp_connect`), and it has to STAY refused: the reservation is held for the whole
+        // assertion, because a bind-and-drop hands the port back to the kernel.
+        let (_unavailable_hold, unavailable) = crate::test_refusing_endpoint::refusing_endpoint();
         let seller = super::super::start_gateway_with_note(
             "127.0.0.1:0".parse().unwrap(),
             UpstreamConfig::Mock,
@@ -1504,30 +1845,417 @@ mod tests {
         )
         .await
         .unwrap();
-        let backend = CancelBackend::new(Vec::new(), address('a'), 1, CancelBehavior::Remove);
-
         let failure = check_readiness(
             &seller,
-            &unavailable.to_string(),
+            &unavailable,
             Duration::from_millis(100),
             None,
             &address('b'),
+            AdvertiseProbePolicy::default(),
         )
         .await
         .expect_err("unreachable advertised endpoint");
 
         assert_eq!(failure.component, HealthComponent::AdvertisedGateway);
-        assert_eq!(backend.posts.load(Ordering::Relaxed), 0);
+        // the component error names the probed ADDRESS, the failing STAGE and the underlying
+        // cause, instead of the bare `transport error` that cost hours of `rustls=debug`.
+        let detail = failure
+            .into_startup_error(&unavailable.to_string())
+            .to_string();
+        assert!(
+            detail.starts_with("error[E_ADVERTISE_UNREACHABLE] (network): advertised gateway "),
+            "{detail}"
+        );
+        assert!(detail.contains(&unavailable), "{detail}");
+        // The explicit staging reaches `tcp_connect` on a closed port; sniffing the chain could
+        // only ever have guessed `tls_handshake` here.
+        assert!(detail.contains("(stage: tcp_connect)"), "{detail}");
+        assert!(
+            detail.contains("\n  cause: advertised gateway self-probe failed at tcp_connect"),
+            "{detail}"
+        );
+        assert!(detail.contains("\n  hint: "), "{detail}");
+        // 's tolerance does NOT apply to a non-public advertise, and the hint says so instead
+        // of offering the tunnel excuse.
+        assert!(
+            detail.contains("the advertised address is not public"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("a remote buyer connects fine"),
+            "the tolerant hint must not be offered for a non-public advertise: {detail}"
+        );
+        seller.server_task.abort();
+    }
+
+    /// an advertised address that a remote buyer CAN dial, whose in-process self-probe fails
+    /// at the transport level, must not block the offer -- the seller host is a known-limited
+    /// observation point behind NAT/VPN/a reverse tunnel.
+    #[tokio::test]
+    async fn public_advertise_transport_failure_warns_and_still_posts() {
+        // TEST-NET-1: classified public by the classifier, never actually reachable.
+        const PUBLIC_UNREACHABLE: &str = "192.0.2.1:8443";
+        assert!(crate::seller::advertise::advertise_is_public(
+            PUBLIC_UNREACHABLE
+        ));
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let owner = address('f');
+        let tc = address('9');
+        let backend = CancelBackend::new(Vec::new(), owner.clone(), 77, CancelBehavior::Remove);
+        let mut config = cfg(&tc);
+        config.gateway_advertise = PUBLIC_UNREACHABLE.to_string();
+
+        check_readiness(
+            &seller,
+            PUBLIC_UNREACHABLE,
+            Duration::from_millis(150),
+            None,
+            &tc,
+            AdvertiseProbePolicy::default(),
+        )
+        .await
+        .expect("a transport-level self-probe failure against a public advertise only warns");
+
+        super::super::prepare_seller_offer(seller.note.as_ref(), &backend, &config, Some(&owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.posts.load(Ordering::Relaxed),
+            1,
+            "the offer must still be posted after the degraded probe"
+        );
         seller.server_task.abort();
     }
 
     #[tokio::test]
-    async fn upstream_unreachable_rejected_missing_model_and_timeout_fail_closed() {
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+    async fn pr795_edge_tolerated_public_probe_timeout_keeps_healthy_upstream_ready_and_posts() {
+        // This literal only selects the production public-advertise verdict. The injected pending
+        // probe below never dials it, so the regression has no DNS or external-network dependency.
+        const SYNTHETIC_PUBLIC_ADVERTISE: &str = "192.0.2.1:8443";
+        assert!(crate::seller::advertise::advertise_is_public(
+            SYNTHETIC_PUBLIC_ADVERTISE
+        ));
+        let (base_url, upstream_server) =
+            http_server("200 OK", healthy_sse(), Duration::from_millis(10)).await;
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            openai(base_url),
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let owner = address('6');
+        let tc = address('7');
+        let backend = CancelBackend::new(Vec::new(), owner.clone(), 78, CancelBehavior::Remove);
+        let mut config = cfg(&tc);
+        config.gateway_advertise = SYNTHETIC_PUBLIC_ADVERTISE.to_string();
+        let timeout = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+
+        check_readiness_with_probe(
+            &seller,
+            SYNTHETIC_PUBLIC_ADVERTISE,
+            timeout,
+            None,
+            &tc,
+            AdvertiseProbePolicy::default(),
+            std::future::pending::<std::result::Result<(), ProbeFault>>(),
+        )
+        .await
+        .expect("the healthy upstream result must survive a tolerated public probe timeout");
+        assert!(
+            started.elapsed() >= timeout,
+            "the advertise probe did not reach its timeout"
+        );
+
+        super::super::prepare_seller_offer(seller.note.as_ref(), &backend, &config, Some(&owner))
             .await
-            .unwrap()
-            .local_addr()
             .unwrap();
+        assert_eq!(
+            backend.posts.load(Ordering::Relaxed),
+            1,
+            "the tolerated timeout plus healthy upstream must still permit the SELL"
+        );
+        seller.server_task.abort();
+        upstream_server.await.unwrap();
+    }
+
+    /// `--require-advertise-probe` restores the pre- hard fail on the same input.
+    #[tokio::test]
+    async fn require_advertise_probe_makes_a_public_probe_failure_fatal() {
+        const PUBLIC_UNREACHABLE: &str = "192.0.2.1:8443";
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let failure = check_readiness(
+            &seller,
+            PUBLIC_UNREACHABLE,
+            Duration::from_millis(150),
+            None,
+            &address('b'),
+            AdvertiseProbePolicy::Required,
+        )
+        .await
+        .expect_err("--require-advertise-probe must fail closed");
+
+        assert_eq!(failure.component, HealthComponent::AdvertisedGateway);
+        let detail = failure.into_startup_error(PUBLIC_UNREACHABLE).to_string();
+        assert!(
+            detail.contains("error[E_ADVERTISE_UNREACHABLE] (network)"),
+            "{detail}"
+        );
+        assert!(detail.contains(PUBLIC_UNREACHABLE), "{detail}");
+        seller.server_task.abort();
+    }
+
+    /// Collects the emitted `tracing` output of one test thread.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// the degraded arm is where the tolerance costs something -- the offer posts even though
+    /// the self-probe failed -- so it must be LOUD. The component reports `status="warn"` (never
+    /// `pass`), and the `seller_health_degraded` warning carries's structured detail: the
+    /// code, the probed address, the failing stage and the preserved cause, plus the escape hatch.
+    #[tokio::test]
+    async fn a_degraded_probe_warns_loudly_with_the_structured_detail() {
+        const PUBLIC_UNREACHABLE: &str = "192.0.2.1:8443";
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let tc = address('9');
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(sink.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            check_readiness(
+                &seller,
+                PUBLIC_UNREACHABLE,
+                Duration::from_millis(150),
+                None,
+                &tc,
+                AdvertiseProbePolicy::default(),
+            )
+            .await
+            .expect("a transport-level self-probe failure against a public advertise only warns");
+        }
+        let log = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+
+        // The component is warned about, not passed.
+        assert!(
+            log.contains(r#"component="advertised_gateway" status="warn""#),
+            "{log}"
+        );
+        assert!(
+            !log.contains(r#"component="advertised_gateway" status="pass""#),
+            "a failed probe must never report `pass`: {log}"
+        );
+        // 's structured detail survived the degrade path.
+        assert!(log.contains("seller_health_degraded"), "{log}");
+        assert!(
+            log.contains(&format!(
+                "error[E_ADVERTISE_UNREACHABLE] (network): advertised gateway \
+                 {PUBLIC_UNREACHABLE}"
+            )),
+            "{log}"
+        );
+        assert!(log.contains("(stage: "), "{log}");
+        assert!(log.contains("cause: "), "{log}");
+        // And the operator is told how to make it fatal instead.
+        assert!(log.contains("--require-advertise-probe"), "{log}");
+        seller.server_task.abort();
+    }
+
+    /// must not weaken the footgun protection: when the advertised address ANSWERS with a
+    /// foreign certificate, pinning still rejects it and readiness still fails closed.
+    #[tokio::test]
+    async fn foreign_gateway_on_the_advertised_address_stays_fatal() {
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let foreign = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(seller.tls_fingerprint, foreign.tls_fingerprint);
+
+        let advertised = foreign.listen_addr.to_string();
+        let failure = check_readiness(
+            &seller,
+            &advertised,
+            Duration::from_secs(2),
+            None,
+            &address('b'),
+            AdvertiseProbePolicy::default(),
+        )
+        .await
+        .expect_err("a foreign certificate on the advertised address must fail closed");
+
+        assert_eq!(failure.component, HealthComponent::AdvertisedGateway);
+        let detail = failure.into_startup_error(&advertised).to_string();
+        assert!(
+            detail.contains("error[E_ADVERTISE_WRONG_GATEWAY] (tls)"),
+            "{detail}"
+        );
+        assert!(detail.contains("stage: tls_certificate_pin"), "{detail}");
+        seller.server_task.abort();
+        foreign.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pr795_edge_server_returned_grpc_application_statuses_are_fatal_before_sell() {
+        for (index, code) in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::InvalidArgument,
+            tonic::Code::Internal,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Unavailable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (seller, advertised) = status_seller(tonic::Status::new(
+                code,
+                format!("injected server status {code:?}"),
+            ))
+            .await;
+            let owner = address('8');
+            let tc = address('9');
+            let backend = CancelBackend::new(
+                Vec::new(),
+                owner.clone(),
+                200 + index as u128,
+                CancelBehavior::Remove,
+            );
+            let mut config = cfg(&tc);
+            config.gateway_advertise.clone_from(&advertised);
+
+            let error = prepare_seller_offer_with_timing(
+                &seller,
+                &backend,
+                &config,
+                &owner,
+                None,
+                std::future::pending(),
+                SupervisionTiming {
+                    health_interval: Duration::from_millis(5),
+                    health_timeout: Duration::from_secs(2),
+                    cycle_timeout: Duration::from_secs(3),
+                    cancel_poll: Duration::from_millis(1),
+                    abort_gateway_on_stop: true,
+                    advertise_probe: AdvertiseProbePolicy::default(),
+                },
+            )
+            .await
+            .expect_err("a server-returned application status must fail before SELL");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("error[E_ADVERTISE_WRONG_GATEWAY] (tls)")
+                    && rendered.contains("stage: grpc_challenge"),
+                "{code:?}: {rendered}"
+            );
+            assert_eq!(
+                backend.posts.load(Ordering::Relaxed),
+                0,
+                "{code:?}: a gRPC application status must never degrade into a SELL"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_degradation_covers_only_transport_faults_on_a_public_advertise() {
+        let transport = ProbeFault::transport(
+            "tls_handshake",
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+        );
+        let wrong = ProbeFault::wrong_endpoint(
+            "tls_certificate_pin",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mismatch"),
+        );
+        let public = "94.156.178.14:8443";
+        let private = "127.0.0.1:8443";
+
+        assert!(probe_should_degrade(
+            &transport,
+            public,
+            AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        ));
+        assert!(!probe_should_degrade(
+            &transport,
+            public,
+            AdvertiseProbePolicy::Required
+        ));
+        assert!(!probe_should_degrade(
+            &transport,
+            private,
+            AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        ));
+        assert!(!probe_should_degrade(
+            &wrong,
+            public,
+            AdvertiseProbePolicy::TolerateTunneledTransportFailure
+        ));
+    }
+
+    #[test]
+    fn tunneled_probe_warning_names_the_address_and_the_issue() {
+        let hint = tunneled_probe_hint("94.156.178.14:8443");
+        assert!(hint.contains("94.156.178.14:8443"), "{hint}");
+        assert!(hint.contains(""), "{hint}");
+        assert!(hint.contains("--require-advertise-probe"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn upstream_unreachable_rejected_missing_model_and_timeout_fail_closed() {
+        // The first case is the UNREACHABLE upstream(refused at connect), a different fail-closed
+        // path from the fourth(a server that answers too slowly). If a bind-and-drop port is taken
+        // by somebody else the two collapse into one and the case stops proving its own name
+        // so the refusing reservation is held for the whole assertion.
+        let (_dead_hold, dead) = crate::test_refusing_endpoint::refusing_endpoint();
         let cases = [
             (format!("http://{dead}"), None, Duration::from_secs(1)),
             (
@@ -1575,6 +2303,7 @@ mod tests {
                 timeout,
                 None,
                 &address('c'),
+                AdvertiseProbePolicy::default(),
             )
             .await
             .expect_err("bad upstream must fail readiness");
@@ -1610,6 +2339,7 @@ mod tests {
                 Duration::from_secs(1),
                 None,
                 BUYER_TC,
+                AdvertiseProbePolicy::default(),
             )
             .await
             .expect("healthy cycle");
@@ -1660,6 +2390,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             BUYER_TC,
+            AdvertiseProbePolicy::default(),
         )
         .await
         .expect_err("upstream rejection fails the health cycle");
@@ -1696,6 +2427,7 @@ mod tests {
             Duration::from_secs(1),
             None,
             &tc,
+            AdvertiseProbePolicy::default(),
         )
         .await
         .expect("gateway and mock upstream are ready");
@@ -1749,6 +2481,7 @@ mod tests {
                 cycle_timeout: Duration::from_millis(300),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -1805,6 +2538,7 @@ mod tests {
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -1862,6 +2596,7 @@ mod tests {
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -1916,6 +2651,7 @@ mod tests {
                 cycle_timeout: Duration::from_millis(300),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -1965,6 +2701,7 @@ mod tests {
                 cycle_timeout: Duration::from_millis(150),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -2010,7 +2747,7 @@ mod tests {
             &seller,
             &backend,
             &cfg_for_seller(&tc, &seller),
-            &watch("gateway-death"),
+            &watch("gateway-death").1,
             &id,
             std::future::pending(),
             fast_timing(),
@@ -2057,7 +2794,7 @@ mod tests {
             &seller,
             &backend,
             &cfg_for_seller(&tc, &seller),
-            &watch("shared-deadline"),
+            &watch("shared-deadline").1,
             &id,
             std::future::pending(),
             SupervisionTiming {
@@ -2066,6 +2803,7 @@ mod tests {
                 cycle_timeout: Duration::from_millis(30),
                 cancel_poll: Duration::from_millis(1),
                 abort_gateway_on_stop: true,
+                advertise_probe: AdvertiseProbePolicy::default(),
             },
         )
         .await
@@ -2117,7 +2855,7 @@ mod tests {
             &seller,
             &backend,
             &cfg_for_seller(&tc, &seller),
-            &watch("upstream-failure"),
+            &watch("upstream-failure").1,
             &id,
             std::future::pending(),
             fast_timing(),
@@ -2173,6 +2911,7 @@ mod tests {
             Duration::from_secs(1),
             Some(&id),
             &tc,
+            AdvertiseProbePolicy::default(),
         )
         .await
         .expect_err("restart readiness must fail");
@@ -2216,7 +2955,7 @@ mod tests {
             &seller,
             &backend,
             &cfg_for_seller(&tc, &seller),
-            &watch("shutdown"),
+            &watch("shutdown").1,
             &id,
             std::future::ready(()),
             fast_timing(),
@@ -2260,7 +2999,7 @@ mod tests {
             &seller,
             &backend,
             &cfg_for_seller(&tc, &seller),
-            &watch("watcher-error"),
+            &watch("watcher-error").1,
             &id,
             std::future::pending(),
             fast_timing(),
@@ -2317,7 +3056,7 @@ mod tests {
         .unwrap();
         let shutdown = std::future::ready(()).fuse();
         tokio::pin!(shutdown);
-        let watch = watch("match-cancel-race");
+        let (_cursor_dir, watch) = watch("match-cancel-race");
         let cfg = cfg_for_seller(&tc, &seller);
 
         let outcome = supervise_with_timing(
@@ -2522,7 +3261,7 @@ mod tests {
                     &seller,
                     &backend,
                     &cfg_for_seller(&tc, &seller),
-                    &watch(&format!("property-{order_id}")),
+                    &watch(&format!("property-{order_id}")).1,
                     &id,
                     std::future::pending(),
                     fast_timing(),

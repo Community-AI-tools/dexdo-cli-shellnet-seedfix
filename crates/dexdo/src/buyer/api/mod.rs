@@ -256,8 +256,448 @@ impl Default for BuyerApiFailurePolicy {
 pub struct Route {
     pub handover: Handover,
     pub token_contract: TokenContract,
-    /// Deal/session token budget. Per-request `max_tokens` is honored by the handlers but cannot exceed this.
+    /// Deal/session token budget as it stood when the route was built. Per-request `max_tokens` is
+    /// honored by the handlers but cannot exceed the deal's LIVE budget
+    /// ([`ApiDeal::remaining_tokens`]), which for an ordinary deal is exactly this figure minus what
+    /// has been delivered and for a subscription tracks the current week.
     pub max_tokens: u64,
+}
+
+/// Live weekly allowance of a running subscription route.
+/// A subscription's ceiling is one weekly quota measured from what the previous weeks consumed, and it
+/// moves at every week boundary of a four-week term. The figure a client computes from
+/// `getSubscription()` is not reliably that ceiling: the recorded `weekBaseTokens`/`weekIndex` move
+/// when a week is BOOKED, not when the clock passes a boundary, and the relation has three phases
+/// (see [`dexdo_core::subscription_claim_cap_at`]) - exact while no boundary has been crossed, an
+/// under-statement across one that nobody booked, and an upper bound past the final boundary, where
+/// the ceiling becomes the cumulative total already declared. Neither of the last two is strict.
+/// So this does not predict. When the allowance is spent, or when the recorded week has run out on the
+/// wall clock, it submits the permissionless boundary-booking call and then recomputes from the
+/// coherent state that comes back. The buyer's clock only decides WHEN to go and ask; what is
+/// authorized comes from the chain, and a failure to book authorizes nothing.
+pub struct SubscriptionWeeklyBudget {
+    chain: Arc<dyn ChainBackend>,
+    token_contract: TokenContract,
+    /// One reconciliation at a time; the losers read the ceiling the winner published.
+    refresh_lock: Mutex<()>,
+    /// The cumulative claim this route's local counter measures FROM: `tokensPending` as it stood
+    /// when the route was built and `delivered_tokens` was zero. Fixed for the life of the deal.
+    /// Everything the contract bounds is CUMULATIVE, and the local counter is not - so the two are
+    /// only comparable through this one baseline. `anchor + delivered` is what the deal has actually
+    /// consumed, whether or not the seller has got round to claiming it; the ceiling is therefore
+    /// `_claimCap - anchor` and never `delivered +(_claimCap - tokensPending)`, which reads the
+    /// remainder off the seller's claim and hands the difference back to the route every time he
+    /// lags. A seller who stops claiming stops the route: his lag no longer buys it anything.
+    /// Rebased exactly once, and only if the route was built BEFORE the trial tick was accepted:
+    /// `acceptProbe` seeds all three claim stages with one `TICK_SIZE`(`TokenContract.sol:690`),
+    /// which is consumption this route did not make and must therefore sit BELOW its local zero. An
+    /// anchor taken at zero and left there would authorize one tick more than the term ever sells.
+    claim_anchor: std::sync::Mutex<u128>,
+    /// Whether [`Self::claim_anchor`] still needs that one rebase.
+    anchored_before_probe: AtomicBool,
+    #[cfg(test)]
+    rebase_barrier: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
+    /// Set only from authoritative state: a disputed/stopped deal, or a term whose final boundary is
+    /// BOOKED. Terminal is forever - no later reconciliation may reopen it.
+    terminal: AtomicBool,
+    /// The `weekIndex` the published ceiling belongs to. A ceiling is republished when - and only
+    /// when - the chain says the week changed, so an under-used week can never roll into the next.
+    published_week: AtomicU8,
+    /// Unix second at which the published week runs out on the wall clock. Reaching it forces a
+    /// reconciliation before anything further is served; it never authorizes anything by itself.
+    published_week_expires_at: AtomicU64,
+}
+
+/// What the pre-request admission gate decided.
+enum RouteBudget {
+    /// Tokens this request has RESERVED against the route. Holding it is what keeps a concurrent
+    /// request from being handed the same remainder; dropping it returns whatever was not delivered.
+    Admitted(RouteReservation),
+    /// Nothing is deliverable; the payload is the operator-facing reject text.
+    Exhausted(String),
+}
+
+/// An admitted request's claim on the route's remaining tokens.
+/// Reservation happens once, atomically, before the model is contacted - `granted` is the request's
+/// hard output cap. What the stream does not use comes back when this is dropped, so an over-asking
+/// request cannot strand the week's quota.
+struct RouteReservation {
+    reserved: Arc<AtomicU64>,
+    granted: u64,
+    used: u64,
+}
+
+impl RouteReservation {
+    fn remaining(&self) -> u64 {
+        self.granted.checked_sub(self.used).unwrap_or(0)
+    }
+
+    fn checked_used_after(&self, delivered: u64) -> Result<u64, String> {
+        self.used
+            .checked_add(delivered)
+            .filter(|used| *used <= self.granted)
+            .ok_or_else(|| {
+                format!(
+                    "accepted output of {delivered} tokens does not fit the held route reservation: \
+                     {} used of {} granted",
+                    self.used, self.granted
+                )
+            })
+    }
+}
+
+impl Drop for RouteReservation {
+    fn drop(&mut self) {
+        self.reserved.fetch_sub(self.remaining(), Ordering::SeqCst);
+    }
+}
+
+/// Tell the seller the limit this request was actually ADMITTED for.
+/// Admission reserves `granted` against the authoritative weekly ceiling, which is usually smaller
+/// than the caller's own `max_tokens`. Sending the caller's figure upstream asks the seller to
+/// produce output nobody reserved: the buyer's hard cap then has to throw the excess away, and a
+/// single legal multi-token chunk straddling the remaining allowance wastes the whole request. The
+/// grant belongs on the wire, not only in the buyer's bookkeeping.
+/// Returns the figure it actually wrote, which is what the buyer then enforces on the way back.
+/// Since the grant can be LARGER than the caller's own limit -- admission reserves the deal's
+/// unpaid identity verification on top of the ask, and whatever verification leaves unspent stays in
+/// the reservation. That remainder is headroom the deal has already paid for, not output the caller
+/// asked for, so the receiving cap is this figure and not the whole remaining grant.
+fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u64 {
+    let granted = u32::try_from(granted).unwrap_or(u32::MAX);
+    let capped = match canon.params.as_mut() {
+        Some(params) => {
+            params.max_tokens = match params.max_tokens {
+                // `0` is "unset" on the wire, so an unset caller limit becomes the grant itself.
+                0 => granted,
+                asked => asked.min(granted),
+            };
+            params.max_tokens
+        }
+        None => {
+            canon.params = Some(dexdo_proto::SamplingParams {
+                temperature: 0.0,
+                max_tokens: granted,
+                stop: Vec::new(),
+                greedy: false,
+            });
+            granted
+        }
+    };
+    u64::from(capped)
+}
+
+const ORDINARY_BUDGET_EXHAUSTED: &str =
+    "active deal budget exhausted; waiting for renewal handover";
+
+/// Refusal for a deal that still owes its one-per-deal identity verification and no longer has the
+/// budget to pay for that AND deliver an answer.
+/// It can fire with tokens still on the route, and that is the point: admitting them would spend the
+/// last of the deal on a probe no answer could follow, which is exactly the paid-verification /
+/// zero-inference outcome this refusal exists to prevent. A resumed deal is where it is reachable --
+/// [`ApiDeal::new`] builds a fresh, unverified gate over whatever remainder the route was rebuilt
+/// with.
+const UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION: &str =
+    "what is left of this deal cannot pay for the identity verification it still owes and deliver \
+     an answer as well; refusing before the verification probe is sent rather than burning it for \
+     nothing";
+
+impl SubscriptionWeeklyBudget {
+    /// `claim_anchor`, `published_week` and `expires_at` must all come from the SAME coherent snapshot
+    /// the route's initial `max_tokens` was computed from: the anchor is that snapshot's
+    /// `tokensPending`, which is where the route's local delivered counter starts at zero.
+    pub fn new(
+        chain: Arc<dyn ChainBackend>,
+        token_contract: TokenContract,
+        state: &dexdo_core::DealChainState,
+        subscription: &dexdo_core::DealSubscription,
+    ) -> Self {
+        Self {
+            chain,
+            token_contract,
+            refresh_lock: Mutex::new(()),
+            claim_anchor: std::sync::Mutex::new(state.tokens_pending),
+            anchored_before_probe: AtomicBool::new(!state.probe_accepted),
+            #[cfg(test)]
+            rebase_barrier: std::sync::Mutex::new(None),
+            terminal: AtomicBool::new(subscription.term_is_over()),
+            published_week: AtomicU8::new(subscription.week_index),
+            published_week_expires_at: AtomicU64::new(subscription.recorded_week_expires_at()),
+        }
+    }
+
+    /// The local ceiling implied by an authoritative snapshot: the contract's own `_claimCap`,
+    /// expressed against the anchor the local counter measures from.
+    /// Fails closed rather than saturating. A cap below the anchor means the chain has contradicted
+    /// the state this route was built on, and a ceiling that does not fit `u64` cannot be enforced by
+    /// a `u64` counter - in both cases a manufactured number would be an authorization nobody
+    /// computed, so there is none.
+    fn local_ceiling(
+        &self,
+        snapshot: &dexdo_core::DealChainSnapshot,
+        anchor: u128,
+    ) -> Result<u64, String> {
+        let cap = dexdo_core::subscription_claim_cap_at(&snapshot.state, &snapshot.subscription)
+            .map_err(|error| format!("subscription {}: {error}", self.token_contract))?;
+        let local = cap.checked_sub(anchor).ok_or_else(|| {
+            format!(
+                "subscription {}: claim ceiling {cap} is below the cumulative claim {anchor} this \
+                 route was anchored on; refusing rather than authorizing on contradictory state",
+                self.token_contract
+            )
+        })?;
+        u64::try_from(local).map_err(|_| {
+            format!(
+                "subscription {}: claim ceiling {local} tokens above the anchor does not fit the \
+                 route's counter; refusing rather than serving a truncated authorization",
+                self.token_contract
+            )
+        })
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::SeqCst)
+    }
+
+    /// Whether the published week has run out on the wall clock. A trigger, never an authorization:
+    /// it only says the route must go and ask the chain again before serving anything else.
+    fn published_week_ran_out(&self) -> bool {
+        unix_now_secs() >= self.published_week_expires_at.load(Ordering::SeqCst)
+    }
+
+    /// Rebase the anchor the first time an authoritative read shows the trial tick accepted.
+    /// Returns whether it moved, because the ceiling that was published against the old one is then
+    /// stale and must be recomputed in the same breath.
+    /// `acceptProbe` sets all three claim stages to a FLAT `TICK_SIZE` - it does not add one. So it
+    /// absorbs whatever this route had already delivered before acceptance (`delivered`, capped at a
+    /// tick by the seller's own pre-probe capacity), and the part of that seed which is NOT this
+    /// route's own delivery is `TICK_SIZE - delivered`. That, and only that, belongs below the local
+    /// counter's zero.
+    /// Adding a whole `TICK_SIZE` instead would be wrong in both directions at once: the current week
+    /// would still be over by `TICK_SIZE - delivered`, and the first booking would then measure the
+    /// new week short by `delivered`. The errors do not cancel - they change sign at the boundary.
+    /// The trigger cannot be `weekIndex`: acceptance does not move it. It is the acceptance flag on a
+    /// fresh snapshot, which is why a route still anchored pre-probe reconciles on every admission.
+    fn rebase_anchor_on_probe(
+        &self,
+        state: &dexdo_core::DealChainState,
+        delivered: u64,
+        anchor: &mut u128,
+    ) -> Result<bool, String> {
+        if !state.probe_accepted || !self.anchored_before_probe.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let rebased_anchor = dexdo_core::TICK_SIZE
+            .checked_sub(u128::from(delivered))
+            .ok_or_else(|| {
+                format!(
+                    "subscription {}: the route delivered {delivered} tokens before probe acceptance, \
+                     above the one-tick probe claim {}; refusing contradictory state",
+                    self.token_contract,
+                    dexdo_core::TICK_SIZE
+                )
+            })?;
+        *anchor = rebased_anchor;
+        Ok(true)
+    }
+
+    /// Whether this route's anchor still describes a deal whose trial tick was not yet accepted.
+    /// While that is true the fast admission path is not safe: the ceiling it would serve was
+    /// measured from a cumulative claim the contract is about to move underneath it.
+    fn anchored_before_probe(&self) -> bool {
+        self.anchored_before_probe.load(Ordering::SeqCst)
+    }
+
+    /// Book every boundary the CHAIN says is due, then recompute from the state that comes back.
+    /// Returns the reject text when the route may not serve.
+    /// The booking is a MONEY PATH, not a read: `_chargeWeeksThrough` moves already-escrowed value -
+    /// `_deposit -= pay + fee; _finalizedOwed += pay; _feeAccrued += fee`
+    /// (`TokenContract.sol:922-933`). What it does not do is create a new commitment: it charges the
+    /// weeks the term already owes, which every exit charges anyway, so it cannot cost the buyer
+    /// anything the deal had not already committed. It is also permissionless, and it is the only
+    /// thing here that decides a boundary was crossed - the contract refuses it when none was.
+    /// Nothing is published until the whole coherent state has been validated. Publishing the week or
+    /// its expiry before the ceiling that belongs to them would leave a stale positive ceiling looking
+    /// fresh, and the next request would skip reconciliation entirely and serve it.
+    async fn reconcile(&self, ceiling: &AtomicU64, delivered: &AtomicU64) -> Result<(), String> {
+        if self.is_terminal() {
+            return Err(format!(
+                "subscription {} is terminal; the contract admits no further claim",
+                self.token_contract
+            ));
+        }
+        // Ask the chain to cross whatever it owes. A deal with nothing due answers ERR_SETTLE_WINDOW_OPEN
+        // and nothing changes - which is the correct answer to "is the week over?" and is exactly why
+        // the buyer's clock is not allowed to answer it.
+        let booking = self.chain.settle_week(&self.token_contract).await;
+        let snapshot = self
+            .chain
+            .deal_snapshot(&self.token_contract)
+            .await
+            .map_err(|error| {
+                format!(
+                    "subscription {}: authoritative weekly state is unreadable ({error}); refusing \
+                     rather than serving on a stale ceiling",
+                    self.token_contract
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "subscription {}: no coherent snapshot; refusing rather than serving on a stale \
+                     ceiling",
+                    self.token_contract
+                )
+            })?;
+        if !snapshot.subscription.is_subscription() {
+            return Err(format!(
+                "TokenContract {} is not a subscription; its budget has no weekly boundary",
+                self.token_contract
+            ));
+        }
+        if snapshot.state.disputed || snapshot.state.is_stopped() {
+            self.terminal.store(true, Ordering::SeqCst);
+            return Err(format!(
+                "subscription {} is disputed/stopped; it cannot be revived by a quota refresh",
+                self.token_contract
+            ));
+        }
+        if snapshot.subscription.term_is_over() {
+            self.terminal.store(true, Ordering::SeqCst);
+            return Err(format!(
+                "subscription {} has served its full {}-week term; the claim ceiling is the \
+                 cumulative total already declared and no quota remains",
+                self.token_contract, snapshot.subscription.sub_weeks
+            ));
+        }
+        if !snapshot.state.opened {
+            // Not latched: only the terminal paths clear `_opened` for good, and the serving gate
+            // refuses an unopened deal on its own terms.
+            return Err(format!(
+                "subscription {} is not open; no weekly quota is servable",
+                self.token_contract
+            ));
+        }
+        let week = snapshot.subscription.week_index;
+        let expires_at = snapshot.subscription.recorded_week_expires_at();
+        let republished = self.published_week.load(Ordering::SeqCst) != week;
+
+        // The booking's RESPONSE is not evidence; the booked state is. A submission whose response
+        // was lost still moved the chain, and a submission that succeeded is not visible until a read
+        // shows it. So when the chain says it booked and the state that comes back is still the week
+        // we already had, this read cannot support anything: publish nothing and let the next request
+        // ask again, rather than republishing an expiry that would let it skip asking.
+        if booking.is_ok() && !republished {
+            return Err(format!(
+                "subscription {} booked a boundary the authoritative read does not show yet; \
+                 refusing rather than serving week {} on a read that lags the booking",
+                self.token_contract,
+                u32::from(week) + 1
+            ));
+        }
+        // Nothing booked, and the week on record has run out on the wall clock. Whether the contract
+        // refused because no boundary was due or the submission never landed cannot be told apart
+        // from here - and either way the remainder on record belongs to a week the clock says is
+        // over. Publish nothing: a fresh expiry would authorize exactly the stale remainder that must
+        // not be served, and the next request must come back and ask again.
+        if !republished && unix_now_secs() >= expires_at {
+            return Err(format!(
+                "subscription {} could not book the boundary its week {} of {} needs (the contract \
+                 answered no boundary was due, or the submission did not land); the recorded week \
+                 ended at unix {expires_at} and its remainder is not an authorization",
+                self.token_contract,
+                u32::from(week) + 1,
+                snapshot.subscription.sub_weeks
+            ));
+        }
+
+        // Everything below is computed BEFORE anything is published, so a failure here leaves the
+        // route exactly as it was - still expired, still forced to reconcile on the next request.
+        // The trial tick may have been accepted since this route was built. That does not move
+        // `weekIndex`, so it is not a republish - but it does move the baseline the ceiling is
+        // measured from, which makes the published one stale.
+        // `claim_anchor` is also the cutover mutex used by per-chunk accounting while this route is
+        // still pre-probe. It is acquired only after all chain awaits and held across the complete
+        // linearization point: delivered sample, anchor/ceiling publication, and gate cutover.
+        let mut cutover_anchor = if snapshot.state.probe_accepted && self.anchored_before_probe() {
+            Some(self.claim_anchor.lock().map_err(|_| {
+                format!(
+                    "subscription {}: acceptance cutover lock is poisoned; refusing quota",
+                    self.token_contract
+                )
+            })?)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if cutover_anchor.is_some() {
+            if let Some(barrier) = self.rebase_barrier.lock().unwrap().take() {
+                barrier.wait();
+                barrier.wait();
+            }
+        }
+        let delivered_at_cutover = delivered.load(Ordering::SeqCst);
+        let rebased = match cutover_anchor.as_deref_mut() {
+            Some(anchor) => self.rebase_anchor_on_probe(
+                &snapshot.state,
+                delivered_at_cutover,
+                anchor,
+            )?,
+            None => false,
+        };
+        let published_ceiling = if republished || rebased {
+            // A new week was BOOKED. Its allowance is measured from the cumulative claim the booking
+            // re-based on, and it starts here: whatever the previous week left unspent is forfeited,
+            // never carried across the boundary.
+            let anchor = match cutover_anchor.as_deref() {
+                Some(anchor) => *anchor,
+                None => *self.claim_anchor.lock().map_err(|_| {
+                    format!(
+                        "subscription {}: claim anchor lock is poisoned; refusing quota",
+                        self.token_contract
+                    )
+                })?,
+            };
+            self.local_ceiling(&snapshot, anchor)?
+        } else {
+            ceiling.load(Ordering::SeqCst)
+        };
+        if published_ceiling <= delivered.load(Ordering::SeqCst) {
+            let booked = match &booking {
+                Ok(()) => "the boundary was booked",
+                Err(_) => "no boundary was due",
+            };
+            // A drawn-down week is a fact about the CURRENT week, so publishing it is right: the
+            // route may serve nothing until the next boundary, and the expiry is when to ask again.
+            self.publish(week, expires_at, ceiling, published_ceiling);
+            if rebased {
+                self.anchored_before_probe.store(false, Ordering::SeqCst);
+            }
+            return Err(format!(
+                "subscription {} week {} of {} is drawn down ({booked}); the next weekly quota opens \
+                 at unix {expires_at} and the deal stays live until then",
+                self.token_contract,
+                u32::from(week) + 1,
+                snapshot.subscription.sub_weeks,
+            ));
+        }
+        self.publish(week, expires_at, ceiling, published_ceiling);
+        if rebased {
+            self.anchored_before_probe.store(false, Ordering::SeqCst);
+        }
+        drop(cutover_anchor);
+        Ok(())
+    }
+
+    /// Publish the week, its expiry and the ceiling that belongs to them, in that order, once the
+    /// whole snapshot has been validated. They are one fact about one week and are never written
+    /// apart: a fresh expiry over a stale ceiling is precisely what lets the next request skip
+    /// reconciliation and serve a week that has ended.
+    fn publish(&self, week: u8, expires_at: u64, ceiling: &AtomicU64, published_ceiling: u64) {
+        ceiling.store(published_ceiling, Ordering::SeqCst);
+        self.published_week.store(week, Ordering::SeqCst);
+        self.published_week_expires_at
+            .store(expires_at, Ordering::SeqCst);
+    }
 }
 
 /// One currently usable consumer-API deal: route, settlement terminal, and one-per-deal content gate.
@@ -267,6 +707,14 @@ pub struct ApiDeal {
     pub session: Arc<SessionSettle>,
     pub content_gate: Arc<ContentGate>,
     delivered_tokens: Arc<AtomicU64>,
+    /// Tokens handed out to admitted requests, delivered or still in flight. Admission moves this and
+    /// nothing else, so two requests can never be handed the same remainder.
+    reserved_tokens: Arc<AtomicU64>,
+    /// Live ceiling on the CUMULATIVE `delivered_tokens` counter. An ordinary deal pins it to
+    /// `route.max_tokens` for the life of the deal; a subscription republishes it from the contract's
+    /// own claim ceiling every time a week boundary is BOOKED.
+    token_ceiling: Arc<AtomicU64>,
+    weekly: Option<Arc<SubscriptionWeeklyBudget>>,
     last_accepted_output_unix_secs: Arc<AtomicU64>,
     accepted_output_generation: Arc<AtomicU64>,
     active_requests: Arc<AtomicU64>,
@@ -275,11 +723,15 @@ pub struct ApiDeal {
 
 impl ApiDeal {
     pub fn new(route: Route, session: Arc<SessionSettle>, content_gate: Arc<ContentGate>) -> Self {
+        let token_ceiling = Arc::new(AtomicU64::new(route.max_tokens));
         Self {
             route,
             session,
             content_gate,
             delivered_tokens: Arc::new(AtomicU64::new(0)),
+            reserved_tokens: Arc::new(AtomicU64::new(0)),
+            token_ceiling,
+            weekly: None,
             last_accepted_output_unix_secs: Arc::new(AtomicU64::new(0)),
             accepted_output_generation: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
@@ -287,18 +739,197 @@ impl ApiDeal {
         }
     }
 
-    pub fn delivered_tokens(&self) -> u64 {
+    /// Attach the live weekly allowance of a subscription route. Without it the deal keeps the
+    /// fixed `route.max_tokens` budget, which is exactly right for an ordinary by-fact deal.
+    pub fn with_weekly_budget(mut self, weekly: Arc<SubscriptionWeeklyBudget>) -> Self {
+        self.weekly = Some(weekly);
+        self
+    }
+
+    /// Cumulative tokens this route has delivered. Production never reads it -- the ceiling and the
+    /// reservation are what callers act on -- so it exists only where its one consumer does.
+    #[cfg(test)]
+    fn delivered_tokens(&self) -> u64 {
         self.delivered_tokens.load(Ordering::SeqCst)
     }
 
+    /// Tokens still deliverable under the published ceiling -- what has NOT been handed to a request.
     pub fn remaining_tokens(&self) -> u64 {
-        self.route
-            .max_tokens
-            .saturating_sub(self.delivered_tokens())
+        if self.weekly.as_ref().is_some_and(|w| w.is_terminal()) {
+            return 0;
+        }
+        self.admission_ceiling()
+            .saturating_sub(self.reserved_tokens.load(Ordering::SeqCst))
     }
 
-    pub fn record_delivered(&self, n: u64) {
-        self.delivered_tokens.fetch_add(n, Ordering::SeqCst);
+    /// The contract admits at most its canonical trial tick until `acceptProbe` has been observed
+    /// and this route's anchor/ceiling cutover is complete. The buyer enforces that cap independently
+    /// of the seller's capacity recorder, including while the acceptance snapshot is in flight.
+    fn admission_ceiling(&self) -> u64 {
+        // The canonical trial tick as a token count. `TICK_SIZE` is a `u128` only because the
+        // contract's cumulative counters are; the canon value fits a `u64` counter exactly, and the
+        // assertion is what keeps that a fact rather than an assumption.
+        const PROBE_TICK_TOKENS: u64 = dexdo_core::TICK_SIZE as u64;
+        const _: () = assert!(PROBE_TICK_TOKENS as u128 == dexdo_core::TICK_SIZE);
+
+        if self
+            .weekly
+            .as_ref()
+            .is_some_and(|weekly| weekly.anchored_before_probe())
+        {
+            // Flat `TICK_SIZE`, and deliberately NOT `min(TICK_SIZE, published)`: funding refuses
+            // anything under two ticks(`TokenContract.sol:453`, `paid - bond < 2 * unit`) and a
+            // subscription's volume is additionally a whole number of weeks of ticks, so the
+            // smallest legal shape is four ticks over four weeks and the pre-acceptance ceiling is
+            // never below one tick. That `min` could not take its second branch on any reachable
+            // deal, and a clamp that cannot fire reads as a protection while being none.
+            return PROBE_TICK_TOKENS;
+        }
+        self.token_ceiling.load(Ordering::SeqCst)
+    }
+
+    /// Take a request's tokens out of the published ceiling, atomically. `asked` is the caller's own
+    /// output limit; `None` asks for everything left.
+    /// A grant has two parts and they are not equal. The FLOOR is what the deal owes its
+    /// one-per-deal identity verification, which [`ContentGate::ensure_verified`] spends out of this
+    /// same reservation and nothing else; above it sits the answer's clamp. The clamp may be
+    /// SHORTENED -- a route with room for one token of a two-token ask still answers, with one token.
+    /// The floor may not: a grant that does not exceed it pays for the verification and delivers
+    /// nothing, so clamping down to it would admit precisely the paid-probe / zero-inference outcome
+    /// of. That is refused here instead, before any probe is sent.
+    /// Both are decided against ONE observation of the ceiling and one of the gate, re-read on every
+    /// attempt: a request that loses the compare-exchange recomputes what it owes and what is left
+    /// together, so a concurrent reservation can never leave it holding a floor it cannot cover. With
+    /// nothing owed the floor is zero and this is the ordinary "nothing left to hand out" refusal.
+    fn try_reserve(&self, asked: Option<u64>) -> Option<RouteReservation> {
+        let mut reserved = self.reserved_tokens.load(Ordering::SeqCst);
+        loop {
+            let ceiling = self.admission_ceiling();
+            let free = ceiling.saturating_sub(reserved);
+            let floor = self.content_gate.outstanding_verification_tokens();
+            let granted = match asked {
+                Some(asked) => asked.saturating_add(floor).min(free),
+                None => free,
+            };
+            if granted <= floor {
+                return None;
+            }
+            match self.reserved_tokens.compare_exchange(
+                reserved,
+                reserved.saturating_add(granted),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(RouteReservation {
+                        reserved: self.reserved_tokens.clone(),
+                        granted,
+                        used: 0,
+                    })
+                }
+                Err(observed) => reserved = observed,
+            }
+        }
+    }
+
+    /// The pre-request admission gate: reserve this request's output cap, or say why not.
+    /// An ordinary deal answers from its fixed funded budget. A subscription reconciles against the
+    /// chain first whenever its published week is spent OR has run out on the wall clock -- the second
+    /// is what stops an under-used week being carried across its boundary, and what makes the end of
+    /// the term reachable at all rather than leaving a stale positive remainder servable forever.
+    /// Reconciliation books the boundary through the permissionless path and recomputes from the
+    /// coherent state that comes back; a booking that is not due, or a read that fails, authorizes
+    /// nothing.
+    async fn admit(&self, requested: Option<u32>) -> RouteBudget {
+        // what a request ASKS for is not all it has to pay for. A deal that has not passed its
+        // one-per-deal identity verification owes those probe tokens too, and `ensure_verified`
+        // spends them out of THIS request's reservation and nothing else. Reserving only the
+        // caller's figure hands the first request a grant verification consumes whole, and the first
+        // real inference on a fresh deal is then refused for a zero grant -- the live 502 of. So
+        // `try_reserve` adds that debt to the ask as an unclampable floor, and an `Admitted` grant
+        // therefore always holds the whole verification AND a deliverable answer. Only the SIZE of
+        // the reservation changes, and only while the deal owes something: the gate reports zero once
+        // its verdict is cached, so every later request reserves exactly its ask. What verification
+        // does not spend returns to the route with the guard, and the answer still goes on the wire
+        // capped by the caller's own figure, so the slack is headroom for what the deal owed rather
+        // than licence to serve more than was asked.
+        let want = requested.map(u64::from).filter(|n| *n > 0);
+        let Some(weekly) = self.weekly.as_ref() else {
+            return match self.try_reserve(want) {
+                Some(reservation) => RouteBudget::Admitted(reservation),
+                None => RouteBudget::Exhausted(self.exhausted_reason()),
+            };
+        };
+        if weekly.is_terminal() {
+            return RouteBudget::Exhausted(format!(
+                "subscription {} is terminal; the contract admits no further claim",
+                self.route.token_contract
+            ));
+        }
+        // A route anchored before the trial tick was accepted must ask the chain: acceptance moves
+        // the cumulative claim its local zero is measured from without moving `weekIndex`, so the
+        // cached ceiling is a tick too generous until an authoritative read rebases it.
+        if self.remaining_tokens() > 0
+            && !weekly.published_week_ran_out()
+            && !weekly.anchored_before_probe()
+        {
+            if let Some(reservation) = self.try_reserve(want) {
+                return RouteBudget::Admitted(reservation);
+            }
+        }
+        let _guard = weekly.refresh_lock.lock().await;
+        // The reconciliation that held the lock may already have published this week's ceiling.
+        if self.remaining_tokens() > 0
+            && !weekly.published_week_ran_out()
+            && !weekly.anchored_before_probe()
+        {
+            return match self.try_reserve(want) {
+                Some(reservation) => RouteBudget::Admitted(reservation),
+                None => RouteBudget::Exhausted(self.exhausted_reason()),
+            };
+        }
+        match weekly
+            .reconcile(&self.token_ceiling, &self.delivered_tokens)
+            .await
+        {
+            Ok(()) => match self.try_reserve(want) {
+                Some(reservation) => RouteBudget::Admitted(reservation),
+                None => RouteBudget::Exhausted(self.exhausted_reason()),
+            },
+            Err(reason) => RouteBudget::Exhausted(reason),
+        }
+    }
+
+    /// Why [`Self::try_reserve`] handed nothing out, in the operator's terms. A deal that still owes
+    /// its identity verification can be refused with budget left on the route, so the two
+    /// cases do not share one sentence: "exhausted" would send an operator looking for a spent deal
+    /// when the remainder is simply too small to verify and answer out of.
+    fn exhausted_reason(&self) -> String {
+        if self.content_gate.outstanding_verification_tokens() > 0 {
+            UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION.to_string()
+        } else {
+            ORDINARY_BUDGET_EXHAUSTED.to_string()
+        }
+    }
+
+    /// Account delivered output without crossing the currently published global ceiling. Reached
+    /// only through [`ConsumerRequestGuard::record_delivered`], which validates the request's held
+    /// reservation first and commits that reservation only after this atomic update succeeds.
+    fn record_delivered(&self, n: u64) -> Result<(), String> {
+        let ceiling = self.token_ceiling.load(Ordering::SeqCst);
+        self.delivered_tokens
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |delivered| {
+                delivered.checked_add(n)
+                    .filter(|next| *next <= ceiling)
+            })
+            .map(|_| ())
+            .map_err(|delivered| match delivered.checked_add(n) {
+                Some(next) => format!(
+                    "accepted output would raise cumulative delivery from {delivered} to {next} \
+                     tokens above the currently published route ceiling {ceiling}"
+                ),
+                None => "cumulative delivered-token accounting overflow".to_string(),
+            })
     }
 
     /// Record output immediately before a streaming adapter yields it to its consumer.
@@ -330,6 +961,7 @@ impl ApiDeal {
             accepted_output_generation: self.accepted_output_generation.clone(),
             session: self.session.clone(),
             failure_heartbeat: None,
+            reservation: None,
         }
     }
 
@@ -351,9 +983,48 @@ pub(crate) struct ConsumerRequestGuard {
     accepted_output_generation: Arc<AtomicU64>,
     session: Arc<SessionSettle>,
     failure_heartbeat: Option<dexdo_core::chain::HeartbeatGuard>,
+    /// This request's slice of the route's remaining tokens. Dropped with the guard, which returns
+    /// whatever the stream did not deliver.
+    reservation: Option<RouteReservation>,
 }
 
 impl ConsumerRequestGuard {
+    fn hold(&mut self, reservation: RouteReservation) {
+        self.reservation = Some(reservation);
+    }
+
+    fn remaining_grant(&self) -> u64 {
+        self.reservation
+            .as_ref()
+            .map(RouteReservation::remaining)
+            .unwrap_or(0)
+    }
+
+    /// Account delivered output against BOTH the deal's cumulative counter and this request's
+    /// reservation, so the tokens it did not use come back to the week rather than being stranded.
+    fn record_delivered(&mut self, deal: &ApiDeal, delivered: u64) -> Result<(), String> {
+        // The existing anchor mutex is the acceptance cutover mutex. Every subscription chunk takes
+        // it, including chunks from old reservations after the pre-probe flag has been cleared: a
+        // chunk either commits before the cutover samples delivery, or validates the new ceiling.
+        let _cutover = match deal.weekly.as_ref() {
+            Some(weekly) => Some(weekly.claim_anchor.lock().map_err(|_| {
+                format!(
+                    "subscription {}: acceptance cutover lock is poisoned; refusing output",
+                    deal.route.token_contract
+                )
+            })?),
+            None => None,
+        };
+        let reservation = self
+            .reservation
+            .as_mut()
+            .ok_or_else(|| "accepted output has no admitted route reservation".to_string())?;
+        let next_used = reservation.checked_used_after(delivered)?;
+        deal.record_delivered(delivered)?;
+        reservation.used = next_used;
+        Ok(())
+    }
+
     pub(crate) fn arm_upstream_failure(&mut self) {
         self.failure_heartbeat = Some(dexdo_core::chain::HeartbeatGuard::new(
             self.accepted_output_generation.clone(),
@@ -510,15 +1181,6 @@ pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
     token_ids.max(logprobs).max(1)
 }
 
-/// Consumer request limit, bounded by the already-purchased deal budget. `None`/`0` means "use the budget".
-pub(crate) fn request_token_limit(requested: Option<u32>, budget: u64) -> u64 {
-    requested
-        .map(u64::from)
-        .filter(|n| *n > 0)
-        .unwrap_or(budget)
-        .min(budget)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamErrorPolicyAction {
     RequestScoped,
@@ -669,15 +1331,38 @@ impl ContentGate {
         }
     }
 
+    /// Output tokens this deal still OWES to its one-per-deal identity verification.
+    /// Verification is paid output that [`Self::ensure_verified`] spends out of the admitting
+    /// request's reservation, so this is the unclampable FLOOR of that reservation
+    /// ([`ApiDeal::try_reserve`]): a request that cannot hold it and still deliver an answer is
+    /// refused rather than admitted for less. It is the ceiling of what verification can cost -- the
+    /// B8 fingerprint probe and then the B7-full reference spot-check, each capped at
+    /// `CONTENT_PROBE_MAX_TOKENS` -- because a gate that degrades a layer to a pass spends less and
+    /// hands the difference straight back when the request guard drops. Zero once a definitive
+    /// verdict is cached: the gate never probes twice, so every later request on the deal reserves
+    /// only what it asks for.
+    pub(crate) fn outstanding_verification_tokens(&self) -> u64 {
+        match &self.check {
+            ContentCheck::Skip => 0,
+            ContentCheck::Probe { .. } if self.verdict.get().is_some() => 0,
+            ContentCheck::Probe { .. } => CONTENT_PROBE_MAX_TOKENS.saturating_mul(2),
+        }
+    }
+
     /// Run the content-identity gate once per deal. `Skip` -> `Ok(())`. `Probe` -> run B8 then B7-full
     /// ONCE(cached): the cached `Ok(())`/`Err(reason)` is the definitive verdict(pass/bail); a transport error
     /// is propagated as `Err` WITHOUT being cached, so the next request retries. On a bail the deal is closed
     /// to new requests before the verdict is cached and returned.
-    pub async fn ensure_verified(
+    /// verification spends the CALLER'S held reservation and nothing else. Each accepted probe
+    /// chunk is charged through `request_guard` before the probe stream may await again, so dropping
+    /// the handler while B7 is pending cannot return quota already spent by B8. A transport error
+    /// likewise leaves every preceding accepted chunk charged. `OnceCell` waiters do not run the
+    /// initializer, so only the request whose guard is passed into that initializer pays.
+    pub(crate) async fn ensure_verified(
         &self,
         buyer: &Buyer,
-        route: &Route,
-        session: &SessionSettle,
+        deal: &ApiDeal,
+        request_guard: &mut ConsumerRequestGuard,
     ) -> Result<(), String> {
         match &self.check {
             ContentCheck::Skip => Ok(()),
@@ -696,35 +1381,49 @@ impl ContentGate {
                     .get_or_try_init::<String, _, _>(|| async {
                         // B8 content fingerprint. The `?` makes a transport error the OUTER Err(not cached);
                         // a definitive verdict goes through `Ok(...)`.
-                        let v8 = buyer
-                            .behavioral_probe(
-                                &route.handover,
-                                &route.token_contract,
-                                model_id,
-                                CONTENT_PROBE_MAX_TOKENS,
-                                models,
-                            )
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let b8_cap = request_guard
+                            .remaining_grant()
+                            .min(CONTENT_PROBE_MAX_TOKENS);
+                        let v8 = {
+                            let mut charge = |tokens| request_guard.record_delivered(deal, tokens);
+                            buyer
+                                .behavioral_probe(
+                                    &deal.route.handover,
+                                    &deal.route.token_contract,
+                                    model_id,
+                                    b8_cap,
+                                    models,
+                                    Some(&mut charge),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?
+                        };
                         if let Verdict::Bail(r) = v8 {
-                            session
+                            deal.session
                                 .settle_verification_bail("content-identity-bail")
                                 .await;
                             return Ok(Err(r));
                         }
                         // B7-full reference spot-check(greedy vs the official endpoint).
-                        let v7 = buyer
-                            .reference_spotcheck(
-                                &route.handover,
-                                &route.token_contract,
-                                model_id,
-                                CONTENT_PROBE_MAX_TOKENS,
-                                models,
-                            )
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let b7_cap = request_guard
+                            .remaining_grant()
+                            .min(CONTENT_PROBE_MAX_TOKENS);
+                        let v7 = {
+                            let mut charge = |tokens| request_guard.record_delivered(deal, tokens);
+                            buyer
+                                .reference_spotcheck(
+                                    &deal.route.handover,
+                                    &deal.route.token_contract,
+                                    model_id,
+                                    b7_cap,
+                                    models,
+                                    Some(&mut charge),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?
+                        };
                         if let Verdict::Bail(r) = v7 {
-                            session
+                            deal.session
                                 .settle_verification_bail("content-identity-bail")
                                 .await;
                             return Ok(Err(r));
@@ -1767,14 +2466,20 @@ impl ApiState {
         session: Arc<SessionSettle>,
         content_gate: Arc<ContentGate>,
     ) -> Self {
+        Self::single_deal(
+            buyer,
+            frame_model,
+            ApiDeal::new(route, session, content_gate),
+        )
+    }
+
+    /// One already-built deal -- the seam a subscription route needs, because its live weekly budget
+    /// is attached to the [`ApiDeal`] rather than to the immutable [`Route`].
+    pub fn single_deal(buyer: Arc<Buyer>, frame_model: String, deal: ApiDeal) -> Self {
         Self {
             buyer,
             frame_model,
-            deals: Arc::new(RouteManager::new(ApiDeal::new(
-                route,
-                session,
-                content_gate,
-            ))),
+            deals: Arc::new(RouteManager::new(deal)),
         }
     }
 
@@ -1890,6 +2595,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexdo_core::SUB_WEEK_LEN;
 
     #[test]
     fn default_failure_policy_uses_canonical_parameters() {
@@ -2112,14 +2818,6 @@ mod tests {
     }
 
     #[test]
-    fn request_limit_honors_request_and_caps_by_budget() {
-        assert_eq!(request_token_limit(Some(400), 1_000_000), 400);
-        assert_eq!(request_token_limit(Some(2_000_000), 1_000_000), 1_000_000);
-        assert_eq!(request_token_limit(None, 1_000_000), 1_000_000);
-        assert_eq!(request_token_limit(Some(0), 1_000_000), 1_000_000);
-    }
-
-    #[test]
     fn api_deal_tracks_active_and_recent_consumer_demand() {
         let deal = ApiDeal::new(
             Route {
@@ -2167,26 +2865,6 @@ mod tests {
             2
         );
         assert_eq!(accounted_tokens(&CanonChunk::default()), 1);
-    }
-
-    #[test]
-    fn sse_paths_record_delivery_per_chunk() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
-        for source in [openai, anthropic] {
-            assert!(
-                source.contains("let before = driver.received();"),
-                "SSE path must snapshot delivery count before accounting"
-            );
-            assert!(
-                source.contains("deal.record_delivered(driver.received().saturating_sub(before));"),
-                "SSE path must record each rendered chunk immediately"
-            );
-            assert!(
-                !source.contains("let received = driver.received();\n        drop(driver);\n        deal.record_delivered(received);"),
-                "SSE path must not wait until stream end to publish delivered tokens"
-            );
-        }
     }
 
     fn heartbeat_test_deal() -> ApiDeal {
@@ -3730,5 +4408,2334 @@ mod tests {
         assert!(api.contains("settle_dead_gateway(\"stream-error-before-token\", &heartbeat)"));
         assert!(api
             .contains("settle_seller_stalls_mid_stream(\"seller-stalls-mid-stream\", &heartbeat)"));
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // a running subscription route must follow the week the CONTRACT is in.
+    // The chain double below is a small faithful `TokenContract`: `settleWeek` books a boundary only
+    // when the CHAIN says one is due and otherwise refuses(`ERR_SETTLE_WINDOW_OPEN`), and booking
+    // re-bases `weekBaseTokens` on the cumulative claim exactly as `_chargeWeeksThrough` does. The
+    // buyer's clock is moved only through `period_start`, which is what the contract itself measures
+    // against - so a test can never authorize a week the "chain" has not crossed.
+    // The upstream is registered deliberately unconstrained: the seller's own capacity accounting has
+    // its own regressions, and here every refusal must be the buyer's weekly budget and nothing else.
+    // ----------------------------------------------------------------------------------------
+
+    /// Two ticks a week over a four-week term, eight ticks funded.
+    /// Not the smallest shape the book accepts - `InferenceOrderBook.sol:1309` requires only that the
+    /// tick count divide by `SUB_WEEKS`, so FOUR ticks(one a week) is the true minimum. Two a week is
+    /// the smallest shape in which the accepted probe's tick is visible as a part of a week rather
+    /// than the whole of it.
+    const WEEK_QUOTA: u128 = 2 * dexdo_core::TICK_SIZE;
+
+    /// What `acceptProbe` has already paid for and claimed: the trial tick(`TokenContract.sol:690`).
+    /// No probe-accepted deal is ever below this, on any of the three claim stages.
+    const PROBE_CLAIM: u128 = dexdo_core::TICK_SIZE;
+
+    /// Value of one tick in this fixture, so a booking's money movement is a real subtraction rather
+    /// than a token count standing in for one.
+    const TEST_TICK_VALUE: u128 = 3;
+
+    /// The whole term's escrow: eight ticks at [`TEST_TICK_VALUE`].
+    const TEST_DEPOSIT: u128 = 8 * TEST_TICK_VALUE;
+
+    struct WeeklyQuotaChain {
+        token_contract: TokenContract,
+        snapshot: std::sync::Mutex<dexdo_core::DealChainSnapshot>,
+        /// Boundaries the CHAIN clock has crossed and nobody has booked yet.
+        due_boundaries: std::sync::Mutex<u8>,
+        settle_fails: std::sync::atomic::AtomicBool,
+        /// The counterparty files a dispute while a booking submission is in flight.
+        dispute_on_settle: std::sync::atomic::AtomicBool,
+        /// Reads still to be answered from the state as it stood BEFORE the last booking.
+        stale_reads: std::sync::atomic::AtomicUsize,
+        /// What the last read would have returned had it not been served stale.
+        pre_booking: std::sync::Mutex<Option<dexdo_core::DealChainSnapshot>>,
+        snapshot_reads: std::sync::atomic::AtomicUsize,
+        settle_calls: std::sync::atomic::AtomicUsize,
+        settle_bookings: std::sync::atomic::AtomicUsize,
+        /// Calls that would move value the route is NEVER allowed to move: a new BUY commitment,
+        /// a claim, an exit. The boundary booking is not one of them - it is money, but money the
+        /// term already owed, so it is measured by `settle_bookings` and by the deposit itself.
+        foreign_money_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WeeklyQuotaChain {
+        fn new(token_contract: &str, period_start: u64, claimed: u128) -> Self {
+            Self {
+                token_contract: token_contract.to_string(),
+                snapshot: std::sync::Mutex::new(dexdo_core::DealChainSnapshot {
+                    account_code_hash: "code".to_string(),
+                    account_boc_hash: "boc".to_string(),
+                    state: weekly_state(claimed),
+                    subscription: weekly_subscription(period_start, 0, 0),
+                    seller_bond: dexdo_core::DealSellerBond {
+                        bond_funded: true,
+                        bond_held: 2,
+                        bond_required: 2,
+                    },
+                    buyer_bond: dexdo_core::DealBuyerBond {
+                        bond_held: 2,
+                        bond_required: 2,
+                    },
+                }),
+                due_boundaries: std::sync::Mutex::new(0),
+                settle_fails: std::sync::atomic::AtomicBool::new(false),
+                dispute_on_settle: std::sync::atomic::AtomicBool::new(false),
+                stale_reads: std::sync::atomic::AtomicUsize::new(0),
+                pre_booking: std::sync::Mutex::new(None),
+                snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
+                settle_calls: std::sync::atomic::AtomicUsize::new(0),
+                settle_bookings: std::sync::atomic::AtomicUsize::new(0),
+                foreign_money_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.snapshot_reads.load(Ordering::SeqCst)
+        }
+
+        fn settle_calls(&self) -> usize {
+            self.settle_calls.load(Ordering::SeqCst)
+        }
+
+        fn bookings(&self) -> usize {
+            self.settle_bookings.load(Ordering::SeqCst)
+        }
+
+        fn foreign_money_calls(&self) -> usize {
+            self.foreign_money_calls.load(Ordering::SeqCst)
+        }
+
+        /// Value the bookings have moved out of escrow and credited to the seller.
+        fn settled_value(&self) -> (u128, u128) {
+            let snapshot = self.snapshot.lock().unwrap();
+            (snapshot.state.deposit, snapshot.state.finalized_owed)
+        }
+
+        /// The authoritative books, for a test that must pin the contract's own figure rather than
+        /// assert an inequality the route could satisfy for the wrong reason.
+        fn books(&self) -> (dexdo_core::DealChainState, dexdo_core::DealSubscription) {
+            let snapshot = self.snapshot.lock().unwrap();
+            (snapshot.state, snapshot.subscription)
+        }
+
+        /// The next read answers from BEFORE the booking that precedes it - an ordinary lagging read.
+        fn serve_one_stale_read(&self) {
+            self.stale_reads.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn week_index(&self) -> u8 {
+            self.snapshot.lock().unwrap().subscription.week_index
+        }
+
+        /// The seller lands a cumulative claim - the only thing that moves `tokensPending`.
+        fn seller_claims(&self, cumulative: u128) {
+            self.snapshot.lock().unwrap().state = weekly_state(cumulative);
+        }
+
+        /// The CHAIN clock crosses `weeks` boundaries. Nothing is booked by this: `weekIndex` and
+        /// `weekBaseTokens` stay exactly where they were, as the live getter leaves them.
+        fn chain_crosses_boundaries(&self, weeks: u8) {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            snapshot.subscription.period_start = snapshot
+                .subscription
+                .period_start
+                .saturating_sub(u64::from(weeks) * SUB_WEEK_LEN.as_secs());
+            *self.due_boundaries.lock().unwrap() += weeks;
+        }
+
+        /// `acceptProbe`: the trial tick is accepted, seeding all three claim stages and the money
+        /// mark with one `TICK_SIZE` and leaving `weekBaseTokens` at zero - week one counts the probe
+        /// against its own quota(`TokenContract.sol:690-696`).
+        fn accepts_probe(&self) {
+            let mut snapshot = self.snapshot.lock().unwrap();
+            snapshot.state.probe_accepted = true;
+            snapshot.state.tokens_final = PROBE_CLAIM;
+            snapshot.state.tokens_superseded = PROBE_CLAIM;
+            snapshot.state.tokens_pending = PROBE_CLAIM;
+            snapshot.subscription.tokens_paid = PROBE_CLAIM;
+        }
+
+        /// The counterparty disputes the deal while the buyer's boundary booking is in flight.
+        /// This is the only ordering in which a request can reach the reconciliation with a
+        /// disputed deal at all: the serving gate([`SessionSettle::ensure_open_for_serving`]) reads
+        /// the deal a moment earlier and refuses a disputed one on its own terms, so what the
+        /// reconciliation defends against is precisely a dispute that lands inside the submission
+        /// window it is already past.
+        fn disputes_while_booking(&self) {
+            self.dispute_on_settle
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A probe-accepted deal at cumulative claim `claimed`.
+    /// `acceptProbe` seeds ALL THREE claim stages and the money mark with one `TICK_SIZE`
+    /// (`TokenContract.sol:690-696`), so `claimed` counts the trial tick and can never be below it.
+    /// A fixture starting at zero would be a deal no chain can report, and every figure measured from
+    /// it would be a tick too generous.
+    fn weekly_state(claimed: u128) -> dexdo_core::DealChainState {
+        // Zero is the OPEN-but-not-yet-accepted shape; anything else is post-`acceptProbe` and can
+        // never be below the trial tick it seeded.
+        assert!(
+            claimed == 0 || claimed >= PROBE_CLAIM,
+            "a probe-accepted deal has already claimed its trial tick"
+        );
+        dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            probe_accepted: claimed > 0,
+            disputed: false,
+            deposit: TEST_DEPOSIT,
+            finalized_owed: 0,
+            tokens_final: claimed,
+            tokens_superseded: claimed,
+            tokens_pending: claimed,
+            probe_tick: 0,
+            funded_time: Some(1),
+            probe_time: 1,
+            prev_claim_time: 1,
+            last_claim_time: 1,
+            dispute_time: 0,
+        }
+    }
+
+    /// `tokens_paid` is the money mark: `acceptProbe` seeds it with one `TICK_SIZE` and every booked
+    /// boundary raises it to `(weekIndex + 1) * tokensPerWeek`, so after booking to week `k` it stands
+    /// at `k * tokensPerWeek`. It is never zero -- a subscription's volume is a whole number of weeks
+    /// of ticks, so `tokensPerWeek >= TICK_SIZE` and no assignment can go under the probe's tick.
+    fn weekly_subscription(
+        period_start: u64,
+        week_index: u8,
+        week_base_tokens: u128,
+    ) -> dexdo_core::DealSubscription {
+        dexdo_core::DealSubscription {
+            deal_flags: dexdo_core::order_flags::SUBSCRIPTION,
+            sub_weeks: dexdo_core::SUBSCRIPTION_WEEKS,
+            week_index,
+            tokens_per_week: WEEK_QUOTA,
+            funded_tokens: WEEK_QUOTA * u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
+            tokens_paid: (u128::from(week_index) * WEEK_QUOTA).max(dexdo_core::TICK_SIZE),
+            period_start,
+            week_base_tokens,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainBackend for WeeklyQuotaChain {
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            unimplemented!("the weekly-quota route never discovers offers")
+        }
+
+        async fn post_offer(
+            &self,
+            _offer: dexdo_core::SellOffer,
+            _note: &dyn Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer-only backend")
+        }
+
+        async fn place_buy(
+            &self,
+            _token_contract: &TokenContract,
+            _note: &dyn Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.foreign_money_calls.fetch_add(1, Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "a weekly reconciliation must never buy anything".to_string(),
+            ))
+        }
+
+        async fn read_match(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            unimplemented!("the route already holds its handover")
+        }
+
+        async fn open_stream(
+            &self,
+            _token_contract: &TokenContract,
+            _enc_endpoint: Vec<u8>,
+            _note: &dyn Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("buyer-only backend")
+        }
+
+        async fn read_handover(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            Ok(None)
+        }
+
+        async fn claim_tokens(
+            &self,
+            _token_contract: &TokenContract,
+            _note: &dyn Note,
+            _cumulative_tokens: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.foreign_money_calls.fetch_add(1, Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "the buyer never claims".to_string(),
+            ))
+        }
+
+        /// The permissionless boundary booking, as the contract implements it: it settles only what
+        /// the CHAIN has actually crossed, and refuses when the window is still open.
+        /// It is a MONEY PATH and is modelled as one. `_chargeWeeksThrough` charges each week it
+        /// books - `_deposit -= pay; _finalizedOwed += pay`(`TokenContract.sol:922-933`) - against
+        /// `due =(weekIndex + 1) * tokensPerWeek - tokensPaid`, clamped by what the deposit still
+        /// holds. What it never does is commit anything NEW: those weeks are already owed and every
+        /// exit charges them anyway.
+        async fn settle_week(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            self.settle_calls.fetch_add(1, Ordering::SeqCst);
+            if self.dispute_on_settle.load(Ordering::SeqCst) {
+                // Somebody else's transaction lands first: from here on every read of this account
+                // is a disputed one.
+                self.snapshot.lock().unwrap().state.disputed = true;
+            }
+            if self.settle_fails.load(Ordering::SeqCst) {
+                return Err(dexdo_core::ChainError::Chain(
+                    "settleWeek submission failed".to_string(),
+                ));
+            }
+            let mut due = self.due_boundaries.lock().unwrap();
+            let mut snapshot = self.snapshot.lock().unwrap();
+            *self.pre_booking.lock().unwrap() = Some(snapshot.clone());
+            if *due == 0 || snapshot.subscription.term_is_over() {
+                return Err(dexdo_core::ChainError::Chain(
+                    "ERR_SETTLE_WINDOW_OPEN".to_string(),
+                ));
+            }
+            while *due > 0 && !snapshot.subscription.term_is_over() {
+                // `_chargeWeeksThrough`, in order: charge the week, then advance the books.
+                let target = u128::from(snapshot.subscription.week_index + 1) * WEEK_QUOTA;
+                let owed_tokens = target.saturating_sub(snapshot.subscription.tokens_paid);
+                let pay = (owed_tokens / dexdo_core::TICK_SIZE)
+                    .saturating_mul(TEST_TICK_VALUE)
+                    .min(snapshot.state.deposit);
+                snapshot.state.deposit -= pay;
+                snapshot.state.finalized_owed += pay;
+                snapshot.subscription.tokens_paid = target;
+                snapshot.subscription.week_index += 1;
+                // The new week starts from what has been consumed so far.
+                snapshot.subscription.week_base_tokens = snapshot.state.tokens_pending;
+                *due -= 1;
+            }
+            self.settle_bookings.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop(
+            &self,
+            _token_contract: &TokenContract,
+            _note: &dyn Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            self.foreign_money_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
+        }
+
+        async fn deal_snapshot(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            self.snapshot_reads.fetch_add(1, Ordering::SeqCst);
+            if self
+                .stale_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                if let Some(stale) = self.pre_booking.lock().unwrap().clone() {
+                    return Ok(Some(stale));
+                }
+            }
+            Ok(Some(self.snapshot.lock().unwrap().clone()))
+        }
+
+        async fn deal_state(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            Ok(Some(self.snapshot.lock().unwrap().state))
+        }
+
+        async fn snapshot(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            None
+        }
+    }
+
+    /// One buyer endpoint in front of one real TLS gateway.
+    struct WeeklyRouteHarness {
+        addr: SocketAddr,
+        buyer: Arc<Buyer>,
+        chain: Arc<WeeklyQuotaChain>,
+        deals: Arc<RouteManager>,
+        seller: crate::seller::RunningSeller,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl WeeklyRouteHarness {
+        async fn ask(&self, max_tokens: u64) -> (reqwest::StatusCode, String) {
+            self.ask_path("/v1/chat/completions", max_tokens).await
+        }
+
+        /// Both consumer paths take the same request fields, so one body drives either endpoint --
+        /// which is what makes the two paths comparable when they compete for one remainder.
+        async fn ask_path(&self, path: &str, max_tokens: u64) -> (reqwest::StatusCode, String) {
+            self.ask_full(path, max_tokens, "weekly quota", true).await
+        }
+
+        /// One request with everything the adversarial cases need to vary: which consumer protocol,
+        /// what the request may cost, what the seller is asked to do, and whether the answer is
+        /// streamed or aggregated.
+        async fn ask_full(
+            &self,
+            path: &str,
+            max_tokens: u64,
+            prompt: &str,
+            stream: bool,
+        ) -> (reqwest::StatusCode, String) {
+            let body = serde_json::json!({
+                "model": "dexdo-mock",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "stream": stream
+            });
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap()
+                .post(format!("http://{}{path}", self.addr))
+                .json(&body)
+                .send()
+                .await
+                .expect("the local endpoint answers");
+            let status = response.status();
+            (status, response.text().await.expect("body"))
+        }
+
+        /// What the LIVE route says it may still hand out - the production figure admission gates on.
+        async fn remaining(&self) -> u64 {
+            self.deals
+                .current()
+                .await
+                .expect("the harness route is published")
+                .remaining_tokens()
+        }
+
+        async fn delivered(&self) -> u64 {
+            self.deals
+                .current()
+                .await
+                .expect("the harness route is published")
+                .delivered_tokens()
+        }
+
+        async fn shutdown(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(task) = self.task.take() {
+                let _ = task.await;
+            }
+            self.seller.server_task.abort();
+        }
+    }
+
+    /// The seller emits as many tokens as it is asked for: unconstrained, so that every refusal in
+    /// these tests is the buyer's weekly budget and nothing else.
+    const UNCONSTRAINED_UPSTREAM: u64 = 64 * dexdo_core::TICK_SIZE as u64;
+
+    /// A route built BEFORE the trial tick was accepted: `open()` has funded and opened the deal but
+    /// `acceptProbe` has not run, so every claim stage is genuinely zero.
+    async fn weekly_route_harness_before_probe(expires_in: u64) -> WeeklyRouteHarness {
+        weekly_route_harness_with_upstream(0, true, expires_in, UNCONSTRAINED_UPSTREAM).await
+    }
+
+    async fn weekly_route_harness(claimed: u128, subscription: bool) -> WeeklyRouteHarness {
+        weekly_route_harness_expiring_in(claimed, subscription, SUB_WEEK_LEN.as_secs()).await
+    }
+
+    async fn weekly_route_harness_expiring_in(
+        claimed: u128,
+        subscription: bool,
+        expires_in: u64,
+    ) -> WeeklyRouteHarness {
+        weekly_route_harness_with_upstream(
+            claimed,
+            subscription,
+            expires_in,
+            UNCONSTRAINED_UPSTREAM,
+        )
+        .await
+    }
+
+    /// `expires_in` is how many seconds of the recorded week are left on the WALL CLOCK when the route
+    /// is built. A short value lets a test cross the boundary of a RUNNING route by waiting, which is
+    /// the only thing that happens in production: `periodStart` never moves, the clock does.
+    /// `upstream_tokens` is how many tokens the seller's model will emit at most. Below the request's
+    /// own cap it is a model that simply stops early - which is what leaves part of a reservation
+    /// unused.
+    async fn weekly_route_harness_with_upstream(
+        claimed: u128,
+        subscription: bool,
+        expires_in: u64,
+        upstream_tokens: u64,
+    ) -> WeeklyRouteHarness {
+        weekly_route_harness_gated(
+            claimed,
+            subscription,
+            expires_in,
+            upstream_tokens,
+            ContentGate::skip(),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await
+    }
+
+    /// The same route with a real content-identity gate, so a test can watch what verification
+    /// itself spends out of the admitted grant.
+    async fn weekly_route_harness_gated(
+        claimed: u128,
+        subscription: bool,
+        expires_in: u64,
+        upstream_tokens: u64,
+        content_gate: ContentGate,
+        upstream: crate::seller::UpstreamConfig,
+    ) -> WeeklyRouteHarness {
+        let token_contract = "0:".to_string() + &"9".repeat(64);
+        let period_start = unix_now_secs() + expires_in - SUB_WEEK_LEN.as_secs();
+        let chain = Arc::new(WeeklyQuotaChain::new(
+            &token_contract,
+            period_start,
+            claimed,
+        ));
+
+        // shape B: the gateway makes the ONE bind. Reserving a port here and releasing it
+        // before `start_gateway_with` re-binds hands it back to the kernel, and any concurrent
+        // `bind(0)` can be given that exact port in between.
+        let seller = crate::seller::start_gateway_with("127.0.0.1:0".parse().unwrap(), upstream)
+            .await
+            .expect("TLS mock gateway");
+        let gateway_addr = seller.listen_addr;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
+        let buyer = Arc::new(Buyer::from_note(note.clone()));
+        // The seller's own view of a deal whose probe has NOT been accepted yet. Before
+        // `acceptProbe` the three claim stages really are zero, so this one is built rather than
+        // derived from the probe-accepted fixture, which can never be.
+        let upstream_state = dexdo_core::DealChainState {
+            probe_accepted: false,
+            tokens_final: 0,
+            tokens_superseded: 0,
+            tokens_pending: 0,
+            ..weekly_state(PROBE_CLAIM)
+        };
+        seller
+            .state
+            .register_stream(
+                &token_contract,
+                note.pubkey(),
+                upstream_tokens,
+                upstream_state,
+                dexdo_core::DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: 64 * dexdo_core::TICK_SIZE,
+                    funded_tokens: 64 * dexdo_core::TICK_SIZE,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                },
+            )
+            .expect("register the upstream stream");
+
+        let initial = weekly_subscription(period_start, 0, 0);
+        let headroom =
+            dexdo_core::subscription_current_week_headroom(&weekly_state(claimed), &initial)
+                .expect("recorded week headroom");
+        let route = Route {
+            handover: Handover {
+                endpoint: format!("https://{gateway_addr}"),
+                tls_fingerprint: seller.tls_fingerprint.clone(),
+            },
+            token_contract: token_contract.clone(),
+            max_tokens: u64::try_from(headroom).unwrap(),
+        };
+        let session = Arc::new(SessionSettle::new_with_failure_policy_and_lifetime(
+            chain.clone(),
+            token_contract.clone(),
+            note,
+            BuyerApiFailurePolicy::default(),
+            SessionLifetimePolicy::Preserve,
+        ));
+        let deal = ApiDeal::new(route, session, Arc::new(content_gate));
+        let deal = if subscription {
+            deal.with_weekly_budget(Arc::new(SubscriptionWeeklyBudget::new(
+                chain.clone(),
+                token_contract.clone(),
+                &weekly_state(claimed),
+                &initial,
+            )))
+        } else {
+            deal
+        };
+        let state = ApiState::single_deal(buyer.clone(), "dexdo-mock".to_string(), deal);
+        let deals = state.deals.clone();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("bind the local endpoint");
+
+        WeeklyRouteHarness {
+            addr,
+            buyer,
+            chain,
+            deals,
+            seller,
+            shutdown: Some(shutdown_tx),
+            task: Some(task),
+        }
+    }
+
+    #[tokio::test]
+    async fn booked_boundary_serves_the_next_week_without_a_restart() {
+        // Week one with only the accepted probe claimed: the quota LESS that trial tick is available.
+        let harness = weekly_route_harness_expiring_in(PROBE_CLAIM, true, 2).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        assert_eq!(harness.remaining().await, quota - probe);
+
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.delivered().await, 8);
+
+        // The seller claims what he has actually served - the probe and those eight tokens - and the
+        // CHAIN crosses one boundary. Nobody has booked it, so the getter still reads
+        // weekIndex=0/weekBaseTokens=0: the stale-getter shape of.
+        harness.chain.seller_claims(PROBE_CLAIM + 8);
+        harness.chain.chain_crosses_boundaries(1);
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        assert_eq!(harness.chain.week_index(), 0);
+
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "the same running route must serve week two without a restart: {body}"
+        );
+        assert_eq!(
+            harness.chain.bookings(),
+            1,
+            "the new week must come from the permissionless booking, never from the buyer's clock"
+        );
+        assert_eq!(harness.chain.week_index(), 1);
+        // The new week's allowance is a whole quota measured from the cumulative claim, and the 8
+        // tokens of the old week were NOT carried into it.
+        assert_eq!(harness.remaining().await, quota - 8);
+        // The booking is a money path: it charged week one out of escrow and credited the seller.
+        // One tick, not two - `acceptProbe` had already paid for the trial tick of week one, and
+        // `_chargeWeeksThrough` charges up to the cumulative total the term owes rather than a flat
+        // quota on top of it.
+        let (deposit, finalized_owed) = harness.chain.settled_value();
+        assert_eq!(finalized_owed, TEST_TICK_VALUE);
+        assert_eq!(deposit, TEST_DEPOSIT - TEST_TICK_VALUE);
+        // ...but no NEW commitment: no buy, no claim, no exit.
+        assert_eq!(harness.chain.foreign_money_calls(), 0);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_under_used_week_is_forfeited_at_its_boundary_and_never_rolls_over() {
+        // Week one barely used: a large POSITIVE remainder is cached on the route.
+        let harness = weekly_route_harness_expiring_in(PROBE_CLAIM, true, 2).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        let (status, body) = harness.ask(4).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.remaining().await, quota - probe - 4);
+
+        // The chain crosses the boundary with that remainder still positive. The seller claims only
+        // what he served: the probe's tick and those four tokens.
+        harness.chain.seller_claims(PROBE_CLAIM + 4);
+        harness.chain.chain_crosses_boundaries(1);
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(
+            harness.chain.bookings(),
+            1,
+            "a boundary must be reconciled even when the cached remainder is positive"
+        );
+        // One quota from the new base, NOT the new quota plus what week one left unspent.
+        assert_eq!(harness.remaining().await, quota - 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_positive_remainder_does_not_survive_the_final_boundary() {
+        let harness = weekly_route_harness_expiring_in(PROBE_CLAIM, true, 2).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let (status, body) = harness.ask(4).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(
+            harness.remaining().await > 0,
+            "a positive remainder is cached"
+        );
+
+        // The whole term elapses on the chain while that remainder is still spendable.
+        harness
+            .chain
+            .chain_crosses_boundaries(dexdo_core::SUBSCRIPTION_WEEKS);
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "a finished term may not keep serving a stale remainder: {body}"
+        );
+        assert!(body.contains("full 4-week term"), "{body}");
+        assert_eq!(harness.remaining().await, 0);
+        assert_eq!(harness.chain.week_index(), dexdo_core::SUBSCRIPTION_WEEKS);
+        // ...and it never comes back.
+        harness.chain.seller_claims(quota.into());
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("terminal"), "{body}");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_booking_authorizes_nothing_and_names_the_next_boundary() {
+        // The recorded week is spent.
+        let harness = weekly_route_harness(WEEK_QUOTA, true).await;
+        let period_start = harness
+            .chain
+            .snapshot
+            .lock()
+            .unwrap()
+            .subscription
+            .period_start;
+
+        // No boundary is due: the contract refuses the booking and nothing may be served.
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("no boundary was due"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "next weekly quota opens at unix {}",
+                period_start + SUB_WEEK_LEN.as_secs()
+            )),
+            "a temporary weekly state must report when it lifts: {body}"
+        );
+        assert_eq!(harness.chain.settle_calls(), 1);
+        assert_eq!(harness.chain.bookings(), 0);
+
+        // A boundary IS due, but the settlement submission itself fails: fail closed, no allowance.
+        harness.chain.chain_crosses_boundaries(1);
+        harness
+            .chain
+            .settle_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "an unbooked boundary is not an allowance: {body}"
+        );
+        assert_eq!(harness.chain.bookings(), 0);
+        assert_eq!(harness.remaining().await, 0);
+
+        // Once the booking lands, the same route serves again.
+        harness
+            .chain
+            .settle_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.chain.bookings(), 1);
+        // The one booking that landed charged the week it booked - one tick, the part of week one the
+        // accepted probe had not already paid - and nothing else moved value: the two refused
+        // attempts before it charged nothing at all.
+        let (deposit, finalized_owed) = harness.chain.settled_value();
+        assert_eq!(finalized_owed, TEST_TICK_VALUE);
+        assert_eq!(deposit, TEST_DEPOSIT - TEST_TICK_VALUE);
+        assert_eq!(harness.chain.foreign_money_calls(), 0);
+        harness.shutdown().await;
+    }
+
+    /// A dispute that lands while the booking is in flight is what the reconciliation's
+    /// disputed/stopped branch is for: the request is already past the serving gate, which read a
+    /// clean deal a moment earlier. The reconciliation is then the last reader of authoritative
+    /// state before anything is served, and what it latches is forever - a boundary the chain
+    /// crosses afterwards is the strongest revival there is, and it must republish nothing.
+    #[tokio::test]
+    async fn terminal_subscription_is_never_revived_by_a_reconciliation() {
+        // The recorded week is spent, so the request goes to the chain rather than serving from a
+        // cached remainder.
+        let harness = weekly_route_harness(WEEK_QUOTA, true).await;
+        harness.chain.disputes_while_booking();
+
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("disputed/stopped"), "{body}");
+
+        // A boundary is now genuinely due: booking it would measure a whole fresh quota from the
+        // cumulative claim, which is exactly the revival a latched route may not have.
+        harness.chain.chain_crosses_boundaries(1);
+        let reads = harness.chain.reads();
+        let settle_calls = harness.chain.settle_calls();
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let RouteBudget::Exhausted(reason) = deal.admit(Some(1)).await else {
+            panic!("a terminal subscription may not admit a request");
+        };
+        assert!(reason.contains("terminal"), "{reason}");
+        assert_eq!(deal.remaining_tokens(), 0);
+        assert_eq!(
+            harness.chain.bookings(),
+            0,
+            "a terminal route must never book a boundary it can no longer claim"
+        );
+        assert_eq!(
+            (harness.chain.reads(), harness.chain.settle_calls()),
+            (reads, settle_calls),
+            "a latched terminal route must not keep polling the chain"
+        );
+        harness.shutdown().await;
+    }
+
+    /// Adversarial admission: the simultaneous requested sum far exceeds the exact remaining quota, on
+    /// BOTH consumer paths. Reservation is what must hold the line - delivered may never pass the
+    /// authoritative remainder, whoever asks first.
+    #[tokio::test]
+    async fn concurrent_requests_cannot_be_handed_the_same_remainder() {
+        let harness = weekly_route_harness(WEEK_QUOTA - 12, true).await;
+        assert_eq!(harness.remaining().await, 12);
+
+        // Six requests of eight tokens each: 48 asked for against 12 available.
+        let mut answers = Vec::new();
+        for path in [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/chat/completions",
+            "/v1/messages",
+        ] {
+            answers.push(harness.ask_path(path, 8));
+        }
+        let answers = futures::future::join_all(answers).await;
+        let served = answers
+            .iter()
+            .filter(|(status, _)| *status == reqwest::StatusCode::OK)
+            .count();
+        assert!(served >= 1, "the available quota must still be servable");
+
+        assert!(
+            harness.delivered().await <= 12,
+            "delivered {} exceeded the authoritative weekly remainder of 12",
+            harness.delivered().await
+        );
+        assert_eq!(harness.remaining().await, 0);
+        for (status, body) in &answers {
+            assert!(
+                *status == reqwest::StatusCode::OK
+                    || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "{status}: {body}"
+            );
+        }
+        harness.shutdown().await;
+    }
+
+    /// An over-asking request must not strand the week: what it did not deliver comes back.
+    #[tokio::test]
+    async fn an_unused_reservation_returns_to_the_week() {
+        let harness =
+            weekly_route_harness_with_upstream(WEEK_QUOTA - 16, true, SUB_WEEK_LEN.as_secs(), 5)
+                .await;
+        assert_eq!(harness.remaining().await, 16);
+
+        // Reserve the WHOLE remainder against a model that stops after five tokens: admission takes
+        // all sixteen out of the week, the stream uses five, and the other eleven must come back. A
+        // test that asked for exactly what it delivers would pass with the refund deleted.
+        let (status, body) = harness.ask(16).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let delivered = harness.delivered().await;
+        assert!(
+            delivered < 16,
+            "this test only proves anything while the stream leaves part of its reservation unused; \
+             delivered {delivered} of 16"
+        );
+        assert_eq!(
+            harness.remaining().await,
+            16 - delivered,
+            "exactly the undelivered part of the reservation must come back to the week"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A seller who does not claim what he served must not thereby enlarge the route.
+    /// The two counters are not comparable without a baseline: the route's `delivered` starts at zero
+    /// while the contract bounds a CUMULATIVE claim. Publishing `delivered + (_claimCap -
+    /// tokensPending)` reads the remainder off the seller's claim, so every token he has served but
+    /// not claimed is handed back to the route a second time.
+    /// The boundary is BOOKED first and the booking is confirmed to have moved `weekIndex` before
+    /// anything is compared, so the un-booked-boundary understatement(phase 2) is out of play and
+    /// what remains is only the baseline. And the assertion is an EQUALITY against the figure the
+    /// contract itself would admit - `ceiling <= cap` would pass just as well on two errors that
+    /// happen to cancel.
+    #[tokio::test]
+    async fn a_lagging_seller_claim_cannot_enlarge_the_route() {
+        // Week one, probe claimed. Anchor = PROBE_CLAIM, so the route may deliver quota - probe.
+        let harness = weekly_route_harness_expiring_in(PROBE_CLAIM, true, 2).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        assert_eq!(harness.remaining().await, quota - probe);
+
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.delivered().await, 8);
+
+        // The seller serves those eight tokens and claims NOTHING for them: `tokensPending` stays at
+        // the probe. The chain crosses a boundary and the route books it.
+        harness.chain.chain_crosses_boundaries(1);
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+
+        // Phase 2 is out of play only once the boundary is actually BOOKED - confirm it moved.
+        assert_eq!(harness.chain.bookings(), 1);
+        assert_eq!(harness.chain.week_index(), 1);
+
+        // The contract re-based the week on the cumulative claim, which the lagging seller left at
+        // the probe: `_claimCap = weekBaseTokens + tokensPerWeek = probe + quota`. Against the anchor
+        // the route measures from, that is exactly one quota of local capacity - no more, whatever
+        // the seller has or has not claimed.
+        let (state, subscription) = harness.chain.books();
+        assert_eq!(subscription.week_base_tokens, PROBE_CLAIM);
+        assert_eq!(state.tokens_pending, PROBE_CLAIM);
+        let cap = dexdo_core::subscription_claim_cap_at(&state, &subscription).expect("claim cap");
+        assert_eq!(cap, PROBE_CLAIM + WEEK_QUOTA);
+        let authorized = u64::try_from(cap - PROBE_CLAIM).unwrap();
+        assert_eq!(authorized, quota);
+
+        // EQUALITY, both sides pinned: what the route may still hand out is the contract's own
+        // ceiling minus everything this route has already reserved against it.
+        assert_eq!(
+            harness.remaining().await,
+            authorized - 9,
+            "the ceiling must be the contract's cap measured from the route's own anchor"
+        );
+        harness.shutdown().await;
+    }
+
+    /// The other direction, on its own: a boundary the chain has
+    /// crossed and NOBODY has booked, with the seller's claim exactly level with delivery. Here the
+    /// recorded books understate the contract - phase 2 - and the route must still refuse until it
+    /// has booked, rather than reasoning its way to the larger figure.
+    #[tokio::test]
+    async fn an_unbooked_boundary_understates_the_ceiling_and_authorizes_nothing() {
+        // The recorded week is exactly spent: cap = 0 + quota, pending = quota.
+        let harness = weekly_route_harness_expiring_in(WEEK_QUOTA, true, 2).await;
+        assert_eq!(harness.remaining().await, 0);
+
+        // The chain crosses a boundary. Nobody books it, and the mock refuses to book one that is
+        // not due, so the recorded books stay where they are.
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let (state, subscription) = harness.chain.books();
+        assert_eq!(
+            subscription.week_index, 0,
+            "the getter lags until it is booked"
+        );
+        let recorded = dexdo_core::subscription_claim_cap_at(&state, &subscription).expect("cap");
+        assert_eq!(recorded, WEEK_QUOTA);
+
+        // What the contract would admit once the crossed boundary is booked is strictly more - the
+        // understatement, with no delivery lag anywhere in it.
+        let booked = dexdo_core::DealSubscription {
+            week_index: 1,
+            week_base_tokens: state.tokens_pending,
+            ..subscription
+        };
+        let after_booking =
+            dexdo_core::subscription_claim_cap_at(&state, &booked).expect("booked cap");
+        assert_eq!(after_booking, WEEK_QUOTA + WEEK_QUOTA);
+        assert!(recorded < after_booking);
+
+        // The route serves NEITHER figure: it has not booked, so it has no authorization at all.
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(harness.remaining().await, 0);
+        harness.shutdown().await;
+    }
+
+    /// A reconciliation that cannot finish must publish NOTHING.
+    /// The booking landed and the read that followed still shows the old week - a lagging read, which
+    /// on a real node is ordinary. Republishing the week's expiry here would mark the route fresh
+    /// while its ceiling still belonged to the week that just ended, and the next request would skip
+    /// reconciliation entirely and serve it.
+    #[tokio::test]
+    async fn a_booking_the_read_does_not_show_publishes_nothing() {
+        // A POSITIVE remainder on record - the stale figure that must not be served.
+        let harness = weekly_route_harness_expiring_in(WEEK_QUOTA - 16, true, 2).await;
+        assert_eq!(harness.remaining().await, 16);
+
+        harness.chain.chain_crosses_boundaries(1);
+        harness.chain.serve_one_stale_read();
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        // The booking lands, the read lags: refuse, and leave the route exactly as expired as it was.
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("read does not show yet"), "{body}");
+        assert_eq!(harness.chain.bookings(), 1);
+        assert_eq!(
+            harness.remaining().await,
+            16,
+            "the stale ceiling is untouched - it is simply no longer reachable without reconciling"
+        );
+
+        // The next request must reconcile AGAIN rather than serve the stale positive remainder.
+        let reads = harness.chain.reads();
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(
+            harness.chain.reads() > reads,
+            "a refused reconciliation must not leave the route looking fresh"
+        );
+        assert_eq!(harness.chain.week_index(), 1);
+        harness.shutdown().await;
+    }
+
+    /// A week that has ended on the wall clock with nothing booked authorizes nothing, however much
+    /// it has left on record.
+    #[tokio::test]
+    async fn an_expired_week_with_no_booking_refuses_its_positive_remainder() {
+        // Sixteen tokens left, and the week runs out two seconds from now.
+        let harness = weekly_route_harness_expiring_in(WEEK_QUOTA - 16, true, 2).await;
+        assert_eq!(harness.remaining().await, 16);
+
+        // The wall clock passes the boundary but the CHAIN has not crossed one, so the contract
+        // refuses to book. The remainder on record belongs to a week the clock says is over.
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("is not an authorization"), "{body}");
+        assert_eq!(harness.chain.bookings(), 0);
+
+        // And it stays refused: nothing was published, so every later request goes back to the chain
+        // instead of finding a fresh-looking expiry over the stale ceiling.
+        let reads = harness.chain.reads();
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            harness.chain.reads() > reads,
+            "an unbooked expired week must be re-asked, never assumed"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A seller decides how many tokens a chunk holds, and the grant must hold anyway.
+    /// Every chunk here carries four token ids. With three tokens of quota left, the first chunk
+    /// already overshoots it - so it must never be rendered at all, on either protocol and whether
+    /// the answer is streamed or aggregated. Accounting after rendering would hand the consumer four
+    /// tokens against a reservation of three, and the excess would never appear in the next ceiling.
+    #[tokio::test]
+    async fn a_fat_chunk_cannot_deliver_past_the_grant() {
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            for stream in [true, false] {
+                let harness = weekly_route_harness(WEEK_QUOTA - 3, true).await;
+                assert_eq!(harness.remaining().await, 3);
+
+                let (status, body) = harness
+                    .ask_full(path, 3, "DEXDO_FIXTURE_FATCHUNK weekly quota", stream)
+                    .await;
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+                let delivered = harness.delivered().await;
+                assert!(
+                    delivered <= 3,
+                    "{path} stream={stream}: delivered {delivered} past a grant of 3"
+                );
+                // The chunk is four tokens against three of grant, so nothing at all is exposed and
+                // the whole reservation returns to the week.
+                assert_eq!(delivered, 0, "{path} stream={stream}: {body}");
+                assert_eq!(harness.remaining().await, 3, "{path} stream={stream}");
+                harness.shutdown().await;
+            }
+        }
+    }
+
+    /// The same cap, one step in: two fat chunks fit a grant of eight, the third does not (
+    /// review 3). What must not happen is a third chunk being rendered and then noticed.
+    #[tokio::test]
+    async fn fat_chunks_stop_exactly_at_the_grant() {
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            for stream in [true, false] {
+                let harness = weekly_route_harness(WEEK_QUOTA - 9, true).await;
+                assert_eq!(harness.remaining().await, 9);
+
+                let (status, body) = harness
+                    .ask_full(path, 9, "DEXDO_FIXTURE_FATCHUNK weekly quota", stream)
+                    .await;
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+                let delivered = harness.delivered().await;
+                assert_eq!(
+                    delivered, 8,
+                    "{path} stream={stream}: two four-token chunks fit a grant of nine, a third does \
+                     not: {body}"
+                );
+                assert_eq!(harness.remaining().await, 1, "{path} stream={stream}");
+                harness.shutdown().await;
+            }
+        }
+    }
+
+    /// The grant must reach the WIRE, and hold even when the seller ignores it.
+    /// Admission reserves two tokens against a request that asked for eight. Two things must then be
+    /// true, on both consumer protocols and whether the answer is streamed or aggregated:
+    /// 1. the seller is TOLD two - the outbound `CanonRequest.params.max_tokens` carries the grant,
+    /// not the caller's larger figure - which is what the seller's own delivery count proves;
+    /// 2. and if the seller ignores it anyway, the buyer still refuses. This one is deliberately
+    /// noncompliant: it answers with a one-token chunk and then a two-token chunk, straddling the
+    /// remaining allowance. The second chunk is never rendered, exactly one token is recorded, and
+    /// the token that was reserved but not delivered returns to the week.
+    #[tokio::test]
+    async fn the_grant_reaches_the_wire_and_holds_against_a_noncompliant_seller() {
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            for stream in [true, false] {
+                let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
+                assert_eq!(harness.remaining().await, 2);
+
+                let (status, body) = harness
+                    .ask_full(
+                        path,
+                        8,
+                        "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT weekly quota",
+                        stream,
+                    )
+                    .await;
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+
+                // 1. What the SELLER was told, read straight off the wire: the seller echoes the
+                // token limit it received, and it is the grant - not the caller's eight.
+                assert!(
+                    body.contains("limit=2"),
+                    "{path} stream={stream}: the outbound max_tokens must be the grant, not the \
+                     caller's limit: {body}"
+                );
+
+                // 2. What the BUYER accepted: the one-token chunk only. The two-token chunk did not
+                // fit the remaining grant and was refused before it could be rendered.
+                assert_eq!(
+                    harness.delivered().await,
+                    1,
+                    "{path} stream={stream}: a straddling chunk must fail closed before render: \
+                     {body}"
+                );
+                assert_eq!(
+                    harness.remaining().await,
+                    1,
+                    "{path} stream={stream}: the undelivered token returns to the week"
+                );
+                harness.shutdown().await;
+            }
+        }
+    }
+
+    /// A route built before the trial tick was accepted must not keep a tick of authorization the
+    /// term never sold it.
+    /// `open()` leaves the claim stages at zero and `acceptProbe` seeds all three with one
+    /// `TICK_SIZE`, so a route anchored pre-probe measures its local zero from a cumulative claim the
+    /// contract is about to move underneath it. The anchor rebases once on that transition; without
+    /// it the published ceiling is a whole tick above what the contract will admit.
+    #[tokio::test]
+    async fn an_anchor_taken_before_the_probe_rebases_on_acceptance() {
+        // D = 8 tokens delivered BEFORE acceptance. D = 0 would hide the whole defect: the two
+        // errors it causes are `TICK_SIZE - D` in this week and `D` in the next one.
+        let harness = weekly_route_harness_before_probe(2).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+
+        // Anchored at zero, pre-probe: the buyer independently exposes only the canonical trial
+        // tick even though the recorded weekly ceiling is larger.
+        assert_eq!(harness.remaining().await, probe);
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.delivered().await, 8);
+
+        // The seller accepts the trial tick. `acceptProbe` sets the claim stages to a FLAT
+        // TICK_SIZE, so it absorbs those eight tokens rather than adding to them.
+        harness.chain.accepts_probe();
+
+        // A boundary is crossed and booked, so the route recomputes from authoritative state.
+        harness.chain.chain_crosses_boundaries(1);
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let RouteBudget::Admitted(reservation) = deal.admit(Some(1)).await else {
+            panic!("the booked week must be servable");
+        };
+        assert_eq!(harness.chain.bookings(), 1);
+
+        // Week two's cap is one quota measured from the cumulative claim the booking re-based on,
+        // which is the probe's tick. The new week must be a WHOLE quota: the eight tokens delivered
+        // before acceptance were paid for by the probe's seed and must not be charged again here.
+        let (state, subscription) = harness.chain.books();
+        let cap = dexdo_core::subscription_claim_cap_at(&state, &subscription).expect("cap");
+        assert_eq!(cap, PROBE_CLAIM + WEEK_QUOTA);
+        drop(reservation);
+        assert_eq!(
+            deal.remaining_tokens(),
+            quota,
+            "the new week is a whole quota - not a quota less the D delivered before the probe"
+        );
+        assert_eq!(u64::try_from(cap).unwrap() - probe, quota);
+        harness.shutdown().await;
+    }
+
+    /// The same defect in the OTHER direction, before any boundary: the week the route is already in
+    /// . `acceptProbe` does not move `weekIndex`, so a rebase triggered by the week
+    /// changing never runs here at all, and the route keeps offering `TICK_SIZE - D` more than the
+    /// contract will admit for the rest of the current week.
+    #[tokio::test]
+    async fn acceptance_corrects_the_current_week_without_a_boundary() {
+        // A full week ahead, so nothing here depends on the expiry trigger - only on acceptance.
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+
+        // D = 8 again: delivered before the trial tick was accepted.
+        assert_eq!(harness.remaining().await, probe);
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(harness.delivered().await, 8);
+
+        harness.chain.accepts_probe();
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let RouteBudget::Admitted(reservation) = deal.admit(Some(1)).await else {
+            panic!("the current week is still servable after acceptance");
+        };
+        drop(reservation);
+
+        // The cumulative claim is now one tick and the week's cap is one quota, so what the contract
+        // will still admit is `quota - TICK_SIZE` - whatever this route delivered before acceptance,
+        // because the seed absorbed it. No boundary was crossed and none was booked.
+        assert_eq!(harness.chain.bookings(), 0);
+        assert_eq!(harness.chain.week_index(), 0);
+        assert_eq!(
+            deal.remaining_tokens(),
+            quota - probe,
+            "after acceptance the current week may not still offer the pre-probe remainder"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A concurrent admission waits until acceptance rebase and ceiling are both published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_acceptance_reconcile_keeps_stale_ceiling_closed() {
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        harness.chain.accepts_probe();
+
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let weekly = deal.weekly.as_ref().expect("subscription budget").clone();
+        let (state, _) = harness.chain.books();
+        let contradictory = u64::try_from(dexdo_core::TICK_SIZE).unwrap() + 1;
+        let mut anchor = weekly.claim_anchor.lock().unwrap();
+        assert!(
+            weekly
+                .rebase_anchor_on_probe(&state, contradictory, &mut anchor)
+                .is_err(),
+            "delivery above the flat probe claim must fail closed"
+        );
+        drop(anchor);
+        assert!(weekly.anchored_before_probe());
+        let rebase_barrier = Arc::new(std::sync::Barrier::new(2));
+        *weekly.rebase_barrier.lock().unwrap() = Some(rebase_barrier.clone());
+        let first_deal = deal.clone();
+        let first = tokio::spawn(async move { first_deal.admit(Some(1)).await });
+        rebase_barrier.wait();
+        assert!(
+            weekly.anchored_before_probe(),
+            "the fast-path gate stays closed until the corrected ceiling is published"
+        );
+
+        let second_deal = deal.clone();
+        let second = tokio::spawn(async move { second_deal.admit(Some(1)).await });
+        rebase_barrier.wait();
+        let first = first.await.expect("first admission task");
+        let second = second.await.expect("second admission task");
+        let RouteBudget::Admitted(first) = first else {
+            panic!("the corrected week remains servable");
+        };
+        let RouteBudget::Admitted(second) = second else {
+            panic!("the second admission sees the corrected week");
+        };
+        drop((first, second));
+        assert_eq!(
+            deal.remaining_tokens(),
+            quota - probe,
+            "both admissions were made only after the accepted probe's tick was published"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A pre-acceptance over-request reaches the seller with only its admitted trial-tick remainder.
+    /// A held reservation leaves two tokens free, keeping the real handler/echo path bounded while
+    /// the caller still asks for far more than the canonical pre-probe ceiling.
+    #[tokio::test]
+    async fn pre_probe_admission_and_wire_shape_are_capped_to_the_trial_tick() {
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the connected harness route is published");
+
+        assert_eq!(deal.route.max_tokens, quota, "the recorded route ceiling is weekly");
+        assert_eq!(deal.remaining_tokens(), probe, "pre-probe admission is one tick");
+        let RouteBudget::Admitted(held) = deal
+            .admit(Some(u32::try_from(probe - 2).unwrap()))
+            .await
+        else {
+            panic!("the setup holds all but two tokens of the canonical trial tick");
+        };
+        assert_eq!(held.remaining(), probe - 2);
+        assert_eq!(deal.remaining_tokens(), 2);
+
+        let (status, body) = harness
+            .ask_full(
+                "/v1/chat/completions",
+                u64::from(u32::MAX),
+                "DEXDO_FIXTURE_ECHOLIMIT weekly quota",
+                false,
+            )
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(
+            body.contains("limit=2"),
+            "the seller must observe CanonRequest.params.max_tokens=2, not the caller's u32::MAX: \
+             {body}"
+        );
+        assert_eq!(deal.delivered_tokens(), 2);
+        drop(held);
+        assert_eq!(deal.remaining_tokens(), probe - 2);
+        harness.shutdown().await;
+    }
+
+    /// Actual delivery from a reservation admitted before `acceptProbe` is linearized against the
+    /// one-time anchor/ceiling cutover by the same standard-library mutex, without timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_flight_trial_delivery_is_serialized_with_acceptance_cutover() {
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let quota = u64::try_from(WEEK_QUOTA).unwrap();
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let weekly = deal.weekly.as_ref().expect("subscription budget").clone();
+
+        let mut in_flight = deal.begin_request(unix_now_secs());
+        let RouteBudget::Admitted(reservation) = deal.admit(Some(2)).await else {
+            panic!("the pre-probe trial reservation is available");
+        };
+        in_flight.hold(reservation);
+        harness.chain.accepts_probe();
+
+        // Stop the cutover after it owns `claim_anchor` but before it samples delivered tokens.
+        let cutover_barrier = Arc::new(std::sync::Barrier::new(2));
+        *weekly.rebase_barrier.lock().unwrap() = Some(cutover_barrier.clone());
+        let cutover_deal = deal.clone();
+        let cutover = tokio::spawn(async move { cutover_deal.admit(Some(1)).await });
+        cutover_barrier.wait();
+
+        // Start one real guard charge while the cutover owns that same mutex. With no shared lock it
+        // would enter the sampled probe seed; with the lock it is deterministically charged after it.
+        let delivery_barrier = Arc::new(std::sync::Barrier::new(2));
+        let delivery_started = delivery_barrier.clone();
+        let delivery_deal = deal.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_started.wait();
+            in_flight.record_delivered(&delivery_deal, 1)?;
+            Ok::<_, String>(in_flight)
+        });
+        delivery_barrier.wait();
+        cutover_barrier.wait();
+
+        let RouteBudget::Admitted(cutover_reservation) =
+            cutover.await.expect("acceptance cutover task")
+        else {
+            panic!("the corrected current week remains servable");
+        };
+        let in_flight = delivery
+            .await
+            .expect("delivery task")
+            .expect("in-flight delivery accounting");
+        assert_eq!(deal.delivered_tokens(), 1);
+        drop((cutover_reservation, in_flight));
+        assert_eq!(
+            deal.remaining_tokens(),
+            quota - probe - 1,
+            "the post-cutover chunk is charged once outside the accepted probe seed"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A reservation made before acceptance cannot outlive the ceiling that acceptance publishes.
+    /// This is the minimum legal subscription: Q=T, with the whole trial tick reserved and D=0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_pre_probe_reservation_cannot_deliver_after_zero_ceiling_cutover() {
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let probe = u64::try_from(PROBE_CLAIM).unwrap();
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let weekly = deal.weekly.as_ref().expect("subscription budget").clone();
+
+        // Narrow the existing canonical fixture to its minimum legal shape before any admission:
+        // one tick per week, four ticks funded. The accepted probe consumes week one's whole quota.
+        {
+            let mut snapshot = harness.chain.snapshot.lock().unwrap();
+            snapshot.subscription.tokens_per_week = PROBE_CLAIM;
+            snapshot.subscription.funded_tokens =
+                PROBE_CLAIM * u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        }
+        deal.token_ceiling.store(probe, Ordering::SeqCst);
+        assert_eq!(deal.remaining_tokens(), probe, "Q=T before acceptance");
+
+        let mut old_request = deal.begin_request(unix_now_secs());
+        let RouteBudget::Admitted(reservation) = deal.admit(None).await else {
+            panic!("the pre-probe request reserves R=T");
+        };
+        assert_eq!(reservation.remaining(), probe, "R=T");
+        old_request.hold(reservation);
+        assert_eq!(deal.delivered_tokens(), 0, "D=0");
+        harness.chain.accepts_probe();
+
+        // Hold the real acceptance cutover after it owns `claim_anchor`. The old request begins its
+        // late charge while that lock is held, then must validate the newly published zero ceiling.
+        let cutover_barrier = Arc::new(std::sync::Barrier::new(2));
+        *weekly.rebase_barrier.lock().unwrap() = Some(cutover_barrier.clone());
+        let cutover_deal = deal.clone();
+        let cutover = tokio::spawn(async move { cutover_deal.admit(Some(1)).await });
+        cutover_barrier.wait();
+
+        let delivery_barrier = Arc::new(std::sync::Barrier::new(2));
+        let delivery_started = delivery_barrier.clone();
+        let delivery_deal = deal.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_started.wait();
+            let result = old_request.record_delivered(&delivery_deal, 1);
+            (result, old_request)
+        });
+        delivery_barrier.wait();
+        cutover_barrier.wait();
+
+        let RouteBudget::Exhausted(reason) = cutover.await.expect("acceptance cutover task") else {
+            panic!("the accepted probe consumes all of Q=T");
+        };
+        assert!(reason.contains("drawn down"), "{reason}");
+
+        let (late_delivery, old_request) = delivery.await.expect("late delivery task");
+        let error = late_delivery.expect_err("a late token is above the rebased zero ceiling");
+        assert!(error.contains("published route ceiling 0"), "{error}");
+        assert_eq!(
+            old_request.remaining_grant(),
+            probe,
+            "rejection leaves the old reservation entirely unused"
+        );
+        assert_eq!(
+            deal.delivered_tokens(),
+            0,
+            "rejection leaves cumulative delivery unchanged, so no chunk can be exposed"
+        );
+        assert_eq!(
+            deal.reserved_tokens.load(Ordering::SeqCst),
+            probe,
+            "the held reservation is unchanged until its guard drops"
+        );
+        drop(old_request);
+        assert_eq!(deal.reserved_tokens.load(Ordering::SeqCst), 0);
+        assert_eq!(deal.remaining_tokens(), 0, "week one remains fully consumed");
+        harness.shutdown().await;
+    }
+
+    /// What a deal that has not passed its one-per-deal identity verification still owes: the B8
+    /// fingerprint probe and then the B7-full reference spot-check, each at the canonical probe
+    /// budget. This is the FLOOR of every admission on such a deal, so a fixture's remainder
+    /// is written against it rather than as a bare number that would silently stop meaning anything
+    /// if the canonical budget moved.
+    const VERIFICATION_DEBT: u64 = 2 * CONTENT_PROBE_MAX_TOKENS;
+
+    /// A models config whose ONLY verification layer is B8, and whose fingerprint the mock seller
+    /// satisfies: the mock echoes the prompt after a `mock-reply: ` marker, so a one-token answer
+    /// already carries it. B7 needs `DEXDO_FIXTURE_ABSENT_KEY` in the environment and degrades to a
+    /// pass without spending when it is missing, which keeps these tests to one probe exactly.
+    fn probe_models(
+        probe_prompt: &str,
+        base_url: &str,
+        api_key_env: &str,
+    ) -> Arc<ModelsConfig> {
+        Arc::new(
+            ModelsConfig::from_json(
+                &serde_json::json!({
+                    "models": { "dexdo-mock": {
+                        "frame_model": "dexdo-mock",
+                        "base_url": base_url,
+                        "served_model": "dexdo-mock",
+                        "api_key_env": api_key_env,
+                        "tokenizer_family": "mock",
+                        "price_per_tick": 1000,
+                        "fingerprints": [ {
+                            "probe_prompt": probe_prompt,
+                            "expected_contains": "mock-reply"
+                        } ]
+                    } }
+                })
+                .to_string(),
+            )
+            .expect("canonical probe models config"),
+        )
+    }
+
+    /// A fresh deal can pay for the identity verification it owes and still answer.
+    /// The live blocker, end to end: an ordinary by-fact deal, a gate that has verified nothing, and
+    /// an ordinary caller asking for a couple of tokens. Admission used to reserve the ask and
+    /// nothing else, so the verification the deal owed had to come out of it - B8 consumed the whole
+    /// grant, B7 was then handed zero and refused ("the admitted grant cannot pay for the identity
+    /// verification this deal still owes"), and the first real request on a fresh deal came back 502
+    /// with the probe tick burned. Nothing here fabricates a grant: it is computed by the real
+    /// admission gate, reached through the real HTTP handler, against a real TLS gateway.
+    #[tokio::test]
+    async fn fresh_deal_pays_for_its_identity_verification_and_still_answers() {
+        const REFERENCE_KEY: &str = "DEXDO_FIXTURE_FRESH_DEAL_REFERENCE_KEY";
+        std::env::set_var(REFERENCE_KEY, "test-key");
+        // A reference that closes every connection. B7 is live - it buys its seller-side probe out
+        // of the same grant, which is the layer the live deal was refused at - and then degrades to
+        // a pass(R3) without this test depending on a real reference model.
+        let reference_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closing reference listener");
+        let reference_addr = reference_listener.local_addr().unwrap();
+        let reference_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = reference_listener.accept().await {
+                drop(socket);
+            }
+        });
+        let harness = weekly_route_harness_gated(
+            0,
+            // An ordinary by-fact deal: the shape the blocker was observed on, and the one whose
+            // admission never asks the chain anything.
+            false,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    &format!("http://{reference_addr}"),
+                    REFERENCE_KEY,
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+        let budget = harness.remaining().await;
+        let verification = VERIFICATION_DEBT;
+        assert!(budget > verification + 2, "the deal itself can afford both");
+
+        let (status, body) = harness
+            .ask_full(
+                "/v1/chat/completions",
+                2,
+                "DEXDO_FIXTURE_ECHOLIMIT fresh deal",
+                false,
+            )
+            .await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "a fresh deal must reach its first inference: {body}"
+        );
+        assert!(
+            body.contains("limit=2"),
+            "the seller is asked for the CALLER's two tokens - never for the verification headroom \
+             left in the grant, and never for an unset limit: {body}"
+        );
+        assert_eq!(
+            harness.delivered().await,
+            verification + 2,
+            "both verification layers were issued for the canonical probe budget out of the same \
+             admission, and the answer still got the two tokens that were asked for"
+        );
+        assert_eq!(
+            harness.remaining().await,
+            budget - verification - 2,
+            "the deal is charged for what was delivered and nothing else: what the reservation did \
+             not spend came back when the request ended"
+        );
+
+        // The deal is verified now, so the next request owes nothing on top of its own ask.
+        let (status, body) = harness
+            .ask_full(
+                "/v1/chat/completions",
+                2,
+                "DEXDO_FIXTURE_ECHOLIMIT verified deal",
+                false,
+            )
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(body.contains("limit=2"), "{body}");
+        assert_eq!(
+            harness.delivered().await,
+            verification + 4,
+            "identity verification is owed once per deal, not once per request"
+        );
+
+        reference_task.abort();
+        let _ = reference_task.await;
+        std::env::remove_var(REFERENCE_KEY);
+        harness.shutdown().await;
+    }
+
+    /// A RESUMED deal is admitted only when it can verify AND still answer.
+    /// The fresh deal above starts with a whole week in hand, so its first request never comes near
+    /// the floor. A resumed one does: [`ApiDeal::new`] builds a new, unverified gate over whatever
+    /// remainder the route was rebuilt with, and a subscription route can be rebuilt in the middle of
+    /// a drawn-down week. Adding the debt to what a request ASKS for is not enough on its own -
+    /// a reservation is `min(want, free)`, so a positive remainder too small to hold the debt would
+    /// still be admitted, spend itself on the probe and refuse the answer for a zero grant: the
+    /// reported 502, reached by resuming instead of by starting.
+    /// So the boundary itself is the invariant, walked one token at a time rather than by enlarging
+    /// the fixture until every grant comes out whole. `free == debt` is REFUSED with the whole
+    /// remainder untouched and nothing settled; `free == debt + 1` is admitted and answers, with the
+    /// ANSWER clamped below the ask - never the floor; `free == debt + ask` answers in full.
+    #[tokio::test]
+    async fn a_resumed_deal_is_admitted_only_when_it_can_verify_and_still_answer() {
+        const REFERENCE_KEY: &str = "DEXDO_FIXTURE_RESUMED_DEAL_REFERENCE_KEY";
+        const ASK: u64 = 2;
+        std::env::set_var(REFERENCE_KEY, "test-key");
+        // A reference that closes every connection: B7 buys its seller-side probe out of the grant
+        // and then degrades to a pass(R3), so the deal really does spend the whole debt it owes and
+        // the rows below are the true boundary rather than a generous one.
+        let reference_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closing reference listener");
+        let reference_addr = reference_listener.local_addr().unwrap();
+        let reference_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = reference_listener.accept().await {
+                drop(socket);
+            }
+        });
+
+        for (free, answered) in [
+            (VERIFICATION_DEBT, None),
+            (VERIFICATION_DEBT + 1, Some(1)),
+            (VERIFICATION_DEBT + ASK, Some(ASK)),
+        ] {
+            let harness = weekly_route_harness_gated(
+                WEEK_QUOTA - u128::from(free),
+                // A subscription rebuilt mid-week: the route carries the remainder of a week it did
+                // not start, and the gate carries none of the verification a restart threw away.
+                true,
+                SUB_WEEK_LEN.as_secs(),
+                UNCONSTRAINED_UPSTREAM,
+                ContentGate::probe(
+                    "dexdo-mock".to_string(),
+                    probe_models(
+                        "identity probe",
+                        &format!("http://{reference_addr}"),
+                        REFERENCE_KEY,
+                    ),
+                ),
+                crate::seller::UpstreamConfig::Mock,
+            )
+            .await;
+            assert_eq!(harness.remaining().await, free);
+
+            let (status, body) = harness
+                .ask_full(
+                    "/v1/chat/completions",
+                    ASK,
+                    "DEXDO_FIXTURE_ECHOLIMIT resumed deal",
+                    false,
+                )
+                .await;
+
+            match answered {
+                None => {
+                    assert_eq!(
+                        status,
+                        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        "free={free}: a remainder one token short of verifying and answering must \
+                         be refused: {body}"
+                    );
+                    assert!(
+                        body.contains(UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION),
+                        "free={free}: refused as what it is, not as a spent deal: {body}"
+                    );
+                    assert_eq!(
+                        harness.delivered().await,
+                        0,
+                        "free={free}: the refusal comes BEFORE the probe, so nothing is charged"
+                    );
+                    assert_eq!(
+                        harness.remaining().await,
+                        free,
+                        "free={free}: the whole remainder stays on the route"
+                    );
+                    assert_eq!(
+                        harness.chain.settle_calls(),
+                        0,
+                        "free={free}: a positive, non-expired remainder is refused locally rather \
+                         than submitted to settleWeek"
+                    );
+                    assert_eq!(
+                        harness.chain.reads(),
+                        0,
+                        "free={free}: a local verification-floor refusal reads no chain state"
+                    );
+                    assert_eq!(
+                        harness.chain.foreign_money_calls(),
+                        0,
+                        "free={free}: nothing is settled against the seller for a probe he was \
+                         never asked to serve"
+                    );
+                }
+                Some(answered) => {
+                    assert_eq!(
+                        status,
+                        reqwest::StatusCode::OK,
+                        "free={free}: one token more than the debt is a servable deal: {body}"
+                    );
+                    assert!(
+                        body.contains(&format!("limit={answered}")),
+                        "free={free}: the seller is told what the ANSWER may be - the clamp falls \
+                         on the answer, never on the verification floor: {body}"
+                    );
+                    assert_eq!(
+                        harness.delivered().await,
+                        VERIFICATION_DEBT + answered,
+                        "free={free}: the whole verification the deal owed, and then the answer"
+                    );
+                    assert_eq!(
+                        harness.remaining().await,
+                        free - VERIFICATION_DEBT - answered,
+                        "free={free}: the deal is charged for what was delivered and nothing else"
+                    );
+                }
+            }
+            harness.shutdown().await;
+        }
+
+        reference_task.abort();
+        let _ = reference_task.await;
+        std::env::remove_var(REFERENCE_KEY);
+    }
+
+    /// A CONCURRENT first request is never handed a partial verification.
+    /// The floor has to be applied inside the same atomic attempt that reads the remainder, not
+    /// computed before it. Four first-requests race on a deal that has verified nothing: one of them
+    /// can be paid for in full, and what is left afterwards is exactly the verification debt - a
+    /// positive remainder, and the most dangerous one there is, being the precise size of a probe it
+    /// could not follow with an answer. Clamping to `min(want, free)` would hand it to a runner-up,
+    /// which would burn it on the probe and return with no inference: again, reached by a race
+    /// rather than by a restart. Exactly one racer is admitted, for its whole ask plus the whole
+    /// debt, and the remainder is left where it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_first_request_is_never_handed_a_partial_verification() {
+        const ASK: u64 = 2;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        // One whole admission, and then exactly the debt: the largest remainder that still cannot
+        // pay for a verification AND deliver an answer.
+        const FREE: u64 = GRANT + VERIFICATION_DEBT;
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - FREE as u128,
+            false,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+        assert_eq!(harness.remaining().await, FREE);
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+
+        let start = Arc::new(tokio::sync::Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let deal = deal.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    deal.admit(Some(ASK as u32)).await
+                })
+            })
+            .collect();
+        let mut admitted = Vec::new();
+        let mut refused = Vec::new();
+        for racer in racers {
+            match racer.await.expect("admission task") {
+                RouteBudget::Admitted(reservation) => admitted.push(reservation),
+                RouteBudget::Exhausted(reason) => refused.push(reason),
+            }
+        }
+
+        assert_eq!(
+            admitted.len(),
+            1,
+            "only one of these requests can be paid for in full: {refused:?}"
+        );
+        assert_eq!(
+            admitted[0].granted, GRANT,
+            "the winner holds its own ask AND the whole verification the deal owes"
+        );
+        for reason in &refused {
+            assert!(
+                reason.contains(UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION),
+                "the losers are refused for the remainder they could not cover: {reason}"
+            );
+        }
+        // Read while the winner's reservation is still HELD: the debt-sized remainder is neither
+        // reserved by a loser nor quietly consumed by the winner.
+        assert_eq!(
+            deal.remaining_tokens(),
+            VERIFICATION_DEBT,
+            "a remainder that cannot cover a verification stays on the route instead of being \
+             handed out as a grant the probe would consume whole"
+        );
+        drop(admitted);
+        harness.shutdown().await;
+    }
+
+    /// Verification headroom is never served to the caller as answer tokens.
+    /// Admission reserves the deal's unpaid verification on top of the ask, so the grant a handler
+    /// still HOLDS when it caps the answer can be far larger than the caller's own limit. Here the
+    /// fingerprint layer is the only one that spends - B7 has no reference key and degrades without
+    /// spending - so half the debt is still held: 66 against an ask of 2. `cap_canon_to_grant`
+    /// returns the caller's figure and BOTH handlers must enforce THAT on the way back. A handler
+    /// that reached for `request_guard.remaining_grant()` instead would be indistinguishable against
+    /// a compliant seller, which is why this one is not compliant: told 2, it answers with a
+    /// one-token chunk and then a two-token chunk, straddling the ask. Only the first may be
+    /// charged, only the first may be shown, and the headroom nothing spent must come back.
+    #[tokio::test]
+    async fn verification_headroom_is_never_served_as_answer_tokens() {
+        const ASK: u64 = 2;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        // B8 probes for the canonical budget; B7 degrades on a missing reference key without
+        // spending, so exactly half of the reserved debt is still held when the answer is capped.
+        const VERIFICATION_SPEND: u64 = CONTENT_PROBE_MAX_TOKENS;
+        const HELD_AT_CAP: u64 = GRANT - VERIFICATION_SPEND;
+        // The divergence this test exists to catch, made a property of the fixture rather than of
+        // the run: the two candidate caps are different numbers, so a handler that binds the held
+        // grant instead of the returned caller cap cannot pass here by coincidence.
+        const _: () = assert!(
+            HELD_AT_CAP > ASK,
+            "the held grant must exceed the caller's ask at the cap, or the wrong cap is invisible"
+        );
+
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            let harness = weekly_route_harness_gated(
+                WEEK_QUOTA - GRANT as u128,
+                false,
+                SUB_WEEK_LEN.as_secs(),
+                UNCONSTRAINED_UPSTREAM,
+                ContentGate::probe(
+                    "dexdo-mock".to_string(),
+                    probe_models(
+                        "identity probe",
+                        "https://reference.invalid/v1",
+                        "DEXDO_FIXTURE_ABSENT_KEY",
+                    ),
+                ),
+                crate::seller::UpstreamConfig::Mock,
+            )
+            .await;
+            assert_eq!(harness.remaining().await, GRANT);
+
+            let (status, body) = harness
+                .ask_full(
+                    path,
+                    ASK,
+                    "overrun DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT",
+                    false,
+                )
+                .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{path}: {body}");
+            assert!(
+                body.contains("limit=2"),
+                "{path}: the seller is told the caller's ask, never the held grant: {body}"
+            );
+            assert!(
+                !body.contains("overrun"),
+                "{path}: the straddling chunk crosses the caller's cap and may not be rendered, \
+                 however much verification headroom the grant still holds: {body}"
+            );
+            assert_eq!(
+                harness.delivered().await,
+                VERIFICATION_SPEND + 1,
+                "{path}: one probe and the single answer token that fits the ask - capping on the \
+                 held grant would charge the straddling chunk too: {body}"
+            );
+            assert_eq!(
+                harness.remaining().await,
+                GRANT - VERIFICATION_SPEND - 1,
+                "{path}: the verification the gate never spent and the answer token the seller \
+                 straddled away both return to the route"
+            );
+            harness.shutdown().await;
+        }
+    }
+
+    /// A one-token remainder is refused before verification can burn it ( blocker 2, as
+    /// closes it).
+    /// bounded what verification may SPEND: with a grant of one the gate was ISSUED a budget of
+    /// one rather than the canonical 64, so nothing escaped the reservation. What that could not do
+    /// is make the request worth admitting - the whole grant went to the probe, the answer was then
+    /// refused for a zero grant, and the caller paid for a probe and got no inference. That is the
+    /// live failure, and admission now refuses the shape outright: the token stays on the
+    /// route, nothing is charged, and nothing is settled against a seller who was never asked to
+    /// serve the probe. The spend bound is untouched - it simply has nothing left to bound here,
+    /// because an admitted grant is never smaller than the verification it has to cover.
+    #[tokio::test]
+    async fn a_one_token_remainder_is_refused_before_verification_can_burn_it() {
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - 1,
+            true,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+        assert_eq!(harness.remaining().await, 1);
+
+        // One token cannot hold the verification this deal owes AND an answer, so the request never
+        // reaches the probe rather than spending itself on one.
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.contains(UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION),
+            "{body}"
+        );
+
+        assert_eq!(
+            harness.delivered().await,
+            0,
+            "the probe is not sent at all, so nothing is charged for it: {body}"
+        );
+        assert_eq!(
+            harness.remaining().await,
+            1,
+            "the token stays on the route instead of buying a probe no answer could follow"
+        );
+        assert_eq!(
+            harness.chain.settle_calls(),
+            0,
+            "a positive, non-expired remainder is refused locally rather than submitted to \
+             settleWeek"
+        );
+        assert_eq!(
+            harness.chain.reads(),
+            0,
+            "a local verification-floor refusal reads no chain state"
+        );
+        assert_eq!(
+            harness.chain.foreign_money_calls(),
+            0,
+            "a refusal at admission takes no settlement action against the counterparty"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A noncompliant probe chunk cannot cross the verification cap it was issued.
+    /// An admitted grant now covers the whole verification a deal owes, so the probe's own
+    /// budget is always the canonical one - which a four-token chunk divides exactly and can no
+    /// longer straddle. A seller that chunks 1, 2, 2,... still can: it reaches 63 of the 64 and then
+    /// offers two more. That chunk is refused before it is accounted, the tokens already accepted
+    /// stay charged, and the rest of the reservation comes back.
+    #[tokio::test]
+    async fn a_noncompliant_probe_chunk_cannot_cross_the_verification_cap() {
+        const ASK: u64 = 2;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        // Accepted as 1, 3, 5,... so the last chunk that fits leaves the budget one token short.
+        const ACCEPTED: u64 = CONTENT_PROBE_MAX_TOKENS - 1;
+        let models = probe_models(
+            "DEXDO_FIXTURE_STRADDLE identity probe",
+            "https://reference.invalid/v1",
+            "DEXDO_FIXTURE_ABSENT_KEY",
+        );
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - GRANT as u128,
+            true,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe("dexdo-mock".to_string(), models),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+
+        let (status, body) = harness.ask(ASK).await;
+        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains("noncompliant chunk"), "{body}");
+        assert_eq!(
+            harness.delivered().await,
+            ACCEPTED,
+            "the chunks that fit are charged; the one that would cross the cap is not: {body}"
+        );
+        assert_eq!(
+            harness.remaining().await,
+            GRANT - ACCEPTED,
+            "the rejected chunk may not be clamped into the reservation, and what the refused probe \
+             did not spend returns"
+        );
+        harness.shutdown().await;
+    }
+
+    /// Handler cancellation during B7 returns only the unused part of its held reservation.
+    /// The grant is the caller's eight tokens plus the verification the deal owes; the seller
+    /// emits one token per stream, so the two probes spend two of it and the rest is slack the
+    /// cancellation has to give back.
+    #[tokio::test]
+    async fn cancelled_handler_keeps_probe_spend_in_its_reservation() {
+        const ASK: u64 = 8;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        const REFERENCE_KEY: &str = "DEXDO_FIXTURE_PENDING_REFERENCE_KEY";
+        std::env::set_var(REFERENCE_KEY, "test-key");
+        let reference_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pending reference listener");
+        let reference_addr = reference_listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let reference_task = tokio::spawn(async move {
+            let (socket, _) = reference_listener.accept().await.expect("B7 reference call");
+            let _socket_held_open = socket;
+            let _ = seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let models = probe_models(
+            "identity probe",
+            &format!("http://{reference_addr}"),
+            REFERENCE_KEY,
+        );
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - GRANT as u128,
+            true,
+            SUB_WEEK_LEN.as_secs(),
+            1,
+            ContentGate::probe("dexdo-mock".to_string(), models),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+        let state = ApiState {
+            buyer: harness.buyer.clone(),
+            frame_model: "dexdo-mock".to_string(),
+            deals: harness.deals.clone(),
+        };
+        let request = serde_json::from_value::<crate::buyer::render::OpenAiChatRequest>(
+            serde_json::json!({
+                "model": "dexdo-mock",
+                "messages": [{"role": "user", "content": "ordinary answer"}],
+                "max_tokens": 8,
+                "stream": false
+            }),
+        )
+        .expect("OpenAI request");
+        let handler = tokio::spawn(async move {
+            openai::chat_completions(axum::extract::State(state), axum::Json(request)).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .expect("B7 reaches the pending reference endpoint")
+            .expect("B7 reference notification");
+        assert_eq!(
+            deal.delivered_tokens(),
+            2,
+            "B8 and the seller half of B7 are charged before B7 awaits its reference"
+        );
+        assert_eq!(deal.remaining_tokens(), 0, "the whole grant is still held");
+
+        handler.abort();
+        let _ = handler.await;
+        assert_eq!(deal.delivered_tokens(), 2);
+        assert_eq!(
+            deal.remaining_tokens(),
+            GRANT - 2,
+            "cancellation returns only the unused tokens, not the two paid probe tokens"
+        );
+        reference_task.abort();
+        let _ = reference_task.await;
+        std::env::remove_var(REFERENCE_KEY);
+        harness.shutdown().await;
+    }
+
+    /// One accepted B8 chunk remains charged when the provider stream then fails.
+    #[tokio::test]
+    async fn partial_probe_transport_failure_keeps_accepted_tokens_charged() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const ASK: u64 = 8;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        const UPSTREAM_KEY: &str = "DEXDO_FIXTURE_PARTIAL_PROBE_KEY";
+        std::env::set_var(UPSTREAM_KEY, "test-key");
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("partial upstream listener");
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.expect("B8 upstream call");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("read B8 request");
+                assert!(read > 0, "B8 request headers ended early");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"mock-reply: \"},\"logprobs\":{\"content\":[{\"token\":\"mock-reply\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\n";
+            let headers = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+            socket.write_all(headers).await.expect("write response headers");
+            socket
+                .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                .await
+                .expect("write event size");
+            socket.write_all(event).await.expect("write one B8 event");
+            socket.write_all(b"\r\n").await.expect("finish event chunk");
+            socket.shutdown().await.expect("truncate chunked response");
+        });
+        let upstream = crate::seller::UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
+            base_url: format!("http://{upstream_addr}"),
+            model: "dexdo-mock".to_string(),
+            frame_model: "dexdo-mock".to_string(),
+            claimed_model_override: None,
+            api_key_env: UPSTREAM_KEY.to_string(),
+            tokenizer_family: "mock".to_string(),
+            capabilities: crate::seller::Capabilities {
+                logprobs: true,
+                top_logprobs: None,
+                max_output_tokens: Some(64),
+            },
+        });
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - GRANT as u128,
+            true,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            upstream,
+        )
+        .await;
+
+        let (status, body) = harness.ask(ASK).await;
+        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(
+            harness.delivered().await,
+            1,
+            "the complete B8 chunk preceding the transport failure remains charged"
+        );
+        assert_eq!(
+            harness.remaining().await,
+            GRANT - 1,
+            "only the unused tokens return when the failed probe reservation drops"
+        );
+        upstream_task.await.expect("partial upstream task");
+        std::env::remove_var(UPSTREAM_KEY);
+        harness.shutdown().await;
+    }
+
+    /// The shared probe spend is charged exactly once, to the request that incurred it (
+    /// blocker 2).
+    /// `OnceCell` lets one caller run the probes while the others wait for its verdict. The spend
+    /// belongs to the caller that ran them: a counter shared on the gate would let a waiter take the
+    /// charge for output it never asked for, or let two requests each be charged for the same
+    /// tokens. Each call therefore brings its own counter, and only the initializing call writes.
+    #[tokio::test]
+    async fn concurrent_waiters_are_not_charged_for_another_request_s_probe() {
+        // Each concurrent first-request is admitted for what it ASKS plus the identity verification
+        // the deal still owes - nobody has cached a verdict yet - so the fixture holds four
+        // whole admissions rather than four bare asks. The three that only wait spend none of it and
+        // hand it all back.
+        const ASK: u64 = 64;
+        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        let harness = weekly_route_harness_gated(
+            WEEK_QUOTA - 4 * GRANT as u128,
+            true,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+        let deal = harness
+            .deals
+            .current()
+            .await
+            .expect("the harness route is published");
+
+        // Four concurrent verifications, each holding its own real reservation. Only the initializer
+        // may draw down the guard it was invoked with; waiters retain their entire grants.
+        let mut guards = Vec::new();
+        for _ in 0..4 {
+            let mut guard = deal.begin_request(unix_now_secs());
+            let RouteBudget::Admitted(reservation) = deal.admit(Some(ASK as u32)).await else {
+                panic!("the fixture has four whole admissions");
+            };
+            assert_eq!(
+                reservation.granted, GRANT,
+                "admission reserves the ask plus the verification this deal owes"
+            );
+            guard.hold(reservation);
+            guards.push(guard);
+        }
+        let calls = guards.iter_mut().map(|guard| {
+            deal.content_gate
+                .ensure_verified(&harness.buyer, &deal, guard)
+        });
+        for outcome in futures::future::join_all(calls).await {
+            outcome.expect("the mock seller satisfies its own fingerprint");
+        }
+
+        let charged: Vec<u64> = guards
+            .iter()
+            .map(|guard| GRANT - guard.remaining_grant())
+            .collect();
+        let paying = charged.iter().filter(|spent| **spent > 0).count();
+        assert_eq!(
+            paying, 1,
+            "exactly one caller ran the probes and exactly one is charged: {charged:?}"
+        );
+        assert!(
+            charged.iter().sum::<u64>() <= CONTENT_PROBE_MAX_TOKENS,
+            "one verification, charged once: {charged:?}"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_route_budget_is_unchanged_and_reads_no_chain_state() {
+        let harness = weekly_route_harness(WEEK_QUOTA - 8, false).await;
+
+        let (status, body) = harness.ask(8).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains(ORDINARY_BUDGET_EXHAUSTED), "{body}");
+
+        harness.chain.chain_crosses_boundaries(1);
+        let (status, body) = harness.ask(1).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "an ordinary route has no weekly boundary to cross: {body}"
+        );
+        assert!(body.contains(ORDINARY_BUDGET_EXHAUSTED), "{body}");
+        assert_eq!(harness.chain.reads(), 0);
+        assert_eq!(harness.chain.settle_calls(), 0);
+        harness.shutdown().await;
     }
 }

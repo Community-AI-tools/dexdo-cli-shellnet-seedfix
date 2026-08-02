@@ -20,6 +20,9 @@ pub(crate) mod note_cmd;
 pub(crate) mod oracle;
 pub(crate) mod orders;
 pub(crate) mod policy;
+// the book views it annotates(`orders`, `market`) only exist on the real chain path.
+#[cfg(feature = "shellnet")]
+pub(crate) mod provenance;
 pub(crate) mod recover;
 pub(crate) mod reports;
 pub(crate) mod seller;

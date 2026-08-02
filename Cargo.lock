@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-core"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2031,6 +2031,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2043,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-e2e"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2063,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-proto"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

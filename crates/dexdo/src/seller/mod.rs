@@ -2,6 +2,7 @@
 //! Headless(R12): starts without a GUI and serves the stream as a daemon.
 
 pub mod advance;
+pub mod advertise;
 pub mod auth;
 pub mod capacity;
 pub mod gateway;
@@ -1659,14 +1660,15 @@ mod tests {
         }
     }
 
-    fn temp_cursor_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dexdo-seller-watch-test-{}-{}",
-            std::process::id(),
-            now_unix().unwrap()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}.json"))
+    /// the directory is returned with the path and must be held for as long as the cursor is
+    /// read or written -- the previous `<pid>-<seconds>` directory was never removed.
+    fn temp_cursor_path(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("dexdo-seller-watch-test")
+            .tempdir()
+            .expect("seller watch cursor directory");
+        let path = dir.path().join(format!("{name}.json"));
+        (dir, path)
     }
 
     fn sample_match(token_contract: &str, buyer_pubkey: NotePubkey) -> Match {
@@ -1717,8 +1719,9 @@ mod tests {
                 .await
                 .expect("gateway starts");
         assert!(!seller.server_task.is_finished(), "gateway remains running");
+        let (_cursor_dir, cursor_path) = temp_cursor_path(cursor_name);
         let watch = SellerMatchWatchConfig {
-            cursor_path: temp_cursor_path(cursor_name),
+            cursor_path,
             poll_interval: Duration::from_millis(1),
         };
         let matched = tokio::time::timeout(
@@ -2226,7 +2229,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_match_cursor_persists_and_resume_uses_it() {
-        let cursor_path = temp_cursor_path("resume");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("resume");
         let seller = test_seller();
         let cfg = test_cfg("tc-watch");
         let buyer = LocalNote::generate();
@@ -2278,7 +2281,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_opened_cursor_recovers_fill_before_auth_resume() {
-        let cursor_path = temp_cursor_path("legacy-opened-fill-recovery");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("legacy-opened-fill-recovery");
         let seller = test_seller();
         let tc = "tc-legacy-opened";
         let cfg = test_cfg(tc);
@@ -2334,7 +2337,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fill_lineage_is_saved_before_open_stream() {
-        let cursor_path = temp_cursor_path("partial-before-open");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("partial-before-open");
         let seller = test_seller();
         let cfg = test_cfg("tc-partial-before-open");
         let buyer = LocalNote::generate();
@@ -2374,7 +2377,7 @@ mod tests {
 
     #[tokio::test]
     async fn authoritative_tc_size_mismatch_fails_before_persist_or_open() {
-        let cursor_path = temp_cursor_path("authoritative-size-mismatch");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("authoritative-size-mismatch");
         let seller = test_seller();
         let cfg = test_cfg("tc-authoritative-size-mismatch");
         let buyer = LocalNote::generate();
@@ -2450,7 +2453,7 @@ mod tests {
 
     #[tokio::test]
     async fn transient_match_watch_network_error_keeps_seller_alive() {
-        let cursor_path = temp_cursor_path("transient-network");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("transient-network");
         let seller = test_seller();
         let cfg = test_cfg("tc-transient-network");
         let buyer = LocalNote::generate();
@@ -2481,7 +2484,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_match_transport_error_surfaces_without_reprovisioning() {
-        let cursor_path = temp_cursor_path("post-match-transport");
+        let (_cursor_dir, cursor_path) = temp_cursor_path("post-match-transport");
         let seller = test_seller();
         let cfg = test_cfg("tc-post-match-transport");
         let buyer = LocalNote::generate();

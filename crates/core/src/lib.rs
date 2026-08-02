@@ -3,7 +3,14 @@
 //! machine/formulas), plus real local note cryptography and `MockChainBackend`.
 //! Canon: `dexdo-cli.md`-, `private-inference-market-design.md`-,, Appx. A.
 
+// issue: canonical `<dapp_id>::<account_id>` addresses -- the one parse/format for every address a
+// user reads, pastes, or has persisted. Non-gated: the format logic is offline-tested.
+pub mod address;
 pub mod chain;
+// issue: the structured user-facing error (stable code + kind + message + preserved source
+// chain). It lives in `core` -- not in the CLI crate -- because `dexdo` already depends on `core`,
+// so there is no dependency inversion, and both crates can construct the same codes.
+pub mod error;
 pub mod handover;
 pub mod machine;
 pub mod note;
@@ -46,6 +53,7 @@ pub use shellnet::{
     TokenContractSettlementReceipt, TokenContractSettlementReceipts, DEFAULT_SHELLNET_ENDPOINT,
 };
 
+pub use address::{CanonicalAddress, DEXDO_DAPP_ID};
 pub use chain::flags as order_flags;
 pub use chain::{
     aggregate_tree, check_buy_deposit_headroom, check_disputable,
@@ -53,16 +61,18 @@ pub use chain::{
     check_release_disputable, check_seller_pubkey, check_subscription_buy_reserve,
     check_withdrawable_shell, deal_anomalies, executable_quote, per_model_breakdown,
     required_escrow_for_buy, submit_safe_single_ask_quote, subscription_buy_clearing_refund,
-    subscription_buy_reserve, validate_seller_resume_state, ChainBackend, ChainError, ClaimBounds,
-    CounterpartyTally, DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState, DealRole,
-    DealSellerBond, DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement,
-    Match, MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend,
-    ModelBreakdown, NoteSnapshot, OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats,
-    QuoteFill, RawUint128, ReclaimAction, SellOffer, SellOfferOutcome, SettlementAction,
+    subscription_buy_reserve, subscription_claim_cap_at, subscription_current_week_headroom,
+    validate_seller_resume_state, ChainBackend, ChainError, ClaimBounds, CounterpartyTally,
+    DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState, DealRole, DealSellerBond,
+    DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
+    MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend, ModelBreakdown,
+    NoteSnapshot, OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats, QuoteFill,
+    RawUint128, SellOffer, SellOfferOutcome, SettlementAction,
     SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
     SettlementActionReceipt, StreamSnapshot, SubscriptionBuyReserve, TokenContract, TreeSnapshot,
     UNKNOWN_MODEL,
 };
+pub use error::{codes as error_codes, BoxError, DexdoError, ErrorCode, ErrorKind};
 pub use handover::Handover;
 pub use machine::{InvariantError, Settlement, StreamMachine, StreamState, Tick};
 pub use manifest::{

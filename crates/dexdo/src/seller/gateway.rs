@@ -106,6 +106,7 @@ impl UpstreamFailure {
 pub struct DealDelivery {
     pub count: Arc<AtomicU64>,
     pub done: Arc<AtomicBool>,
+    update_lock: Arc<Mutex<()>>,
     event_sequence: Arc<AtomicU64>,
     terminal_trail_emitted: Arc<AtomicBool>,
 }
@@ -138,7 +139,8 @@ pub enum AuthoritativeDeliveryFinish {
 /// Request-scoped accounting event emitted by the gateway relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthoritativeDeliveryEvent {
-    /// A positive authoritative delta, emitted only after the corresponding output reached the buyer stream.
+    /// A positive authoritative delta. Structured-chunk deltas are emitted after reserving buyer-stream
+    /// capacity and before forwarding; separate usage deltas follow their already-forwarded output.
     Delivered(NonZeroU64),
     /// Emitted exactly once when the relay terminates.
     Finished(AuthoritativeDeliveryFinish),
@@ -162,7 +164,10 @@ impl AuthoritativeDeliveryRecorder for DealDelivery {
     ) -> Result<(), Status> {
         match event {
             AuthoritativeDeliveryEvent::Delivered(tokens) => {
-                add_authoritative_tokens(&self.count, tokens.get())
+                let _guard = self.update_lock.lock().unwrap();
+                let next = checked_authoritative_tokens(&self.count, tokens.get())?;
+                self.count.store(next, Ordering::Release);
+                Ok(())
             }
             AuthoritativeDeliveryEvent::Finished(_) => Ok(()),
         }
@@ -181,10 +186,13 @@ impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
     ) -> Result<(), Status> {
         match event {
             AuthoritativeDeliveryEvent::Delivered(tokens) => {
+                let _guard = self.delivery.update_lock.lock().unwrap();
+                let next = checked_authoritative_tokens(&self.delivery.count, tokens.get())?;
                 self.reservation
                     .record_delivered(tokens.get())
                     .map_err(capacity_status)?;
-                self.delivery.record_authoritative_delivery(event)
+                self.delivery.count.store(next, Ordering::Release);
+                Ok(())
             }
             AuthoritativeDeliveryEvent::Finished(finish) => match finish {
                 AuthoritativeDeliveryFinish::Clean | AuthoritativeDeliveryFinish::Interrupted => {
@@ -417,9 +425,10 @@ impl Default for GatewayState {
     }
 }
 
-/// Relay one gRPC stream's upstream chunks to the buyer while recording only authoritative token deltas after
-/// successful forwarding. The request-scoped recorder receives exactly one terminal classification, but the
-/// relay never sets deal-level `done`: one request ending is not the session ending. The default
+/// Relay one gRPC stream's upstream chunks to the buyer. Structured-accounting deltas are recorded after
+/// reserving buyer-stream capacity and before forwarding; separate usage is recorded after its preceding
+/// output. The request-scoped recorder receives exactly one terminal classification, but the relay never sets
+/// deal-level `done`: one request ending is not the session ending. The default
 /// [`DealDelivery`] recorder adds exact deltas to the shared cumulative count consumed by `drive_advance`;
 /// capacity-aware recorders may additionally persist reservation reconciliation without deriving provider
 /// counts themselves.
@@ -460,13 +469,16 @@ pub(crate) async fn relay_counting<R>(
                 }
                 let needs_usage = accounted_tokens == 0
                     && (!chunk.text.is_empty() || !chunk.reasoning.is_empty());
-                if tx.send(Ok(chunk)).await.is_err() {
-                    break if awaiting_usage {
-                        AuthoritativeDeliveryFinish::AmbiguousUsage
-                    } else {
-                        AuthoritativeDeliveryFinish::Interrupted
-                    };
-                }
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        break if awaiting_usage {
+                            AuthoritativeDeliveryFinish::AmbiguousUsage
+                        } else {
+                            AuthoritativeDeliveryFinish::Interrupted
+                        };
+                    }
+                };
                 if accounted_tokens > 0 {
                     let tokens = NonZeroU64::new(accounted_tokens)
                         .expect("positive branch has nonzero delta");
@@ -474,9 +486,11 @@ pub(crate) async fn relay_counting<R>(
                         AuthoritativeDeliveryEvent::Delivered(tokens),
                     ) {
                         terminal_error = Some(status);
-                        break AuthoritativeDeliveryFinish::AmbiguousUsage;
+                        break AuthoritativeDeliveryFinish::Interrupted;
                     }
-                } else if needs_usage {
+                }
+                permit.send(Ok(chunk));
+                if needs_usage {
                     awaiting_usage = true;
                 }
             }
@@ -544,14 +558,12 @@ fn reserve_status(error: ReserveError) -> Status {
 }
 
 #[allow(clippy::result_large_err)]
-fn add_authoritative_tokens(count: &AtomicU64, tokens: u64) -> Result<(), Status> {
+fn checked_authoritative_tokens(count: &AtomicU64, tokens: u64) -> Result<u64, Status> {
     debug_assert!(tokens > 0);
     count
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(tokens)
-        })
-        .map(|_| ())
-        .map_err(|_| Status::data_loss("authoritative delivered-token high-water overflow"))
+        .load(Ordering::Acquire)
+        .checked_add(tokens)
+        .ok_or_else(|| Status::data_loss("authoritative delivered-token high-water overflow"))
 }
 
 /// gRPC implementation of the gateway service.
@@ -1281,22 +1293,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buyer_disconnect_before_forward_releases_subscription_reservation() {
+    async fn fat_structured_chunk_is_rejected_before_buyer_exposure() {
         let state = GatewayState::new();
-        let tc = "0:buyer-disconnect";
+        let tc = "0:fat-structured-chunk";
         state
             .register_stream(
                 tc,
                 buyer_pubkey(),
-                100,
+                u64::MAX,
                 subscription_state(TICK_SIZE),
-                subscription_shape(),
+                ordinary_shape(TICK_SIZE + 2),
             )
             .unwrap();
-        let reservation = state.capacity.reserve(&tc.to_string(), 100).unwrap();
+        let reservation = state.capacity.reserve(&tc.to_string(), u64::MAX).unwrap();
+        assert_eq!(reservation.amount(), 2);
         let (up_tx, up_rx) = mpsc::channel(1);
-        let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
-        drop(rx);
+        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
         up_tx
             .send(crate::seller::upstream::chunk_with_structured_accounting(
                 CanonChunk {
@@ -1318,10 +1330,72 @@ mod tests {
             None,
         )
         .await;
+        let status = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(rx.recv().await.is_none(), "the rejected chunk was exposed");
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(snapshot.local_delivered_after_anchor, 0);
         assert_eq!(snapshot.outstanding_reservation, 0);
-        assert_eq!(snapshot.available().unwrap(), TICK_SIZE);
+        assert_eq!(snapshot.available().unwrap(), 2);
+        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_recorder_overflow_changes_no_state_and_exposes_no_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = GatewayState::with_upstream_and_deals_dir(
+            UpstreamConfig::Mock,
+            directory.path().to_path_buf(),
+        );
+        let tc = "0:capacity-recorder-overflow";
+        state
+            .register_stream(
+                tc,
+                buyer_pubkey(),
+                u64::MAX,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(TICK_SIZE + 2),
+            )
+            .unwrap();
+        let reservation = state.capacity.reserve(&tc.to_string(), u64::MAX).unwrap();
+        assert_eq!(reservation.amount(), 2);
+        let delivery = state.delivery(tc);
+        delivery.count.store(u64::MAX, Ordering::Relaxed);
+        let (up_tx, up_rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
+        up_tx
+            .send(crate::seller::upstream::chunk_with_structured_accounting(
+                CanonChunk {
+                    token_ids: vec![1],
+                    ..CanonChunk::default()
+                },
+            ))
+            .await
+            .unwrap();
+        drop(up_tx);
+
+        relay_counting(
+            up_rx,
+            tx,
+            CapacityDeliveryRecorder {
+                reservation,
+                delivery: delivery.clone(),
+            },
+            None,
+        )
+        .await;
+        let status = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert_eq!(
+            status.message(),
+            "authoritative delivered-token high-water overflow"
+        );
+        assert!(rx.recv().await.is_none(), "the rejected chunk was exposed");
+        let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+        assert_eq!(snapshot.outstanding_reservation, 0);
+        assert_eq!(snapshot.available().unwrap(), 2);
+        assert_eq!(delivery.count.load(Ordering::Acquire), u64::MAX);
     }
 
     #[tokio::test]
@@ -1515,12 +1589,9 @@ mod tests {
         drop(up_tx);
 
         relay_counting(up_rx, tx, recorder(count.clone()), None).await;
-        assert!(
-            rx.recv().await.unwrap().is_ok(),
-            "chunk was delivered first"
-        );
         let status = rx.recv().await.unwrap().unwrap_err();
         assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(rx.recv().await.is_none(), "the rejected chunk was exposed");
         assert_eq!(count.load(Ordering::Acquire), u64::MAX);
     }
 
@@ -1548,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_recorder_gets_exact_delta_then_one_clean_finish() {
+    async fn accepted_structured_chunk_is_forwarded_once_and_recorded_once() {
         let events = EventRecorder::default();
         let (up_tx, up_rx) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
@@ -1564,7 +1635,12 @@ mod tests {
         drop(up_tx);
 
         relay_counting(up_rx, tx, events.clone(), None).await;
-        while rx.recv().await.is_some() {}
+        let chunk = rx.recv().await.unwrap().unwrap();
+        assert_eq!(chunk.token_ids, vec![1, 2, 3]);
+        assert!(
+            rx.recv().await.is_none(),
+            "structured chunk was forwarded twice"
+        );
         assert_eq!(
             events.events(),
             vec![
@@ -1614,7 +1690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_recorder_marks_buyer_disconnect_interrupted_without_delivery() {
+    async fn closed_receiver_before_permit_records_no_delivery() {
         let events = EventRecorder::default();
         let (up_tx, up_rx) = mpsc::channel(1);
         let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
@@ -1740,7 +1816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_recorder_marks_forwarded_missing_usage_ambiguous_once() {
+    async fn separate_usage_missing_after_forward_remains_ambiguous() {
         let events = EventRecorder::default();
         let (up_tx, up_rx) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
@@ -1757,7 +1833,7 @@ mod tests {
         drop(up_tx);
 
         relay_counting(up_rx, tx, events.clone(), None).await;
-        assert!(rx.recv().await.unwrap().is_ok());
+        assert_eq!(rx.recv().await.unwrap().unwrap().text, "forwarded");
         assert_eq!(
             rx.recv().await.unwrap().unwrap_err().code(),
             tonic::Code::DataLoss

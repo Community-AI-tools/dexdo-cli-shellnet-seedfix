@@ -1,3 +1,25 @@
+## v0.0.21
+
+- fix(test): let the live acceptance suite finish a full run
+- fix: admission reserves the identity verification a fresh deal owes
+- fix: preserve seller probe source chain
+- fix: close seller liveness edge regressions
+- fix(test): remove the shared-resource races that make CI non-deterministic (, )
+- fix: use canonical advertise structured error
+- fix: make installer PATH persistence rc-backed
+- fix(ci): assert terminal 3/4/4 accounting
+- fix(test): keep seller child output line-safe under libtest
+- fix: refresh the subscription weekly allowance across boundaries
+- fix(seller): reserve relay capacity before exposure
+- fix: resolve an inherited :0 advertise to the bound gateway address
+- fix: read canonical addresses in the release gate and live tests
+- fix: let the real buyer book his own subscription week boundary
+- fix: drive pool-only reclaim from recorded metadata alone
+- fix: stop onboarding docs instructing a rejected --token-type
+- merge: land structured CLI errors on top of /
+- fix: urgent v0.0.21 pack -- installer PATH, canonical addresses, release version guard (, , )
+- fix: validate public gateway advertise and tolerate tunneled self-probe (, )
+
 ## v0.0.20
 
 - fix(tests): keep the models-fixture guard compiling without test-giver

@@ -463,9 +463,6 @@ pub const DEFAULT_DASHBOARD_LISTEN: &str = "127.0.0.1:8765";
 /// Default deal-audit export format spelling.
 pub const DEFAULT_EXPORT_FORMAT: &str = "json";
 
-/// Default deposit nominal used by `dexdo note deploy`.
-pub const DEFAULT_NOTE_DEPLOY_NOMINAL: &str = "N100";
-
 /// Default hostname used by `dexdo note deploy` for shellnet.
 pub const DEFAULT_NOTE_DEPLOY_ENDPOINT: &str = "shellnet.ackinacki.org";
 

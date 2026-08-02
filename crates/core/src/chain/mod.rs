@@ -1170,13 +1170,8 @@ mod tests {
     /// different canonical TC.
     #[tokio::test]
     async fn shared_book_foreign_seller_ask_does_not_block_intended_buy() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-shared-book-{}-{}",
-            std::process::id(),
-            "foreign-ask"
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -1218,21 +1213,14 @@ mod tests {
         assert_eq!(m.token_contract, intended_tc);
         assert_eq!(m.price_per_tick, u64::try_from(crate::PRICE_STEP).unwrap());
         assert_eq!(m.buyer_pubkey, buyer.pubkey());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// duplicate active sell posts for the same TC fail. A fill consumes the active ask but also
     /// permanently binds that TC to its first seller/buyer pair, so it cannot be posted again.
     #[tokio::test]
     async fn mock_duplicate_sell_post_and_filled_tc_repost_both_fail() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-dup-post-{}-{}",
-            std::process::id(),
-            "active-tc"
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -1265,18 +1253,12 @@ mod tests {
             chain.read_match(&tc).await.unwrap().buyer_pubkey,
             buyer.pubkey()
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn mock_sell_post_preserves_subscription_flag() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-seller-subscription-flag-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -1310,16 +1292,12 @@ mod tests {
                 assert_eq!(raw[0].flags, 0x60);
             }
         }
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn mock_high_valid_price_preserves_exact_aggregate_stop_accounting() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-high-price-stop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         // This regression isolates u128 money accounting; claim-clock parity is covered by the
         // dedicated mock tests, so this fixture explicitly removes both timing bounds.
         let consts = ProtocolConsts {
@@ -1440,17 +1418,14 @@ mod tests {
             escrow + two_p,
             "buyer escrow plus seller bond must be conserved across the settlement"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// (R11): `note_snapshot` shows the note's offers, its deals and the **anonymous**
     /// counterparty(the note's pubkey, not an identity); another note sees nothing.
     #[tokio::test]
     async fn note_snapshot_shows_offers_deals_and_anon_counterparty() {
-        let base = std::env::temp_dir().join(format!("dexdo-snap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -1502,8 +1477,6 @@ mod tests {
             n.offers.is_empty() && n.deals.is_empty(),
             "another note sees nothing"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- issue: per-model by-fact accounting breakdown(pure) ----
@@ -1954,7 +1927,7 @@ mod recover_tests {
 mod dispute_reclaim_tests {
     use super::{
         check_disputable, check_reclaimable, check_release_disputable, check_seller_pubkey,
-        check_withdrawable_shell, DealChainState, ReclaimAction,
+        check_withdrawable_shell, DealChainState,
     };
     use crate::params::MATCH_OPEN_TIMEOUT_SECS;
 
@@ -2007,7 +1980,7 @@ mod dispute_reclaim_tests {
         }
     }
 
-    fn owned_reclaim(state: DealChainState, now: u64) -> Result<ReclaimAction, String> {
+    fn owned_reclaim(state: DealChainState, now: u64) -> Result<(), String> {
         let me = [7u8; 32];
         check_reclaimable(
             state,
@@ -2044,10 +2017,8 @@ mod dispute_reclaim_tests {
         assert!(owned_reclaim(never_opened, 1_099)
             .unwrap_err()
             .contains("MATCH_OPEN_TIMEOUT"));
-        assert_eq!(
-            owned_reclaim(never_opened, 1_100).unwrap(),
-            ReclaimAction::StreamCleanup
-        );
+        owned_reclaim(never_opened, 1_100)
+            .expect("the exact never-opened shape past MATCH_OPEN_TIMEOUT is admissible");
 
         let mut not_funded = never_opened;
         not_funded.funded = false;

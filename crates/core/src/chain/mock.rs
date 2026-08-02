@@ -3204,12 +3204,8 @@ mod tests {
 
     #[tokio::test]
     async fn mock_sell_terms_and_match_volume_follow_the_canonical_contract_bounds() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-mock-canonical-sell-terms-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3294,18 +3290,12 @@ mod tests {
             .place_buy_ticks(&aon_tc, &buyer, 2)
             .await
             .expect_err("AON must not partially fund one deal");
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn mock_deal_state_uses_exact_fill_fee_and_lifecycle_times() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-mock-contract-state-shape-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3363,18 +3353,12 @@ mod tests {
             .await
             .expect_err("a terminal deal is not a seller resume match");
         assert!(terminal_error.to_string().contains("terminal"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn cleanup_unopened_waits_and_refunds_exact_deposit_and_bonds() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-mock-cleanup-unopened-accounting-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3421,18 +3405,12 @@ mod tests {
             }
         );
         assert!(chain.deal_state(&tc).await.unwrap().is_none());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn dispute_receipt_is_nonterminal_and_snapshot_arithmetic_fails_closed() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-mock-dispute-and-snapshot-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3485,16 +3463,12 @@ mod tests {
             .await
             .expect_err("cross-getter bond drift must reject the snapshot");
         assert!(incoherent.to_string().contains("exceeds bondRequired"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn accept_probe_rejects_the_canonical_window_across_restart_without_mutation() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-probe-window-restart-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         assert_eq!(consts.probe_window.as_secs(), 180);
@@ -3568,17 +3542,12 @@ mod tests {
                 .unwrap()
                 .probe_accepted
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn open_stream_rejects_duplicate_and_terminal_reopen_without_mutation() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-stream-reopen-restart-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -3649,17 +3618,12 @@ mod tests {
             restarted.read_handover(&tc).await.unwrap(),
             Some(original_handover)
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn buyer_and_seller_stop_reject_a_disputed_stream_across_restart_without_mutation() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-disputed-stop-restart-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -3712,15 +3676,12 @@ mod tests {
             before_endpoints
         );
         assert_eq!(restarted.deal_snapshot(&tc).await.unwrap().unwrap(), before);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn probe_claim_state_matches_the_contract_seed() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-probe-claim-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3756,16 +3717,12 @@ mod tests {
         assert!(accepted.probe_accepted);
         assert_eq!(accepted.tokens_final, TICK_SIZE);
         assert_eq!(accepted.tokens_pending, TICK_SIZE);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn stream_money_writes_require_the_canonical_deal_actor_without_mutation() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-mock-stream-actors-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -3847,16 +3804,12 @@ mod tests {
                 .contains("requires the matched buyer note"));
             assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_dispute);
         }
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn matched_tc_cannot_rebind_its_first_seller_or_buyer() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-mock-match-actors-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -3917,18 +3870,12 @@ mod tests {
             state.matches.get(&tc).unwrap().buyer_pubkey,
             first_buyer.pubkey()
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn cancelled_unfunded_tc_keeps_its_original_seller_across_restart() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-mock-cancelled-seller-binding-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4019,18 +3966,12 @@ mod tests {
             funded_bytes,
             "matched/funded rejection must not mutate persisted state"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn equal_cumulative_claim_retry_is_rejected_after_close() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-equal-claim-after-close-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -4055,18 +3996,12 @@ mod tests {
             "{error}"
         );
         assert_eq!(chain.deal_state(&tc).await.unwrap().unwrap(), before);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn equal_cumulative_claim_retry_is_rejected_during_dispute() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-equal-claim-during-dispute-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -4091,16 +4026,12 @@ mod tests {
             "{error}"
         );
         assert_eq!(chain.deal_state(&tc).await.unwrap().unwrap(), before);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn claim_uses_real_time_and_rejects_pre_interval_across_restart_without_mutation() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-real-claim-clock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -4142,16 +4073,12 @@ mod tests {
             accepted.last_claim_time <= unix_now_secs(),
             "the mock must never manufacture and persist a future claim timestamp"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn claim_rejects_physical_over_rate_after_restart_without_mutation() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-claim-over-rate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts {
             min_claim_interval: std::time::Duration::from_secs(1),
@@ -4183,18 +4110,12 @@ mod tests {
             "an over-rate claim must not mutate the persisted high-water or timestamps"
         );
         assert!(before.state.last_claim_time <= unix_now_secs());
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn raw_cumulative_claims_preserve_sub_tick_precision_and_exact_payment() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-raw-cumulative-claims-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let consts = ProtocolConsts::canonical();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -4273,8 +4194,6 @@ mod tests {
             buyer_pay + buyer_fee,
             2 * u128::from(price),
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     proptest! {
@@ -4290,12 +4209,8 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let base = std::env::temp_dir().join(format!(
-                    "dexdo-raw-chunking-{}-{first_delta}-{second_delta}",
-                    std::process::id()
-                ));
-                let _ = std::fs::remove_dir_all(&base);
-                std::fs::create_dir_all(&base).unwrap();
+                let base_dir = tempfile::tempdir().expect("test temp dir");
+                let base = base_dir.path();
                 let chain = MockChainBackend::new(
                     base.join("eps.json"),
                     ProtocolConsts::canonical(),
@@ -4378,7 +4293,6 @@ mod tests {
                     one.buyer_refunded,
                     funded_pay + funded_fee - expected_pay - expected_fee,
                 );
-                let _ = std::fs::remove_dir_all(&base);
                 Ok(())
             })?;
         }
@@ -4386,12 +4300,8 @@ mod tests {
 
     #[tokio::test]
     async fn probe_acceptance_latch_survives_terminal_restart() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-probe-acceptance-latch-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4467,16 +4377,12 @@ mod tests {
                 expected_tokens_final
             );
         }
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn dispute_time_is_exposed_and_survives_restart() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-dispute-time-restart-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4511,18 +4417,12 @@ mod tests {
             raised_at,
             "getState disputeTime must remain the exact dispute instant after restart"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn persisted_stream_schema_rejects_missing_or_unknown_money_fields() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-stream-schema-restart-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4589,18 +4489,12 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported persisted stream schema 4"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn corrupted_raw_finalized_volume_fails_instead_of_fabricating_max_ticks() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-corrupt-finalized-volume-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -4631,18 +4525,12 @@ mod tests {
             before,
             "an impossible raw volume must fail during load without rewriting the sidecar"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn corrupt_claim_and_lifecycle_sidecars_fail_closed_before_state_use() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-corrupt-persisted-claims-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4763,18 +4651,12 @@ mod tests {
             "funded Match has no persisted deal shape",
         )
         .await;
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn corrupt_deal_bindings_and_machine_counters_fail_closed_without_mutation() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-corrupt-persisted-bindings-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4870,18 +4752,12 @@ mod tests {
             "fundedTokens 5000000 disagree with matched volume 4000000",
         )
         .await;
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn corrupt_subscription_sidecars_reject_every_canonical_bound_without_mutation() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-corrupt-persisted-subscription-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -4982,16 +4858,12 @@ mod tests {
             "ordinary deal has contradictory weekly state",
         )
         .await;
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn mock_subscription_shape_uses_matched_funded_volume() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-subscription-shape-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -5029,18 +4901,86 @@ mod tests {
             snapshot.buyer_bond.bond_required,
             2 * u128::from(TEST_PRICE)
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&base);
+    /// PHASE 2 against the contract-faithful mock: a boundary the clock has crossed and nobody
+    /// has charged. The client twin computed from those recorded books is UNDERSTATED, and computed
+    /// from the state the booking publishes it is the contract's own cap -- which is why the running
+    /// route books first and computes from what comes back rather than deciding which phase it is in.
+    #[tokio::test]
+    async fn unbooked_boundary_understates_the_weekly_ceiling_until_it_is_booked() {
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
+        let endpoints = base.join("eps.json");
+        let chain = MockChainBackend::new(
+            endpoints.clone(),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let seller = LocalNote::from_seed(&[41u8; 32]);
+        let buyer = LocalNote::from_seed(&[42u8; 32]);
+        let tc = "tc-subscription-booked-ceiling".to_string();
+        chain
+            .post_offer(
+                SellOffer {
+                    price_per_tick: TEST_PRICE,
+                    max_ticks: 8,
+                    token_contract: tc.clone(),
+                    flags: flags::AON | flags::SUBSCRIPTION,
+                },
+                &seller,
+            )
+            .await
+            .unwrap();
+        chain.place_buy(&tc, &buyer).await.unwrap();
+        chain.open_stream(&tc, vec![], &seller).await.unwrap();
+        elapse_probe_window(&chain, &tc);
+        chain.accept_probe(&tc).await.unwrap();
+
+        // Week one is partly consumed, so the base the next week is measured from is not zero.
+        chain.claim_tokens(&tc, &seller, TICK_SIZE).await.unwrap();
+
+        // The clock crosses one boundary; nobody has charged it yet.
+        let mut persisted = chain.load_state().unwrap();
+        persisted
+            .deal_subscriptions
+            .get_mut(&tc)
+            .unwrap()
+            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
+        chain.store_state(&persisted).unwrap();
+
+        let stale = chain.deal_snapshot(&tc).await.unwrap().unwrap();
+        assert_eq!(
+            stale.subscription.week_index, 0,
+            "the getter lags until a week is booked"
+        );
+        let recorded = super::subscription_claim_cap_at(&stale.state, &stale.subscription).unwrap();
+
+        chain.settle_week(&tc).await.unwrap();
+        let booked = chain.deal_snapshot(&tc).await.unwrap().unwrap();
+        assert_eq!(booked.subscription.week_index, 1);
+        let applied =
+            super::subscription_claim_cap_at(&booked.state, &booked.subscription).unwrap();
+        assert_eq!(
+            applied,
+            booked.subscription.week_base_tokens + booked.subscription.tokens_per_week,
+            "computed from booked state, the client twin is the contract's own cap"
+        );
+        assert_eq!(
+            booked.subscription.week_base_tokens, booked.state.tokens_pending,
+            "the booking re-bases the week on the cumulative claim, forfeiting what week one left"
+        );
+        assert!(
+            recorded < applied,
+            "across an unbooked boundary the recorded books understate the cap: recorded {recorded} \
+             vs applied {applied}"
+        );
     }
 
     #[tokio::test]
     async fn mock_subscription_crosses_boundaries_without_rolling_unused_quota() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-boundaries-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let chain = MockChainBackend::new(
             endpoints.clone(),
@@ -5187,18 +5127,12 @@ mod tests {
                 .contains("not an open accepted subscription"),
             "{terminal_retry}"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn post_term_subscription_claim_is_frozen_while_equal_retry_and_close_window_remain() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-post-term-subscription-claim-cap-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -5284,18 +5218,12 @@ mod tests {
         assert!(closed.state.is_stopped());
         assert_eq!(closed.state.tokens_final, 2 * TICK_SIZE);
         assert_eq!(closed.state.tokens_pending, 2 * TICK_SIZE);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn max_price_full_subscription_keeps_exact_monotonic_u128_fees() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-max-price-subscription-fees-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -5350,18 +5278,12 @@ mod tests {
         assert!(terminal.closed);
         assert_eq!(terminal.buyer_locked, 0);
         assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn mock_subscription_settlement_rejects_pre_probe_and_pre_boundary() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-settle-gates-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -5423,18 +5345,12 @@ mod tests {
             .unwrap_err();
         assert!(malformed_cap.to_string().contains("weekBaseTokens"));
         assert!(malformed_cap.to_string().contains("exceeds fundedTokens"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_buyer_stop_charges_started_week_but_seller_stop_charges_only_elapsed() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-stop-week-accounting-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -5503,18 +5419,12 @@ mod tests {
             }
             assert_mock_money_conserved(&chain, tc, buyer_funding, seller_funding);
         }
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_seller_stop_pays_zero_for_matured_current_week_consumption() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-seller-stop-current-week-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
         let seller = LocalNote::from_seed(&[63u8; 32]);
@@ -5585,19 +5495,13 @@ mod tests {
         assert_eq!(cell.buyer_bond, 0);
         assert_eq!(cell.seller_locked, 0);
         assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_buyer_concession_preserves_week_claim_bonds_and_conservation_after_restart(
     ) {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-concession-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -5699,18 +5603,12 @@ mod tests {
         assert_eq!(cell.buyer_bond, 0);
         assert_eq!(cell.seller_locked, 0);
         assert_mock_money_conserved(&restarted, &tc, buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_dispute_timeout_is_reachable_at_deadline_and_burns_equal_stakes() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-dispute-timeout-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -5783,18 +5681,12 @@ mod tests {
             terminal_snapshot,
             "a terminal timeout retry must fail without changing the settlement"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_dispute_timeout_preserves_proved_pay_and_burns_equal_contested_stakes() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-dispute-timeout-accounting-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let endpoints = base.join("eps.json");
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
@@ -5892,8 +5784,6 @@ mod tests {
         assert_eq!(cell.buyer_bond, 0);
         assert_eq!(cell.seller_locked, 0);
         assert_mock_money_conserved(&restarted, &tc, buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     proptest! {
@@ -5908,12 +5798,8 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let base = std::env::temp_dir().join(format!(
-                    "dexdo-ordinary-raw-dispute-floor-{}-{raw_tail}",
-                    std::process::id()
-                ));
-                let _ = std::fs::remove_dir_all(&base);
-                std::fs::create_dir_all(&base).unwrap();
+                let base_dir = tempfile::tempdir().expect("test temp dir");
+                let base = base_dir.path();
                 let consts = ProtocolConsts::canonical();
                 let chain = MockChainBackend::new(
                     base.join("eps.json"),
@@ -5959,7 +5845,6 @@ mod tests {
                 assert_eq!(cell.burned, stake + probe_fee);
                 assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
 
-                let _ = std::fs::remove_dir_all(&base);
             });
         }
     }
@@ -5983,12 +5868,8 @@ mod tests {
                 let mut outcomes = Vec::new();
 
                 for timed_out in [false, true] {
-                    let base = std::env::temp_dir().join(format!(
-                        "dexdo-subscription-raw-dispute-floor-{}-{raw_tail}-{timed_out}",
-                        std::process::id()
-                    ));
-                    let _ = std::fs::remove_dir_all(&base);
-                    std::fs::create_dir_all(&base).unwrap();
+                    let base_dir = tempfile::tempdir().expect("test temp dir");
+                    let base = base_dir.path();
                     let chain = MockChainBackend::new(
                         base.join("eps.json"),
                         consts,
@@ -6077,7 +5958,6 @@ mod tests {
                         buyer_stake,
                     ));
 
-                    let _ = std::fs::remove_dir_all(&base);
                 }
 
                 let concession = outcomes[0];
@@ -6092,12 +5972,8 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_raw_claim_tail_caps_dispute_at_two_p_and_conserves_money() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-raw-dispute-cap-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let consts = ProtocolConsts::canonical();
         let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
         let seller = LocalNote::from_seed(&[59u8; 32]);
@@ -6165,18 +6041,12 @@ mod tests {
         assert_eq!(cell.buyer_refunded, future_refund);
         assert_eq!(cell.burned, expected_burn);
         assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
     async fn subscription_pre_probe_terminal_paths_price_each_party_exactly() {
-        let base = std::env::temp_dir().join(format!(
-            "dexdo-subscription-pre-probe-terminals-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -6230,8 +6100,6 @@ mod tests {
         assert_eq!(seller_stop.seller_received, u128::from(price));
         assert_eq!(seller_stop.buyer_refunded, buyer_funding);
         assert_mock_money_conserved(&chain, "tc-seller-pre-probe", buyer_funding, seller_funding);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     proptest! {
@@ -6248,12 +6116,8 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let base = std::env::temp_dir().join(format!(
-                    "dexdo-subscription-conservation-{}-{ticks_per_week}-{buyer_ends}-{pre_probe}",
-                    std::process::id()
-                ));
-                let _ = std::fs::remove_dir_all(&base);
-                std::fs::create_dir_all(&base).unwrap();
+                let base_dir = tempfile::tempdir().expect("test temp dir");
+                let base = base_dir.path();
                 let chain = MockChainBackend::new(
                     base.join("eps.json"),
                     ProtocolConsts::canonical(),
@@ -6289,17 +6153,14 @@ mod tests {
                     buyer_funding,
                     seller_funding,
                 );
-                let _ = std::fs::remove_dir_all(&base);
             });
         }
     }
 
     #[tokio::test]
     async fn high_price_timeout_rejects_legacy_wrapped_seller_lock() {
-        let base =
-            std::env::temp_dir().join(format!("dexdo-high-price-timeout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let base_dir = tempfile::tempdir().expect("test temp dir");
+        let base = base_dir.path();
         let chain = MockChainBackend::new(
             base.join("eps.json"),
             ProtocolConsts::canonical(),
@@ -6358,7 +6219,5 @@ mod tests {
             closed.buyer_refunded, buyer_refund,
             "the buyer's escrow is conserved"
         );
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

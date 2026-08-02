@@ -30,7 +30,7 @@ use dexdo_core::params::{
 /// `MarketManifest` whose `token_contract` is the deployed, active address.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
-    use dexdo_core::{Address, KeyPair, RealChainBackend};
+    use dexdo_core::{KeyPair, RealChainBackend};
     // A3: reject an invalid limit price at the command boundary, before any key/file/network read or write.
     validate_price_step(args.price_per_tick)?;
     policy::load_seller_runtime_policy(args.policy.as_deref())?;
@@ -73,8 +73,8 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     if let Some(policy) = registry_policy.as_ref() {
         let expected_order_book = chain
             .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
@@ -191,7 +191,7 @@ pub(crate) async fn run_provision(args: ProvisionArgs) -> Result<()> {
 /// no-op). Same lazy deploy the seller's `post_offer` does, surfaced as a first-class operate command.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
-    use dexdo_core::{model_hash_for, Address, KeyPair, RealChainBackend, TICK_SIZE};
+    use dexdo_core::{model_hash_for, KeyPair, RealChainBackend, TICK_SIZE};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr (active inference note) is required")
     })?;
@@ -234,8 +234,8 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tick_size = TICK_SIZE;
     let ob = chain
         .inference_orderbook_address(&note, &model_hash, tick_size)
@@ -322,8 +322,8 @@ pub(crate) async fn run_destroy(args: DestroyArgs) -> Result<()> {
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-    let note =
-        Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
     eprintln!(

@@ -95,7 +95,6 @@ pub(crate) struct RuntimeDealHandleInput<'a> {
 }
 
 #[cfg(feature = "shellnet")]
-#[derive(Debug, Clone)]
 pub(crate) struct PoolRecoveryInputs {
     pub(crate) note_addr: String,
     pub(crate) note_secret_hex: Zeroizing<String>,
@@ -104,7 +103,6 @@ pub(crate) struct PoolRecoveryInputs {
 }
 
 #[cfg(feature = "shellnet")]
-#[derive(Debug, Clone)]
 pub(crate) struct PoolRecoveryRecord {
     pub(crate) pool_path: std::path::PathBuf,
     pub(crate) note_addr: String,
@@ -275,14 +273,14 @@ pub(crate) fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::
     }
 }
 
+/// The explicitly supplied recovery identity, normalized once for both the single-target resolver and
+/// the multi-target plan: `(--note-addr, --token-contract/--market)`.
 #[cfg(feature = "shellnet")]
-pub(crate) fn resolve_pool_recovery_inputs(
-    command: &str,
-    identity: &IdentityArgs,
+fn explicit_recovery_identity(
+    identity: &RecoveryIdentityArgs,
     market: Option<&std::path::Path>,
     token_contract: Option<&str>,
-    pool: Option<&std::path::Path>,
-) -> Result<PoolRecoveryInputs> {
+) -> Result<(Option<String>, Option<String>)> {
     let explicit_tc = if market.is_some() || token_contract.is_some() {
         let (tc, _frame, _nonce) = resolve_market_fields(market, token_contract, None)?;
         Some(dexdo_core::normalize_wallet_address(&tc).map_err(|e| anyhow::anyhow!("{e}"))?)
@@ -295,19 +293,58 @@ pub(crate) fn resolve_pool_recovery_inputs(
         .map(dexdo_core::normalize_wallet_address)
         .transpose()
         .map_err(|e| anyhow::anyhow!("--note-addr: {e}"))?;
-    if let (Some(note_addr), Some(note_key), Some(tc)) = (
-        &explicit_note_addr,
-        identity.note_key.as_deref(),
-        &explicit_tc,
-    ) {
-        return Ok(PoolRecoveryInputs {
-            note_addr: note_addr.clone(),
-            note_secret_hex: read_secret_hex(note_key, "--note-key")?.into(),
-            token_contract: tc.clone(),
-            pool_record: None,
-        });
-    }
+    Ok((explicit_note_addr, explicit_tc))
+}
 
+/// `--note-addr` + `--note-key` + `--token-contract/--market` fully determine one deal; the pool is not
+/// read at all in that case. Returns the signing identity of that deal: `(note, owner key, TC)`.
+#[cfg(feature = "shellnet")]
+fn fully_explicit_recovery_identity(
+    identity: &RecoveryIdentityArgs,
+    explicit_note_addr: Option<&String>,
+    explicit_tc: Option<&String>,
+) -> Result<Option<(String, Zeroizing<String>, String)>> {
+    let (Some(note_addr), Some(note_key), Some(tc)) = (
+        explicit_note_addr,
+        identity.note_key.as_deref(),
+        explicit_tc,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        note_addr.clone(),
+        read_secret_hex(note_key, "--note-key")?.into(),
+        tc.clone(),
+    )))
+}
+
+/// The owner key a recovery signs with: an explicit `--note-key` overrides the key recorded next to the
+/// entry. Exactly one copy of the secret is produced, and it is moved, never cloned.
+#[cfg(feature = "shellnet")]
+fn recovery_note_secret(
+    identity: &RecoveryIdentityArgs,
+    recorded: String,
+) -> Result<Zeroizing<String>> {
+    match identity.note_key.as_deref() {
+        Some(path) => Ok(read_secret_hex(path, "--note-key")?.into()),
+        None => Ok(recorded.into()),
+    }
+}
+
+/// Every pool note entry that records a `token_contract` and matches the explicitly supplied filters --
+/// **every role**, including `seller`. Role selection belongs to the caller: a seller row for the same
+/// note and TokenContract as a buyer row is a same-deal contradiction that a buyer-side plan must be able
+/// to see, while a seller row for some other deal is simply not part of that plan.
+#[cfg(feature = "shellnet")]
+fn matching_pool_recovery_records(
+    command: &str,
+    pool: Option<&std::path::Path>,
+    explicit_note_addr: Option<&String>,
+    explicit_tc: Option<&String>,
+) -> Result<(
+    std::path::PathBuf,
+    Vec<crate::cli::note::PoolNoteRecoveryRecord>,
+)> {
     let Some(pool_path) = note_pool_path(pool) else {
         bail!(
             "{command}: pass --note-addr, --note-key, and --token-contract/--market, or pass --pool / set \
@@ -316,15 +353,27 @@ pub(crate) fn resolve_pool_recovery_inputs(
     };
     let pool_path = crate::cli::note::resolve_private_file_path(&pool_path, "DEXDO_PN_POOL")?;
     let pool = load_pool_json(&pool_path)?;
-    let mut records = crate::cli::note::pool_note_recovery_records(&pool)?
+    let records = crate::cli::note::pool_note_recovery_records(&pool)?
         .into_iter()
-        .filter(|(note_addr, _, tc, role)| {
-            (role == "buyer" || role == "unknown")
-                && explicit_note_addr
-                    .as_ref()
-                    .is_none_or(|want| want == note_addr)
-                && explicit_tc.as_ref().is_none_or(|want| want == tc)
+        .filter(|record| {
+            explicit_note_addr.is_none_or(|want| *want == record.note_addr)
+                && explicit_tc.is_none_or(|want| *want == record.token_contract)
         })
+        .collect::<Vec<_>>();
+    Ok((pool_path, records))
+}
+
+/// The buyer-side recovery entries a single-deal resolver acts on, and the loud refusal when the pool
+/// records none.
+#[cfg(feature = "shellnet")]
+fn buyer_side_recovery_records(
+    command: &str,
+    pool_path: &std::path::Path,
+    records: Vec<crate::cli::note::PoolNoteRecoveryRecord>,
+) -> Result<Vec<crate::cli::note::PoolNoteRecoveryRecord>> {
+    let records = records
+        .into_iter()
+        .filter(|record| record.role == "buyer" || record.role == "unknown")
         .collect::<Vec<_>>();
     if records.is_empty() {
         bail!(
@@ -333,6 +382,62 @@ pub(crate) fn resolve_pool_recovery_inputs(
             pool_path.display()
         );
     }
+    Ok(records)
+}
+
+/// Resolve the one deal `dispute` acts on. `dispute` persists nothing back into the pool.
+#[cfg(feature = "shellnet")]
+pub(crate) fn resolve_pool_recovery_inputs(
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+) -> Result<PoolRecoveryInputs> {
+    resolve_recovery_inputs("dispute", identity, market, token_contract, pool, false)
+}
+
+/// Resolve the one deal `recover` acts on. `recover` writes the resolved buyer record back into the pool
+/// after its STOP and is the only consumer of `PoolRecoveryInputs::pool_record`.
+#[cfg(feature = "shellnet")]
+pub(crate) fn resolve_persistable_pool_recovery_inputs(
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+) -> Result<PoolRecoveryInputs> {
+    resolve_recovery_inputs("recover", identity, market, token_contract, pool, true)
+}
+
+#[cfg(feature = "shellnet")]
+fn resolve_recovery_inputs(
+    command: &str,
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+    persists_pool_record: bool,
+) -> Result<PoolRecoveryInputs> {
+    let (explicit_note_addr, explicit_tc) =
+        explicit_recovery_identity(identity, market, token_contract)?;
+    if let Some((note_addr, note_secret_hex, token_contract)) = fully_explicit_recovery_identity(
+        identity,
+        explicit_note_addr.as_ref(),
+        explicit_tc.as_ref(),
+    )? {
+        return Ok(PoolRecoveryInputs {
+            note_addr,
+            note_secret_hex,
+            token_contract,
+            pool_record: None,
+        });
+    }
+    let (pool_path, records) = matching_pool_recovery_records(
+        command,
+        pool,
+        explicit_note_addr.as_ref(),
+        explicit_tc.as_ref(),
+    )?;
+    let mut records = buyer_side_recovery_records(command, &pool_path, records)?;
     if records.len() > 1 {
         bail!(
             "{command}: DEXDO_PN_POOL {} has {} matching recovery entries; pass --note-addr or --token-contract \
@@ -341,28 +446,257 @@ pub(crate) fn resolve_pool_recovery_inputs(
             records.len()
         );
     }
-    let (pool_note_addr, pool_secret, pool_tc, pool_role) = records.remove(0);
-    let note_secret_hex = match identity.note_key.as_deref() {
-        Some(path) => read_secret_hex(path, "--note-key")?.into(),
-        None => pool_secret.clone().into(),
-    };
-    let pool_record = (identity.note_addr.is_none()
+    let record = records.remove(0);
+    // Built only for the caller that persists it, and only when the whole identity came from the pool:
+    // no other path carries a second copy of the recorded owner key.
+    let pool_record = (persists_pool_record
+        && identity.note_addr.is_none()
         && identity.note_key.is_none()
         && market.is_none()
         && token_contract.is_none())
     .then(|| PoolRecoveryRecord {
         pool_path,
-        note_addr: pool_note_addr.clone(),
-        note_secret_hex: pool_secret.into(),
-        token_contract: pool_tc.clone(),
-        role: pool_role,
+        note_addr: record.note_addr.clone(),
+        note_secret_hex: record.owner_secret_hex.clone().into(),
+        token_contract: record.token_contract.clone(),
+        role: record.role.clone(),
     });
     Ok(PoolRecoveryInputs {
-        note_addr: explicit_note_addr.unwrap_or(pool_note_addr),
-        note_secret_hex,
-        token_contract: explicit_tc.unwrap_or(pool_tc),
+        note_addr: explicit_note_addr.unwrap_or(record.note_addr),
+        note_secret_hex: recovery_note_secret(identity, record.owner_secret_hex)?,
+        token_contract: explicit_tc.unwrap_or(record.token_contract),
         pool_record,
     })
+}
+
+/// One deal a pool-only recovery may act on: exactly the facts the driver signs and decides with, and
+/// nothing else. A plan is driven, never persisted, so a target deliberately carries no copy of the
+/// pool's persistence record -- one recorded owner key, held once, for the consumer that actually reads it.
+#[cfg(feature = "shellnet")]
+pub(crate) struct PoolRecoveryTarget {
+    pub(crate) note_addr: String,
+    pub(crate) note_secret_hex: Zeroizing<String>,
+    pub(crate) token_contract: String,
+    /// The entry's recorded `token_contract_updated_at_unix`, never the reader's clock.
+    pub(crate) recorded_at_unix: Option<u64>,
+}
+
+/// A recorded entry the plan refuses to act on because the pool's own records contradict each other.
+#[cfg(feature = "shellnet")]
+pub(crate) struct PoolRecoveryRefusal {
+    pub(crate) note_addr: String,
+    pub(crate) token_contract: String,
+    pub(crate) reason: String,
+}
+
+/// Every deal a pool-only recovery can drive, in a deterministic order, plus the entries it refuses.
+#[cfg(feature = "shellnet")]
+pub(crate) struct PoolRecoveryPlan {
+    pub(crate) targets: Vec<PoolRecoveryTarget>,
+    pub(crate) refused: Vec<PoolRecoveryRefusal>,
+}
+
+/// plan a recovery from recorded pool metadata alone. Where
+/// [`resolve_pool_recovery_inputs`] resolves exactly one deal and refuses as soon as the pool holds a
+/// second recoverable entry, this returns **all** recorded deals so the caller can drive each of them as
+/// its own individually idempotent action -- an ordinary pool holds one entry per deal the note took part
+/// in, and after a crash the pool file is all the operator has.
+/// Money-safety rules enforced here, before any chain contact:
+/// * exactly one planned target per recorded deal -- rows for the same note and TokenContract collapse
+/// only when **every** recorded fact agrees(owner key, role and recorded time); a row that agrees on
+/// the deal but disagrees on any of them -- including one row calling the note the buyer and another
+/// calling it the seller -- is a contradiction, not a duplicate, and is refused with it;
+/// * a note whose records contradict each other(the same note claiming two different TokenContracts) is
+/// refused outright, and so is a TokenContract claimed by more than one note. These are counted over
+/// the **complete** buyer-side candidate set, contradicted deals included, so a contradiction refuses
+/// every deal it touches instead of quietly clearing the way for its own sibling;
+/// * a recorded `seller` deal is not a buyer-side candidate at all: a note that sold one deal and bought
+/// another is ordinary, and its seller record neither joins nor blocks the buyer plan;
+/// * the order is taken from the recorded `token_contract_updated_at_unix` (entries with a recorded time
+/// first, earliest first; entries without one last), tie-broken by the recorded note/TokenContract
+/// addresses -- never from the reader's wall clock and never from the entry's position in the file, so
+/// permuting the pool file cannot change what runs or in which order.
+#[cfg(feature = "shellnet")]
+pub(crate) fn resolve_pool_recovery_plan(
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+) -> Result<PoolRecoveryPlan> {
+    // `reclaim` is the only command that drives a plan; `recover`/`dispute` resolve a single deal
+    // through `resolve_pool_recovery_inputs`.
+    let command = "reclaim";
+    let (explicit_note_addr, explicit_tc) =
+        explicit_recovery_identity(identity, market, token_contract)?;
+    if let Some((note_addr, note_secret_hex, token_contract)) = fully_explicit_recovery_identity(
+        identity,
+        explicit_note_addr.as_ref(),
+        explicit_tc.as_ref(),
+    )? {
+        return Ok(PoolRecoveryPlan {
+            targets: vec![PoolRecoveryTarget {
+                note_addr,
+                note_secret_hex,
+                token_contract,
+                recorded_at_unix: None,
+            }],
+            refused: Vec::new(),
+        });
+    }
+    let (pool_path, records) = matching_pool_recovery_records(
+        command,
+        pool,
+        explicit_note_addr.as_ref(),
+        explicit_tc.as_ref(),
+    )?;
+
+    // One candidate per recorded deal, in a key order fixed by the recorded addresses. A candidate is
+    // either coherent(one agreed row) or contradicted(rows that disagree); both are candidates, so a
+    // contradiction is still counted when deciding whether some other deal is ambiguous.
+    let mut by_deal: std::collections::BTreeMap<
+        (String, String),
+        Vec<crate::cli::note::PoolNoteRecoveryRecord>,
+    > = std::collections::BTreeMap::new();
+    for record in records {
+        by_deal
+            .entry((record.note_addr.clone(), record.token_contract.clone()))
+            .or_default()
+            .push(record);
+    }
+    let mut candidates: Vec<(crate::cli::note::PoolNoteRecoveryRecord, Option<String>)> =
+        Vec::new();
+    for ((_, token_contract), rows) in by_deal {
+        let first = &rows[0];
+        let disagreeing = rows
+            .iter()
+            .filter(|row| {
+                row.owner_secret_hex != first.owner_secret_hex
+                    || row.role != first.role
+                    || row.recorded_at_unix != first.recorded_at_unix
+            })
+            .count();
+        if disagreeing == 0 {
+            // A coherent `seller` record is this note's own sold deal, not a buyer recovery entry.
+            if first.role == "seller" {
+                continue;
+            }
+            candidates.push((rows.into_iter().next().expect("group is never empty"), None));
+            continue;
+        }
+        // A contradicted deal is a buyer-side concern only if some row claims the buyer side.
+        if !rows
+            .iter()
+            .any(|row| row.role == "buyer" || row.role == "unknown")
+        {
+            continue;
+        }
+        let reason = format!(
+            "DEXDO_PN_POOL {} holds {} rows for TokenContract {token_contract} whose recorded facts \
+             disagree (owner key, role or recorded time); refusing to guess which row is the deal -- fix \
+             the pool or pass explicit --note-addr/--note-key/--token-contract",
+            pool_path.display(),
+            rows.len(),
+        );
+        candidates.push((
+            rows.into_iter().next().expect("group is never empty"),
+            Some(reason),
+        ));
+    }
+    if candidates.is_empty() {
+        bail!(
+            "{command}: DEXDO_PN_POOL {} has no matching note entry with token_contract recovery metadata; \
+             run the buyer once with this pool active, or pass explicit --note-addr/--note-key/--token-contract",
+            pool_path.display()
+        );
+    }
+    if candidates.len() > 1 && identity.note_key.is_some() {
+        bail!(
+            "{command}: DEXDO_PN_POOL {} has {} matching recovery entries and --note-key names a single \
+             note's owner key; pass --note-addr to select that entry, or drop --note-key so each entry is \
+             driven with its own recorded owner key",
+            pool_path.display(),
+            candidates.len()
+        );
+    }
+    // Counted over the complete candidate set -- contradicted deals included -- and over addresses only,
+    // so the recorded owner key is never copied to decide admissibility.
+    let mut deals_per_note: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut notes_per_tc: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (record, _) in &candidates {
+        *deals_per_note.entry(record.note_addr.clone()).or_default() += 1;
+        *notes_per_tc
+            .entry(record.token_contract.clone())
+            .or_default() += 1;
+    }
+
+    let mut refused = Vec::new();
+    let mut targets = Vec::new();
+    for (record, contradiction) in candidates {
+        let deals_for_note = deals_per_note[&record.note_addr];
+        let notes_for_tc = notes_per_tc[&record.token_contract];
+        if let Some(reason) = contradiction {
+            refused.push(PoolRecoveryRefusal {
+                reason,
+                note_addr: record.note_addr,
+                token_contract: record.token_contract,
+            });
+            continue;
+        }
+        if deals_for_note > 1 {
+            refused.push(PoolRecoveryRefusal {
+                reason: format!(
+                    "DEXDO_PN_POOL {} holds {deals_for_note} contradictory recovery records for note {}; \
+                     refusing to act on any of them -- fix the pool or pass explicit \
+                     --note-addr/--note-key/--token-contract for the intended deal",
+                    pool_path.display(),
+                    record.note_addr
+                ),
+                note_addr: record.note_addr,
+                token_contract: record.token_contract,
+            });
+            continue;
+        }
+        if notes_for_tc > 1 {
+            refused.push(PoolRecoveryRefusal {
+                reason: format!(
+                    "DEXDO_PN_POOL {} has {notes_for_tc} different notes recorded as the buyer of \
+                     TokenContract {}; refusing to act on a contradictory record -- fix the pool or pass \
+                     explicit --note-addr/--note-key/--token-contract for the intended deal",
+                    pool_path.display(),
+                    record.token_contract
+                ),
+                note_addr: record.note_addr,
+                token_contract: record.token_contract,
+            });
+            continue;
+        }
+        targets.push(PoolRecoveryTarget {
+            note_secret_hex: recovery_note_secret(identity, record.owner_secret_hex)?,
+            note_addr: explicit_note_addr.clone().unwrap_or(record.note_addr),
+            token_contract: explicit_tc.clone().unwrap_or(record.token_contract),
+            recorded_at_unix: record.recorded_at_unix,
+        });
+    }
+    targets.sort_by(|left, right| plan_order_key(left).cmp(&plan_order_key(right)));
+    refused.sort_by(|left, right| {
+        (&left.note_addr, &left.token_contract).cmp(&(&right.note_addr, &right.token_contract))
+    });
+    Ok(PoolRecoveryPlan { targets, refused })
+}
+
+/// The total order a plan runs in, made of recorded facts only: entries carrying a recorded time come
+/// first and earliest first, entries without one come last, and both are tie-broken by the recorded
+/// note and TokenContract addresses. Nothing here can vary with the pool file's row order.
+#[cfg(feature = "shellnet")]
+fn plan_order_key(target: &PoolRecoveryTarget) -> (bool, u64, &String, &String) {
+    (
+        target.recorded_at_unix.is_none(),
+        target.recorded_at_unix.unwrap_or(0),
+        &target.note_addr,
+        &target.token_contract,
+    )
 }
 
 #[cfg(feature = "shellnet")]

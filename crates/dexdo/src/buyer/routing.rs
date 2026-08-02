@@ -494,6 +494,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                     &self.expected_model,
                     self.max_tokens,
                     &self.models,
+                    None,
                 )
                 .await
             {
@@ -507,6 +508,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                     &self.expected_model,
                     self.max_tokens,
                     &self.models,
+                    None,
                 )
                 .await
             {
