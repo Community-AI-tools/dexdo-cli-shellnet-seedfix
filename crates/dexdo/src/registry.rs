@@ -11,6 +11,16 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "shellnet")]
 use serde_json::json;
+#[cfg(feature = "shellnet")]
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+#[cfg(feature = "shellnet")]
+use tokio::sync::OnceCell;
+
+#[cfg(feature = "shellnet")]
+type RegistryAccountSnapshot = std::result::Result<String, String>;
 
 pub const MODEL_REGISTRY_ABI_JSON: &str =
     include_str!("../../../contracts/compiled/airegistry/ModelRegistry.abi.json");
@@ -209,7 +219,13 @@ pub enum BuyerMissingBookPolicy {
 #[async_trait]
 pub trait ModelRegistryReader: Send + Sync {
     async fn model(&self, frame_model: &str) -> Result<Option<ModelRegistryEntry>>;
+
+    async fn registered_model_names(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
+
+const REGISTERED_MODEL_SUGGESTION_LIMIT: usize = 5;
 
 pub async fn validate_registered_model(
     reader: &(dyn ModelRegistryReader + Send + Sync),
@@ -218,6 +234,7 @@ pub async fn validate_registered_model(
     frame_model: &str,
     expected_order_book: &str,
 ) -> Result<ModelRegistryFacts> {
+    let registry_display = dexdo_core::address::display(registry_address);
     let expected_model_hash = dexdo_core::model_hash_for(frame_model);
     let expected_order_book = validate_registry_address(expected_order_book)
         .with_context(|| format!("expected orderBook for frame_model {frame_model}"))?;
@@ -226,7 +243,7 @@ pub async fn validate_registered_model(
             "{} model registry check failed: frame_model {} is not registered in ModelRegistry {}",
             role.as_str(),
             frame_model,
-            registry_address
+            registry_display
         );
     };
     if !entry.exists {
@@ -234,7 +251,7 @@ pub async fn validate_registered_model(
             "{} model registry check failed: frame_model {} is not registered in ModelRegistry {}",
             role.as_str(),
             frame_model,
-            registry_address
+            registry_display
         );
     }
     if normalize_hash(&entry.model_hash) != normalize_hash(&expected_model_hash) {
@@ -242,7 +259,7 @@ pub async fn validate_registered_model(
             "{} model registry check failed: frame_model {} ModelRegistry {} modelHash {} != sha256(frame_model) {}",
             role.as_str(),
             frame_model,
-            registry_address,
+            registry_display,
             entry.model_hash,
             expected_model_hash
         );
@@ -253,7 +270,7 @@ pub async fn validate_registered_model(
                 "{} model registry check failed: frame_model {} ModelRegistry {} returned malformed orderBook",
                 role.as_str(),
                 frame_model,
-                registry_address
+                registry_display
             )
         })?
     {
@@ -262,9 +279,9 @@ pub async fn validate_registered_model(
                 "{} model registry check failed: frame_model {} ModelRegistry {} orderBook {} != dexdo derived orderBook {}",
                 role.as_str(),
                 frame_model,
-                registry_address,
-                registry_order_book,
-                expected_order_book
+                registry_display,
+                dexdo_core::address::display(&registry_order_book),
+                dexdo_core::address::display(&expected_order_book)
             );
         }
     }
@@ -281,6 +298,7 @@ pub async fn resolve_registered_model_identity(
     registry_address: &str,
     claimed_model: &str,
 ) -> Result<ResolvedModelIdentity> {
+    let registry_display = dexdo_core::address::display(registry_address);
     let candidates = registry_identity_candidates(claimed_model);
     let mut misses = Vec::new();
     for candidate in &candidates {
@@ -292,7 +310,7 @@ pub async fn resolve_registered_model_identity(
                         "{} content identity registry check failed: claimed model {} resolved to ModelRegistry {} entry {} but modelHash {} != sha256(entry) {}",
                         role.as_str(),
                         claimed_model,
-                        registry_address,
+                        registry_display,
                         candidate,
                         entry.model_hash,
                         expected_model_hash
@@ -303,7 +321,7 @@ pub async fn resolve_registered_model_identity(
                         format!(
                             "{} content identity registry check failed: ModelRegistry {} entry {} returned malformed orderBook",
                             role.as_str(),
-                            registry_address,
+                            registry_display,
                             candidate
                         )
                     })?;
@@ -317,13 +335,151 @@ pub async fn resolve_registered_model_identity(
             _ => misses.push(candidate.clone()),
         }
     }
+    let suggestions = registered_model_suggestions(reader, claimed_model)
+        .await
+        .unwrap_or_default();
+    if !suggestions.is_empty() {
+        bail!(
+            "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}; registered canonical suggestions: {:?}",
+            role.as_str(),
+            claimed_model,
+            registry_display,
+            misses,
+            suggestions
+        );
+    }
     bail!(
         "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}",
         role.as_str(),
         claimed_model,
-        registry_address,
+        registry_display,
         misses
     )
+}
+
+async fn registered_model_suggestions(
+    reader: &(dyn ModelRegistryReader + Send + Sync),
+    claimed_model: &str,
+) -> Result<Vec<String>> {
+    let discovered = reader.registered_model_names().await?;
+    let forbidden_aliases = served_model_suggestion_aliases(claimed_model);
+    let comparison = claimed_model.trim().to_ascii_lowercase();
+    let mut ranked = discovered
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .filter(|name| {
+            let comparison_name = name.to_ascii_lowercase();
+            !forbidden_aliases
+                .iter()
+                .any(|alias| alias == &comparison_name)
+        })
+        .map(|name| {
+            let distance = ascii_case_folded_levenshtein_distance(&comparison, &name);
+            (distance, name)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    ranked.dedup_by(|left, right| left.1 == right.1);
+    ranked.truncate(REGISTERED_MODEL_SUGGESTION_LIMIT);
+
+    let mut suggestions = Vec::new();
+    for (_, name) in ranked {
+        let Ok(Some(entry)) = reader.model(&name).await else {
+            continue;
+        };
+        let expected_model_hash = dexdo_core::model_hash_for(&name);
+        if !entry.exists
+            || normalize_hash(&entry.model_hash) != normalize_hash(&expected_model_hash)
+        {
+            continue;
+        }
+        let Ok(Some(order_book)) = nonzero_registry_order_book(&entry.order_book) else {
+            continue;
+        };
+        #[cfg(feature = "shellnet")]
+        {
+            let Ok(expected_order_book) =
+                dexdo_core::RealChainBackend::canonical_inference_orderbook_address(
+                    &expected_model_hash,
+                )
+            else {
+                continue;
+            };
+            if order_book != expected_order_book.with_workchain() {
+                continue;
+            }
+        }
+        #[cfg(not(feature = "shellnet"))]
+        let _ = order_book;
+        suggestions.push(name);
+    }
+    Ok(suggestions)
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn model_registry_names_from_storage_fields(fields: &Value) -> Result<Vec<String>> {
+    let mut names = fields
+        .get("_models")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("ModelRegistry storage exposes no _models map"))?
+        .values()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("ModelRegistry _models entry is not a string"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    names.dedup();
+    Ok(names)
+}
+
+fn served_model_suggestion_aliases(model_id: &str) -> Vec<String> {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let mut aliases = Vec::new();
+    if normalized.contains('/') {
+        push_candidate(&mut aliases, &normalized);
+        if let Some(display_alias) = display_case_served_alias(&normalized) {
+            push_candidate(&mut aliases, &display_alias);
+        }
+    }
+    if let Some(alias) = frame_model_to_served_alias(&normalized) {
+        push_candidate(&mut aliases, &alias);
+        if let Some(display_alias) = display_case_served_alias(&alias) {
+            push_candidate(&mut aliases, &display_alias);
+        }
+    }
+    aliases
+        .into_iter()
+        .map(|alias| alias.to_ascii_lowercase())
+        .collect()
+}
+
+fn ascii_case_folded_levenshtein_distance(left: &str, right: &str) -> usize {
+    let left = left.as_bytes();
+    let right = right.to_ascii_lowercase();
+    let right = right.as_bytes();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.iter().enumerate() {
+            current[right_index + 1] = if left_byte == right_byte {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(previous[right_index + 1])
+                    .min(current[right_index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 pub fn registry_identity_candidates(model_id: &str) -> Vec<String> {
@@ -346,6 +502,13 @@ pub fn model_id_alias(model_id: &str) -> String {
 }
 
 fn frame_model_to_served_alias(model_id: &str) -> Option<String> {
+    if let Ok(canonical) = dexdo_core::parse_canonical_model_id(model_id) {
+        return Some(format!(
+            "{}/{}-{}",
+            canonical.producer, canonical.model, canonical.version
+        ));
+    }
+
     let (vendor, rest) = model_id.split_once("--")?;
     if vendor.is_empty() || rest.is_empty() {
         return None;
@@ -456,7 +619,9 @@ pub fn order_book_availability(
             Ok(RegistryBookAction::SellerMayDeployMissing)
         }
         RegistryRole::Seller => bail!(
-            "seller model registry check failed: frame_model {frame_model} canonical order book {order_book} from ModelRegistry {registry_address} is not deployed and seller.deploy_missing_order_book=false"
+            "seller model registry check failed: frame_model {frame_model} canonical order book {} from ModelRegistry {} is not deployed and seller.deploy_missing_order_book=false",
+            dexdo_core::address::display(order_book),
+            dexdo_core::address::display(registry_address)
         ),
         RegistryRole::Buyer
             if buyer_missing_book_policy == BuyerMissingBookPolicy::HideFromAvailableList =>
@@ -464,7 +629,9 @@ pub fn order_book_availability(
             Ok(RegistryBookAction::BuyerHideMissing)
         }
         RegistryRole::Buyer => bail!(
-            "buyer model registry check failed: frame_model {frame_model} canonical order book {order_book} from ModelRegistry {registry_address} is not deployed; not available to buy now"
+            "buyer model registry check failed: frame_model {frame_model} canonical order book {} from ModelRegistry {} is not deployed; not available to buy now",
+            dexdo_core::address::display(order_book),
+            dexdo_core::address::display(registry_address)
         ),
     }
 }
@@ -494,48 +661,125 @@ pub struct ShellnetModelRegistryReader {
     chain: dexdo_core::RealChainBackend,
     registry_address: dexdo_core::Address,
     abi_json: String,
+    account_boc: Arc<OnceCell<RegistryAccountSnapshot>>,
+    getter_runner: dexdo_core::airegistry::run::GetterRunner,
 }
 
 #[cfg(feature = "shellnet")]
 impl ShellnetModelRegistryReader {
     pub fn from_manifest(contracts: &Path, registry_address: &str) -> Result<Self> {
-        Self::from_manifest_abi_json(contracts, registry_address, MODEL_REGISTRY_ABI_JSON)
+        Self::from_manifest_with_endpoint(contracts, None, registry_address)
+    }
+
+    pub fn from_manifest_with_endpoint(
+        contracts: &Path,
+        endpoint: Option<&str>,
+        registry_address: &str,
+    ) -> Result<Self> {
+        Self::from_manifest_abi_json(contracts, endpoint, registry_address, MODEL_REGISTRY_ABI_JSON)
     }
 
     pub fn from_manifest_abi_json(
         contracts: &Path,
+        endpoint: Option<&str>,
         registry_address: &str,
         abi_json: &str,
     ) -> Result<Self> {
         validate_model_registry_abi_getters(abi_json).context("embedded ModelRegistry ABI")?;
-        let registry_address = dexdo_core::Address::parse(registry_address)
-            .map_err(|e| anyhow::anyhow!("ModelRegistry address {registry_address}: {e}"))?;
-        let chain = dexdo_core::RealChainBackend::connect(contracts)
+        // The ModelRegistry is a shared-DApp account and this field is the chain address every
+        // getter below is run against, so only the chain half is stored.
+        let registry_address = dexdo_core::address::parse_chain_address(registry_address)
+            .map_err(|e| anyhow::anyhow!("ModelRegistry address {registry_address}: {e}"))?
+            .into_chain();
+        let chain = dexdo_core::RealChainBackend::connect_with_endpoint(contracts, endpoint)
             .with_context(|| format!("connect shellnet using {}", contracts.display()))?;
+        let snapshot_key = format!(
+            "{}\0{}",
+            chain.client().endpoint(),
+            registry_address.with_workchain()
+        );
+        let account_boc = registry_account_snapshots()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ModelRegistry snapshot lock is poisoned"))?
+            .entry(snapshot_key)
+            .or_default()
+            .clone();
         Ok(Self {
             chain,
             registry_address,
             abi_json: abi_json.to_string(),
+            account_boc,
+            getter_runner: dexdo_core::airegistry::run::GetterRunner::new()
+                .context("create local ModelRegistry getter runner")?,
         })
     }
 
+    /// Download this registry account once for the lifetime of the CLI process.
+    /// Every getter then runs locally against this immutable startup snapshot.
+    pub async fn read_account_once(&self) -> Result<()> {
+        self.account_boc().await.map(|_| ())
+    }
+
+    async fn account_boc(&self) -> Result<&str> {
+        let account = self
+            .account_boc
+            .get_or_init(|| async {
+                let read = async {
+                    let account = self
+                        .chain
+                        .client()
+                        .get_account(&self.registry_address)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "ModelRegistry {} account was not found",
+                                dexdo_core::address::display(
+                                    &self.registry_address.with_workchain()
+                                )
+                            )
+                        })?;
+                    if !account.is_active() {
+                        bail!(
+                            "ModelRegistry {} is not active (status {})",
+                            dexdo_core::address::display(&self.registry_address.with_workchain()),
+                            account.status
+                        );
+                    }
+                    account.boc.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "active ModelRegistry {} returned no account BOC",
+                            dexdo_core::address::display(&self.registry_address.with_workchain())
+                        )
+                    })
+                };
+                read.await
+                    .map_err(|error: anyhow::Error| format!("{error:#}"))
+            })
+            .await;
+        account
+            .as_deref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))
+    }
+
     async fn getter(&self, method: &str, frame_model: &str) -> Result<Value> {
-        self.chain
-            .client()
+        self.getter_runner
             .run_getter(
-                &self.registry_address,
                 &self.abi_json,
+                &self.registry_address.with_workchain(),
+                self.account_boc().await?,
                 method,
                 json!({ "canonicalName": frame_model }),
             )
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "ModelRegistry {} is not active; cannot read {method}({frame_model})",
-                    self.registry_address.with_workchain()
-                )
-            })
+            .await
     }
+}
+
+#[cfg(feature = "shellnet")]
+fn registry_account_snapshots(
+) -> &'static Mutex<HashMap<String, Arc<OnceCell<RegistryAccountSnapshot>>>> {
+    static SNAPSHOTS: OnceLock<Mutex<HashMap<String, Arc<OnceCell<RegistryAccountSnapshot>>>>> =
+        OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(feature = "shellnet")]
@@ -572,6 +816,15 @@ impl ModelRegistryReader for ShellnetModelRegistryReader {
             model_hash,
             order_book,
         }))
+    }
+
+    async fn registered_model_names(&self) -> Result<Vec<String>> {
+        let fields = dexdo_core::RealChainBackend::decode_account_storage_fields(
+            self.account_boc().await?,
+            &self.abi_json,
+            "ModelRegistry",
+        )?;
+        model_registry_names_from_storage_fields(&fields)
     }
 }
 
@@ -940,6 +1193,35 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    #[test]
+    fn model_registry_reader_prefers_explicit_endpoint_over_manifest() {
+        let dir = temp_dir("registry-explicit-endpoint");
+        let contracts = dir.path().join("deployed.shellnet.json");
+        std::fs::write(
+            &contracts,
+            serde_json::json!({
+                "network": "shellnet",
+                "endpoint": "https://stale-manifest.example/graphql",
+                "superroot": ZERO_ADDR,
+                "dapp_config": "",
+                "dapp_id": "0".repeat(64),
+                "model_registry": REG
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let reader = ShellnetModelRegistryReader::from_manifest_with_endpoint(
+            &contracts,
+            Some("https://explicit.example/graphql"),
+            REG,
+        )
+        .expect("construct registry reader without a chain request");
+
+        assert_eq!(reader.chain.client().endpoint(), "https://explicit.example");
+    }
+
+    #[cfg(feature = "shellnet")]
     #[tokio::test]
     #[ignore = "read-only live shellnet evidence; requires current deployed.shellnet.json endpoint"]
     async fn live_shellnet_model_registry_reader_reads_seeded_model() {
@@ -1074,6 +1356,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn issue_1227_model_alias_omits_canonical_flags() {
+        assert_eq!(
+            model_id_alias("qwen--qwen3--32b--w8k--tools"),
+            "qwen/qwen3-32b"
+        );
+    }
+
+    #[test]
+    fn issue_1227_model_alias_preserves_three_part_output() {
+        assert_eq!(model_id_alias("qwen--qwen3--32b"), "qwen/qwen3-32b");
+    }
+
+    #[test]
+    fn issue_1227_model_alias_preserves_noncanonical_outputs() {
+        let cases = [
+            ("qwen/qwen3-32b", "qwen/qwen3-32b"),
+            ("model-y", "model-y"),
+            ("qwen--qwen3", "qwen/qwen3"),
+            ("qwen--qwen3--32b--turbo", "qwen/qwen3-32b-turbo"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(model_id_alias(input), expected, "input: {input}");
+        }
+    }
+
     #[tokio::test]
     async fn content_identity_rejects_unregistered_qwen_variant_without_family_fallback() {
         let reader = FakeReader::default().with(
@@ -1091,7 +1400,8 @@ mod tests {
         .to_string();
         assert!(err.contains("does not resolve"), "{err}");
         assert!(err.contains("buyer"), "{err}");
-        assert!(err.contains(REG), "{err}");
+        // The registry address is rendered canonically now; identify it by account id.
+        assert!(err.contains(REG.trim_start_matches("0:")), "{err}");
         assert!(
             err.contains("qwen--qwen3.6--27b"),
             "specific variant is reported: {err}"
@@ -1499,5 +1809,216 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+}
+
+#[cfg(test)]
+mod issue_1076_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct SuggestionReader {
+        fields: Value,
+        decode_failure: bool,
+        entries: BTreeMap<String, ModelRegistryEntry>,
+        model_queries: Mutex<Vec<String>>,
+        discovery_queries: AtomicUsize,
+    }
+
+    impl SuggestionReader {
+        fn new(fields: Value) -> Self {
+            Self {
+                fields,
+                decode_failure: false,
+                entries: BTreeMap::new(),
+                model_queries: Mutex::new(Vec::new()),
+                discovery_queries: AtomicUsize::new(0),
+            }
+        }
+
+        fn decode_failure() -> Self {
+            Self {
+                fields: serde_json::json!({"_models": {}}),
+                decode_failure: true,
+                entries: BTreeMap::new(),
+                model_queries: Mutex::new(Vec::new()),
+                discovery_queries: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_entry(mut self, name: &str, model_hash: String) -> Self {
+            let order_book = order_book_for_hash(&model_hash);
+            self.entries.insert(
+                name.to_string(),
+                ModelRegistryEntry {
+                    exists: true,
+                    model_hash,
+                    order_book,
+                },
+            );
+            self
+        }
+
+        fn model_queries(&self) -> Vec<String> {
+            self.model_queries.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelRegistryReader for SuggestionReader {
+        async fn model(&self, frame_model: &str) -> Result<Option<ModelRegistryEntry>> {
+            self.model_queries
+                .lock()
+                .unwrap()
+                .push(frame_model.to_string());
+            Ok(self.entries.get(frame_model).cloned())
+        }
+
+        async fn registered_model_names(&self) -> Result<Vec<String>> {
+            self.discovery_queries.fetch_add(1, Ordering::SeqCst);
+            if self.decode_failure {
+                bail!("fixture ModelRegistry storage decode failed");
+            }
+            model_registry_names_from_storage_fields(&self.fields)
+        }
+    }
+
+    fn valid_hash(name: &str) -> String {
+        dexdo_core::model_hash_for(name)
+    }
+
+    fn registry_address() -> &'static str {
+        "0:9999999999999999999999999999999999999999999999999999999999999999"
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn order_book_for_hash(model_hash: &str) -> String {
+        dexdo_core::RealChainBackend::canonical_inference_orderbook_address(model_hash)
+            .unwrap()
+            .with_workchain()
+    }
+
+    #[cfg(not(feature = "shellnet"))]
+    fn order_book_for_hash(_model_hash: &str) -> String {
+        "0:1111111111111111111111111111111111111111111111111111111111111111".to_string()
+    }
+
+    fn suggestions_from_error(error: &str) -> Vec<String> {
+        let (_, suggestions) = error
+            .split_once("; registered canonical suggestions: ")
+            .unwrap_or_else(|| panic!("suggestion suffix is absent: {error}"));
+        serde_json::from_str(suggestions).expect("suggestions use a JSON-compatible string list")
+    }
+
+    #[tokio::test]
+    async fn issue_1076_decoded_map_suggestions_are_deterministic_truncated_and_revalidated() {
+        let fields = serde_json::json!({
+            "_models": {
+                "0x07": "unrelated-model",
+                "0x06": "alpha-model-0005",
+                "0x05": "alpha-model-0004",
+                "0x04": "alpha-model-0003",
+                "0x03": "alpha-model-0002",
+                "0x02": "alpha-model-0001",
+                "0x01": "alpha-model-0000"
+            }
+        });
+        let reader = SuggestionReader::new(fields)
+            .with_entry("alpha-model-0000", valid_hash("alpha-model-0000"))
+            .with_entry("alpha-model-0001", valid_hash("alpha-model-0001"))
+            .with_entry("alpha-model-0002", valid_hash("different-model"))
+            .with_entry("alpha-model-0003", valid_hash("alpha-model-0003"))
+            .with_entry("alpha-model-0004", valid_hash("alpha-model-0004"))
+            .with_entry("alpha-model-0005", valid_hash("alpha-model-0005"));
+
+        let error = resolve_registered_model_identity(
+            &reader,
+            RegistryRole::Seller,
+            registry_address(),
+            "alpha-model-000x",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            suggestions_from_error(&error),
+            [
+                "alpha-model-0000",
+                "alpha-model-0001",
+                "alpha-model-0003",
+                "alpha-model-0004"
+            ]
+        );
+        assert!(error.contains("tried [\"alpha-model-000x\"]"), "{error}");
+        assert_eq!(reader.discovery_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &reader.model_queries()[1..],
+            &[
+                "alpha-model-0000",
+                "alpha-model-0001",
+                "alpha-model-0002",
+                "alpha-model-0003",
+                "alpha-model-0004"
+            ],
+            "only the deterministic top {REGISTERED_MODEL_SUGGESTION_LIMIT} finalists are revalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_1076_served_model_aliases_are_never_suggested() {
+        let fields = serde_json::json!({
+            "_models": {
+                "0x01": "openai/gpt-4o-mini",
+                "0x02": "Openai/Gpt-4O-Mini",
+                "0x03": "gpt-4o-mini"
+            }
+        });
+        let reader = SuggestionReader::new(fields)
+            .with_entry("openai/gpt-4o-mini", valid_hash("openai/gpt-4o-mini"))
+            .with_entry("Openai/Gpt-4O-Mini", valid_hash("Openai/Gpt-4O-Mini"))
+            .with_entry("gpt-4o-mini", valid_hash("gpt-4o-mini"));
+
+        let suggestions = registered_model_suggestions(&reader, "openai--gpt-4o-mini")
+            .await
+            .unwrap();
+
+        assert_eq!(suggestions, ["gpt-4o-mini"]);
+        assert_eq!(reader.model_queries(), ["gpt-4o-mini"]);
+    }
+
+    #[tokio::test]
+    async fn issue_1076_decode_failure_preserves_existing_error() {
+        let requested = "missing-model";
+        let baseline_reader = SuggestionReader::new(serde_json::json!({"_models": {}}));
+        let baseline = resolve_registered_model_identity(
+            &baseline_reader,
+            RegistryRole::Buyer,
+            registry_address(),
+            requested,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        let reader = SuggestionReader::decode_failure();
+        let error = resolve_registered_model_identity(
+            &reader,
+            RegistryRole::Buyer,
+            registry_address(),
+            requested,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(error, baseline);
+        assert!(
+            !error.contains("registered canonical suggestions"),
+            "{error}"
+        );
+        assert_eq!(reader.discovery_queries.load(Ordering::SeqCst), 1);
     }
 }

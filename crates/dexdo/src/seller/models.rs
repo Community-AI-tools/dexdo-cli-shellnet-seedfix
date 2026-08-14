@@ -10,19 +10,12 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Model capabilities -- what the endpoint actually supports. Consumed by
-/// (capability-aware request: don't send `logprobs` to strict endpoints that respond `400`).
-/// The default is **conservative**(`logprobs=false`): an unknown/undescribed endpoint is not eligible for
-/// monetized serving or readiness until an authoritative usage source is configured.
+/// Model capabilities -- what the endpoint actually supports.
+/// Unlike the rest of the config this struct does NOT deny unknown fields: the retired `logprobs` /
+/// `top_logprobs` keys are still present in already-deployed `models.json` files, and rejecting them
+/// would take every such seller off the market on upgrade. They are ignored, not honoured.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Capabilities {
-    /// Whether the upstream supports the `logprobs` field.
-    #[serde(default)]
-    pub logprobs: bool,
-    /// How many top alternatives to request when `logprobs=true`. `None` -> don't send `top_logprobs`.
-    #[serde(default)]
-    pub top_logprobs: Option<u32>,
     /// The model's **own** maximum output length(completion tokens) at this endpoint. The outbound
     /// generation limit is clamped to it in addition to the deal budget: a deal budget is
     /// `ticks * TICK_SIZE` tokens, which every real provider rejects with `400` (Groq answers
@@ -66,7 +59,7 @@ pub struct ModelConfig {
     pub tokenizer_family: String,
     /// Default tick price in raw ECC[2] units(`PRICE_STEP = 1_000_000_000` raw = 1 SHELL).
     pub price_per_tick: u64,
-    /// Upstream capabilities. By default -- conservative(no `logprobs`).
+    /// Upstream capabilities.
     #[serde(default)]
     pub capabilities: Capabilities,
     /// Extra content-identity spellings the served model self-reports(e.g. qwen `["Qwen/Qwen3-32B"]`),
@@ -214,8 +207,6 @@ mod tests {
         assert_eq!(by_key.frame_model, "qwen--qwen3--32b");
         assert_eq!(by_key.served_model, "qwen/qwen3-32b");
         assert_eq!(by_key.tokenizer_family, "qwen");
-        assert!(by_key.capabilities.logprobs);
-        assert_eq!(by_key.capabilities.top_logprobs, Some(5));
         assert_eq!(by_key.capabilities.max_output_tokens, Some(40_960));
         // By the canonical frame_model.
         let by_frame = cfg.get("qwen--qwen3--32b").expect("by frame");
@@ -244,14 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_default_is_conservative_off() {
-        // An entry without `capabilities` -> the conservative default(no logprobs),.
+    fn capabilities_default_leaves_the_output_cap_unknown() {
         let json = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
           "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1}}}"#;
         let cfg = ModelsConfig::from_json(json).unwrap();
         let m = cfg.get("m").unwrap();
-        assert!(!m.capabilities.logprobs, "default capability -- off");
-        assert_eq!(m.capabilities.top_logprobs, None);
         // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
         assert_eq!(m.capabilities.max_output_tokens, None);
     }

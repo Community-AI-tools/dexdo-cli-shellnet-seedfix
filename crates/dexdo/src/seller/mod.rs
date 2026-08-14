@@ -12,7 +12,10 @@ pub mod models;
 pub mod tls;
 pub mod upstream;
 
-pub use advance::{drive_advance, drive_advance_with_observer, AdvanceWindows, ClaimStateObserver};
+pub use advance::{
+    drive_advance, drive_advance_with_observer, AdvanceWindows, ClaimDeliveryMeasurement,
+    ClaimStateObserver,
+};
 pub use keeper::{
     drive_subscription_keeper, drive_subscription_keeper_with_observer, SubscriptionKeeperObserver,
 };
@@ -39,6 +42,10 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const SUBSCRIPTION_SELL_FLAGS: u8 = order_flags::AON | order_flags::SUBSCRIPTION;
 const SELLER_MATCH_WATCH_CURSOR_VERSION: u32 = 1;
+
+fn display_token_contract(token_contract: &str) -> String {
+    dexdo_core::address::display_self_dapp(token_contract)
+}
 
 /// Seller configuration for one stream.
 #[derive(Debug, Clone)]
@@ -97,6 +104,7 @@ pub struct SellerMatchWatchConfig {
 #[serde(deny_unknown_fields)]
 struct SellerMatchWatchCursor {
     version: u32,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
     token_contract: TokenContract,
     source: MatchWatchCursor,
     last_polled_unix: Option<u64>,
@@ -115,7 +123,7 @@ pub struct SellerFillLineage {
     pub price_per_tick: u64,
     #[serde(default)]
     pub replacement_nonce: Option<u64>,
-    #[serde(default)]
+    #[serde(default, with = "dexdo_core::address::serde_self_dapp_opt")]
     pub replacement_token_contract: Option<TokenContract>,
 }
 
@@ -165,8 +173,8 @@ impl SellerMatchWatchCursor {
         {
             bail!(
                 "seller fill TokenContract {} does not match {}",
-                fill.token_contract,
-                cfg.token_contract
+                display_token_contract(&fill.token_contract),
+                display_token_contract(&cfg.token_contract)
             );
         }
         let matched_ticks = u64::try_from(fill.ticks)
@@ -178,7 +186,7 @@ impl SellerMatchWatchCursor {
                 "seller config price/ticks ({},{}) do not match TokenContract.getDeal ({authoritative_price},{authoritative_ticks}) for {}",
                 cfg.price_per_tick,
                 cfg.max_ticks,
-                cfg.token_contract
+                display_token_contract(&cfg.token_contract)
             );
         }
         if u128::from(authoritative_ticks) < MIN_STREAM_BUY_TICKS
@@ -245,8 +253,8 @@ impl SellerMatchWatchCursor {
                     bail!(
                         "seller watch cursor {} is for token_contract {}, not {}",
                         path.display(),
-                        cursor.token_contract,
-                        token_contract
+                        display_token_contract(&cursor.token_contract),
+                        display_token_contract(token_contract)
                     );
                 }
                 Ok(cursor)
@@ -300,14 +308,15 @@ pub fn persist_seller_replacement(
     nonce: u64,
     replacement_token_contract: Option<&str>,
 ) -> Result<SellerFillLineage> {
+    let token_contract_display = display_token_contract(token_contract);
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
     let fill = cursor.fill.as_mut().ok_or_else(|| {
-        anyhow!("seller match for {token_contract} has no authoritative owner fill lineage")
+        anyhow!("seller match for {token_contract_display} has no authoritative owner fill lineage")
     })?;
     fill.validate()?;
     match fill.replacement_nonce {
         Some(existing) if existing != nonce => {
-            bail!("seller replacement for {token_contract} reserved nonce {existing}, not {nonce}")
+            bail!("seller replacement for {token_contract_display} reserved nonce {existing}, not {nonce}")
         }
         None => fill.replacement_nonce = Some(nonce),
         _ => {}
@@ -315,7 +324,9 @@ pub fn persist_seller_replacement(
     if let Some(replacement) = replacement_token_contract {
         match fill.replacement_token_contract.as_deref() {
             Some(existing) if !existing.eq_ignore_ascii_case(replacement) => bail!(
-                "seller replacement for {token_contract} is linked to {existing}, not {replacement}"
+                "seller replacement for {token_contract_display} is linked to {}, not {}",
+                display_token_contract(existing),
+                display_token_contract(replacement)
             ),
             None => fill.replacement_token_contract = Some(replacement.to_string()),
             _ => {}
@@ -491,7 +502,7 @@ fn validate_subscription_offer_volume(cfg: &SellerConfig) -> Result<()> {
             "seller subscription offer for TokenContract {} requires non-zero max_ticks no greater \
              than {SUBSCRIPTION_MAX_TICKS} and divisible by the fixed {SUBSCRIPTION_WEEKS}-week \
              term, got {}",
-            cfg.token_contract,
+            display_token_contract(&cfg.token_contract),
             cfg.max_ticks
         );
     }
@@ -499,6 +510,7 @@ fn validate_subscription_offer_volume(cfg: &SellerConfig) -> Result<()> {
 }
 
 fn resting_offer_error(token_contract: &str, reason: impl std::fmt::Display) -> anyhow::Error {
+    let token_contract = display_token_contract(token_contract);
     anyhow!(
         "seller cannot safely resume or post TokenContract {token_contract}: {reason}. \
          Check the raw order book and cancel the existing order before retrying."
@@ -544,8 +556,9 @@ fn validate_resting_offer(
         return Err(resting_offer_error(
             &cfg.token_contract,
             format!(
-                "raw order {} belongs to TokenContract {order_tc}, not this TC",
-                order.order_id
+                "raw order {} belongs to TokenContract {}, not this TC",
+                order.order_id,
+                display_token_contract(order_tc)
             ),
         ));
     }
@@ -576,7 +589,9 @@ fn validate_resting_offer(
             &cfg.token_contract,
             format!(
                 "raw order {} owner {} does not match seller note {}",
-                order.order_id, order.owner_note, expected_owner
+                order.order_id,
+                dexdo_core::address::display(&order.owner_note),
+                dexdo_core::address::display(expected_owner)
             ),
         ));
     }
@@ -630,7 +645,7 @@ pub async fn inspect_seller_offer(
         Err(error) => {
             return Err(anyhow!(
                 "seller: existing-match resume preflight failed for {}: {error}",
-                cfg.token_contract
+                display_token_contract(&cfg.token_contract)
             ));
         }
     }
@@ -712,6 +727,7 @@ async fn read_opened_with_retry(
     chain: &dyn ChainBackend,
     token_contract: &TokenContract,
 ) -> Result<bool> {
+    let token_contract_display = display_token_contract(token_contract);
     let mut last_failure = String::new();
     for attempt in 1..=SELLER_OPEN_STATE_READ_ATTEMPTS {
         match chain.deal_state(token_contract).await {
@@ -726,7 +742,7 @@ async fn read_opened_with_retry(
         if attempt < SELLER_OPEN_STATE_READ_ATTEMPTS {
             let delay = SELLER_OPEN_STATE_INITIAL_BACKOFF * attempt as u32;
             tracing::warn!(
-                token_contract = %token_contract,
+                token_contract = %token_contract_display,
                 attempt,
                 max_attempts = SELLER_OPEN_STATE_READ_ATTEMPTS,
                 backoff_ms = delay.as_millis(),
@@ -737,7 +753,7 @@ async fn read_opened_with_retry(
         }
     }
     bail!(
-        "TokenContract {token_contract} getState unreadable after {SELLER_OPEN_STATE_READ_ATTEMPTS} attempts; refusing to skip open_stream: {last_failure}"
+        "TokenContract {token_contract_display} getState unreadable after {SELLER_OPEN_STATE_READ_ATTEMPTS} attempts; refusing to skip open_stream: {last_failure}"
     )
 }
 
@@ -753,8 +769,8 @@ pub async fn provision_match(
     if m.token_contract != cfg.token_contract {
         bail!(
             "seller watcher returned match for token_contract {}, expected {}",
-            m.token_contract,
-            cfg.token_contract
+            display_token_contract(&m.token_contract),
+            display_token_contract(&cfg.token_contract)
         );
     }
     // the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
@@ -763,9 +779,12 @@ pub async fn provision_match(
         endpoint: format!("https://{}", cfg.gateway_advertise),
         tls_fingerprint: seller.tls_fingerprint.clone(),
     };
-    let enc = seller
-        .note
-        .encrypt_to(&m.buyer_pubkey, &handover.to_bytes());
+    // The payload names the deal it is written for, so the buyer can refuse it on any other deal
+    // (E2E-OPEN-07 wrong-deal replay) before it treats that deal as opened.
+    let enc = seller.note.encrypt_to(
+        &m.buyer_pubkey,
+        &handover.to_deal_bytes(&cfg.token_contract),
+    );
 
     // the gateway must authorize the matched buyer BEFORE that buyer can connect.
     // Register buyer+budget BEFORE writing the handover on-chain: the buyer learns the endpoint only
@@ -786,7 +805,7 @@ pub async fn provision_match(
         };
         bail!(
             "TokenContract {}: seller configured {expected} mode but strict deal snapshot is {observed}",
-            cfg.token_contract
+            display_token_contract(&cfg.token_contract)
         );
     }
     seller.state.register_stream(
@@ -802,7 +821,7 @@ pub async fn provision_match(
             .await?;
     } else {
         tracing::info!(
-            token_contract = %cfg.token_contract,
+            token_contract = %display_token_contract(&cfg.token_contract),
             "seller gateway restored auth for opened deal; skipping duplicate open_stream"
         );
     }
@@ -814,7 +833,10 @@ async fn read_coherent_deal_capacity(
     token_contract: &TokenContract,
 ) -> Result<(DealChainState, DealSubscription)> {
     let snapshot = chain.deal_snapshot(token_contract).await?.ok_or_else(|| {
-        anyhow!("TokenContract {token_contract}: coherent deal snapshot returned no capacity data")
+        anyhow!(
+            "TokenContract {}: coherent deal snapshot returned no capacity data",
+            display_token_contract(token_contract)
+        )
     })?;
     Ok((snapshot.state, snapshot.subscription))
 }
@@ -842,7 +864,7 @@ async fn poll_match(
         bail!(
             "seller fill poll returned {} fills for TokenContract {}",
             matching.len(),
-            cfg.token_contract
+            display_token_contract(&cfg.token_contract)
         );
     }
     if let Some(fill) = matching.pop() {
@@ -852,7 +874,7 @@ async fn poll_match(
             .ok_or_else(|| {
                 anyhow!(
                     "TokenContract {} getDeal is unavailable for authoritative seller fill accounting",
-                    cfg.token_contract
+                    display_token_contract(&cfg.token_contract)
                 )
             })?;
         cursor.record_fill(cfg, authoritative_price, authoritative_ticks, &fill)?;
@@ -876,7 +898,7 @@ async fn poll_match(
                 bail!(
                     "seller owner history returned {} fills for TokenContract {}",
                     fills.len(),
-                    cfg.token_contract
+                    display_token_contract(&cfg.token_contract)
                 );
             }
             let fill = fills.pop().ok_or_else(|| {
@@ -884,7 +906,7 @@ async fn poll_match(
                     "legacy seller cursor for opened TokenContract {} has no persisted fill and \
                      the authoritative owner history cannot recover it; refusing to resume or \
                      start advance with guessed capacity",
-                    cfg.token_contract
+                    display_token_contract(&cfg.token_contract)
                 )
             })?;
             let (authoritative_price, authoritative_ticks) = chain
@@ -893,7 +915,7 @@ async fn poll_match(
                 .ok_or_else(|| {
                     anyhow!(
                         "TokenContract {} getDeal is unavailable while recovering legacy seller fill",
-                        cfg.token_contract
+                        display_token_contract(&cfg.token_contract)
                     )
                 })?;
             cursor.record_fill(cfg, authoritative_price, authoritative_ticks, &fill)?;
@@ -951,7 +973,7 @@ pub async fn wait_for_match(
             {
                 tracing::warn!(
                     event = "seller_match_watch_network_error",
-                    token_contract = %cfg.token_contract,
+                    token_contract = %display_token_contract(&cfg.token_contract),
                     error = %error,
                     "transient seller match-watch network error; keeping gateway alive"
                 );
@@ -1235,12 +1257,10 @@ mod tests {
                 deposit: 1_000,
                 finalized_owed: 0,
                 tokens_final: 0,
-                tokens_superseded: 0,
                 tokens_pending: 0,
                 funded_time: Some(1),
                 probe_tick: 0,
                 probe_time: 0,
-                prev_claim_time: 0,
                 last_claim_time: 0,
                 dispute_time: 0,
             }))
@@ -1289,12 +1309,10 @@ mod tests {
                 deposit: 1_000,
                 finalized_owed: 0,
                 tokens_final: 0,
-                tokens_superseded: 0,
                 tokens_pending: 0,
                 funded_time: Some(1),
                 probe_tick: 0,
                 probe_time: 0,
-                prev_claim_time: 0,
                 last_claim_time: 0,
                 dispute_time: 0,
             };
@@ -1360,12 +1378,10 @@ mod tests {
             deposit,
             finalized_owed: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             probe_tick: 0,
             funded_time: Some(1),
             probe_time: 0,
-            prev_claim_time: 0,
             last_claim_time: 0,
             dispute_time: 0,
         }
@@ -1571,12 +1587,10 @@ mod tests {
                 deposit: 1_000,
                 finalized_owed: 0,
                 tokens_final: 0,
-                tokens_superseded: 0,
                 tokens_pending: 0,
                 funded_time: Some(1),
                 probe_tick: 0,
                 probe_time: 0,
-                prev_claim_time: 0,
                 last_claim_time: 0,
                 dispute_time: 0,
             }))
@@ -1598,12 +1612,10 @@ mod tests {
                     deposit: 1_000,
                     finalized_owed: 0,
                     tokens_final: 0,
-                    tokens_superseded: 0,
                     tokens_pending: 0,
                     funded_time: Some(1),
                     probe_tick: 0,
                     probe_time: 0,
-                    prev_claim_time: 0,
                     last_claim_time: 0,
                     dispute_time: 0,
                 });
@@ -1704,6 +1716,150 @@ mod tests {
         }
     }
 
+    /// Issues ** /** at a money-path consumer, where the equality DECIDES something.
+    /// The helpers that drop the dapp id -- `to_chain_param`, `normalize_wallet_address`,
+    /// `parse_chain_address` -- are all documented to yield the workchain form, so asserting that
+    /// they preserve it would be asserting against intended behaviour. The defect is not the
+    /// conversion; it is that consumers then treat two DIFFERENT accounts as one.
+    /// [`validate_resting_offer`](`seller/mod.rs:508`) is such a consumer, and the decision it
+    /// makes is whether this seller ADOPTS a resting SELL as its own. It normalises both sides
+    /// through `normalize_wallet_address` (`core/src/wallet.rs:20-24`, which is
+    /// `CanonicalAddress::parse(..).legacy()`) and compares:
+    /// ```text
+    /// if actual_tc != wanted_tc { return Err(..) } //:546
+    /// if actual_owner != wanted_owner { return Err(..) } // the same shape, for the owner note
+    /// ```
+    /// Because both sides collapse to `0:<account_id>`, a resting order belonging to an account in
+    /// a DIFFERENT DApp -- a different contract, with different code and different money -- compares
+    /// equal to this seller's own. `inspect_seller_offer`(`:650`) then classifies it `Resting` and
+    /// `prepare_seller_offer` resumes it INSTEAD of posting: the seller ends up watching, and later
+    /// serving a match against, a TokenContract that is not its own.
+    /// Both operands are swept, because they are separate `require`-shaped comparisons and fixing
+    /// one would leave the other: a foreign-dapp TOKEN CONTRACT, and a foreign-dapp OWNER NOTE.
+    /// Asserted on the verdict `validate_resting_offer` returns -- the production decision -- not on
+    /// the rendering of any address.
+    /// RED on this head, for both operands.
+    #[test]
+    #[ignore = "issues : address identity collapses to the account id, so a foreign-dapp \
+                TokenContract or owner note is adopted as this seller's own. RED until the code PR \
+                carries the dapp id into the comparison. UN-IGNORE there."]
+    fn a_foreign_dapp_order_is_not_adopted_as_this_sellers_own() {
+        let account = "9".repeat(64);
+        let owner_account = "b".repeat(64);
+        let foreign_dapp = "3".repeat(64);
+        assert_ne!(
+            foreign_dapp,
+            dexdo_core::DEXDO_DAPP_ID,
+            "the fixture must name a FOREIGN dapp"
+        );
+
+        let cfg = SellerConfig {
+            token_contract: format!("0:{account}"),
+            price_per_tick: 1_000,
+            max_ticks: 8,
+            subscription: false,
+            gateway_advertise: "127.0.0.1:1".to_string(),
+            mock_token_count: 8,
+        };
+        let ours_owner = format!("0:{owner_account}");
+
+        // Operand 1 -- the order's TokenContract lives in another DApp.
+        let foreign_tc = format!("{foreign_dapp}::{account}");
+        let order = raw_sell(
+            1,
+            &ours_owner,
+            Some(&foreign_tc),
+            cfg.price_per_tick.into(),
+            8,
+        );
+        let verdict = validate_resting_offer(&order, Some(&ours_owner), &cfg);
+        assert!(
+            verdict.is_err(),
+            "a resting SELL on TokenContract {foreign_tc} -- a different DApp from this seller's \
+             {} -- was adopted as this seller's own; the seller will watch and serve a contract it \
+             does not own",
+            cfg.token_contract
+        );
+
+        // Operand 2 -- the order's OWNER NOTE lives in another DApp.
+        let foreign_owner = format!("{foreign_dapp}::{owner_account}");
+        let order = raw_sell(
+            2,
+            &foreign_owner,
+            Some(&cfg.token_contract),
+            cfg.price_per_tick.into(),
+            8,
+        );
+        let verdict = validate_resting_offer(&order, Some(&ours_owner), &cfg);
+        assert!(
+            verdict.is_err(),
+            "a resting SELL owned by note {foreign_owner} -- a different DApp from this seller's \
+             {ours_owner} -- was accepted as this seller's own order"
+        );
+
+        // The controls, and they carry the property under test. A control that is only ever
+        // written in the LEGACY `0:<account>` form shares nothing with the negatives above, so the
+        // pair would pass on a change that rejected every canonical `::` address -- including valid
+        // same-DApp orders. That change is a plausible over-correction of exactly this defect, so
+        // the accepted cases must include the canonical form of THIS seller's own DApp.
+        let canonical_tc = format!("{}::{account}", dexdo_core::DEXDO_DAPP_ID);
+        let canonical_owner = format!("{}::{owner_account}", dexdo_core::DEXDO_DAPP_ID);
+        for (label, order, expected_owner) in [
+            (
+                "legacy form, this seller's own order",
+                raw_sell(
+                    3,
+                    &ours_owner,
+                    Some(&cfg.token_contract),
+                    cfg.price_per_tick.into(),
+                    8,
+                ),
+                ours_owner.clone(),
+            ),
+            (
+                "CANONICAL form, same DApp, own TokenContract",
+                raw_sell(
+                    4,
+                    &ours_owner,
+                    Some(&canonical_tc),
+                    cfg.price_per_tick.into(),
+                    8,
+                ),
+                ours_owner.clone(),
+            ),
+            (
+                "CANONICAL form, same DApp, own owner note",
+                raw_sell(
+                    5,
+                    &canonical_owner,
+                    Some(&cfg.token_contract),
+                    cfg.price_per_tick.into(),
+                    8,
+                ),
+                ours_owner.clone(),
+            ),
+            (
+                "CANONICAL form, same DApp, both halves",
+                raw_sell(
+                    6,
+                    &canonical_owner,
+                    Some(&canonical_tc),
+                    cfg.price_per_tick.into(),
+                    8,
+                ),
+                canonical_owner.clone(),
+            ),
+        ] {
+            validate_resting_offer(&order, Some(&expected_owner), &cfg).unwrap_or_else(|error| {
+                panic!(
+                    "{label}: a same-DApp order was refused, so the rejection above cannot be \
+                     attributed to the FOREIGN dapp -- it rejects the canonical form as such: \
+                     {error}"
+                )
+            });
+        }
+    }
+
     async fn prepare_start_gateway_and_watch(
         backend: &StartupBackend,
         cfg: &SellerConfig,
@@ -1748,9 +1904,16 @@ mod tests {
             error.to_string().contains(expected_error),
             "expected `{expected_error}` in `{error}`"
         );
+        // Identify the TC by its ACCOUNT ID, not by one spelling of the address. The error renders
+        // the canonical `<dapp>::<account>` form now while `cfg.token_contract` holds the
+        // legacy `0:<account>` one, so a whole-string match asserted the rendering rather than the
+        // identification -- and broke the moment the rendering moved, which is exactly what it did.
+        // The account id is common to every form the client can print, so this survives the next
+        // rendering change too.
+        let tc_account = cfg.token_contract.trim_start_matches("0:");
         assert!(
-            error.to_string().contains(&cfg.token_contract),
-            "error must identify the TC: {error}"
+            error.to_string().contains(tc_account),
+            "error must identify the TC account {tc_account}: {error}"
         );
         assert!(
             error.to_string().contains("cancel the existing order"),
@@ -2052,7 +2215,8 @@ mod tests {
                 .expect_err("terminal zero-deposit TC must fail startup");
             let error = error.to_string();
 
-            assert!(error.contains(&tc), "{error}");
+            // Account id, not one spelling of the address -- the message is canonical now.
+            assert!(error.contains(tc.trim_start_matches("0:")), "{error}");
             assert!(error.contains("deposit=0"), "{error}");
             assert!(
                 error.contains(&format!("price_per_tick={price_per_tick}")),
@@ -2483,6 +2647,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_1185_classified_transient_match_watch_error_retries_the_poll() {
+        let (_cursor_dir, cursor_path) = temp_cursor_path("classified-transient-network");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-classified-transient-network");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match(
+                "tc-classified-transient-network",
+                buyer.pubkey(),
+            )),
+            None,
+            now_unix().unwrap() as i64 + 1,
+        )
+        .with_poll_failures(1);
+        let watch = SellerMatchWatchConfig {
+            cursor_path,
+            poll_interval: Duration::from_millis(1),
+        };
+
+        let matched = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_match(&seller, &backend, &cfg, &watch),
+        )
+        .await
+        .expect("transient classification must keep the match watcher alive")
+        .expect("the next poll returns the match");
+
+        assert_eq!(matched.token_contract, "tc-classified-transient-network");
+        assert_eq!(backend.polls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn post_match_transport_error_surfaces_without_reprovisioning() {
         let (_cursor_dir, cursor_path) = temp_cursor_path("post-match-transport");
         let seller = test_seller();
@@ -2812,12 +3009,10 @@ mod tests {
             deposit: 1,
             finalized_owed: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             probe_tick: 1,
             funded_time: Some(1),
             probe_time: 0,
-            prev_claim_time: 0,
             last_claim_time: 0,
             dispute_time: 0,
         };

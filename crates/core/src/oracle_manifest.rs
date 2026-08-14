@@ -36,17 +36,21 @@ fn is_uint256_hex(s: &str) -> bool {
 }
 
 /// A provisioned dex prediction-market. `bounds` are the range-event boundaries (uint256
-/// prices, kept as decimal strings); `outcome_names` label the `bounds.len() + 1` ranges. Addresses are
-/// `workchain:hex`. No secrets -- public/derivable only.
+/// prices, kept as decimal strings); `outcome_names` label the `bounds.len() + 1` ranges. The address
+/// fields are written canonically and accept canonical or legacy input. These contracts all belong to
+/// the protocol-defined RootPN/Oracle DApp(`4`). No secrets -- public/derivable only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OracleMarketManifest {
     /// Network the market is deployed on(e.g. `shellnet`).
     pub network: String,
     /// `RootOracle` address(the dex root that deploys oracles).
+    #[serde(with = "crate::address::serde_canonical")]
     pub root_oracle: String,
     /// Per-owner `Oracle` address(deploys `OracleEventList`s).
+    #[serde(with = "crate::address::serde_canonical")]
     pub oracle: String,
     /// Per-oracle `OracleEventList` address(holds the range events).
+    #[serde(with = "crate::address::serde_canonical")]
     pub oracle_event_list: String,
     /// Hash of the PMP oracle list(`oracleListHash`).
     pub oracle_list_hash: String,
@@ -55,10 +59,12 @@ pub struct OracleMarketManifest {
     /// Human-readable event name.
     pub event_name: String,
     /// Per-event `PMP`(prediction-market pool) address.
+    #[serde(with = "crate::address::serde_canonical")]
     pub pmp: String,
     /// PMP token type.
     pub token_type: u32,
     /// The inference `InferenceOrderBook` the range event resolves against(the price source).
+    #[serde(with = "crate::address::serde_canonical")]
     pub inference_order_book: String,
     /// The OB's model identity(`frame_model`), so the market's price source is unambiguous.
     pub frame_model: String,

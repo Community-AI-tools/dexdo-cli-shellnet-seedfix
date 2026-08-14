@@ -37,16 +37,20 @@ tvm_types = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.a
 # with the tvm-sdk source gosh.ackinacki pulls transitively, so the single-SDK
 # invariant(`ci/check-single-sdk.sh`) holds.
 tvm_abi = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.an", optional = true }
+# Read-only salted-code identity checks use the SDK's canonical code-salt parser/rebuilder.
+# The workspace patch keeps this direct dependency on the same TVM SDK revision as the rest.
+tvm_client = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
-# Browser User-Agent for writes(`/v2/messages` behind Cloudflare): ChainClient uses the
-# default reqwest UA(fine for getters), but submitting messages needs a browser UA -- the backend
-# keeps its own http client. reqwest is already in the graph(via gosh.ackinacki).
+# Explicit User-Agent for writes(`/v2/messages` behind Cloudflare): ChainClient uses the
+# default reqwest UA(fine for getters), but submitting messages needs an explicit UA -- the edge
+# 403s library defaults(see `DEXDO_USER_AGENT`) -- so the backend keeps its own http client.
+# reqwest is already in the graph(via gosh.ackinacki).
 reqwest = { workspace = true, optional = true }
 
 [features]
 # Real on-chain(Acki Nacki testnet) behind the ChainBackend/Note trait. Disabled by
 # default: the mock e2e stays green without TVM SDK v3.
-shellnet = ["dep:gosh-ackinacki", "dep:anyhow", "dep:tvm_block", "dep:tvm_types", "dep:tvm_abi", "dep:base64", "dep:reqwest"]
+shellnet = ["dep:gosh-ackinacki", "dep:anyhow", "dep:tvm_block", "dep:tvm_types", "dep:tvm_abi", "dep:tvm_client", "dep:base64", "dep:reqwest"]
 # (hard rule): the giver(test faucet) lives ONLY behind this NON-DEFAULT feature, so production
 # builds(the `dexdo` binary + default/`shellnet` `dexdo-core`) contain zero giver -- deploy/gas come from
 # the operator wallet. Only the live test harness enables it. Implies `shellnet`(the giver is on-chain).

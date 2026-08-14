@@ -1,7 +1,10 @@
 //! `dexdo` CLI command handlers(`seller`/`buyer`/`monitor`/`provision`/`destroy`/`recover`), split out of
 //! `main.rs`(PR3, move-only). Behavior-identical to the pre-split handlers.
 
-pub(crate) use crate::cli::admin::{run_destroy, run_market_deploy, run_provision};
+pub(crate) use crate::cli::accumulator::run_accumulator;
+pub(crate) use crate::cli::admin::{
+    run_destroy, run_market_deploy, run_provision, run_provision_with_deal_gas_overhead,
+};
 use crate::cli::args::*;
 pub(crate) use crate::cli::close::run_close;
 use crate::cli::deals;
@@ -11,7 +14,8 @@ pub(crate) use crate::cli::market_views::{
 pub(crate) use crate::cli::markets::run_markets;
 pub(crate) use crate::cli::monitor::run_monitor;
 pub(crate) use crate::cli::note_cmd::{
-    run_note_balance, run_note_deploy, run_note_recover, run_note_withdraw,
+    run_note_balance, run_note_deploy, run_note_outstanding, run_note_recover, run_note_topup,
+    run_note_transfer, run_note_wallet, run_note_withdraw,
 };
 pub(crate) use crate::cli::oracle::run_oracle;
 pub(crate) use crate::cli::orders::run_orders;
@@ -24,16 +28,19 @@ pub(crate) use crate::cli::recover::{
 pub(crate) use crate::cli::reports::{
     run_dashboard, run_deals, run_export, run_history, run_status,
 };
-pub(crate) use crate::cli::seller::run_seller;
+pub(crate) use crate::cli::seller::{run_seller, run_seller_with_deal_gas_overhead};
+pub(crate) use crate::cli::settlement_receipt::run_settlement_receipt;
 use crate::cli::support::*;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
+#[cfg(feature = "shellnet")]
+use dexdo::registry::{
+    default_model_registry_address, resolve_registered_model_identity, ModelRegistryReader,
+};
 #[cfg(feature = "shellnet")]
 use dexdo::registry::{
     enforce_model_registry_policy as enforce_model_registry_policy_with_reader,
     ShellnetModelRegistryReader,
 };
-#[cfg(feature = "shellnet")]
-use dexdo::registry::{resolve_registered_model_identity, ModelRegistryReader};
 use dexdo::registry::{
     BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistryValidationInput,
     RegistryValidationPolicy,
@@ -52,13 +59,14 @@ use dexdo_core::{
 };
 #[cfg(feature = "shellnet")]
 use serde_json::{json, Value};
+#[cfg(any(feature = "shellnet", test))]
 use std::future::Future;
 #[cfg(feature = "shellnet")]
 use std::io::Write as _;
 #[cfg(feature = "shellnet")]
 use zeroize::Zeroizing;
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[cfg(any(feature = "shellnet", test))]
 pub(crate) async fn direct_chain_read_with_timeout<T>(
     timeout_secs: u64,
     read: impl Future<Output = Result<T>>,
@@ -115,12 +123,37 @@ pub(crate) struct PoolRecoveryRecord {
 pub(crate) struct PoolWriteLock {
     path: std::path::PathBuf,
     pool_path: std::path::PathBuf,
+    /// The OS advisory lock on the sentinel file, held for exactly as long as the sentinel exists.
+    /// The sentinel records a PID together with the OS host name whose process table gives that PID
+    /// meaning. A PID still is not evidence by itself: it outlives the process that wrote it and it
+    /// is reused. This handle makes same-host liveness observable -- the kernel drops an advisory
+    /// lock when the process holding it dies, however it died, including under SIGKILL where no
+    /// `Drop` runs. Reclaim therefore requires a same-host identity match before it trusts either
+    /// the advisory lock or the PID probe.
+    /// `fs2` is the mechanism this client already locks with -- `acquire_seller_pool_lock`
+    /// (`crates/dexdo/src/cli/seller.rs`) and the note-deploy wallet lock
+    /// (`crates/dexdo/src/cli/note_cmd.rs`) are the same call.
+    file: Option<std::fs::File>,
 }
 
 #[cfg(feature = "shellnet")]
 impl Drop for PoolWriteLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Unlink BEFORE releasing, and this order is load-bearing. A recovery that opened
+        // this sentinel while the advisory lock was still held is refused as contended, and one
+        // that opens after the unlink finds nothing to reclaim and takes the lock the ordinary way.
+        // Releasing first would leave a moment in which the sentinel is present and unlocked: a
+        // recovery landing in that moment would claim it, and the next line here would then delete
+        // the lock it had just legitimately taken.
+        // The fallback is for the platform that refuses to remove a file while it is still open;
+        // this handle is opened with the sharing that allows it, so the first attempt is expected
+        // to succeed, and the sentinel must not survive an ordinary release either way -- one that
+        // did would read to the next run as a crashed holder.
+        let unlinked = std::fs::remove_file(&self.path).is_ok();
+        self.file.take();
+        if !unlinked {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -198,12 +231,356 @@ pub(crate) fn try_acquire_pool_write_lock(pool_path: &std::path::Path) -> Result
     acquire_pool_write_lock_inner(pool_path, false)
 }
 
+/// The sentinel path for one pool file, and the resolved pool path itself.
+/// One place, so the acquiring path and the recovery path can never disagree about which file the
+/// lock IS.
 #[cfg(feature = "shellnet")]
-fn acquire_pool_write_lock_inner(pool_path: &std::path::Path, wait: bool) -> Result<PoolWriteLock> {
+fn pool_write_lock_paths(
+    pool_path: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let pool_path = crate::cli::note::resolve_private_file_path(pool_path, "DEXDO_PN_POOL")?;
     let mut lock_name = pool_path.as_os_str().to_os_string();
     lock_name.push(".lock");
-    let lock_path = std::path::PathBuf::from(lock_name);
+    Ok((std::path::PathBuf::from(lock_name), pool_path))
+}
+
+/// Is this error the platform saying somebody else holds the advisory lock?
+#[cfg(feature = "shellnet")]
+fn pool_lock_is_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        || error.kind() == std::io::ErrorKind::WouldBlock
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PoolWriteLockHolder {
+    pid: u32,
+    host: String,
+}
+
+#[cfg(feature = "shellnet")]
+enum RecordedPoolWriteLockHolder {
+    HostAware(PoolWriteLockHolder),
+    LegacyPid(u32),
+}
+
+#[cfg(feature = "shellnet")]
+fn parse_pool_write_lock_holder(recorded: &str) -> Option<RecordedPoolWriteLockHolder> {
+    if let Ok(pid) = recorded.parse::<u32>() {
+        return Some(RecordedPoolWriteLockHolder::LegacyPid(pid));
+    }
+    serde_json::from_str::<PoolWriteLockHolder>(recorded)
+        .ok()
+        .filter(|holder| !holder.host.is_empty())
+        .map(RecordedPoolWriteLockHolder::HostAware)
+}
+
+/// The operating system's name for this host.
+/// Rust's standard library has no hostname query. The target-specific dependencies already used by
+/// this crate expose the native query, so the lock does not need another identity crate or a
+/// filesystem-dependent substitute.
+#[cfg(feature = "shellnet")]
+fn current_pool_lock_host_identity() -> Result<String> {
+    #[cfg(unix)]
+    {
+        let mut identity = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        // SAFETY: uname initializes the caller-owned utsname on success. The return value is
+        // checked before the value is assumed initialized.
+        if unsafe { libc::uname(identity.as_mut_ptr()) } != 0 {
+            bail!(
+                "query host identity with uname: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // SAFETY: the successful uname call above initialized every field.
+        let identity = unsafe { identity.assume_init() };
+        let end = identity
+            .nodename
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("uname returned a host identity without a terminator")
+            })?;
+        let bytes = identity.nodename[..end]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        let host = String::from_utf8(bytes)
+            .context("uname returned a host identity that is not valid UTF-8")?;
+        if host.is_empty() {
+            bail!("uname returned an empty host identity");
+        }
+        return Ok(host);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::WindowsProgramming::{
+            GetComputerNameW, MAX_COMPUTERNAME_LENGTH,
+        };
+
+        let mut identity = vec![0_u16; MAX_COMPUTERNAME_LENGTH as usize + 1];
+        let mut length = identity.len() as u32;
+        // SAFETY: the buffer is writable for length UTF-16 code units, and length points to an
+        // initialized count. GetComputerNameW writes at most that many units and updates the count.
+        if unsafe { GetComputerNameW(identity.as_mut_ptr(), &mut length) } == 0 {
+            bail!(
+                "query host identity with GetComputerNameW: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let host = String::from_utf16(&identity[..length as usize])
+            .context("GetComputerNameW returned an invalid host identity")?;
+        if host.is_empty() {
+            bail!("GetComputerNameW returned an empty host identity");
+        }
+        return Ok(host);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!("this platform has no supported host identity query");
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn encode_pool_write_lock_holder(holder: &PoolWriteLockHolder) -> Result<String> {
+    serde_json::to_string(holder).context("encode pool lock holder identity")
+}
+
+/// Is the process a sentinel recorded still running? `None` when this platform cannot say.
+/// SECOND signal, never the first. A PID is reused and it outlives the process that wrote it, so
+/// this can never establish on its own that a holder is gone -- [`reclaim_pool_write_lock_if_holder_is_gone`]
+/// uses it only to REFUSE, by requiring the advisory lock and this to agree before anything is
+/// taken over. What it is here to catch is the one direction the advisory lock alone gets wrong: a
+/// sentinel written by a build that did not take the lock carries none, and a live holder of one
+/// would otherwise read as gone.
+/// This is a local process-table query. A host-aware sentinel reaches it only after its recorded
+/// host matches this host; a foreign-host sentinel is refused before either local signal is used.
+/// `kill(pid, 0)` is the POSIX existence check -- it performs the permission and existence test and
+/// delivers no signal. Its three answers map exactly onto the three this returns, and anything else
+/// is `None` rather than a guess.
+#[cfg(feature = "shellnet")]
+pub(crate) fn recorded_holder_is_running(pid: u32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        // 0 and negatives are process GROUP selectors to `kill`, not process ids, and a value past
+        // `pid_t` cannot name one at all. None of them is a question this can answer.
+        if pid == 0 || pid > i32::MAX as u32 {
+            return None;
+        }
+        // SAFETY: `kill` with signal 0 is a pure existence/permission query on a value already
+        // checked to be a representable, positive `pid_t`. It writes nothing, delivers nothing, and
+        // borrows nothing.
+        let answered = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if answered == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // No process bears this id.
+            Some(libc::ESRCH) => Some(false),
+            // One does, and it is not ours to signal. Still running.
+            Some(libc::EPERM) => Some(true),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Take over a pool lock whose holder is PROVABLY gone, and only then.
+/// `--resume` is the crash-recovery entry point, and a buyer that was SIGKILLed mid-submit left a
+/// sentinel behind: `Drop` never ran, nothing else removes one, and every later attempt -- including
+/// the recovery attempt -- was refused for the lifetime of the file. The safety property and the
+/// recovery path contradicted each other and the safety property won by accident of implementation.
+/// What makes taking it over defensible is that the verdict is LIVENESS, not absence:
+/// * a host-aware sentinel must name this host. Advisory locks and process tables are local
+/// signals, so neither is consulted for a foreign host; the host-identity refusal names the
+/// recorded host, this host, and the two signals it cannot trust. A pid-only legacy sentinel
+/// cannot make that check and keeps the pre- two-signal fallback for compatibility.
+/// * the first signal is the OS advisory lock every holder takes on the sentinel for as long as
+/// it holds it. The kernel releases it when the holding process dies, whatever killed it, so a
+/// lock that is still held is a holder that is still running, and a live holder is refused -- in
+/// those words, rather than as a bare "already held".
+/// * an UNLOCKED sentinel is not, by itself, evidence that the holder is gone. A sentinel written
+/// by a build that did not take the lock carries none while its holder is alive and well, so
+/// lock-absence alone would report that live holder as gone -- the one direction in which this
+/// could fail open, and the only one, since every other branch refuses. So the second signal has
+/// to agree: the recorded process must ALSO not be running. The PID is still never sufficient --
+/// it is reused, and it is not consulted at all until the lock is already free -- but it is
+/// necessary, and two independent signals saying "gone" is what a take-over costs.
+/// * anything this cannot establish -- a foreign or unreadable host identity, an unreadable or
+/// unparseable sentinel, a lock error that is not contention, a platform that cannot answer the
+/// liveness question, an unlocked sentinel whose recorded process IS running, or a read-back
+/// that does not find our own claim -- is a refusal. Doubt fails closed, in the words of the
+/// doubt.
+/// Taking the lock over does NOT mean forgetting what it guarded. The caller reclaims it only in
+/// order to run the by-fact reconciliation the buyer money journal exists for, before any second
+/// submission is allowed; see `raise_pending_buyer_money_before_fresh_reads`.
+/// Returns `Ok(None)` when there is no sentinel at all -- nothing to reclaim, and the caller takes
+/// the lock the ordinary way.
+#[cfg(feature = "shellnet")]
+pub(crate) fn reclaim_pool_write_lock_if_holder_is_gone(
+    pool_path: &std::path::Path,
+) -> Result<Option<PoolWriteLock>> {
+    use std::io::{Read as _, Seek as _};
+
+    let (lock_path, pool_path) = pool_write_lock_paths(pool_path)?;
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => bail!("pool lock {} must be a regular file", lock_path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!("inspect pool lock {}: {e}", lock_path.display()),
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!(
+            "cannot establish whether the holder of pool lock {} is still running: opening it \
+             failed with {e}",
+            lock_path.display()
+        ),
+    };
+    // The recorded holder. Its host decides whether the two local liveness signals below are
+    // meaningful; the raw text is also what refusals name so an operator can inspect the claim.
+    let recorded = {
+        let mut recorded = String::new();
+        match file.read_to_string(&mut recorded) {
+            Ok(_) => recorded.trim().to_string(),
+            Err(_) => String::new(),
+        }
+    };
+    let recorded_holder = parse_pool_write_lock_holder(&recorded);
+    let shown = match &recorded_holder {
+        Some(RecordedPoolWriteLockHolder::HostAware(holder)) => {
+            format!("pid {} on host {:?}", holder.pid, holder.host)
+        }
+        Some(RecordedPoolWriteLockHolder::LegacyPid(pid)) => format!("pid {pid}"),
+        None if recorded.is_empty() => "nothing".to_string(),
+        None => format!("unparseable value {recorded:?}"),
+    };
+    let host_for_claim = match &recorded_holder {
+        Some(RecordedPoolWriteLockHolder::HostAware(holder)) => {
+            let this_host = match current_pool_lock_host_identity() {
+                Ok(host) => host,
+                Err(error) => bail!(
+                    concat!(
+                        "host identity check for pool lock {} saw recorded host {:?}, but reading ",
+                        "this host failed with {:#}; it needed the same host before the ",
+                        "advisory-lock and PID liveness signals could be trusted, so nothing was ",
+                        "reclaimed"
+                    ),
+                    lock_path.display(),
+                    holder.host,
+                    error
+                ),
+            };
+            if holder.host != this_host {
+                bail!(
+                    concat!(
+                        "host identity check for pool lock {} saw recorded host {:?}, but this host ",
+                        "is {:?}; it needed the same host before the advisory-lock and PID liveness ",
+                        "signals could be trusted, so nothing was reclaimed"
+                    ),
+                    lock_path.display(),
+                    holder.host,
+                    this_host
+                );
+            }
+            Some(this_host)
+        }
+        Some(RecordedPoolWriteLockHolder::LegacyPid(_)) | None => None,
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {}
+        Err(e) if pool_lock_is_contended(&e) => bail!(
+            "pool lock {} is held by a process that is still running (it recorded {shown}); this is \
+             a live holder, not a leftover",
+            lock_path.display()
+        ),
+        Err(e) => bail!(
+            "cannot establish whether the holder of pool lock {} is still running: locking it \
+             failed with {e}",
+            lock_path.display()
+        ),
+    }
+    // The lock is free. That is NOT yet a holder that is gone: a sentinel written by a build that
+    // did not take the lock carries none while its holder is alive, so the recorded process has to
+    // agree before anything is taken over.
+    let recorded_pid = match &recorded_holder {
+        Some(RecordedPoolWriteLockHolder::HostAware(holder)) => Some(holder.pid),
+        Some(RecordedPoolWriteLockHolder::LegacyPid(pid)) => Some(*pid),
+        None => None,
+    };
+    match recorded_pid.and_then(recorded_holder_is_running) {
+        Some(false) => {}
+        Some(true) => bail!(
+            "pool lock {} carries no lock, but the process it records is running ({shown}); an \
+             unlocked sentinel is not evidence its holder is gone, so this is undecidable and \
+             nothing was reclaimed",
+            lock_path.display()
+        ),
+        None => bail!(
+            "cannot establish whether the holder of pool lock {} is still running: it records \
+             {shown}, and this platform cannot answer that for it; nothing was reclaimed",
+            lock_path.display()
+        ),
+    }
+    // Both signals say the holder is gone. Claim the sentinel as ours by recording this process,
+    // then read it back BY PATH: if the file we just locked had already been unlinked by a reclaim
+    // that completed between our open and our lock, the read-back finds a different sentinel -- or
+    // none -- and we refuse rather than run beside whoever created it.
+    let ours = match host_for_claim {
+        Some(host) => encode_pool_write_lock_holder(&PoolWriteLockHolder {
+            pid: std::process::id(),
+            host,
+        })?,
+        // A pre- sentinel has no host identity to validate. Preserve its pid-only format while
+        // applying the exact advisory-lock plus local-pid fallback it was written for.
+        None => std::process::id().to_string(),
+    };
+    let claim = |file: &mut std::fs::File| -> std::io::Result<()> {
+        // Rewind before truncating: the read above left the cursor at the end of the old pid, and
+        // writing there would leave that many NUL bytes in front of ours.
+        file.rewind()?;
+        file.set_len(0)?;
+        writeln!(file, "{ours}")?;
+        file.flush()
+    };
+    if let Err(e) = claim(&mut file) {
+        bail!(
+            "claim pool lock {} after its holder was found gone: {e}",
+            lock_path.display()
+        );
+    }
+    match std::fs::read_to_string(&lock_path) {
+        Ok(observed) if observed.trim() == ours => {}
+        Ok(observed) => bail!(
+            "pool lock {} was taken by another process while it was being reclaimed (it now \
+             records {}); nothing was reclaimed",
+            lock_path.display(),
+            observed.trim()
+        ),
+        Err(e) => bail!(
+            "cannot confirm the reclaimed pool lock {} is the one now held: {e}",
+            lock_path.display()
+        ),
+    }
+    Ok(Some(PoolWriteLock {
+        path: lock_path,
+        pool_path,
+        file: Some(file),
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+fn acquire_pool_write_lock_inner(pool_path: &std::path::Path, wait: bool) -> Result<PoolWriteLock> {
+    let (lock_path, pool_path) = pool_write_lock_paths(pool_path)?;
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(POOL_LOCK_TIMEOUT_SECS);
     loop {
@@ -216,16 +593,44 @@ fn acquire_pool_write_lock_inner(pool_path: &std::path::Path, wait: bool) -> Res
         }
         match options.open(&lock_path) {
             Ok(mut lock) => {
-                if let Err(e) = writeln!(lock, "{}", std::process::id()) {
+                let holder = current_pool_lock_host_identity().and_then(|host| {
+                    encode_pool_write_lock_holder(&PoolWriteLockHolder {
+                        pid: std::process::id(),
+                        host,
+                    })
+                });
+                let holder = match holder {
+                    Ok(holder) => holder,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&lock_path);
+                        return Err(error.context(format!(
+                            "record host identity in pool lock {}",
+                            lock_path.display()
+                        )));
+                    }
+                };
+                if let Err(e) = writeln!(lock, "{holder}") {
                     let _ = std::fs::remove_file(&lock_path);
                     return Err(anyhow::anyhow!(
                         "write pool lock {}: {e}",
                         lock_path.display()
                     ));
                 }
+                // the sentinel first binds this PID to this host. Hold the OS advisory
+                // lock for as long as it exists, so a same-host recovery can tell THIS holder still
+                // running from THIS holder having died without releasing. Nobody else can hold it:
+                // the file was created a line ago by an atomic `create_new`.
+                if let Err(e) = fs2::FileExt::try_lock_exclusive(&lock) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    return Err(anyhow::anyhow!(
+                        "hold pool lock {}: {e}",
+                        lock_path.display()
+                    ));
+                }
                 return Ok(PoolWriteLock {
                     path: lock_path,
                     pool_path,
+                    file: Some(lock),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -253,12 +658,55 @@ fn acquire_pool_write_lock_inner(pool_path: &std::path::Path, wait: bool) -> Res
     }
 }
 
+/// Hold the write lock for one update of a pool-shaped FILE, and let a dead holder's sentinel go.
+/// Everything that comes through here is a plain file write -- the pool JSON, the buyer money
+/// journal, the buyer subscription state, the pool recovery record, the note-deploy fold -- and every
+/// one of them lands atomically(`write_pool_private` -> `write_private_atomic`). So the file a
+/// crashed holder leaves behind is whole either way, and its sentinel asserts one thing only:
+/// somebody is writing this file RIGHT NOW. It is not the buyer money lock, which asserts that a
+/// money submission is awaiting by-fact reconciliation; that one is taken through
+/// [`try_acquire_pool_write_lock`] by `BuyerMoneyLock` and stays gated on the recovery entry point,
+/// because taking IT over means promising to reconcile first.
+/// Here there is nothing to reconcile, so a same-host holder both local signals say is gone is
+/// simply not a holder, and no command has to earn the right to say so. That is why this is not
+/// gated on `--resume`: a dead mutex wedges every writer, and gating would leave a fresh buy,
+/// `note deploy` and `recover` refused forever by a process that no longer exists.
+/// It is what still stood in front of `--resume` after the money lock learned to reclaim.
+/// `run_buyer_inner`'s FIRST statement is `preflight_buyer_pool_for_money_move`, which arrives here
+/// on the pool file ahead of every reclaim seam the money lock has; and `write_buyer_submit_journal`
+/// arrives here from inside the money-lock hold, behind them. A buyer SIGKILLed mid-submit holds the
+/// money lock and is inside one of those writes, so it leaves both sentinels -- and either one alone
+/// refused recovery for the lifetime of the file.
+/// The proof is [`reclaim_pool_write_lock_if_holder_is_gone`]'s and it is not weakened to reuse it:
+/// a foreign host is refused before local signals are trusted, a held same-host advisory lock is a
+/// live holder, an unlocked sentinel whose recorded process is still running is undecidable, and
+/// anything that cannot be established is a refusal. A refusal does not fail the update -- it falls
+/// through to the ordinary acquire, which waits for a live holder exactly as it did before and names
+/// what could not be established if that wait runs out. So doubt always lands on the unchanged
+/// behaviour and never on a take-over: the check errs towards leaving the
+/// sentinel alone, which costs an operator-visible stall, rather than towards taking it, which would
+/// cost two writers on one money-adjacent file.
 #[cfg(feature = "shellnet")]
 pub(crate) fn with_pool_write_lock<T>(
     pool_path: &std::path::Path,
     update: impl FnOnce(&std::path::Path) -> Result<T>,
 ) -> Result<T> {
-    let lock = acquire_pool_write_lock(pool_path)?;
+    let lock = match reclaim_pool_write_lock_if_holder_is_gone(pool_path) {
+        Ok(Some(reclaimed)) => {
+            eprintln!(
+                "pool_write_lock_reclaimed {} was left behind by a process that is no longer \
+                 running; taken over for this write",
+                reclaimed.path.display()
+            );
+            reclaimed
+        }
+        // No sentinel: nothing to reclaim, and the ordinary rules apply.
+        Ok(None) => acquire_pool_write_lock(pool_path)?,
+        // Not proof the holder is gone. Wait for it exactly as before, and if that wait runs out,
+        // say what could not be established rather than reporting a live writer.
+        Err(undecided) => acquire_pool_write_lock(pool_path)
+            .map_err(|waited| waited.context(format!("{undecided:#}")))?,
+    };
     update(&lock.pool_path)
 }
 
@@ -266,6 +714,9 @@ pub(crate) fn with_pool_write_lock<T>(
 pub(crate) fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     if let Some(path) = explicit {
         return Some(path.to_path_buf());
+    }
+    if let Some(root) = crate::cli::data_dir::explicit() {
+        return Some(root.join("pn_pool.json"));
     }
     match std::env::var_os("DEXDO_PN_POOL") {
         Some(raw) if !raw.is_empty() => Some(std::path::PathBuf::from(raw)),
@@ -363,27 +814,31 @@ fn matching_pool_recovery_records(
     Ok((pool_path, records))
 }
 
-/// The buyer-side recovery entries a single-deal resolver acts on, and the loud refusal when the pool
-/// records none.
+/// the pool records several recoverable deals and `recover`/`dispute` act on exactly one.
+/// Returned as a typed error instead of a bare message so the caller can resolve the choice from chain
+/// facts and then ask for that one deal **by name**, through the same resolver, rather than opening a
+/// second path into the money. It carries addresses only -- the recorded owner keys stay inside the
+/// resolver, so nothing that decides *which* deal is acted on has ever seen one.
+/// `Display` is the unchanged refusal an operator sees when nothing resolves the choice.
 #[cfg(feature = "shellnet")]
-fn buyer_side_recovery_records(
-    command: &str,
-    pool_path: &std::path::Path,
-    records: Vec<crate::cli::note::PoolNoteRecoveryRecord>,
-) -> Result<Vec<crate::cli::note::PoolNoteRecoveryRecord>> {
-    let records = records
-        .into_iter()
-        .filter(|record| record.role == "buyer" || record.role == "unknown")
-        .collect::<Vec<_>>();
-    if records.is_empty() {
-        bail!(
-            "{command}: DEXDO_PN_POOL {} has no matching note entry with token_contract recovery metadata; \
-             run the buyer once with this pool active, or pass explicit --note-addr/--note-key/--token-contract",
-            pool_path.display()
-        );
-    }
-    Ok(records)
+#[derive(Debug)]
+pub(crate) struct AmbiguousRecoveryDeals {
+    message: String,
+    /// The pool file these deals were read from, already resolved through any symlink.
+    pub(crate) pool: std::path::PathBuf,
+    /// Every selectable deal as `(note address, TokenContract address)`, in the plan's recorded order.
+    pub(crate) deals: Vec<(String, String)>,
 }
+
+#[cfg(feature = "shellnet")]
+impl std::fmt::Display for AmbiguousRecoveryDeals {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl std::error::Error for AmbiguousRecoveryDeals {}
 
 /// Resolve the one deal `dispute` acts on. `dispute` persists nothing back into the pool.
 #[cfg(feature = "shellnet")]
@@ -393,7 +848,28 @@ pub(crate) fn resolve_pool_recovery_inputs(
     token_contract: Option<&str>,
     pool: Option<&std::path::Path>,
 ) -> Result<PoolRecoveryInputs> {
-    resolve_recovery_inputs("dispute", identity, market, token_contract, pool, false)
+    resolve_recovery_inputs("dispute", identity, market, token_contract, pool, false, None)
+}
+
+/// the same resolution, narrowed to the one recorded deal the caller has proved from the chain is
+/// the one this invocation acts on.
+#[cfg(feature = "shellnet")]
+pub(crate) fn resolve_pool_recovery_inputs_for_deal(
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+    deal: &(String, String),
+) -> Result<PoolRecoveryInputs> {
+    resolve_recovery_inputs(
+        "dispute",
+        identity,
+        market,
+        token_contract,
+        pool,
+        false,
+        Some(deal),
+    )
 }
 
 /// Resolve the one deal `recover` acts on. `recover` writes the resolved buyer record back into the pool
@@ -405,9 +881,52 @@ pub(crate) fn resolve_persistable_pool_recovery_inputs(
     token_contract: Option<&str>,
     pool: Option<&std::path::Path>,
 ) -> Result<PoolRecoveryInputs> {
-    resolve_recovery_inputs("recover", identity, market, token_contract, pool, true)
+    resolve_recovery_inputs("recover", identity, market, token_contract, pool, true, None)
 }
 
+/// the same resolution, narrowed to the one recorded deal the caller has proved from the chain is
+/// the one this invocation acts on. The pool record `recover` writes back is still built only from what
+/// the pool itself recorded, exactly as it is for a pool holding a single deal.
+#[cfg(feature = "shellnet")]
+pub(crate) fn resolve_persistable_pool_recovery_inputs_for_deal(
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+    deal: &(String, String),
+) -> Result<PoolRecoveryInputs> {
+    resolve_recovery_inputs(
+        "recover",
+        identity,
+        market,
+        token_contract,
+        pool,
+        true,
+        Some(deal),
+    )
+}
+
+/// Resolve the ONE deal `recover`/`dispute` acts on out of everything the pool records.
+/// the selection is made from [`pool_recovery_plan`] -- the same primitive `reclaim` drives --
+/// rather than from the raw row list, because the raw row count is not the number of deals. Rows that
+/// agree on every recorded fact describe ONE deal recorded twice, and the plan collapses them; the
+/// row count did not, so a pool holding a duplicated entry refused with `pass --note-addr or
+/// --token-contract to disambiguate` while both rows carried the SAME note and the SAME
+/// TokenContract. Neither flag can separate values that are equal, so the advice could not be
+/// followed and that deal's escrow had no way out short of hand-copying the owner key out of the pool
+/// file. Failing closed on a genuine ambiguity is right; refusing where there was none, with no
+/// alternative, is money stranded by the client rather than by the chain.
+/// What did NOT change is the money decision. One invocation still acts on one deal, and fanning a
+/// buyer STOP or a bond-locking dispute across every recorded deal remains a different decision that
+/// belongs to whoever asks for it.
+/// follow-up: with several deals and `selected == None` this still REFUSES, returning
+/// [`AmbiguousRecoveryDeals`] naming each deal so `--token-contract` can select it. `selected` is that
+/// same one-deal decision made for the operator, and only where the chain itself proved it: the caller
+/// reads every recorded deal and comes back naming the one the chain places in the state the command
+/// acts on. It re-enters here rather than driving the plan directly, so the recorded owner key, the
+/// contradiction rules and the record `recover` persists all stay in one place. The plan is re-read
+/// rather than trusted from the caller's first read: a pool that changed in between, or a choice that
+/// is no longer exactly one recorded deal, is refused.
 #[cfg(feature = "shellnet")]
 fn resolve_recovery_inputs(
     command: &str,
@@ -416,37 +935,82 @@ fn resolve_recovery_inputs(
     token_contract: Option<&str>,
     pool: Option<&std::path::Path>,
     persists_pool_record: bool,
+    selected: Option<&(String, String)>,
 ) -> Result<PoolRecoveryInputs> {
-    let (explicit_note_addr, explicit_tc) =
-        explicit_recovery_identity(identity, market, token_contract)?;
-    if let Some((note_addr, note_secret_hex, token_contract)) = fully_explicit_recovery_identity(
-        identity,
-        explicit_note_addr.as_ref(),
-        explicit_tc.as_ref(),
-    )? {
-        return Ok(PoolRecoveryInputs {
-            note_addr,
-            note_secret_hex,
-            token_contract,
-            pool_record: None,
-        });
+    let mut plan = pool_recovery_plan(command, identity, market, token_contract, pool)?;
+    if let Some((want_note, want_tc)) = selected {
+        plan.targets
+            .retain(|target| &target.note_addr == want_note && &target.token_contract == want_tc);
+        if plan.targets.len() != 1 {
+            let want_note = dexdo_core::address::display(want_note);
+            let want_tc = dexdo_core::address::display_self_dapp(want_tc);
+            bail!(
+                "{command}: DEXDO_PN_POOL {} no longer records exactly one recoverable deal for note \
+                 {want_note} and TokenContract {want_tc} ({} found); nothing was submitted",
+                plan.pool_path
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("-"))
+                    .display(),
+                plan.targets.len()
+            );
+        }
     }
-    let (pool_path, records) = matching_pool_recovery_records(
-        command,
-        pool,
-        explicit_note_addr.as_ref(),
-        explicit_tc.as_ref(),
-    )?;
-    let mut records = buyer_side_recovery_records(command, &pool_path, records)?;
-    if records.len() > 1 {
+    if plan.targets.len() > 1 {
+        // Every selectable deal is named, so the operator picks one instead of being told to narrow
+        // a set they cannot see. Addresses only: a target also holds the recorded owner key.
+        let choices = plan
+            .targets
+            .iter()
+            .map(|target| {
+                format!(
+                    "\n  --note-addr {} --token-contract {}",
+                    dexdo_core::address::display(&target.note_addr),
+                    dexdo_core::address::display_self_dapp(&target.token_contract)
+                )
+            })
+            .collect::<String>();
+        let pool_path = plan
+            .pool_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("-"));
+        return Err(anyhow::Error::new(AmbiguousRecoveryDeals {
+            message: format!(
+                "{command}: DEXDO_PN_POOL {} records {} recoverable deals and {command} acts on one; \
+                 pass --note-addr and/or --token-contract to disambiguate, naming exactly one of:{choices}",
+                pool_path.display(),
+                plan.targets.len()
+            ),
+            deals: plan
+                .targets
+                .iter()
+                .map(|target| (target.note_addr.clone(), target.token_contract.clone()))
+                .collect(),
+            pool: pool_path,
+        }));
+    }
+    let Some(target) = plan.targets.pop() else {
+        // The plan itself refuses an empty pool, so reaching here means every recorded deal was
+        // contradicted. Each contradiction says which entry and why, which is what the operator needs
+        // to repair the pool -- a bare count never was.
         bail!(
-            "{command}: DEXDO_PN_POOL {} has {} matching recovery entries; pass --note-addr or --token-contract \
-             to disambiguate",
-            pool_path.display(),
-            records.len()
+            "{command}: DEXDO_PN_POOL {} records no recoverable deal; every matching entry was refused:\n  {}",
+            plan.pool_path
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("-"))
+                .display(),
+            plan.refused
+                .iter()
+                .map(|refusal| refusal.reason.clone())
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
+    };
+    // One deal is selected, but a contradicted sibling is still the operator's money and stays
+    // unrecoverable until the pool is fixed. Saying so here is the only report it gets: this command
+    // is about to act on a different deal and will otherwise look like a clean success.
+    for refusal in &plan.refused {
+        eprintln!("{command}: skipped recovery entry: {}", refusal.reason);
     }
-    let record = records.remove(0);
     // Built only for the caller that persists it, and only when the whole identity came from the pool:
     // no other path carries a second copy of the recorded owner key.
     let pool_record = (persists_pool_record
@@ -454,24 +1018,28 @@ fn resolve_recovery_inputs(
         && identity.note_key.is_none()
         && market.is_none()
         && token_contract.is_none())
-    .then(|| PoolRecoveryRecord {
-        pool_path,
-        note_addr: record.note_addr.clone(),
-        note_secret_hex: record.owner_secret_hex.clone().into(),
-        token_contract: record.token_contract.clone(),
-        role: record.role.clone(),
-    });
+    .then(|| {
+        plan.pool_path.map(|pool_path| PoolRecoveryRecord {
+            pool_path,
+            note_addr: target.note_addr.clone(),
+            note_secret_hex: target.note_secret_hex.clone(),
+            token_contract: target.token_contract.clone(),
+            role: target.role.clone(),
+        })
+    })
+    .flatten();
     Ok(PoolRecoveryInputs {
-        note_addr: explicit_note_addr.unwrap_or(record.note_addr),
-        note_secret_hex: recovery_note_secret(identity, record.owner_secret_hex)?,
-        token_contract: explicit_tc.unwrap_or(record.token_contract),
+        note_addr: target.note_addr,
+        note_secret_hex: target.note_secret_hex,
+        token_contract: target.token_contract,
         pool_record,
     })
 }
 
 /// One deal a pool-only recovery may act on: exactly the facts the driver signs and decides with, and
-/// nothing else. A plan is driven, never persisted, so a target deliberately carries no copy of the
-/// pool's persistence record -- one recorded owner key, held once, for the consumer that actually reads it.
+/// nothing else. A target still carries no `PoolRecoveryRecord` -- the recorded owner key is held once,
+/// by the consumer that actually reads it, and a persistence record is built by the one caller that
+/// persists rather than handed to every caller that drives.
 #[cfg(feature = "shellnet")]
 pub(crate) struct PoolRecoveryTarget {
     pub(crate) note_addr: String,
@@ -479,6 +1047,11 @@ pub(crate) struct PoolRecoveryTarget {
     pub(crate) token_contract: String,
     /// The entry's recorded `token_contract_updated_at_unix`, never the reader's clock.
     pub(crate) recorded_at_unix: Option<u64>,
+    /// The entry's recorded `token_contract_role` (`buyer` or `unknown`; a coherent `seller` row is
+    /// never a buyer-side target). Carried because `recover` must name the row it is writing back to
+    /// (`persist_pool_recovery_record_locked` matches on role), and re-reading the pool to recover a
+    /// fact this plan already read is how a resolved record and a persisted one drift apart.
+    pub(crate) role: String,
 }
 
 /// A recorded entry the plan refuses to act on because the pool's own records contradict each other.
@@ -494,6 +1067,9 @@ pub(crate) struct PoolRecoveryRefusal {
 pub(crate) struct PoolRecoveryPlan {
     pub(crate) targets: Vec<PoolRecoveryTarget>,
     pub(crate) refused: Vec<PoolRecoveryRefusal>,
+    /// The pool file these targets were read from, already resolved through any symlink, or
+    /// `None` when the identity was given in full on the command line and no pool was read at all.
+    pub(crate) pool_path: Option<std::path::PathBuf>,
 }
 
 /// plan a recovery from recorded pool metadata alone. Where
@@ -523,9 +1099,24 @@ pub(crate) fn resolve_pool_recovery_plan(
     token_contract: Option<&str>,
     pool: Option<&std::path::Path>,
 ) -> Result<PoolRecoveryPlan> {
-    // `reclaim` is the only command that drives a plan; `recover`/`dispute` resolve a single deal
-    // through `resolve_pool_recovery_inputs`.
-    let command = "reclaim";
+    pool_recovery_plan("reclaim", identity, market, token_contract, pool)
+}
+
+/// The plan itself, named by the command whose messages it will appear in.
+/// `reclaim` drives every target. `recover` and `dispute` act on ONE -- and this function does not pick
+/// it for them: given several targets they REFUSE, and act only if the caller comes back naming the one
+/// deal the chain proved is the only one they can act on (`resolve_recovery_inputs`'s `selected`,
+/// ). Two live deals, or a chain that cannot answer for one of them, still refuse. Both commands
+/// read the pool through this one function, so what counts as a deal, what counts as a contradiction
+/// and what order entries come back in cannot diverge between them.
+#[cfg(feature = "shellnet")]
+fn pool_recovery_plan(
+    command: &str,
+    identity: &RecoveryIdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+) -> Result<PoolRecoveryPlan> {
     let (explicit_note_addr, explicit_tc) =
         explicit_recovery_identity(identity, market, token_contract)?;
     if let Some((note_addr, note_secret_hex, token_contract)) = fully_explicit_recovery_identity(
@@ -539,8 +1130,11 @@ pub(crate) fn resolve_pool_recovery_plan(
                 note_secret_hex,
                 token_contract,
                 recorded_at_unix: None,
+                // Nothing was read from a pool, so there is no recorded row to write back to.
+                role: String::new(),
             }],
             refused: Vec::new(),
+            pool_path: None,
         });
     }
     let (pool_path, records) = matching_pool_recovery_records(
@@ -591,11 +1185,12 @@ pub(crate) fn resolve_pool_recovery_plan(
             continue;
         }
         let reason = format!(
-            "DEXDO_PN_POOL {} holds {} rows for TokenContract {token_contract} whose recorded facts \
+            "DEXDO_PN_POOL {} holds {} rows for TokenContract {} whose recorded facts \
              disagree (owner key, role or recorded time); refusing to guess which row is the deal -- fix \
              the pool or pass explicit --note-addr/--note-key/--token-contract",
             pool_path.display(),
             rows.len(),
+            dexdo_core::address::display_self_dapp(&token_contract),
         );
         candidates.push((
             rows.into_iter().next().expect("group is never empty"),
@@ -651,7 +1246,7 @@ pub(crate) fn resolve_pool_recovery_plan(
                      refusing to act on any of them -- fix the pool or pass explicit \
                      --note-addr/--note-key/--token-contract for the intended deal",
                     pool_path.display(),
-                    record.note_addr
+                    dexdo_core::address::display(&record.note_addr)
                 ),
                 note_addr: record.note_addr,
                 token_contract: record.token_contract,
@@ -665,7 +1260,7 @@ pub(crate) fn resolve_pool_recovery_plan(
                      TokenContract {}; refusing to act on a contradictory record -- fix the pool or pass \
                      explicit --note-addr/--note-key/--token-contract for the intended deal",
                     pool_path.display(),
-                    record.token_contract
+                    dexdo_core::address::display_self_dapp(&record.token_contract)
                 ),
                 note_addr: record.note_addr,
                 token_contract: record.token_contract,
@@ -677,13 +1272,18 @@ pub(crate) fn resolve_pool_recovery_plan(
             note_addr: explicit_note_addr.clone().unwrap_or(record.note_addr),
             token_contract: explicit_tc.clone().unwrap_or(record.token_contract),
             recorded_at_unix: record.recorded_at_unix,
+            role: record.role,
         });
     }
     targets.sort_by(|left, right| plan_order_key(left).cmp(&plan_order_key(right)));
     refused.sort_by(|left, right| {
         (&left.note_addr, &left.token_contract).cmp(&(&right.note_addr, &right.token_contract))
     });
-    Ok(PoolRecoveryPlan { targets, refused })
+    Ok(PoolRecoveryPlan {
+        targets,
+        refused,
+        pool_path: Some(pool_path),
+    })
 }
 
 /// The total order a plan runs in, made of recorded facts only: entries carrying a recorded time come
@@ -742,15 +1342,15 @@ fn persist_pool_recovery_record_locked(record: &PoolRecoveryRecord) -> Result<()
             "recover: DEXDO_PN_POOL {} no longer contains exactly one resolved {} recovery record for note {} and TokenContract {}; refusing to persist a wrong-key or changed record",
             record.pool_path.display(),
             record.role,
-            record.note_addr,
-            record.token_contract
+            dexdo_core::address::display(&record.note_addr),
+            dexdo_core::address::display_self_dapp(&record.token_contract)
         );
     }
     if conflicting_buyer_record {
         bail!(
             "recover: DEXDO_PN_POOL {} contains a different buyer recovery record for note {}; refusing to clobber or create an ambiguous record",
             record.pool_path.display(),
-            record.note_addr
+            dexdo_core::address::display(&record.note_addr)
         );
     }
     let note = &mut notes[matched[0]];
@@ -788,16 +1388,37 @@ fn is_note_deploy_history_proof_expired_error(error: &anyhow::Error) -> bool {
     crate::cli::note_cmd::note_deploy_has_exact_finalized_rootpn_exit_code(error, 403)
 }
 
+/// `dex::ERR_INVALID_ZKPROOF`(137) finalized by RootPN, which is the OPPOSITE of the 403 next to it.
+/// 403 is a race against the node's history window and is answered by proving again; 137 says the
+/// proof's public inputs disagree with the `value`/`tokenType` RootPN was handed, which no retry can
+/// change. Both arrive as "the submit failed", and found them sharing one outcome -- so they are
+/// separated here by the exact finalized exit code, never by matching text.
+#[cfg(feature = "shellnet")]
+fn is_note_deploy_zk_public_input_mismatch_error(error: &anyhow::Error) -> bool {
+    crate::cli::note_cmd::note_deploy_has_exact_finalized_rootpn_exit_code(error, 137)
+}
+
 #[cfg(feature = "shellnet")]
 pub(crate) fn note_deploy_error(
     funding_multisig_address: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
+    let funding_multisig_address =
+        dexdo_core::address::display_self_dapp(funding_multisig_address);
     if is_note_deploy_history_proof_expired_error(&error) {
         anyhow::anyhow!(
             "note deploy failed: history proof expired (exit 403). The same paid voucher recovery is preserved; \
-             re-run the same `note deploy --recovery` command later (action=resume_same_paid_voucher_later). \
+             re-run the same `dexdo note deploy` command with its `--recovery` file later \
+             (action=resume_same_paid_voucher_later). \
              Do not fund a new voucher. Raw error: deploy PrivateNote from wallet \
+             {funding_multisig_address}: {error}"
+        )
+    } else if is_note_deploy_zk_public_input_mismatch_error(&error) {
+        anyhow::anyhow!(
+            "note deploy failed: the proof's public inputs do not match what RootPN was given \
+             (exit 137, dex::ERR_INVALID_ZKPROOF). This is NOT the 403 history-proof race: proving \
+             the same voucher again, on any history layer, reverts identically \
+             (action=do_not_retry_this_voucher). Raw error: deploy PrivateNote from wallet \
              {funding_multisig_address}: {error}"
         )
     } else if is_note_deploy_wallet_busy_error(&error) {
@@ -831,6 +1452,54 @@ pub(crate) fn load_enabled_model_registry_policy(
 }
 
 #[cfg(feature = "shellnet")]
+pub(crate) async fn preload_model_registry_policy(
+    role: RegistryRole,
+    policy: Option<&RegistryValidationPolicy>,
+    contracts: &std::path::Path,
+) -> Result<()> {
+    preload_model_registry_policy_with_endpoint(role, policy, contracts, None).await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn preload_model_registry_policy_with_endpoint(
+    role: RegistryRole,
+    policy: Option<&RegistryValidationPolicy>,
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        contracts,
+        endpoint,
+        policy.required_address(role)?,
+    )?
+        .read_account_once()
+        .await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn preload_default_model_registry(contracts: &std::path::Path) -> Result<()> {
+    preload_default_model_registry_with_endpoint(contracts, None).await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn preload_default_model_registry_with_endpoint(
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+) -> Result<()> {
+    let registry_address = default_model_registry_address(contracts)?;
+    ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        contracts,
+        endpoint,
+        &registry_address,
+    )?
+    .read_account_once()
+    .await
+}
+
+#[cfg(feature = "shellnet")]
 pub(crate) async fn enforce_model_registry_policy(
     role: RegistryRole,
     policy: &RegistryValidationPolicy,
@@ -840,8 +1509,36 @@ pub(crate) async fn enforce_model_registry_policy(
     order_book_active: bool,
     buyer_missing_book_policy: BuyerMissingBookPolicy,
 ) -> Result<RegistryBookAction> {
+    enforce_model_registry_policy_with_endpoint(
+        role,
+        policy,
+        contracts,
+        None,
+        frame_model,
+        expected_order_book,
+        order_book_active,
+        buyer_missing_book_policy,
+    )
+    .await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn enforce_model_registry_policy_with_endpoint(
+    role: RegistryRole,
+    policy: &RegistryValidationPolicy,
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+    frame_model: &str,
+    expected_order_book: &str,
+    order_book_active: bool,
+    buyer_missing_book_policy: BuyerMissingBookPolicy,
+) -> Result<RegistryBookAction> {
     let registry_address = policy.required_address(role)?;
-    let reader = ShellnetModelRegistryReader::from_manifest(contracts, registry_address)?;
+    let reader = ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        contracts,
+        endpoint,
+        registry_address,
+    )?;
     enforce_model_registry_policy_with_reader(
         &reader,
         role,
@@ -895,6 +1592,9 @@ async fn resolve_model_registry_target_with_reader(
                 .as_deref()
                 .is_some_and(|book| book.eq_ignore_ascii_case(&identity.order_book)))
     {
+        let registry_address = dexdo_core::address::display(registry_address);
+        let identity_order_book = dexdo_core::address::display(&identity.order_book);
+        let target_order_book = dexdo_core::address::display_opt(target.order_book.as_deref(), "-");
         bail!(
             "{} model registry check failed: requested model {} resolved to exact ModelRegistry {} \
              identity {} (modelHash {}, orderBook {}), but the selected market target is {} \
@@ -904,10 +1604,10 @@ async fn resolve_model_registry_target_with_reader(
             registry_address,
             identity.registry_model,
             identity.model_hash,
-            identity.order_book,
+            identity_order_book,
             target.frame_model,
             target.model_hash,
-            target.order_book.as_deref().unwrap_or("-")
+            target_order_book
         );
     }
     target.frame_model = identity.registry_model;
@@ -923,11 +1623,35 @@ pub(crate) async fn resolve_model_registry_target(
     requested_model: &str,
     target: BookTarget,
 ) -> Result<BookTarget> {
+    resolve_model_registry_target_with_endpoint(
+        role,
+        policy,
+        contracts,
+        None,
+        requested_model,
+        target,
+    )
+    .await
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn resolve_model_registry_target_with_endpoint(
+    role: RegistryRole,
+    policy: Option<&RegistryValidationPolicy>,
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+    requested_model: &str,
+    target: BookTarget,
+) -> Result<BookTarget> {
     let Some(policy) = policy else {
         return Ok(target);
     };
     let registry_address = policy.required_address(role)?;
-    let reader = ShellnetModelRegistryReader::from_manifest(contracts, registry_address)?;
+    let reader = ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        contracts,
+        endpoint,
+        registry_address,
+    )?;
     resolve_model_registry_target_with_reader(&reader, role, policy, requested_model, target).await
 }
 
@@ -944,6 +1668,54 @@ pub(crate) async fn resolve_model_registry_target(
     }
     let _ = (role, contracts, requested_model);
     bail!("ModelRegistry validation requires a shellnet build")
+}
+
+/// Resolve a model name against the ModelRegistry the way the BUYER resolves it, and refuse if it
+/// does not resolve.
+/// The lookup is `resolve_registered_model_identity` against the registry named by the contracts
+/// manifest -- the same function, the same candidate order and the same failure text the buyer's
+/// content-identity preflight produces. The point is that both sides ask the SAME question: the
+/// buyer's version is mandatory, and the seller's used to be reachable only through
+/// `resolve_model_registry_target`, which returns its target untouched when no
+/// `--model-registry-validation` config is passed. The guard was there; on the default path nothing
+/// called it, and a seller could deploy a whole market for a name no buyer could ever resolve.
+/// **Answer only.** The resolved registry name is returned but deliberately not substituted for what
+/// the operator asked for: renaming the market under the seller would change the derived
+/// `model_hash` and the book with it, which is the separate canonicalisation question.
+/// This says yes or no, before money moves.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn resolve_registry_content_identity(
+    role: RegistryRole,
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+    requested_model: &str,
+) -> Result<String> {
+    let registry_address = default_model_registry_address(contracts).with_context(|| {
+        format!(
+            "read default ModelRegistry address from {} for content identity",
+            contracts.display()
+        )
+    })?;
+    let reader = ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        contracts,
+        endpoint,
+        &registry_address,
+    )?;
+    let identity =
+        resolve_registered_model_identity(&reader, role, &registry_address, requested_model)
+            .await?;
+    Ok(identity.registry_model)
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn resolve_registry_content_identity(
+    role: RegistryRole,
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+    requested_model: &str,
+) -> Result<String> {
+    let _ = (role, contracts, endpoint, requested_model);
+    bail!("content identity ModelRegistry resolution requires a shellnet build")
 }
 
 #[cfg(all(test, feature = "shellnet"))]
@@ -1031,7 +1803,16 @@ mod registry_target_tests {
 
         assert!(error.contains(REQUESTED), "{error}");
         assert!(error.contains(EXACT), "{error}");
-        assert!(error.contains(EXACT_BOOK), "{error}");
+        // the refusal names the registry's exact order book canonically; an
+        // `InferenceOrderBook` is a contract of the shared dexdo DApp.
+        assert!(
+            error.contains(&format!(
+                "{}::{}",
+                dexdo_core::DEXDO_DAPP_ID,
+                EXACT_BOOK.strip_prefix("0:").expect("fixture chain form")
+            )),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1141,7 +1922,11 @@ pub(crate) fn deal_contracts_path(
                 (!h.contracts.trim().is_empty()).then(|| std::path::PathBuf::from(&h.contracts))
             })
         })
-        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONTRACTS_PATH))
+        .unwrap_or_else(|| {
+            crate::cli::data_dir::explicit()
+                .map(|root| root.join(DEFAULT_CONTRACTS_PATH))
+                .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONTRACTS_PATH))
+        })
 }
 
 #[cfg(feature = "shellnet")]
@@ -1161,23 +1946,98 @@ pub(crate) async fn shellnet_doctor_preflight_market(
 }
 
 #[cfg(feature = "shellnet")]
-pub(crate) fn save_runtime_deal_handle(
+pub(crate) fn save_runtime_deal_handle_for_network(
     input: RuntimeDealHandleInput<'_>,
+    network: &str,
     emit_human_output: bool,
 ) -> Result<deals::DealHandle> {
-    let h = persist_runtime_deal_handle(input, "shellnet")?;
+    let h = persist_runtime_deal_handle(input, network)?;
     if emit_human_output {
         println!("deal_handle={}", h.handle);
     }
     Ok(h)
 }
 
+#[cfg(all(test, feature = "shellnet"))]
+pub(crate) fn save_runtime_deal_handle(
+    input: RuntimeDealHandleInput<'_>,
+    emit_human_output: bool,
+) -> Result<deals::DealHandle> {
+    save_runtime_deal_handle_for_network(
+        input,
+        dexdo_core::params::DEFAULT_DOCTOR_NETWORK,
+        emit_human_output,
+    )
+}
+
 #[cfg(not(feature = "shellnet"))]
+pub(crate) fn save_runtime_deal_handle_for_network(
+    _input: RuntimeDealHandleInput<'_>,
+    _network: &str,
+    _emit_human_output: bool,
+) -> Result<deals::DealHandle> {
+    bail!("real shellnet deal handles unavailable: build with `--features shellnet`")
+}
+
+#[cfg(all(test, not(feature = "shellnet")))]
+#[allow(dead_code)]
 pub(crate) fn save_runtime_deal_handle(
     _input: RuntimeDealHandleInput<'_>,
     _emit_human_output: bool,
 ) -> Result<deals::DealHandle> {
     bail!("real shellnet deal handles unavailable: build with `--features shellnet`")
+}
+
+const GATEWAY_CHECK_STAGES: [&str; 6] = [
+    "dns_resolve",
+    "tcp_connect",
+    "tls_handshake",
+    "http2_handshake",
+    "grpc_challenge",
+    "challenge_response",
+];
+
+fn completed_gateway_check_stages(failed: &str) -> &'static [&'static str] {
+    let barrier = match failed {
+        "tls_certificate_pin" => "tls_handshake",
+        stage => stage,
+    };
+    let completed = GATEWAY_CHECK_STAGES
+        .iter()
+        .position(|stage| *stage == barrier)
+        .unwrap_or(0);
+    &GATEWAY_CHECK_STAGES[..completed]
+}
+
+pub(crate) async fn run_gateway_check(args: GatewayCheckArgs) -> Result<()> {
+    let timeout = dexdo_core::params::SellerLivenessParams::canonical().health_check_timeout;
+    println!("gateway={}", args.endpoint);
+    match dexdo::seller::liveness::probe_gateway_with_timeout(
+        &args.endpoint,
+        &args.tls_fingerprint,
+        timeout,
+    )
+    .await
+    {
+        Ok(()) => {
+            for stage in GATEWAY_CHECK_STAGES {
+                println!("PASS stage={stage}");
+            }
+            Ok(())
+        }
+        Err(fault) => {
+            for stage in completed_gateway_check_stages(fault.stage()) {
+                println!("PASS stage={stage}");
+            }
+            println!(
+                "FAIL stage={} wrong_endpoint={} error={}",
+                fault.stage(),
+                fault.is_wrong_endpoint(),
+                fault.cause_detail()
+            );
+            bail!("gateway reachability check failed at {}", fault.stage())
+        }
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -1260,11 +2120,29 @@ pub(crate) async fn shellnet_doctor_preflight_with_endpoint(
     endpoint: Option<&str>,
     market: Option<&std::path::Path>,
 ) -> Result<()> {
-    let report = shellnet_doctor_report("shellnet", endpoint, contracts, market).await?;
+    let deployed = dexdo_core::Deployed::load(contracts)
+        .with_context(|| format!("load --contracts {}", contracts.display()))?;
+    let endpoint = manifest_preflight_endpoint(&deployed, endpoint)?;
+    let report = shellnet_doctor_report(
+        dexdo_core::params::DEFAULT_DOCTOR_NETWORK,
+        Some(&endpoint),
+        contracts,
+        market,
+    )
+    .await?;
     if !report.is_ok() {
         bail!("{}", render_shellnet_doctor_report(&report));
     }
     Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn manifest_preflight_endpoint(
+    deployed: &dexdo_core::Deployed,
+    endpoint: Option<&str>,
+) -> Result<String> {
+    // `network` selects the SDK profile; it is never a Block Manager host.
+    dexdo_core::resolve_endpoint(endpoint, deployed)
 }
 
 #[cfg(not(feature = "shellnet"))]
@@ -1297,12 +2175,15 @@ pub(crate) async fn run_doctor(_args: DoctorArgs) -> Result<()> {
     bail!("shellnet doctor unavailable: build with `--features shellnet`")
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) struct BookTarget {
     pub(crate) frame_model: String,
+    // Filled on every path; only the shellnet book/market views read these three back.
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) model_hash: String,
     pub(crate) order_book: Option<String>,
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) root_model: Option<String>,
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) note_addr: Option<String>,
 }
 
@@ -1439,6 +2320,7 @@ fn market_note_getter_error(
     endpoint: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
+    let note_addr = dexdo_core::address::display(note_addr);
     let message = format!("{error:#}").to_ascii_lowercase();
     let exit_code = message
         .split_once("exit code:")
@@ -1484,7 +2366,10 @@ pub(crate) fn fold_snapshot_from_orders<'a>(
                 ticks: order.ticks_remaining,
                 escrow: 0,
                 deadline: order.deadline,
-                flags: 0,
+                // the placement event declares `flags`, so this is the book's own answer --
+                // unlike `escrow` just above, which the event does not carry and which the row
+                // therefore renders as `-` rather than as this filler zero.
+                flags: order.flags,
                 timestamp: 0,
             })
             .collect(),
@@ -1689,42 +2574,158 @@ pub(crate) fn resolve_mock_deal_target(
     })
 }
 
+/// The inputs `close` needs *below* clap: a role and an actor note. A stored handle carries
+/// both; a raw `TokenContract` has neither, so the operator must pass `--role` and `--note-addr`.
+/// The handlers resolve identity through this, and the tests that check the `close` lines the CLI
+/// prints call it too, so a printed line cannot drift from what its handler demands.
+pub(crate) fn require_close_target_identity<R>(
+    deal: &str,
+    role: Option<R>,
+    note_addr: Option<&str>,
+) -> Result<(R, String)> {
+    let role = role.ok_or_else(|| {
+        anyhow::anyhow!(
+            "close: `{deal}` is not a local handle; pass --role buyer|seller with a raw TokenContract"
+        )
+    })?;
+    let note_addr = note_addr.ok_or_else(|| {
+        anyhow::anyhow!(
+            "close: `{deal}` is not a local handle; pass --note-addr with a raw TokenContract"
+        )
+    })?;
+    Ok((role, note_addr.to_string()))
+}
+
+/// The `dexdo close` follow-up the CLI hands an operator, built in one place so every message says
+/// the same thing.
+/// It is guidance, not an argv template, and that is forced by what this site knows. `close` signs,
+/// so it demands `--note-key`, and the note owner key is never a value dexdo may render into a
+/// printed line; a raw `TokenContract` target additionally demands the `--role`/`--note-addr` that
+/// `require_close_target_identity` enforces below clap. Emitting `--note-key <buyer-key>` would not
+/// even be a command: a POSIX shell reads `<buyer-key>` as an input redirection and never hands the
+/// token to `dexdo`. So the command is named, the deal reference is rendered shell-quoted (a handle
+/// id or path containing a space is otherwise split by the operator's shell), and the remaining
+/// inputs -- including any non-default `--deals-dir`/`--contracts` this run resolved, which a
+/// follow-up would otherwise silently lose -- are stated in prose the shell never sees.
+pub(crate) fn close_guidance(
+    deal: &str,
+    raw_target_role: Option<&str>,
+    actor: &str,
+    deals_dir: Option<&std::path::Path>,
+    contracts: Option<&std::path::Path>,
+) -> String {
+    let identity = match raw_target_role {
+        Some(role) => format!(
+            ", passing --role {role} and the {actor} --note-addr because this deal reference is a \
+             raw TokenContract and carries neither"
+        ),
+        None => String::new(),
+    };
+    format!(
+        "run `dexdo close` on {}{identity}, with the {actor} --note-key to sign{}",
+        crate::cli::support::shell_arg(deal),
+        identity_free_options(deals_dir, contracts)
+    )
+}
+
+/// The `--deals-dir`/`--contracts` a `close`/`status` follow-up must repeat, stated as prose.
+fn identity_free_options(
+    deals_dir: Option<&std::path::Path>,
+    contracts: Option<&std::path::Path>,
+) -> String {
+    crate::cli::support::stated_options(&[("--deals-dir", deals_dir), ("--contracts", contracts)])
+}
+
+/// The one `close` follow-up that *is* a complete runnable line: `dexdo status` reads, so it needs
+/// no key and no role, and everything it takes is known here. The deal reference is shell-quoted
+/// and the run's own `--deals-dir`/`--contracts` are carried, so the line resolves the same deal
+/// against the same deployment.
+/// Its only caller is the shellnet `close` path, so it exists exactly where that does -- the same
+/// boundary the settlement builders use -- rather than shipping behind a dead-code suppression.
+#[cfg(any(feature = "shellnet", test))]
+pub(crate) fn status_command(
+    deal: &str,
+    deals_dir: Option<&std::path::Path>,
+    contracts: Option<&std::path::Path>,
+) -> String {
+    let mut command = format!("dexdo status {}", crate::cli::support::shell_arg(deal));
+    for (flag, path) in [("--deals-dir", deals_dir), ("--contracts", contracts)] {
+        if let Some(path) = path {
+            command.push_str(&format!(
+                " {flag} {}",
+                crate::cli::support::shell_arg(&path.display().to_string())
+            ));
+        }
+    }
+    command
+}
+
+/// `deals_dir`/`contracts` are the options the *current* run was given, and they are threaded in
+/// rather than re-derived: a handle resolved from a custom `--deals-dir`, or a deal read through an
+/// explicit `--contracts` manifest, would otherwise be pointed at the defaults by the follow-up
+/// this prints.
 #[cfg(feature = "shellnet")]
-pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> String {
+pub(crate) fn close_hint(
+    target: &DealTarget,
+    s: &deals::DealStateSummary,
+    deals_dir: Option<&std::path::Path>,
+    contracts: Option<&std::path::Path>,
+) -> String {
     let deal = target
         .handle
         .as_ref()
         .map(|h| h.handle.as_str())
         .unwrap_or(&target.token_contract);
+    // A raw TokenContract target has no stored handle, so the guidance must also name the
+    // `--role`/`--note-addr` the close handler requires below clap, and it must state the
+    // `--deals-dir`/`--contracts` this run resolved rather than let a rerun fall back to defaults.
+    let raw_seller = target.handle.is_none().then_some("seller");
+    let raw_buyer = target.handle.is_none().then_some("buyer");
+    let close_as_seller = close_guidance(deal, raw_seller, "seller", deals_dir, contracts);
+    let close_as_buyer = close_guidance(deal, raw_buyer, "buyer", deals_dir, contracts);
     match target.role {
         Some(deals::DealHandleRole::Seller) if s.kind == deals::DealStateKind::Stopped => {
-            format!("next=destroy command=`dexdo close {deal} --note-key <seller-key>`")
+            format!("next=destroy action={close_as_seller}")
         }
         Some(deals::DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
             format!(
-                "next=seller_wait_delivery_then_accept_probe command=`keep dexdo seller running for {deal}; it waits for the first delivered canonical tick, then calls TokenContract.acceptProbe() after PROBE_WINDOW; use dexdo close {deal} --note-key <seller-key> to call TokenContract.sellerStop() if the seller must stop` reason=awaiting_delivery_then_probe_window"
+                "next=seller_wait_delivery_then_accept_probe action=keep the seller gateway running for {deal} detail=it waits for the first delivered canonical tick, then calls TokenContract.acceptProbe() after PROBE_WINDOW stop_action={close_as_seller} stop_effect=TokenContract.sellerStop() reason=awaiting_delivery_then_probe_window"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.opened => {
             format!(
-                "next=seller_claim_finalize_or_settle_week_or_seller_stop command=`keep dexdo seller running for {deal}; it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims, while the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries; use dexdo close {deal} --note-key <seller-key> to call TokenContract.sellerStop() if the seller must stop`; buyer may STOP when done"
+                "next=seller_claim_finalize_or_settle_week_or_seller_stop action=keep the seller gateway running for {deal} detail=it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims, while the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries stop_action={close_as_seller} stop_effect=TokenContract.sellerStop(); buyer may STOP when done"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.funded && !s.probe_accepted => {
-            "next=buyer_cleanup_after_timeout command=`dexdo close <buyer-handle> --note-key <buyer-key>`"
-                .to_string()
+            format!(
+                "next=buyer_cleanup_after_timeout action=the buyer {}",
+                close_guidance(
+                    &target.token_contract,
+                    Some("buyer"),
+                    "buyer",
+                    deals_dir,
+                    contracts
+                )
+            )
         }
-        Some(deals::DealHandleRole::Seller) => {
-            "next=no_destroy_yet reason=deal_not_stopped".to_string()
-        }
+        // what is left here is the UNSOLD deal -- never funded, so never opened and never
+        // stopped. "not stopped" was true and useless: there is nothing to stop in a deal that never
+        // started, and the destroy it pointed at could never accept this shape. The applicable
+        // action is `TokenContract.close()`, which returns the seller bond to the note and
+        // self-destructs(`contracts/airegistry/TokenContract.sol:803-821`) -- but only once the ask
+        // is off the book, so the ordering is part of the answer.
+        Some(deals::DealHandleRole::Seller) => format!(
+            "next=close_unsold_deal command=`dexdo close {deal} --note-key '<seller-key>'` reason=deal_never_matched note=cancel_any_resting_ask_first_with_`dexdo orders cancel`"
+        ),
         Some(deals::DealHandleRole::Buyer) if s.kind == deals::DealStateKind::Stopped => {
             "next=none reason=deal_already_terminal".to_string()
         }
-        Some(deals::DealHandleRole::Buyer) if s.opened => format!(
-            "next=stream_stop command=`dexdo close {deal} --note-key <buyer-key>`"
-        ),
+        Some(deals::DealHandleRole::Buyer) if s.opened => {
+            format!("next=stream_stop action={close_as_buyer}")
+        }
         Some(deals::DealHandleRole::Buyer) if s.funded && !s.probe_accepted => {
-            format!("next=cleanup_unopened_after_timeout command=`dexdo close {deal} --note-key <buyer-key>`")
+            format!("next=cleanup_unopened_after_timeout action={close_as_buyer}")
         }
         Some(deals::DealHandleRole::Buyer) => {
             "next=cancel_resting_bid_or_wait_match reason=deal_not_funded".to_string()
@@ -1734,12 +2735,27 @@ pub(crate) fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> St
 }
 
 /// One resting ask as the order-book renderer needs it: price per tick, its max ticks, and the full deal
-/// `TokenContract` address. Kept minimal so both the buyer's pre-buy view and the read-only `markets --table`
-/// view can build it from their own sources(`discover_offers` / `OrderBookSnapshot::resting_asks`).
+/// `TokenContract` address. Kept minimal so both the buyer's pre-buy view and the read-only `dexdo markets`
+/// table view can build it from their own sources(`discover_offers` / `OrderBookSnapshot::resting_asks`).
 pub struct BookRow {
     pub price_per_tick: u128,
     pub max_ticks: u128,
     pub token_contract: String,
+}
+
+pub(crate) fn declared_model_flags(
+    frame_model: &str,
+) -> Option<dexdo_core::CanonicalModelFlags> {
+    dexdo_core::parse_canonical_model_id(frame_model)
+        .ok()
+        .map(|parsed| parsed.flags)
+        .filter(|flags| !flags.is_empty())
+}
+
+pub(crate) fn render_model_flags_field(frame_model: &str) -> String {
+    declared_model_flags(frame_model)
+        .map(|flags| format!(" model_flags={}", flags.render_human()))
+        .unwrap_or_default()
 }
 
 /// Render a per-model inference order book to the terminal as a narrow box table (/ UX:
@@ -1755,7 +2771,7 @@ pub fn print_book_table(
 ) {
     use std::io::IsTerminal;
     // ANSI styling only on a real terminal -- piped/headless output stays plain(clean logs, copyable).
-    let color = std::io::stdout().is_terminal();
+    let color = std::io::stdout().is_terminal() && !crate::cli::no_color_requested();
     let paint = |s: &str, code: &str| {
         if color {
             format!("\x1b[{code}m{s}\x1b[0m")
@@ -1766,7 +2782,10 @@ pub fn print_book_table(
     // One tick = a fixed number of delivered model tokens -- print it
     // so price/tick and the tick counts are interpretable in model tokens, not abstract units.
     let tick_size = DobParams::canonical().tick_size as u128;
-    let title = format!("inference order book -- {frame_model}");
+    let title = format!(
+        "inference order book -- {frame_model}{}",
+        render_model_flags_field(frame_model)
+    );
     let subtitle = format!(
         "1 tick = {tick_size} model tokens * prices are raw ECC[2] (PRICE_STEP 1000000000 = 1 SHELL)"
     );
@@ -1806,7 +2825,7 @@ pub fn print_book_table(
             if let Some(cap) = max_price_per_tick {
                 cells.push(if o.price_per_tick <= cap { "yes" } else { "no" }.to_string());
             }
-            cells.push(o.token_contract.clone());
+            cells.push(dexdo_core::address::display_self_dapp(&o.token_contract));
             cells
         })
         .collect();
@@ -1895,8 +2914,8 @@ pub(crate) fn write_pool_private(path: &std::path::Path, bytes: &[u8]) -> Result
     crate::cli::note::write_private_atomic(path, bytes)
 }
 
-#[cfg(feature = "shellnet")]
-#[cfg_attr(not(test), allow(dead_code))]
+// The only caller is the temp-clobber regression, so the seam exists exactly where it is used.
+#[cfg(all(test, feature = "shellnet"))]
 pub(crate) fn write_pool_private_via_temp(
     path: &std::path::Path,
     tmp: &std::path::Path,
@@ -1985,7 +3004,19 @@ pub(crate) fn note_endpoint_url(endpoint: &str) -> Result<String> {
 pub(crate) fn note_deploy_multisig_secret_hex(
     args: &NoteDeployArgs,
 ) -> Result<(&'static str, String)> {
-    match (&args.multisig_key, &args.multisig_seed_file) {
+    multisig_secret_hex(&args.multisig_key, &args.multisig_seed_file)
+}
+
+/// The `--multisig-key` / `--multisig-seed-file` pair, read once for every command that spends from
+/// the funding wallet. Taken as the two option paths rather than one command's args struct so a
+/// second such command reuses this reading instead of growing its own: two readings of one operator
+/// secret is two places for the "which flag wins" answer to differ.
+#[cfg(feature = "shellnet")]
+pub(crate) fn multisig_secret_hex(
+    multisig_key: &Option<std::path::PathBuf>,
+    multisig_seed_file: &Option<std::path::PathBuf>,
+) -> Result<(&'static str, String)> {
+    match (multisig_key, multisig_seed_file) {
         (Some(_), Some(_)) => bail!("use only one of --multisig-key or --multisig-seed-file"),
         (Some(path), None) => Ok(("--multisig-key", read_secret_hex(path, "--multisig-key")?)),
         (None, Some(path)) => {
@@ -2084,14 +3115,21 @@ mod actionable_error_tests {
             anyhow::anyhow!("note is not active"),
         )
         .to_string();
+        // the actionable error names the note canonically; a PrivateNote is a contract of the
+        // shared dexdo DApp, so its DApp half is `DEXDO_DAPP_ID`.
+        let note_rendered = format!(
+            "{}::{}",
+            dexdo_core::DEXDO_DAPP_ID,
+            note.strip_prefix("0:").expect("fixture is the chain form")
+        );
         let expected = format!(
-            "note {note} not found or not initialized on https://shellnet.example; verify \
+            "note {note_rendered} not found or not initialized on https://shellnet.example; verify \
              `--note-addr` and the shellnet endpoint"
         );
         assert_eq!(mapped, expected);
 
         let exit_60_expected = format!(
-            "market lookup failed for note {note} on https://shellnet.example \
+            "market lookup failed for note {note_rendered} on https://shellnet.example \
              (getInferenceOrderBookAddress exit 60) -- verify the note address is a deployed, \
              initialized order-book note"
         );
@@ -2151,5 +3189,171 @@ mod actionable_error_tests {
             market_note_getter_error(note, "https://shellnet.example", different).to_string(),
             "run_tvm getter getInferenceOrderBookAddress: transport connection refused"
         );
+    }
+}
+
+/// checks that must run in the default build too: the remote PR gate does not compile
+/// the `shellnet` feature, and these are about what the CLI prints, not about the chain.
+#[cfg(test)]
+mod printed_command_tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn provision_mainnet_profile_keeps_manifest_endpoint() {
+        let manifest: dexdo_core::Deployed = serde_json::from_value(serde_json::json!({
+            "network": "mainnet",
+            "endpoint": "https://dd-mainnet.ackinacki.org",
+            "superroot": format!("0:{}", "0".repeat(64)),
+            "dapp_config": "",
+            "dapp_id": "0".repeat(64)
+        }))
+        .expect("mainnet manifest fixture");
+
+        assert_eq!(
+            manifest_preflight_endpoint(&manifest, None).expect("resolve provision endpoint"),
+            "https://dd-mainnet.ackinacki.org"
+        );
+        assert_eq!(
+            manifest_preflight_endpoint(
+                &manifest,
+                Some("https://explicit-mainnet.example/graphql")
+            )
+            .expect("resolve explicit provision endpoint"),
+            "https://explicit-mainnet.example"
+        );
+    }
+
+    /// `close` guidance must be guidance and nothing more. `close` signs, so its handler
+    /// demands a `--note-key` this site does not have; an argv template filling that gap with
+    /// `<buyer-key>` is not even argv, because the shell consumes `<buyer-key>` as a redirection.
+    /// So every command span here has to be a bare command path, and every input the handler
+    /// enforces below clap -- including the `--role`/`--note-addr` a raw `TokenContract` target
+    /// lacks, named through the handler's own `require_close_target_identity` -- has to be stated
+    /// in the prose around it. Both target modes are driven, with a deal reference a shell would
+    /// otherwise split.
+    #[test]
+    fn close_guidance_names_the_command_and_states_every_input_its_handler_demands() {
+        use crate::cli::support::printed_commands::assert_emitted_commands_name_only;
+        let deals_dir = std::path::Path::new("/tmp/my deals");
+        let contracts = std::path::Path::new("/tmp/my deploy/deployed.json");
+        for (raw_role, deal, actor) in [
+            (None, "seller-0:33 with space", "seller"),
+            (Some("seller"), "0:33", "seller"),
+            (Some("buyer"), "0:33", "buyer"),
+        ] {
+            let guidance = close_guidance(deal, raw_role, actor, Some(deals_dir), Some(contracts));
+            // `close` signs, so the key must be stated; and the options this run was given must
+            // survive into the follow-up, or it silently resolves a different handle directory and
+            // a different deployment. Stating them through the helper is what makes the guarantee
+            // structural rather than something this call site remembered to check.
+            assert_emitted_commands_name_only(
+                &guidance,
+                &format!("close guidance (raw_role={raw_role:?})"),
+                &[
+                    &format!("{actor} --note-key"),
+                    "--deals-dir '/tmp/my deals'",
+                    "--contracts '/tmp/my deploy/deployed.json'",
+                ],
+            );
+            assert!(
+                guidance.contains(&crate::cli::support::shell_arg(deal)),
+                "the deal reference must be quoted so a shell keeps it whole: {guidance}"
+            );
+            // Exactly what `load_deal_target` carries for a raw TokenContract: without a stored
+            // handle the role and note come from flags, and the handler rejects their absence.
+            // The two rejections are read from the handler's own function, one input at a time,
+            // so this states what `close` demands rather than restating it.
+            let missing_role =
+                require_close_target_identity::<deals::DealHandleRole>(deal, None, None)
+                    .expect_err("the handler must demand a role for a raw TokenContract")
+                    .to_string();
+            let missing_note =
+                require_close_target_identity(deal, Some(deals::DealHandleRole::Buyer), None)
+                    .expect_err("the handler must demand a note for a raw TokenContract")
+                    .to_string();
+            if raw_role.is_some() {
+                for demanded in [missing_role.as_str(), missing_note.as_str()] {
+                    let flag = if demanded.contains("--role") {
+                        "--role"
+                    } else {
+                        "--note-addr"
+                    };
+                    assert!(
+                        guidance.contains(flag),
+                        "the handler demands {flag} but the guidance omits it: {guidance}"
+                    );
+                }
+            } else {
+                assert!(
+                    !guidance.contains("--role"),
+                    "a stored handle carries the role; guidance must not ask for it: {guidance}"
+                );
+            }
+        }
+    }
+
+    /// `dexdo status` is the one close follow-up that *is* a complete line -- it reads, so it
+    /// needs neither a key nor a role -- and it must survive the operator's shell with the deal
+    /// reference intact and the run's own manifest/handle directory attached.
+    #[test]
+    fn printed_status_line_survives_a_shell_and_keeps_this_run_s_options() {
+        use crate::cli::support::printed_commands::assert_emitted_commands_parse;
+        let line = status_command(
+            "seller-0:33 with space",
+            Some(std::path::Path::new("/tmp/my deals")),
+            Some(std::path::Path::new("/tmp/my deploy/deployed.json")),
+        );
+        assert_emitted_commands_parse(
+            &format!("inspect with `{line}`"),
+            "close status hint",
+            false,
+        );
+        let parsed = crate::Cli::try_parse_from(
+            crate::cli::support::printed_commands::shell_split(&line)
+                .expect("the printed status line is one a shell accepts"),
+        )
+        .unwrap_or_else(|e| panic!("the printed line must parse: {line}\n{e}"));
+        let crate::Command::Status(args) = parsed.command else {
+            panic!("status command");
+        };
+        assert_eq!(args.deal, "seller-0:33 with space");
+        assert_eq!(
+            args.deals_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/my deals"))
+        );
+        assert_eq!(
+            args.contracts.as_deref(),
+            Some(std::path::Path::new("/tmp/my deploy/deployed.json"))
+        );
+    }
+
+    /// the two settlement follow-ups name commands whose handlers demand a seller note and
+    /// owner key *after* clap accepts the line. Neither is known where they are printed, so both
+    /// must be prose naming the command -- and both must still carry the manifest this run used,
+    /// or the operator settles against the default deployment.
+    #[test]
+    fn settlement_guidance_names_its_command_and_keeps_the_authoritative_manifest() {
+        use crate::cli::support::{
+            destroy_guidance, printed_commands::assert_emitted_commands_name_only,
+            release_dispute_guidance,
+        };
+        let contracts = std::path::Path::new("/tmp/my deploy/deployed.json");
+        for guidance in [
+            release_dispute_guidance("0:33", Some(contracts)),
+            destroy_guidance("0:33", Some(contracts)),
+        ] {
+            assert_emitted_commands_name_only(
+                &guidance,
+                "settlement guidance",
+                &[
+                    "--token-contract",
+                    "--note-addr",
+                    "--note-key",
+                    "--contracts '/tmp/my deploy/deployed.json'",
+                ],
+            );
+        }
     }
 }

@@ -128,9 +128,8 @@ pub fn openai_delta_chunk(id: &str, model: &str, created: u64, text: &str, first
     serde_json::to_string(&chunk).expect("serialize openai chunk")
 }
 
-/// Terminal `chat.completion.chunk` with the given `finish_reason`(before `[DONE]`). The normal
-/// end is `"stop"`; a verification bail(B10, model substitution) is `"content_filter"`, so the
-/// consumer can DISTINGUISH a scam-aborted stream from an honest complete response.
+/// Terminal `chat.completion.chunk` with the given `finish_reason`(before `[DONE]`). The caller
+/// supplies the classified terminal: `stop`, `length`, `capacity`, `error`, or `content_filter`.
 pub fn openai_final_chunk(id: &str, model: &str, created: u64, finish_reason: &str) -> String {
     let chunk = OpenAiChunk {
         id: id.to_string(),
@@ -146,8 +145,8 @@ pub fn openai_final_chunk(id: &str, model: &str, created: u64, finish_reason: &s
     serde_json::to_string(&chunk).expect("serialize openai final chunk")
 }
 
-/// Full `chat.completion` for a non-streaming response(text aggregate, B19). `finish_reason` is
-/// `"stop"` on an honest end / `"content_filter"` on a verification bail.
+/// Full `chat.completion` for a non-streaming response(text aggregate, B19), including the
+/// caller-classified `finish_reason`.
 pub fn openai_completion(
     id: &str,
     model: &str,

@@ -1,6 +1,6 @@
 {
   "network": "shellnet",
-  "version": "4.0.32",
+  "version": "4.0.35",
   "dapp_config": "",
   "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
   "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
@@ -10,20 +10,20 @@
   "rootoracle": "0:1515151515151515151515151515151515151515151515151515151515151515",
   "seller_bond": "2P mirror seller bond held in TokenContract (spec 4.2).",
   "contract_hashes": {
-    "_note": "Second-build 4.0.32 code hashes decoded from contracts/compiled/ with `tvm-cli decode stateinit --tvc`. The same version string is shared with the first build and is not identity. All nine pin edges were recomputed; the four fixed live roots and all twelve declared stored child-code cells agree with these artifacts.",
-    "SuperRoot": "e7c9e1365003d4ea6364a504f04a8d7ed669556f7fa6d175e35c1ae74b0828e4",
-    "ModelRegistry": "4c2fb70b23f7c59282029e67783241166c261eaa5159cf65f6096289fdb70e6c",
-    "RootPN": "8ba7776f8bd31654ecc3e6b19db6d4725943dfb1200b4e37c6b4246d5a1cb6f3",
-    "RootOracle": "674480a8cd28b3373bc0813590648d8f49818f64a5de9513daf1036c161dcb38",
-    "RootModel": "8f14a5df64341d261dfd00ff996bf90ba750f78baa3104fba1a72279a6afb6ff",
-    "TokenContract": "b866fde2d1a021d357b7fb75d7dd7dd39b125e101c3cfa32045a8a6f9e9ab8c0",
-    "InferenceOrderBook": "2d7391db445db2cb9a67d2a6f641934653fefb61c27c0863be8faa36fa548d76",
-    "PrivateNote": "87bd964e2170630f7e6cc18935a5751569b630aae1b80b0057604ffe64f21a5a",
-    "Oracle": "21a1e0a27fb1864a5ee219a472d52f370d76ff7bd7635e60932ceec13dd90eb9",
-    "OracleEventList": "db502d534011eb63f11c9a1287cfa73ece0d4a80fe00fb0d4b72867450d4114a",
-    "PMP": "37aa366c97b1cfa4a0b541ddcb58e3a622d73509e290a5da0247ef2befb9eba2",
-    "OrderBook": "0826b722d879cdecd6f09161b2633ae31ec88609fa8b9accd4fb413c980bfc6a",
-    "Nullifier": "b8df44fb83d3ff934a60d8a75daf6022fc0b440a9022c7edc8d9655d73c21d7b"
+    "_note": "4.0.35 code hashes. SIX WERE READ FROM THE LIVE CHAIN, and for those the chain is the source rather than any file: SuperRoot, ModelRegistry, RootPN and RootOracle from the GraphQL `code_hash` of their fixed zerostate accounts under dapp 0000..0004 (all four Active), and PrivateNote and PMP from `RootPN.getDetails()` (`privateNoteCodeHash` / `pmpCodeHash`), which is the code RootPN actually mints - the value that decides whether a freshly minted note is the current generation. The remaining seven are deployed per-deal or per-model, so no account of this generation exists to read: RootModel, TokenContract, InferenceOrderBook, Oracle, OracleEventList, OrderBook and Nullifier are recomputed from the artifacts with `tvm-cli decode stateinit --tvc <file>` and cross-checked against the contracts manifest at the same branch head. All three sources agree on every value they can each speak to. Depths: TokenContract depth 17, PrivateNote depth 20, InferenceOrderBook depth 31, RootModel depth 8, SuperRoot depth 7, RootPN depth 14, RootOracle depth 9, ModelRegistry depth 8, PMP depth 20, OrderBook depth 28, OracleEventList depth 12, Oracle depth 10, Nullifier depth 6. RootPN is built with sold_old (0.80), the other twelve with sold (0.81). READ THIS BEFORE TRUSTING ANY EARLIER TABLE: the values here are NOT the ones this client first pinned. It pinned the artifacts of contracts head 00cdb0fd, and the branch moved twice afterwards - a contracts change, then the specs - so that build was never deployed. A file can lag a deploy; the chain cannot.",
+    "SuperRoot": "7591c2b58646b793d01965e123603c879f125d875f47da8d612224ea0589b1ea",
+    "ModelRegistry": "89fb10d0bff03538ffaca184aa66bb4c9b74c7c88f60affc046273fa961115ef",
+    "RootPN": "8ee7225d4e928296e92c76b0d00efc181a4d7f47ba2ce8825d5fb935658f9703",
+    "RootOracle": "7876890031636ab669fd488e12009e43a3cc8cadb3dce975e11b18bfb8e7e84d",
+    "RootModel": "287831837ad23d5216956ccca347c65eecb31b56eb95e7ce0fe3bbf9f2edcff4",
+    "TokenContract": "a67e1ae0a748f902b248a035eabbcfc6393b3154fed7d7002e0defae8b6d685d",
+    "InferenceOrderBook": "2fa52109d6f38fc3640f35febcb73300a9f96a7a3558bb4ae6b4e00374420016",
+    "PrivateNote": "57e85fa67cc90284b907ea7e9d8c6d35830c02d14bd04d4be6ec884b5748ca0c",
+    "Oracle": "57e7a5603e23beceed0c9ea995fad4a1820eb47c034c9e712eb18d9568443b48",
+    "OracleEventList": "acbad98a1b96d3513d4a36f58cc906d6abe5dbd47bba0e641d30c5d2237fabf1",
+    "PMP": "07fcc9fdd4c680aee8dae848fe68dc018adcd314df3d19dee8388f0342290989",
+    "OrderBook": "8a06269dad1b24897c4da22c3bb77762b1dac892d1568639b05e4382c6b3990e",
+    "Nullifier": "80cb545957066bf81d370100be78ad74df6d7fe277a2a17e3b0bd9551b2ff239"
   },
-  "status": "DEPLOYED CANDIDATE -- live shellnet runs the SECOND 4.0.32 build (TokenContract b866fde2d1a021d3...), verified read-only. NOT accepted, and one gap is deliberate and named: THE DEPLOY PRECEDED THE EXECUTABLE PROOF OF ITS OWN FIXES. Neither the terminal-claim regression nor the new exit-economics part has been run against this build; they run next. A divergence there means a redeploy, and it will be reported by us rather than discovered."
+  "status": "DEPLOYED - shellnet runs 4.0.35, verified read-only from this tree rather than assumed. The four fixed root accounts under dapp 4 (SuperRoot 0:0c0c, ModelRegistry 0:0d0d, RootPN 0:1010, RootOracle 0:1515) are Active and serve exactly the code hashes recorded above; RootPN answers getVersion() == (\"4.0.35\", \"RootPN\") and getDetails() with privateNoteCodeHash 57e85fa6 / pmpCodeHash 07fcc9fd, which is the code it actually mints. Because the four root images are the committed artifacts, the compile-time pins inside them are the ones in this tree's sources: RootPN pins TokenContract a67e1ae0 depth 17 and RootModel 287831 depth 8, SuperRoot pins RootModel 287831, InferenceOrderBook pins PrivateNote 57e85fa6 depth 20, ModelRegistry pins InferenceOrderBook 2fa52109 depth 31. THREE GAPS ARE NAMED. (1) Seven of the thirteen are deployed per-deal or per-model, so no instance of this generation exists on chain to read; their hashes are reproduced from the artifacts, corroborated by the six that were read live. (2) No functional scenario has been exercised against this build by this client: every note that existed is the wrong generation and a fresh pool is being minted. (3) The ModelRegistry set is wiped by updateCode and must be re-seeded before any name resolves; the re-seed carries 8558 strings this generation rather than booleans."
 }

@@ -24,10 +24,18 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
-fs2 = { version = "0.4", optional = true }
+fs2 = "0.4"
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+dexdo-wallet-onboarding = { path = "wallet-onboarding", optional = true }
+qrcode = { version = "0.14", default-features = false, features = ["svg"], optional = true }
+# Gosh.ai onboarding: the pasted Hot address + recovery phrase are read through ONE non-echoing
+# terminal input. Neither std nor any crate already in this graph can disable terminal echo, and a
+# hand-rolled termios/console toggle on a secret path is exactly the wrong place to be original --
+# rpassword is the standard solution and restores the terminal on drop. Only the shellnet build has
+# the interactive provider flow, so the dependency stays out of the default(mock) graph.
+rpassword = { version = "7", optional = true }
 # TLS channel, fingerprint pinning.
 rcgen.workspace = true
 sha2.workspace = true
@@ -40,6 +48,7 @@ axum.workspace = true
 async-stream.workspace = true
 # real OpenAI-compatible upstream(Groq), streaming SSE.
 reqwest.workspace = true
+httpdate.workspace = true
 # D6: default platform path for the endpoints file(config/data dir).
 directories.workspace = true
 ed25519-dalek.workspace = true
@@ -51,6 +60,11 @@ tiny-bip39.workspace = true
 zeroize.workspace = true
 tvm_client = { workspace = true, optional = true }
 
+# the POSIX existence probe (`kill(pid, 0)`) that corroborates an unlocked sentinel. Already
+# in this build graph -- this only makes it callable from here.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -58,13 +72,20 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [features]
 # real shellnet backend in the `dexdo` binary itself(per-role `RealSellerBackend`/`RealBuyerBackend`).
 # OFF by default -- the default(mock) build stays lightweight and cross-platform(D6); the real path
 # (TVM SDK v3 via `dexdo-core/shellnet`) only under this feature.
-shellnet = ["dexdo-core/shellnet", "dep:fs2", "dep:tvm_client"]
+shellnet = [
+    "dexdo-core/shellnet",
+    "dep:dexdo-wallet-onboarding",
+    "dep:qrcode",
+    "dep:rpassword",
+    "dep:tvm_client",
+]
 # (hard rule): the giver(test faucet) is test-only -- gated behind this NON-DEFAULT feature so the
 # production `dexdo` binary contains zero giver. Only the live `live_cli` harness enables it.
 test-giver = ["shellnet", "dexdo-core/test-giver"]

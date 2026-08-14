@@ -1,6 +1,9 @@
 //! Note-management command handlers(Track C8/C9/C12, move-only).
 
-use crate::cli::args::{NoteBalanceArgs, NoteDeployArgs, NoteRecoverArgs, NoteWithdrawArgs};
+use crate::cli::args::{
+    NoteBalanceArgs, NoteDeployArgs, NoteOutstandingArgs, NoteRecoverArgs, NoteWalletArgs,
+    NoteWithdrawArgs,
+};
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     is_note_deploy_wallet_busy_error, note_deploy_error, note_deploy_fold_state_into_pool,
@@ -13,6 +16,15 @@ use crate::cli::support::read_secret_hex;
 use anyhow::bail;
 use anyhow::Result;
 #[cfg(feature = "shellnet")]
+use dexdo_core::shellnet::RetryingReads;
+// one definition of the custodian-key normalization, in `dexdo-core`, for both the note path
+// and the manual-wallet path. This module had its own copy; the two agreed, which is the only good
+// time to remove one. The name is IMPORTED at module scope rather than qualified at each call site
+// on purpose: a second local definition of it is then `error[E0255]`, so "one definition" is a rule
+// the compiler keeps instead of a claim a report carries.
+#[cfg(feature = "shellnet")]
+use dexdo_core::normalize_multisig_pubkey;
+#[cfg(feature = "shellnet")]
 use dexdo_core::params::{
     HERMEZ_SRS_HASH_BUFFER_BYTES, HERMEZ_SRS_HTTP_TIMEOUT, HERMEZ_SRS_MAX_ATTEMPTS,
     HERMEZ_SRS_PROGRESS_STEP_PERCENT, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
@@ -22,9 +34,291 @@ use dexdo_core::params::{
     NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT, NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
     NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT, NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS,
     NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS, NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL, SHELL_CURRENCY_ID,
+    TRANSIENT_READ_ATTEMPT_TIMEOUT,
+    TRANSIENT_READ_INITIAL_BACKOFF, TRANSIENT_READ_MAX_BACKOFF,
 };
+// Not behind `shellnet`: the bounded-proof policy and its operator verdict are plain time and text,
+// so they compile -- and their regressions run -- in the default build too.
+use dexdo_core::params::NOTE_DEPLOY_PROOF_TIMEOUT;
 #[cfg(feature = "shellnet")]
 use std::io::{Read as _, Write as _};
+
+#[cfg(feature = "shellnet")]
+fn grouped_whole_shells(value: u128) -> String {
+    let digits = value.to_string();
+    let mut rendered = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            rendered.push(',');
+        }
+        rendered.push(char::from(byte));
+    }
+    rendered
+}
+
+#[cfg(feature = "shellnet")]
+fn is_operator_wallet_uninit_account_404(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.status() == Some(reqwest::StatusCode::NOT_FOUND)
+            && error.url().is_some_and(|url| url.path() == "/v2/account")
+    })
+}
+
+/// Shared with `wallet onboard manual`: a wallet does not have to live in the dexdo DApp, so
+/// the DApp half of its canonical address is read from the chain rather than assumed.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn operator_wallet_canonical_address(
+    chain: &dexdo_core::RealChainBackend,
+    address: &dexdo_core::Address,
+) -> Result<dexdo_core::CanonicalAddress> {
+    let account_id = address.bare().to_string();
+    let http = dexdo_core::shellnet_http_client()?;
+    let dapp_id = match dexdo_core::shellnet::retry_transient_read(|| {
+        dexdo_core::ackinacki_wallet::query::fetch_dapp_id(
+            &http,
+            chain.client().endpoint(),
+            &account_id,
+        )
+    })
+    .await
+    {
+        Ok(dapp_id) => dapp_id,
+        Err(error) if is_operator_wallet_uninit_account_404(&error) => account_id.clone(),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read operator wallet dapp_id for account {account_id}: {error}"
+            ));
+        }
+    };
+    dexdo_core::CanonicalAddress::parse(&format!("{dapp_id}::{account_id}"))
+        .map_err(|error| anyhow::anyhow!("render operator wallet canonical address: {error}"))
+}
+
+/// The funding recipe as text, so the lines a user actually acts on can be asserted by a test
+/// instead of only inspected by eye. `render_note_balance` in `note.rs` is the same shape: the
+/// command renders, the caller prints.
+/// was an arithmetic defect, but the figures being right is only half of what the user
+/// receives -- the other half is this rendering, and nothing pinned it.
+#[cfg(feature = "shellnet")]
+fn render_operator_wallet_funding(
+    address: &dexdo_core::CanonicalAddress,
+    selected: crate::cli::note::NoteNominal,
+) -> String {
+    use crate::cli::note::{
+        operator_wallet_funding_raw, operator_wallet_funding_summands_raw,
+        operator_wallet_predeploy_native_raw, NoteNominal,
+    };
+    use dexdo_core::private_note::proof::TokenType;
+    use std::fmt::Write as _;
+
+    let shell_decimals = u128::from(TokenType::Shell.decimals());
+    let native_shells = operator_wallet_predeploy_native_raw() / shell_decimals;
+    let ecc_shells = operator_wallet_funding_raw(selected) / shell_decimals;
+    let (_, gas_deposit_raw, gas_voucher_raw) = operator_wallet_funding_summands_raw(selected);
+    let gas_deposit_shells = gas_deposit_raw / shell_decimals;
+    let gas_voucher_shells = gas_voucher_raw / shell_decimals;
+    let native_display = grouped_whole_shells(native_shells);
+    let ecc_display = grouped_whole_shells(ecc_shells);
+    let source_total_display = grouped_whole_shells(native_shells + ecc_shells);
+    let mut out = String::new();
+    writeln!(&mut out, "wallet is waiting for {native_display} SHELL at {address}").unwrap();
+    writeln!(
+        &mut out,
+        "Before deploy, send {native_display} SHELL to {address} with the non-bounceable ECC[2] flag-16 \
+         form. It becomes native deploy gas, which is spendable only as gas and never again as \
+         currency, so this stage asks for what the deploy costs and nothing more; then rerun this \
+         command so dexdo can deploy the wallet."
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "After the wallet is Active, send {ecc_display} SHELL to the same address as ECC[2] \
+         with the active-account flag-1 form, then rerun this command. The two stages are not the \
+         same amount and only stage two depends on the nominal: stage one is the flat deploy-gas \
+         amount above, while stage two is the ECC[2] the deploy actually spends and so carries the \
+         nominal and the gas voucher. Across both stages, the two transfers move \
+         {source_total_display} SHELL from the funding source."
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "This is your wallet; the deploy consumes only the fee and gas, the rest remains yours to \
+         spend or withdraw. Dexdo cannot fund it and uses no giver on this path; complete each \
+         external funding step above, rerunning this command after each one."
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "Note funding choices, the stage-two ECC[2] amount (nominal + {gas_deposit_shells} SHELL \
+         GAS_DEPOSIT + {gas_voucher_shells} SHELL gas voucher):"
+    )
+    .unwrap();
+    for nominal in NoteNominal::ALL {
+        let (nominal_raw, gas_deposit_raw, gas_voucher_raw) =
+            operator_wallet_funding_summands_raw(nominal);
+        writeln!(
+            &mut out,
+            "  {}={} SHELL ({} + {} + {})",
+            nominal.label(),
+            grouped_whole_shells(operator_wallet_funding_raw(nominal) / shell_decimals),
+            nominal_raw / shell_decimals,
+            gas_deposit_raw / shell_decimals,
+            gas_voucher_raw / shell_decimals,
+        )
+        .unwrap();
+    }
+    out
+}
+
+#[cfg(feature = "shellnet")]
+fn print_operator_wallet_funding(
+    address: &dexdo_core::CanonicalAddress,
+    selected: crate::cli::note::NoteNominal,
+) {
+    print!("{}", render_operator_wallet_funding(address, selected));
+}
+
+#[cfg(feature = "shellnet")]
+async fn print_operator_wallet_preconditions(
+    chain: &dexdo_core::RealChainBackend,
+    address: &dexdo_core::Address,
+    keys: &dexdo_core::KeyPair,
+) -> Result<()> {
+    note_deploy_preflight_key_owns_wallet(chain.client(), address, keys).await?;
+    println!("code hash is one of the supported spending hashes: yes");
+    println!("reqConfirms=1: yes");
+    println!("signing key present in getCustodians: yes");
+    Ok(())
+}
+
+/// Derive the user's canonical operational wallet without spending, report the staged external
+/// funding instructions while it is short, and submit the canonical state-init only once funded.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_note_wallet(args: NoteWalletArgs) -> Result<()> {
+    use crate::cli::note::{
+        operator_wallet_funding_raw, operator_wallet_predeploy_native_raw, NoteNominal,
+    };
+    use dexdo_core::{
+        params::SHELL_CURRENCY_ID, private_note::proof::TokenType, KeyPair, RealChainBackend,
+    };
+
+    let secret = read_secret_hex(&args.note_key, "--note-key")?;
+    let keys = KeyPair::from_secret_hex(secret.trim()).map_err(|e| {
+        anyhow::anyhow!(
+            "--note-key {} (SDK secret hex): {e:?}",
+            args.note_key.display()
+        )
+    })?;
+    let selected = NoteNominal::parse(&args.nominal)?;
+    // Two stages, two figures: the flag-16 leg lands as native gas, the flag-1 leg lands as the
+    // ECC[2] `note deploy` spends. Only the second carries the
+    // nominal and the SHELL gas voucher, and only the second may be compared against what the
+    // deploy requires. The first is flat deploy gas and no nominal moves it.
+    let required_ecc_raw = operator_wallet_funding_raw(selected);
+    let required_native_raw = operator_wallet_predeploy_native_raw();
+    let manifest = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    let chain = RealChainBackend::connect_with_endpoint(manifest, args.endpoint.as_deref())?;
+    let address = RealChainBackend::multisig_address(&keys).await?;
+    let canonical_address = operator_wallet_canonical_address(&chain, &address).await?;
+    println!("operator wallet address: {canonical_address}");
+    let account = chain
+        .client()
+        .get_account_retrying(&address)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "read operator wallet {}: {e}; dexdo cannot fund it (no giver) and cannot decide \
+                 whether the canonical deploy is safe",
+                canonical_address
+            )
+        })?;
+
+    let Some(account) = account else {
+        print_operator_wallet_funding(&canonical_address, selected);
+        println!("Balance is absent, so dexdo cannot deploy yet; no chain write was submitted.");
+        return Ok(());
+    };
+
+    if account.status == "NonExist" {
+        print_operator_wallet_funding(&canonical_address, selected);
+        println!("Balance is absent, so dexdo cannot deploy yet; no chain write was submitted.");
+        return Ok(());
+    }
+
+    if account.is_active() {
+        println!("operator wallet already active at {canonical_address}");
+        print_operator_wallet_preconditions(&chain, &address, &keys).await?;
+        let shell_raw = account.ecc_balance(SHELL_CURRENCY_ID);
+        if shell_raw < required_ecc_raw {
+            // What is still owed, not the whole requirement: a wallet already holding part of it
+            // would otherwise be told to send the full figure a second time, and on mainnet that
+            // instruction moves real money.
+            let decimals = u128::from(TokenType::Shell.decimals());
+            let missing_raw = required_ecc_raw - shell_raw;
+            let missing_shells = missing_raw.div_ceil(decimals);
+            bail!(
+                "operator wallet {} is already deployed but has {shell_raw} raw ECC[2]; the selected \
+                 nominal requires {required_ecc_raw} raw, so {missing_raw} raw is still missing. To fix \
+                 it, send {} SHELL to {} as ECC[2] with \
+                 the active-account flag-1 form, then rerun this command. Dexdo cannot fund the \
+                 shortfall (no giver) and cannot deploy again because the wallet is already Active",
+                canonical_address,
+                grouped_whole_shells(missing_shells),
+                canonical_address,
+            );
+        }
+        return Ok(());
+    }
+
+    if account.status != "Uninit" {
+        bail!(
+            "operator wallet {} has acc_type={}; dexdo cannot fund it (no giver) and cannot deploy \
+             the canonical wallet over that account state",
+            canonical_address,
+            account.status
+        );
+    }
+
+    if account.balance < required_native_raw {
+        print_operator_wallet_funding(&canonical_address, selected);
+        println!(
+            "Current predeploy native balance is {} raw; it must reach {required_native_raw} raw before \
+             deploy. ECC[2] is funded after the wallet is Active, and that stage is a different \
+             figure: {required_ecc_raw} raw. Dexdo cannot fund the shortfall, \
+             so it did not deploy and submitted no chain write.",
+            account.balance
+        );
+        return Ok(());
+    }
+
+    let deployed = chain
+        .deploy_multisig_self_funded(&keys)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "operator wallet {} is funded but dexdo could not deploy it: {e}",
+                canonical_address
+            )
+        })?;
+    if deployed != address {
+        let deployed_canonical = operator_wallet_canonical_address(&chain, &deployed).await?;
+        bail!(
+            "canonical wallet deploy returned {}, expected derived address {}",
+            deployed_canonical,
+            canonical_address
+        );
+    }
+    println!("operator wallet deployed at {canonical_address}");
+    print_operator_wallet_preconditions(&chain, &address, &keys).await
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_note_wallet(_args: NoteWalletArgs) -> Result<()> {
+    bail!("note wallet unavailable: build with `--features shellnet`")
+}
 
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
@@ -54,15 +348,16 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
     let client = ChainClient::connect(&recovery.endpoint)?;
     let note_address = dexdo_core::address::parse_chain_address(&note_addr)
         .map_err(|e| anyhow::anyhow!("recovered note {note_addr}: {e}"))?;
+    let note_display = dexdo_core::address::display(&note_addr);
     let details = client
-        .run_getter(
+        .run_getter_retrying(
             &note_address,
             PRIVATE_NOTE_ABI_JSON,
             "getDetails",
             serde_json::json!({}),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("verify recovered PrivateNote {note_addr} owner key: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("verify recovered PrivateNote {note_display} owner key: {e}"))?;
     ensure_recovery_owner_matches_target_note(
         &recovery_path,
         &recovery,
@@ -77,7 +372,7 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
         )
     })?;
     println!(
-        "note recovered -> PrivateNote {note_addr}; folded into --pool {} ({} note(s)) from recovery {}. \
+        "note recovered -> PrivateNote {note_display}; folded into --pool {} ({} note(s)) from recovery {}. \
          No wallet spend was submitted.",
         pool_path.display(),
         n,
@@ -105,74 +400,124 @@ const HERMEZ_SRS_PENDING_MARKER_NAME: &str = ".hermez_srs_sha256.pending";
 const PROVER_CACHE_ARTIFACTS: [&str; 3] =
     ["pk_cache.bin", "vk_cache.bin", "break_points_cache.bin"];
 
+/// One turn per funding wallet, held by EVERY command that spends from the operator's multisig.
+/// `fs2` rather than the `create_new` sentinel this lock used to be. The two differ exactly
+/// where it matters: the kernel drops an advisory lock when the holder is SIGKILLed or dies, while a
+/// sentinel file outlives its creator and blocks every later run until an operator deletes it by
+/// hand -- and a sentinel whose ABSENCE is the free signal cannot tell "nobody holds it" from "the
+/// directory was cleared". This is the mechanism the pool write lock, the seller pool lock, the
+/// instance lock and the prover lock in this client already use.
 #[cfg(feature = "shellnet")]
-struct NoteDeployWalletLock {
-    path: std::path::PathBuf,
+#[derive(Debug)]
+pub(crate) struct FundingWalletLock {
+    file: std::fs::File,
 }
 
 #[cfg(feature = "shellnet")]
-impl Drop for NoteDeployWalletLock {
+impl Drop for FundingWalletLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
+/// Where funding-wallet locks live.
+/// The wallet is a resource OUTSIDE this machine, so the lock is machine-wide for the operator and
+/// deliberately does NOT follow `--data-dir`: two runs under different data directories still spend
+/// the same multisig, and a lock they cannot both see is not a lock. The per-user data directory is
+/// preferred over `std::env::temp_dir()` because the temp root is world-writable; where no per-user
+/// directory can be determined the temp root still serialises the spenders.
 #[cfg(feature = "shellnet")]
-fn note_deploy_lock_path(funding_multisig_address: &str) -> std::path::PathBuf {
+fn funding_wallet_lock_dir() -> std::path::PathBuf {
+    directories::ProjectDirs::from("ai", "gosh", "dexdo")
+        .map(|project| project.data_dir().join("wallet-locks"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The lock file for one(network, funding wallet) pair.
+/// NETWORK IS IN THE KEY. The same multisig address exists on shellnet and on mainnet and
+/// those are different money: keyed on the address alone, a shellnet run and a mainnet run of one
+/// address serialise against each other for no reason, and a network split would be invisible to the
+/// key. The address is collapsed to its legacy `0:<account_id>` form first, so the same wallet
+/// written as `0:<account>` by one command and as `<dapp>::<account>` by another lands on ONE lock
+/// rather than on two that never see each other.
+#[cfg(feature = "shellnet")]
+pub(crate) fn funding_wallet_lock_path(
+    network: &str,
+    funding_multisig_address: &str,
+) -> Result<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(funding_multisig_address.as_bytes());
-    std::env::temp_dir().join(format!(
-        "dexdo-note-deploy-wallet-{}.lock",
-        &hex::encode(digest)[..16]
-    ))
+    let network = network.trim();
+    if network.is_empty() {
+        bail!(
+            "funding wallet lock: the deployed manifest names no network, so this client cannot tell \
+             two spenders of one wallet apart from two spenders on different chains. Pass a \
+             `--contracts` manifest whose `network` field is set."
+        );
+    }
+    let wallet = dexdo_core::CanonicalAddress::parse(funding_multisig_address.trim())
+        .map_err(|error| {
+            anyhow::anyhow!("--multisig-address {funding_multisig_address}: {error}")
+        })?
+        .legacy();
+    let mut digest = Sha256::new();
+    digest.update(network.as_bytes());
+    digest.update([0x1f]);
+    digest.update(wallet.as_bytes());
+    Ok(funding_wallet_lock_dir().join(format!(
+        "dexdo-funding-wallet-{}.lock",
+        &hex::encode(digest.finalize())[..16]
+    )))
+}
+
+/// Take the funding wallet's turn before anything this command does can lead to a spend.
+/// `pub(crate)` because the accumulator commands spend the SAME operator multisig and must
+/// therefore take the SAME turn under the SAME key. A second, parallel lock would serialise each
+/// command against itself while leaving the wallet raced between them, which is worse than no lock
+/// at all -- so this one is shared rather than reimplemented.
+#[cfg(feature = "shellnet")]
+pub(crate) fn acquire_funding_wallet_lock(
+    network: &str,
+    funding_multisig_address: &str,
+) -> Result<FundingWalletLock> {
+    acquire_funding_wallet_lock_with_timeout(
+        network,
+        funding_multisig_address,
+        std::time::Duration::from_secs(note_deploy_lock_timeout()),
+    )
 }
 
 #[cfg(feature = "shellnet")]
-fn acquire_note_deploy_wallet_lock(funding_multisig_address: &str) -> Result<NoteDeployWalletLock> {
-    let path = note_deploy_lock_path(funding_multisig_address);
-    let timeout = note_deploy_lock_timeout();
-    let started = std::time::Instant::now();
-    let mut announced = false;
-    loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                writeln!(
-                    file,
-                    "pid={} wallet={} created_at_unix={}",
-                    std::process::id(),
-                    funding_multisig_address,
-                    unix_now_secs()
-                )
-                .ok();
-                return Ok(NoteDeployWalletLock { path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if started.elapsed().as_secs() >= timeout {
-                    bail!(
-                        "note deploy wallet busy: another `dexdo note deploy` appears to be using funding wallet \
-                         {funding_multisig_address}; lock {} remained for {timeout}s. Retry after the previous \
-                         deploy reaches a terminal state, or remove the lock only after confirming no deploy is \
-                         running.",
-                        path.display()
-                    );
-                }
-                if !announced {
-                    eprintln!(
-                        "note deploy: funding wallet {funding_multisig_address} is already in use locally; \
-                         waiting for {} (timeout {timeout}s)",
-                        path.display()
-                    );
-                    announced = true;
-                }
-                std::thread::sleep(NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL);
-            }
-            Err(e) => bail!("create note deploy wallet lock {}: {e}", path.display()),
-        }
+fn acquire_funding_wallet_lock_with_timeout(
+    network: &str,
+    funding_multisig_address: &str,
+    timeout: std::time::Duration,
+) -> Result<FundingWalletLock> {
+    let path = funding_wallet_lock_path(network, funding_multisig_address)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!(
+                "create funding wallet lock directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
+    // The message names the wallet the way dexdo prints an address: an operator multisig is
+    // a self-DApp account. PR1276 made the lock the message replaced do exactly this, and taking
+    // this branch of the merge wholesale would have dropped it silently -- the key itself is
+    // deliberately built from the legacy form instead, so the two spellings share one lock.
+    let funding_multisig_display = dexdo_core::address::display_self_dapp(funding_multisig_address);
+    let file = acquire_fs2_lock_file(
+        &path,
+        "funding wallet",
+        &format!(
+            "another dexdo command is spending from funding wallet {funding_multisig_display} on \
+             {network}. `note deploy` and `note topup` take turns on one wallet on purpose: two \
+             concurrent spenders of one multisig produce a spend the operator cannot account for"
+        ),
+        timeout,
+        NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL,
+    )?;
+    Ok(FundingWalletLock { file })
 }
 
 #[cfg(feature = "shellnet")]
@@ -211,49 +556,107 @@ fn acquire_note_deploy_prover_cache_lock_with_timeout(
     prover_cache_dir: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<NoteDeployProverCacheLock> {
-    std::fs::create_dir_all(prover_cache_dir).map_err(|e| {
+    acquire_note_deploy_prover_lock_at(
+        prover_cache_dir,
+        "prover cache",
+        "another note deploy is generating or using the shared prover cache",
+        timeout,
+    )
+}
+
+/// Serialize EVERY `note deploy` on this machine, not just the ones sharing a prover cache.
+/// A halo2 proof is CPU-bound while the layer-0 history window it proves against is wall-clock
+/// (`W = 128` blocks, about two minutes). Two proofs running at once therefore stretch each other
+/// past that window and BOTH fall through to layer 1, whose boundary is tens of thousands of blocks
+/// away -- the parallel job that looks four times faster is the one that takes an hour per note
+/// . The per-cache lock cannot see this: the measured collision was three deploys each with
+/// its own prover workspace, so nothing was shared and nothing was serialized. The resource under
+/// contention is the machine, so the lock is keyed to the machine.
+#[cfg(feature = "shellnet")]
+fn acquire_note_deploy_serial_lock() -> Result<NoteDeployProverCacheLock> {
+    acquire_note_deploy_prover_lock_at(
+        &std::env::temp_dir().join("dexdo-note-deploy"),
+        "prover",
+        "another `dexdo note deploy` is proving on this machine. Deploys take turns on purpose: a \
+         halo2 proof is CPU-bound while the layer-0 history window is wall-clock, so two at once \
+         push each other past the window and both escalate to a layer whose boundary is tens of \
+         thousands of blocks away",
+        std::time::Duration::from_secs(note_deploy_lock_timeout()),
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn acquire_note_deploy_prover_lock_at(
+    lock_dir: &std::path::Path,
+    what: &str,
+    advice: &str,
+    timeout: std::time::Duration,
+) -> Result<NoteDeployProverCacheLock> {
+    std::fs::create_dir_all(lock_dir).map_err(|e| {
         anyhow::anyhow!(
             "create prover cache dir {} for lock: {e}",
-            prover_cache_dir.display()
+            lock_dir.display()
         )
     })?;
-    let path = prover_cache_dir.join(".dexdo-prover.lock");
+    let path = lock_dir.join(".dexdo-prover.lock");
+    let file = acquire_fs2_lock_file(
+        &path,
+        &format!("note deploy {what}"),
+        advice,
+        timeout,
+        NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL,
+    )?;
+    Ok(NoteDeployProverCacheLock { file })
+}
+
+/// The one bounded-wait `fs2` acquisition every lock in this file goes through.
+/// Advisory rather than a sentinel file on purpose: the kernel releases it when the holder exits by
+/// any route, including SIGKILL, so a cancelled command leaves nothing behind for the next one to
+/// step over. The wait is bounded and says who it waited for, because a lock that blocks forever
+/// without saying why is indistinguishable from a hang.
+#[cfg(feature = "shellnet")]
+fn acquire_fs2_lock_file(
+    path: &std::path::Path,
+    subject: &str,
+    advice: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
-        .map_err(|e| anyhow::anyhow!("open prover cache lock {}: {e}", path.display()))?;
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open {subject} lock {}: {e}", path.display()))?;
     let started = std::time::Instant::now();
     let mut announced = false;
     loop {
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(NoteDeployProverCacheLock { file }),
+            Ok(()) => return Ok(file),
             Err(error) if note_deploy_lock_is_contended(&error) => {
                 if started.elapsed() >= timeout {
                     let waited = started.elapsed().as_secs();
                     bail!(
-                        "note deploy prover cache busy: waited {waited}s for {}; another note deploy is \
-                         generating or using the shared prover cache. Retry after it finishes, or set \
-                         DEXDO_NOTE_DEPLOY_LOCK_TIMEOUT_SECS to a larger bounded wait.",
+                        "{subject} busy: waited {waited}s for {}; {advice}. Retry after it \
+                         finishes, or set DEXDO_NOTE_DEPLOY_LOCK_TIMEOUT_SECS to a larger bounded wait.",
                         path.display()
                     );
                 }
                 if !announced {
                     eprintln!(
-                        "note deploy: prover cache busy, waited 0s; waiting for {} (timeout {}s)",
+                        "{subject} busy, waited 0s; waiting for {} (timeout {}s)",
                         path.display(),
                         timeout.as_secs()
                     );
                     announced = true;
                 }
                 let remaining = timeout.saturating_sub(started.elapsed());
-                std::thread::sleep(remaining.min(NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL));
+                std::thread::sleep(remaining.min(poll_interval));
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
-                    "try lock prover cache {}: {error}",
+                    "try lock {subject} {}: {error}",
                     path.display()
                 ));
             }
@@ -264,6 +667,309 @@ fn acquire_note_deploy_prover_cache_lock_with_timeout(
 #[cfg(feature = "shellnet")]
 fn note_deploy_lock_is_contended(error: &std::io::Error) -> bool {
     error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+/// How long ONE halo2 voucher proof may take before the operator is told what it has become.
+/// `None` means "however long it takes" and is only ever the operator's own explicit choice
+/// (`DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS=0`), because that is what a deliberate
+/// `HALO2_ATTEMPT_LAYERS=1` run needs. Anything unparseable falls back to the canonical bound
+/// rather than silently disabling it.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+fn note_deploy_proof_timeout_from_env(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw.map(str::trim).and_then(|raw| raw.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(NOTE_DEPLOY_PROOF_TIMEOUT),
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+fn note_deploy_proof_timeout() -> Option<std::time::Duration> {
+    note_deploy_proof_timeout_from_env(
+        std::env::var("DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoteDeployObservedBlockRate {
+    blocks: u64,
+    elapsed: std::time::Duration,
+}
+
+impl NoteDeployObservedBlockRate {
+    fn estimated_wait_minutes(self, target_block_delta: u64) -> Option<u64> {
+        let elapsed_seconds = self.elapsed.as_secs();
+        if target_block_delta == 0 || self.blocks == 0 || elapsed_seconds == 0 {
+            return None;
+        }
+        let wait_seconds = u128::from(target_block_delta)
+            .saturating_mul(u128::from(elapsed_seconds))
+            .div_ceil(u128::from(self.blocks));
+        u64::try_from(wait_seconds.div_ceil(60)).ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoteDeployProofWaitCost {
+    target_layer: u32,
+    target_block_delta: u64,
+    observed_rate: Option<NoteDeployObservedBlockRate>,
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone)]
+struct NoteDeployProofWaitObservation {
+    endpoint: String,
+    event_block_id: Option<String>,
+    event_created_at: u64,
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployProofWaitObservation {
+    fn new(
+        endpoint: &str,
+        event: &dexdo_core::private_note::voucher_event::VoucherExtoutMessage,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            event_block_id: event.block_id.clone(),
+            event_created_at: event.created_at,
+        }
+    }
+
+    async fn observe(self, target_layer: u32) -> Option<NoteDeployProofWaitCost> {
+        use dexdo_core::private_note::{halo2::proof, voucher_event};
+
+        let block_id = self.event_block_id.as_deref()?;
+        let http = reqwest::Client::builder()
+            .timeout(TRANSIENT_READ_ATTEMPT_TIMEOUT)
+            .build()
+            .ok()?;
+        let (event_height, latest_height) = tokio::join!(
+            voucher_event::get_block_height_by_id(&http, &self.endpoint, block_id),
+            voucher_event::get_latest_block_height(&http, &self.endpoint),
+        );
+        let event_height = event_height.ok().flatten()?;
+        let latest_height = latest_height.ok()?;
+        let target_height = proof::target_height_for_layer(
+            event_height,
+            target_layer,
+            proof::SHELLNET_HISTORY_PROOF_WINDOW_SIZE,
+        );
+        let elapsed_seconds = (self.event_created_at > 0)
+            .then(|| unix_now_secs().checked_sub(self.event_created_at))
+            .flatten();
+        let observed_blocks = latest_height.checked_sub(event_height);
+        let observed_rate = match (observed_blocks, elapsed_seconds) {
+            (Some(blocks), Some(elapsed_seconds)) if blocks > 0 && elapsed_seconds > 0 => {
+                Some(NoteDeployObservedBlockRate {
+                    blocks,
+                    elapsed: std::time::Duration::from_secs(elapsed_seconds),
+                })
+            }
+            _ => None,
+        };
+        Some(NoteDeployProofWaitCost {
+            target_layer,
+            target_block_delta: target_height.saturating_sub(latest_height),
+            observed_rate,
+        })
+    }
+}
+
+enum NoteDeployProofWaitCostSource {
+    Unavailable,
+    #[cfg(test)]
+    Known(NoteDeployProofWaitCost),
+    #[cfg(feature = "shellnet")]
+    Observe {
+        observation: NoteDeployProofWaitObservation,
+        target_layer: u32,
+    },
+}
+
+impl NoteDeployProofWaitCostSource {
+    async fn resolve(self) -> Option<NoteDeployProofWaitCost> {
+        match self {
+            Self::Unavailable => None,
+            #[cfg(test)]
+            Self::Known(cost) => Some(cost),
+            #[cfg(feature = "shellnet")]
+            Self::Observe {
+                observation,
+                target_layer,
+            } => observation.observe(target_layer).await,
+        }
+    }
+}
+
+struct NoteDeployProofWindow {
+    bound: Option<std::time::Duration>,
+    wait_cost: NoteDeployProofWaitCostSource,
+}
+
+impl NoteDeployProofWindow {
+    #[cfg(test)]
+    fn known(bound: Option<std::time::Duration>, wait_cost: NoteDeployProofWaitCost) -> Self {
+        Self {
+            bound,
+            wait_cost: NoteDeployProofWaitCostSource::Known(wait_cost),
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn observe(
+        bound: Option<std::time::Duration>,
+        observation: NoteDeployProofWaitObservation,
+        target_layer: u32,
+    ) -> Self {
+        Self {
+            bound,
+            wait_cost: NoteDeployProofWaitCostSource::Observe {
+                observation,
+                target_layer,
+            },
+        }
+    }
+}
+
+impl From<Option<std::time::Duration>> for NoteDeployProofWindow {
+    fn from(bound: Option<std::time::Duration>) -> Self {
+        Self {
+            bound,
+            wait_cost: NoteDeployProofWaitCostSource::Unavailable,
+        }
+    }
+}
+
+/// The verdict an operator gets instead of an hour of silence.
+/// It has to carry three things, because without any one of them the choice cannot be made: what
+/// happened(the layer-0 window closed mid-proof), what waiting now costs against starting over, and
+/// what became of the paid voucher this attempt was holding.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+fn note_deploy_proof_window_missed_message(
+    label: &str,
+    layers: &str,
+    waited: std::time::Duration,
+    recovery_path: &std::path::Path,
+    discarded: bool,
+    wait_cost: Option<NoteDeployProofWaitCost>,
+) -> String {
+    let wait_statement = match wait_cost {
+        Some(cost) if cost.target_block_delta == 0 => format!(
+            "The layer {} target is no longer ahead of the current chain height; target distance \
+             alone cannot provide an honest remaining-wait estimate.",
+            cost.target_layer
+        ),
+        Some(cost) => match cost
+            .observed_rate
+            .and_then(|rate| rate.estimated_wait_minutes(cost.target_block_delta))
+        {
+            Some(minutes) => format!(
+                "The layer {} target is {} blocks away. At the observed chain rate, the derived \
+                 wait is about {minutes} minutes.",
+                cost.target_layer, cost.target_block_delta
+            ),
+            None => format!(
+                "The layer {} target is {} blocks away. This is a long wait; the client has no \
+                 observed block rate for an honest wall-clock estimate.",
+                cost.target_layer, cost.target_block_delta
+            ),
+        },
+        None => "The higher-layer target block delta could not be observed. This is a long wait, \
+                 and no honest wall-clock estimate is available."
+            .to_string(),
+    };
+    let aftermath = if discarded {
+        format!(
+            "This attempt is abandoned and its recovery state {} has been removed: its voucher is \
+             bound to an event whose layer-0 window has closed, so resuming it would re-prove \
+             against the same stale window. Nothing is on chain from it. Start a clean \
+             `dexdo note deploy` -- on testnet the SHELL costs nothing, and a fresh voucher starts \
+             again at layer 0.",
+            recovery_path.display()
+        )
+    } else {
+        format!(
+            "The recovery state {} is KEPT because a PrivateNote is already deployed under it -- \
+             re-running the deploy resumes that note rather than paying for a new one. Do not delete \
+             it.",
+            recovery_path.display()
+        )
+    };
+    format!(
+        "note deploy: the {label} voucher proof did not finish within {}s (attempt layers {layers}). \
+         The halo2 proof is CPU-bound while the history layer it proves against is wall-clock, so \
+         layer 0 is gone. {wait_statement} Running deploys concurrently is what usually causes \
+         this; they are meant to run one at a time. {aftermath} To wait the escalation out instead, \
+         re-run with DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS raised, or 0 for no bound.",
+        waited.as_secs()
+    )
+}
+
+/// Drop the recovery state of an attempt that is being abandoned mid-proof.
+/// Only when it records no deployed PrivateNote. Past that point the file is the sole copy of the
+/// owner key for a note that exists on chain and holds money, and removing it would strand the note
+/// -- an aborted proof is not worth that, whatever it costs to wait.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+fn note_deploy_discard_stale_proof_attempt(
+    recovery_path: &std::path::Path,
+    deployed_note: Option<&str>,
+) -> Result<bool> {
+    if deployed_note.is_some() {
+        return Ok(false);
+    }
+    match std::fs::remove_file(recovery_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(anyhow::anyhow!(
+            "discard stale note deploy recovery {}: {error}",
+            recovery_path.display()
+        )),
+    }
+}
+
+/// Run one voucher proof under the bound, and turn crossing it into a decision the operator makes.
+/// The escalation itself lives in the SDK's attempt plan; what was missing here is that the client
+/// awaited it bare, so a missed window read as a hang. Bounding the await is the whole fix: the
+/// attempt plan and `HALO2_ATTEMPT_LAYERS` keep the meaning they already had.
+/// The two `Result`s answer two different questions and must not be flattened. The outer one is
+/// "did the bound hold" -- its error is the operator verdict and travels unwrapped, because the
+/// callers' own context says to resume this paid voucher later, which is the opposite of what a
+/// discarded attempt needs. The inner one is the prover's own failure, which keeps that context.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+async fn note_deploy_prove_within_history_window<Prove, Proof>(
+    prove: Prove,
+    label: &str,
+    layers: &str,
+    recovery_path: &std::path::Path,
+    deployed_note: Option<&str>,
+    window: impl Into<NoteDeployProofWindow>,
+) -> Result<Result<Proof>>
+where
+    Prove: std::future::Future<Output = Result<Proof>>,
+{
+    let NoteDeployProofWindow { bound, wait_cost } = window.into();
+    let Some(bound) = bound else {
+        return Ok(prove.await);
+    };
+    match tokio::time::timeout(bound, prove).await {
+        Ok(proof) => Ok(proof),
+        Err(_) => {
+            let wait_cost = wait_cost.resolve().await;
+            let discarded = note_deploy_discard_stale_proof_attempt(recovery_path, deployed_note)?;
+            bail!(note_deploy_proof_window_missed_message(
+                label,
+                layers,
+                bound,
+                recovery_path,
+                discarded,
+                wait_cost,
+            ));
+        }
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -324,7 +1030,7 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
         .or_else(|| code_hash.strip_prefix("0X"))
         .unwrap_or(code_hash)
         .to_ascii_lowercase();
-    if code_hash == dexdo_core::canonical_multisig::CODE_HASH {
+    if dexdo_core::canonical_multisig::is_supported_spending_code_hash(&code_hash) {
         return Ok(());
     }
     let wallet_family = if code_hash == NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH {
@@ -334,10 +1040,10 @@ fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> 
     };
     bail!(
         "unsupported funding wallet family {wallet_family}, code_hash {code_hash}; \
-         dexdo note deploy supports only {} {} code_hash {}; \
+         dexdo note deploy supports only {} spending code_hashes {} and {}; \
          preflight rejected before submit; no transaction was submitted and no funds moved",
         dexdo_core::canonical_multisig::CONTRACT_NAME,
-        dexdo_core::canonical_multisig::VERSION,
+        dexdo_core::canonical_multisig::LEGACY_SPENDING_CODE_HASH,
         dexdo_core::canonical_multisig::CODE_HASH,
     )
 }
@@ -356,22 +1062,6 @@ fn note_deploy_update_custodian_submit_transaction_params(
         1,
         voucher_body,
     )
-}
-
-#[cfg(feature = "shellnet")]
-fn normalize_multisig_pubkey(pubkey: &str) -> Option<String> {
-    let pubkey = pubkey
-        .trim()
-        .strip_prefix("0x")
-        .or_else(|| pubkey.trim().strip_prefix("0X"))
-        .unwrap_or_else(|| pubkey.trim());
-    if pubkey.is_empty()
-        || pubkey.len() > 64
-        || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    Some(format!("{pubkey:0>64}").to_ascii_lowercase())
 }
 
 #[cfg(feature = "shellnet")]
@@ -503,9 +1193,10 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
         &self,
         multisig_address: &dexdo_core::Address,
     ) -> Result<String> {
-        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_multisig_address =
+            dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
         let funding_wallet = self
-            .get_account(multisig_address)
+            .get_account_retrying(multisig_address)
             .await
             .map_err(|e| anyhow::anyhow!("read funding wallet {funding_multisig_address}: {e}"))?
             .ok_or_else(|| {
@@ -527,9 +1218,10 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
         &self,
         multisig_address: &dexdo_core::Address,
     ) -> Result<serde_json::Value> {
-        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_multisig_address =
+            dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
         let output = self
-            .run_getter(
+            .run_getter_retrying(
                 multisig_address,
                 dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
                 "getCustodians",
@@ -546,9 +1238,10 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
         &self,
         multisig_address: &dexdo_core::Address,
     ) -> Result<u8> {
-        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_multisig_address =
+            dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
         let output = self
-            .run_getter(
+            .run_getter_retrying(
                 multisig_address,
                 dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
                 "getParameters",
@@ -568,9 +1261,10 @@ impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
         &self,
         multisig_address: &dexdo_core::Address,
     ) -> Result<Vec<(u32, u128)>> {
-        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_multisig_address =
+            dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
         let funding_wallet = self
-            .get_account(multisig_address)
+            .get_account_retrying(multisig_address)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -596,7 +1290,8 @@ async fn note_deploy_preflight_key_owns_wallet(
     multisig_address: &dexdo_core::Address,
     multisig_keys: &dexdo_core::KeyPair,
 ) -> Result<()> {
-    let funding_multisig_address = multisig_address.with_workchain();
+    let funding_multisig_address =
+        dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
     let code_hash = wallet_reader
         .funding_wallet_code_hash(multisig_address)
         .await?;
@@ -649,8 +1344,9 @@ async fn note_deploy_preflight_wallet_ecc(
     recovery: &crate::cli::note::NoteDeployRecoveryState,
     voucher_token_type: u32,
     voucher_value: u64,
+    is_fee: bool,
 ) -> Result<Vec<(u32, u128)>> {
-    let wallet = multisig_address.with_workchain();
+    let wallet = dexdo_core::address::display_self_dapp(&multisig_address.with_workchain());
     let balances = wallet_reader
         .funding_wallet_ecc_balances(multisig_address)
         .await?;
@@ -667,19 +1363,27 @@ async fn note_deploy_preflight_wallet_ecc(
             bail!(
                 "funding wallet {wallet} has insufficient {currency}: available={available} raw, \
                  required={amount} raw, missing={missing} raw; no wallet POST was submitted. Fund \
-                 {currency} and retry the same `dexdo note deploy --recovery` command."
+                 {currency} and retry the same `dexdo note deploy` command unchanged; it resumes from its recovery file."
             );
         }
         Ok(())
     };
+    // What the wallet must hold is what the wallet will ATTACH, which on the deposit leg is the
+    // nominal plus `RootPN.GAS_DEPOSIT` -- not the nominal(`note_deploy_voucher_wire_raw`).
+    let wire_value = crate::cli::note::note_deploy_voucher_wire_raw(is_fee, voucher_value);
     let requested = if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
         && voucher_token_type == SHELL_CURRENCY_ID
     {
-        (voucher_value as u128)
-            .checked_add(shell)
-            .ok_or_else(|| anyhow::anyhow!("note deploy required ECC[2] amount overflow"))?
+        // The deposit leg is charged the WHOLE deploy, because this same wallet funds the gas
+        // voucher on the next leg. That total is `note_deploy_shell_ecc_required_raw`, which is
+        // also what `note wallet`'s funding recipe prints, so the figure a user is told to send
+        // and the figure this check produces cannot disagree.
+        crate::cli::note::note_deploy_shell_ecc_required_raw(
+            voucher_value,
+            recovery.ecc_shell_deposit,
+        )
     } else {
-        voucher_value as u128
+        wire_value
     };
     require(voucher_token_type, requested)?;
     if kind == crate::cli::note::NoteDeployVoucherKind::Deposit
@@ -729,11 +1433,7 @@ async fn note_deploy_build_voucher_submit_boc(
     .await
     .map_err(|e| anyhow::anyhow!("encode RootPN.generateVoucher body: {e}"))?;
 
-    let mut cc = serde_json::Map::new();
-    cc.insert(
-        checkpoint.token_type.to_string(),
-        serde_json::Value::String(checkpoint.raw_value.to_string()),
-    );
+    let cc = checkpoint.voucher_currency_map();
     let boc = encode_external_call(
         &ctx,
         dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
@@ -844,6 +1544,24 @@ trait NoteDeployVoucherSubmitter {
         boc: &str,
         http: &reqwest::Client,
     ) -> Result<Option<NoteDeployWalletActionReceipt>>;
+
+    async fn wait_for_voucher_event_by_sk_u_commit(
+        &self,
+        http: &reqwest::Client,
+        endpoint: &str,
+        root_pn: &dexdo_core::Address,
+        sk_u_commit_hex: &str,
+        timeout: std::time::Duration,
+    ) -> Result<dexdo_core::private_note::voucher_event::VoucherExtoutMessage> {
+        dexdo_core::private_note::voucher_event::wait_for_voucher_event_by_sk_u_commit(
+            http,
+            endpoint,
+            root_pn,
+            sk_u_commit_hex,
+            timeout,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -912,6 +1630,41 @@ fn note_deploy_action_result_label(code: i64) -> Option<&'static str> {
     (code == 38).then_some("NOT_ENOUGH_EXTRA")
 }
 
+/// The `(namespace::CONSTANT)` suffix for a compute-phase exit code, or nothing when the code is 0.
+/// Note deploy printed its compute exit code bare -- `exit_code=403` and nothing else -- which is the
+/// complaint applied to the on-chain half: the number is the whole message and the reader has
+/// to go look it up. The lookup is also easy to get wrong, because these numbers are not one
+/// namespace: `ERR_INVALID_SENDER` is 101 in the `dex` base and 302 in the `airegistry` one. So this
+/// defers entirely to [`dexdo_core::contract_error_label`], which derives every name from the `.sol`
+/// that declares it, names the declaring family, and marks a number more than one family declares
+/// as `ambiguous:` rather than picking a side. No second table is introduced here.
+#[cfg(feature = "shellnet")]
+fn note_deploy_compute_exit_label(code: i64) -> String {
+    dexdo_core::contract_error_label(code)
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default()
+}
+
+/// The same suffix for a compute-phase exit code that came from the **funding wallet**.
+/// [`note_deploy_compute_exit_label`] reads the vendored `contracts/**` declarations, and the
+/// wallet is not one of them: this receipt belongs to `UpdateCustodianMultisigWallet_v2`, which
+/// inherits neither `dex::Errors` nor `AiRegistryErrors`, so a wallet exit 103 rendered through
+/// that table prints `ambiguous: dex::ERR_ALREADY_RESOLVED|modelregistry::ERR_NAME_TOO_LONG` --
+/// two constants from two tables this contract does not declare. Naming a code out of the wrong
+/// contract's table is precisely what set out to stop, so this goes through
+/// [`dexdo_core::unvendored_contract_error_label`], which states which contract answered and why
+/// no constant is shown. No second table is introduced here either.
+#[cfg(feature = "shellnet")]
+fn note_deploy_wallet_compute_exit_label(code: i64) -> String {
+    dexdo_core::unvendored_contract_error_label(NOTE_DEPLOY_WALLET_CONTRACT, code)
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default()
+}
+
+/// The funding wallet this client submits the voucher through, as the contract calls itself.
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_WALLET_CONTRACT: &str = "UpdateCustodianMultisigWallet_v2";
+
 #[cfg(feature = "shellnet")]
 fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
     error.to_string().contains(
@@ -934,6 +1687,8 @@ where
     Op: AsyncFnMut(u64) -> Result<T>,
     Sleep: AsyncFnMut(std::time::Duration),
 {
+    let funding_multisig_display =
+        dexdo_core::address::display_self_dapp(funding_multisig_address);
     let mut attempt = 1u64;
     loop {
         match op(attempt).await {
@@ -945,7 +1700,7 @@ where
                     let backoff_secs =
                         attempt.saturating_mul(NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS);
                     eprintln!(
-                        "note deploy: funding wallet {funding_multisig_address} looks busy/out-of-sync; retrying \
+                        "note deploy: funding wallet {funding_multisig_display} looks busy/out-of-sync; retrying \
                          attempt {} after {backoff_secs}s",
                         attempt + 1
                     );
@@ -984,7 +1739,7 @@ async fn note_deploy_mint_voucher_recoverable(
             live::{prove_voucher_for_event, ProveVoucherForEventParams},
             sk_commit::compute_sk_u_commit_hex,
         },
-        proof, voucher_event,
+        proof,
     };
     let endpoint = client.endpoint();
     let root_pn = dexdo_core::Address::parse(ROOT_PN_ADDRESS)?;
@@ -1065,7 +1820,7 @@ async fn note_deploy_mint_voucher_recoverable(
         );
     }
 
-    let http = reqwest::Client::new();
+    let http = dexdo_core::shellnet_http_client()?;
     if checkpoint.event.is_none() {
         if !checkpoint.submit_maybe_sent {
             if guarded_funding_keys.is_none() {
@@ -1088,6 +1843,7 @@ async fn note_deploy_mint_voucher_recoverable(
                 recovery,
                 voucher_token_type,
                 voucher_value,
+                is_fee,
             )
             .await?;
             let boc = voucher_boc_builder
@@ -1157,18 +1913,19 @@ async fn note_deploy_mint_voucher_recoverable(
                 let label = note_deploy_action_result_label(receipt.action_result_code)
                     .map(|label| format!(" ({label})"))
                     .unwrap_or_default();
-                let compute_exit = receipt
-                    .compute_exit_code
-                    .map_or_else(|| "<unavailable>".to_string(), |code| code.to_string());
+                let compute_exit = receipt.compute_exit_code.map_or_else(
+                    || "<unavailable>".to_string(),
+                    |code| format!("{code}{}", note_deploy_wallet_compute_exit_label(code)),
+                );
                 let currency =
                     note_deploy_ecc_name(kind, recovery.token_type, checkpoint.token_type);
                 bail!(
                     "funding wallet {} {} voucher transaction {} failed definitively: \
                      compute_exit_code={compute_exit}, aborted={}, action_result_code={}{}; the exact \
                      wallet action produced zero outbound messages and left the required ECC unchanged, \
-                     so no corresponding RootPN voucher effect occurred. Fund {currency} and retry \
-                     `dexdo note deploy --recovery {}`.",
-                    multisig_address.with_workchain(),
+                     so no corresponding RootPN voucher effect occurred. Fund {currency} and retry the \
+                     same `dexdo note deploy` command unchanged; it resumes from the state at {}.",
+                    dexdo_core::address::display_self_dapp(&multisig_address.with_workchain()),
                     kind.label(),
                     receipt.transaction_hash,
                     receipt.aborted,
@@ -1179,7 +1936,7 @@ async fn note_deploy_mint_voucher_recoverable(
             }
             if failpoints.after_submit(kind) {
                 bail!(
-                    "simulated interruption after {} voucher wallet submit. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
+                    "simulated interruption after {} voucher wallet submit. Recovery state is at {}; re-run the same `dexdo note deploy` command unchanged to resume from it without a second wallet spend.",
                     kind.label(),
                     recovery_path.display()
                 );
@@ -1195,14 +1952,54 @@ async fn note_deploy_mint_voucher_recoverable(
         if failpoints.before_voucher_event_wait {
             bail!("simulated interruption before voucher event wait");
         }
-        let event = voucher_event::wait_for_voucher_event_by_sk_u_commit(
-            &http,
-            endpoint,
-            &root_pn,
-            &format!("0x{}", checkpoint.sk_u_commit_hex),
-            NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT,
-        )
-        .await
+        // The wallet spend above is never retried. Re-enter only the SDK event wait after a
+        // transient read failure, and keep every attempt inside this single original deadline.
+        let deadline = tokio::time::Instant::now() + NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT;
+        let mut backoff = TRANSIENT_READ_INITIAL_BACKOFF;
+        let mut last_transient_error = None;
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break Err(last_transient_error.take().unwrap_or_else(|| {
+                    anyhow::anyhow!("voucher event wait deadline exhausted")
+                }));
+            }
+            let wait = tokio::time::timeout(
+                remaining,
+                voucher_submitter.wait_for_voucher_event_by_sk_u_commit(
+                    &http,
+                    endpoint,
+                    &root_pn,
+                    &format!("0x{}", checkpoint.sk_u_commit_hex),
+                    remaining,
+                ),
+            )
+            .await;
+            let error = match wait {
+                Ok(Ok(event)) => break Ok(event),
+                Ok(Err(error)) => error,
+                Err(error) => break Err(anyhow::Error::new(error)),
+            };
+            if !error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(transient_reqwest_error)
+            {
+                break Err(error);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break Err(error);
+            }
+            last_transient_error = Some(error);
+            let delay = backoff.min(remaining);
+            tokio::time::sleep(delay).await;
+            if delay == remaining {
+                break Err(last_transient_error.take().unwrap_or_else(|| {
+                    anyhow::anyhow!("voucher event wait deadline exhausted")
+                }));
+            }
+            backoff = (backoff * 2).min(TRANSIENT_READ_MAX_BACKOFF);
+        }
         .map_err(|e| {
             anyhow::anyhow!(
                 "wait for {} VoucherGenerated from persisted wallet submit: {e}; refusing to submit a second wallet spend for recovery {}",
@@ -1219,7 +2016,7 @@ async fn note_deploy_mint_voucher_recoverable(
         );
         if failpoints.after_event(kind) {
             bail!(
-                "simulated interruption after {} VoucherGenerated event before proof/deploy. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
+                "simulated interruption after {} VoucherGenerated event before proof/deploy. Recovery state is at {}; re-run the same `dexdo note deploy` command unchanged to resume from it without a second wallet spend.",
                 kind.label(),
                 recovery_path.display()
             );
@@ -1233,6 +2030,7 @@ async fn note_deploy_mint_voucher_recoverable(
             anyhow::anyhow!("{} voucher event missing after recovery wait", kind.label())
         })?
         .to_sdk();
+    let wait_observation = NoteDeployProofWaitObservation::new(endpoint, &event);
     let proof = {
         // The pinned prover publishes PK/VK/BP non-atomically. Serialize only the cache preflight,
         // proof/keygen, and marker publication; wallet submissions and chain waits stay outside this lock.
@@ -1245,12 +2043,21 @@ async fn note_deploy_mint_voucher_recoverable(
             event,
             sk_u_hex: checkpoint.sk_u_hex.to_string(),
             sk_u_commit_hex: checkpoint.sk_u_commit_hex.clone(),
-            voucher_value,
-            voucher_token_type,
+            // The PROVEN figure, and it is read from the persisted checkpoint rather than from the
+            // local `voucher_value` so the nominal has one carrier: `VoucherGenerated` emits the
+            // post-deduction nominal, so proving over the attached amount is `ERR_INVALID_ZKPROOF`
+            // (137) after the wallet has already spent. The wire figure exists only in
+            // `voucher_currency_map` and the wallet preflight, and must never reach this struct.
+            voucher_value: checkpoint.raw_value,
+            voucher_token_type: checkpoint.token_type,
             ephemeral_pubkey_hex: recipient_ephemeral_pubkey_hex.to_string(),
             history_proof_window_size: None,
             paths: halo2_paths,
         };
+        // Bounded, so a missed layer-0 window becomes a verdict the operator can act on instead of
+        // an hour of silence.
+        let bound = note_deploy_proof_timeout();
+        let deployed_note = recovery.pn_address.clone();
         let proof = if checkpoint.current_proof_is_rejected() {
             let Some(next_layer) = checkpoint.next_sdk_proof_layer() else {
                 bail!(
@@ -1262,12 +2069,20 @@ async fn note_deploy_mint_voucher_recoverable(
             };
             let previous_layers = std::env::var_os("HALO2_ATTEMPT_LAYERS");
             std::env::set_var("HALO2_ATTEMPT_LAYERS", next_layer.to_string());
-            let result = prove_voucher_for_event(params).await;
+            let bounded = note_deploy_prove_within_history_window(
+                prove_voucher_for_event(params),
+                kind.label(),
+                &next_layer.to_string(),
+                recovery_path,
+                deployed_note.as_deref(),
+                NoteDeployProofWindow::observe(bound, wait_observation.clone(), next_layer),
+            )
+            .await;
             match previous_layers {
                 Some(value) => std::env::set_var("HALO2_ATTEMPT_LAYERS", value),
                 None => std::env::remove_var("HALO2_ATTEMPT_LAYERS"),
             }
-            result.map_err(|e| {
+            bounded?.map_err(|e| {
                 anyhow::anyhow!(
                     "prove {} paid voucher on next layer {next_layer}: {e}; \
                      action=resume_same_paid_voucher_later; recovery={}; no new wallet spend is permitted",
@@ -1276,9 +2091,18 @@ async fn note_deploy_mint_voucher_recoverable(
                 )
             })?
         } else {
-            prove_voucher_for_event(params)
-                .await
-                .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?
+            note_deploy_prove_within_history_window(
+                prove_voucher_for_event(params),
+                kind.label(),
+                "SDK default plan",
+                recovery_path,
+                deployed_note.as_deref(),
+                // The SDK default plan starts at layer 0 and falls through to layer 1. This only
+                // observes that next target for the timeout verdict; it does not select a layer.
+                NoteDeployProofWindow::observe(bound, wait_observation, 1),
+            )
+            .await?
+            .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?
         };
         // A successful proof is the cache commit point. Later chain retries and pool finalization must
         // never depend on cache metadata or on PK/VK/BP still being present.
@@ -1422,9 +2246,10 @@ fn note_deploy_rootpn_action_result(
         || receipt.action_result_code.is_some_and(|code| code != 0)
     {
         let context = format!(
-            "RootPN.{method}: finalized transaction {} exit_code={} aborted={} action_result_code={}",
+            "RootPN.{method}: finalized transaction {} exit_code={}{} aborted={} action_result_code={}",
             receipt.transaction_hash,
             receipt.compute_exit_code,
+            note_deploy_compute_exit_label(receipt.compute_exit_code),
             receipt.aborted,
             receipt
                 .action_result_code
@@ -1464,7 +2289,7 @@ async fn note_deploy_submit_rootpn_call(
     )
     .await
     .map_err(|error| anyhow::anyhow!("encode RootPN.{method}: {error}"))?;
-    let http = reqwest::Client::new();
+    let http = dexdo_core::shellnet_http_client()?;
     let dapp_id = fetch_dapp_id(&http, client.endpoint(), root_pn.bare()).await?;
     let submit_error = send_message_routed(
         &http,
@@ -1500,6 +2325,29 @@ async fn note_deploy_submit_rootpn_call(
     note_deploy_rootpn_action_result(method, submit_error, receipt)
 }
 
+/// `RootPN.deployPrivateNote` arguments. `value` is the NOMINAL the proof was built over -- the
+/// post-deduction figure `VoucherGenerated` emitted -- never the amount the wallet attached.
+#[cfg(feature = "shellnet")]
+fn note_deploy_private_note_params(
+    pn_public_hex: &str,
+    deposit_zk: &dexdo_core::private_note::halo2::live::Halo2Proof,
+    deposit_identifier_hash: &str,
+) -> Result<serde_json::Value> {
+    use dexdo_core::private_note::proof::{hex_u256_to_dec, pubkey_to_dec};
+
+    Ok(serde_json::json!({
+        "zkproof": deposit_zk.proof,
+        "depositIdentifierHash": deposit_identifier_hash,
+        "finalLayerHistoricalHashRoot": hex_u256_to_dec(&deposit_zk.final_layer_historical_hash_root_hex)?,
+        "voucherNominalFr": hex_u256_to_dec(&deposit_zk.voucher_nominal_fr_hex)?,
+        "tokenTypeFr": hex_u256_to_dec(&deposit_zk.token_type_fr_hex)?,
+        "ephemeralPubkey": pubkey_to_dec(pn_public_hex)?,
+        "value": deposit_zk.voucher_value,
+        "tokenType": deposit_zk.voucher_token_type,
+        "layerNumber": deposit_zk.layer_number,
+    }))
+}
+
 #[cfg(feature = "shellnet")]
 async fn note_deploy_submit_private_note(
     client: &dexdo_core::ChainClient,
@@ -1508,23 +2356,11 @@ async fn note_deploy_submit_private_note(
     deposit_zk: &dexdo_core::private_note::halo2::live::Halo2Proof,
     deposit_identifier_hash: &str,
 ) -> Result<()> {
-    use dexdo_core::private_note::proof::{hex_u256_to_dec, pubkey_to_dec};
-
     note_deploy_submit_rootpn_call(
         client,
         root_pn,
         "deployPrivateNote",
-        serde_json::json!({
-            "zkproof": deposit_zk.proof,
-            "depositIdentifierHash": deposit_identifier_hash,
-            "finalLayerHistoricalHashRoot": hex_u256_to_dec(&deposit_zk.final_layer_historical_hash_root_hex)?,
-            "voucherNominalFr": hex_u256_to_dec(&deposit_zk.voucher_nominal_fr_hex)?,
-            "tokenTypeFr": hex_u256_to_dec(&deposit_zk.token_type_fr_hex)?,
-            "ephemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
-            "value": deposit_zk.voucher_value,
-            "tokenType": deposit_zk.voucher_token_type,
-            "layerNumber": deposit_zk.layer_number,
-        }),
+        note_deploy_private_note_params(pn_keys.public_hex(), deposit_zk, deposit_identifier_hash)?,
         pn_keys,
     )
     .await
@@ -1564,8 +2400,9 @@ async fn deploy_private_note_from_multisig_recoverable(
         (Some(pn_address), Some(deposit_identifier_hash)) => {
             resumed_existing_note = true;
             eprintln!(
-                "note deploy recovery: PrivateNote {pn_address} is already recorded in {}; skipping \
+                "note deploy recovery: PrivateNote {} is already recorded in {}; skipping \
                  deployPrivateNote spend and resuming later steps.",
+                dexdo_core::address::display(&pn_address),
                 recovery_path.display()
             );
             (pn_address, deposit_identifier_hash)
@@ -1615,8 +2452,9 @@ async fn deploy_private_note_from_multisig_recoverable(
             if recovered_active {
                 resumed_existing_note = true;
                 eprintln!(
-                    "note deploy recovery: recovered active PrivateNote {pn_address} from persisted \
+                    "note deploy recovery: recovered active PrivateNote {} from persisted \
                      deposit proof in {}; skipping repeat deployPrivateNote submit.",
+                    dexdo_core::address::display(&pn_address),
                     recovery_path.display()
                 );
             } else {
@@ -1678,8 +2516,9 @@ async fn deploy_private_note_from_multisig_recoverable(
                 if failpoints.after_deploy_before_note_record {
                     bail!(
                         "simulated interruption after deployPrivateNote active before recovery note record. \
-                         Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` \
-                         to discover the active PrivateNote without repeating deployPrivateNote.",
+                         Recovery state is at {}; re-run the same `dexdo note deploy` command \
+                         unchanged to discover the active PrivateNote without repeating \
+                         deployPrivateNote.",
                         recovery_path.display()
                     );
                 }
@@ -1693,8 +2532,9 @@ async fn deploy_private_note_from_multisig_recoverable(
             crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
             if !recovered_active {
                 eprintln!(
-                    "note deploy recovery: recorded deployed PrivateNote {pn_address} in {}; a later recovery \
+                    "note deploy recovery: recorded deployed PrivateNote {} in {}; a later recovery \
                      will not repeat deployPrivateNote.",
+                    dexdo_core::address::display(&pn_address),
                     recovery_path.display()
                 );
             }
@@ -1709,23 +2549,43 @@ async fn deploy_private_note_from_multisig_recoverable(
         }
     };
 
+    let pn_address_display = dexdo_core::address::display(&pn_address);
     if !recovery.shell_funded {
         let pn = Address::parse(&pn_address)?;
-        let expected_shell = recovery.ecc_shell_deposit as u128;
+        // a resumed process has no reading from before the submit, so its baseline is the
+        // level `RootPN` hands every note it creates. That baseline is a contract constant rather
+        // than an observation, which is why the figure is still a delta and not a threshold picked
+        // to be "high enough".
+        let resumed_funding_target = crate::cli::note::note_shell_funding_target(
+            crate::cli::note::note_birth_shell_ecc(),
+            recovery.ecc_shell_deposit,
+        );
         let already_funded = resumed_existing_note
             && note_deploy_wait_existing_shell_funding(
                 client,
                 &pn,
-                expected_shell,
+                resumed_funding_target,
                 NOTE_DEPLOY_EXISTING_SHELL_FUNDING_TIMEOUT,
             )
             .await?;
         if already_funded {
             eprintln!(
-                "note deploy recovery: PrivateNote {pn_address} already has expected ECC[2] funding; \
+                "note deploy recovery: PrivateNote {pn_address_display} already has expected ECC[2] funding; \
                  skipping sendEccShellToPrivateNote spend."
             );
         } else {
+            // The "before" half of the delta, read before anything is submitted. A missing or
+            // partial reading can only LOWER the target, which is the whole defect, so the level
+            // `RootPN` gives every note it creates is the floor: no reading may produce a target
+            // the note already satisfies.
+            let baseline_shell_ecc = note_deploy_read_note_ecc_shell(client, &pn)
+                .await?
+                .unwrap_or_default()
+                .max(crate::cli::note::note_birth_shell_ecc());
+            let expected_shell = crate::cli::note::note_shell_funding_target(
+                baseline_shell_ecc,
+                recovery.ecc_shell_deposit,
+            );
             let gas_zk = note_deploy_mint_voucher_recoverable(
                 client,
                 recovery_path,
@@ -1821,9 +2681,12 @@ async fn deploy_private_note_from_multisig_recoverable(
             .await?
             {
                 bail!(
-                    "PrivateNote {pn_address} did not show expected ECC[2] funding {expected_shell} within \
-                     {}s after sendEccShellToPrivateNote; recovery state was left unfinalized so rerun \
-                     `dexdo note deploy --recovery {}` before pooling.",
+                    "PrivateNote {pn_address_display} held {baseline_shell_ecc} raw ECC[2] before \
+                     sendEccShellToPrivateNote and did not reach {expected_shell} (that baseline plus the \
+                     {} the gas voucher owes it) within {}s; recovery state was left unfinalized, so \
+                     re-run the same `dexdo note deploy` command unchanged -- it resumes from {} -- \
+                     before pooling.",
+                    recovery.ecc_shell_deposit,
                     NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT.as_secs(),
                     recovery_path.display()
                 );
@@ -1833,7 +2696,7 @@ async fn deploy_private_note_from_multisig_recoverable(
 
     let pn = Address::parse(&pn_address)?;
     client
-        .run_getter(&pn, PRIVATE_NOTE_ABI_JSON, "getDetails", json!({}))
+        .run_getter_retrying(&pn, PRIVATE_NOTE_ABI_JSON, "getDetails", json!({}))
         .await?
         .ok_or_else(|| anyhow::anyhow!("PrivateNote.getDetails returned no output"))?;
     recovery.mark_shell_funded_and_checked()?;
@@ -1842,16 +2705,29 @@ async fn deploy_private_note_from_multisig_recoverable(
 }
 
 #[cfg(feature = "shellnet")]
-async fn note_deploy_wait_existing_shell_funding(
+async fn note_deploy_read_note_ecc_shell(
     client: &dexdo_core::ChainClient,
     note: &dexdo_core::Address,
+) -> Result<Option<u128>> {
+    Ok(client
+        .get_account_retrying(note)
+        .await?
+        .map(|acc| acc.ecc_balance(SHELL_CURRENCY_ID)))
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_wait_note_shell_funding<ReadEccShell>(
+    mut read_note_ecc_shell: ReadEccShell,
     expected_shell_ecc: u128,
     timeout: std::time::Duration,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    ReadEccShell: AsyncFnMut() -> Result<Option<u128>>,
+{
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(acc) = client.get_account(note).await? {
-            if acc.ecc_balance(SHELL_CURRENCY_ID) >= expected_shell_ecc {
+        if let Some(shell_ecc) = read_note_ecc_shell().await? {
+            if shell_ecc >= expected_shell_ecc {
                 return Ok(true);
             }
         }
@@ -1863,6 +2739,21 @@ async fn note_deploy_wait_existing_shell_funding(
 }
 
 #[cfg(feature = "shellnet")]
+async fn note_deploy_wait_existing_shell_funding(
+    client: &dexdo_core::ChainClient,
+    note: &dexdo_core::Address,
+    expected_shell_ecc: u128,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    note_deploy_wait_note_shell_funding(
+        async || note_deploy_read_note_ecc_shell(client, note).await,
+        expected_shell_ecc,
+        timeout,
+    )
+    .await
+}
+
+#[cfg(feature = "shellnet")]
 async fn note_deploy_wait_existing_active(
     client: &dexdo_core::ChainClient,
     note: &dexdo_core::Address,
@@ -1870,7 +2761,7 @@ async fn note_deploy_wait_existing_active(
 ) -> Result<bool> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(acc) = client.get_account(note).await? {
+        if let Some(acc) = client.get_account_retrying(note).await? {
             if acc.is_active() {
                 return Ok(true);
             }
@@ -1890,7 +2781,7 @@ async fn note_deploy_private_note_address(
 ) -> Result<String> {
     use dexdo_core::private_note::artifacts::ROOT_PN_ABI_JSON;
     let out = client
-        .run_getter(
+        .run_getter_retrying(
             root_pn,
             ROOT_PN_ABI_JSON,
             "getPrivateNoteAddress",
@@ -1914,14 +2805,15 @@ async fn note_deploy_wait_active(
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(acc) = client.get_account(address).await? {
+        if let Some(acc) = client.get_account_retrying(address).await? {
             if acc.is_active() {
                 return Ok(());
             }
         }
         if std::time::Instant::now() >= deadline {
             return Err(anyhow::anyhow!(
-                "{address} did not become Active within {}s",
+                "{} did not become Active within {}s",
+                dexdo_core::address::display(&address.with_workchain()),
                 timeout.as_secs()
             ));
         }
@@ -2746,7 +3638,7 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             .map_err(|e| anyhow::anyhow!("deployed note {note_addr}: {e}"))?;
         let details = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 &note_address,
                 PRIVATE_NOTE_ABI_JSON,
                 "getDetails",
@@ -2754,7 +3646,10 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             )
             .await
             .map_err(|e| {
-                anyhow::anyhow!("verify deployed PrivateNote {note_addr} owner key: {e}")
+                anyhow::anyhow!(
+                    "verify deployed PrivateNote {} owner key: {e}",
+                    dexdo_core::address::display(&note_addr)
+                )
             })?;
         ensure_onchain_owner_matches_pool_key(
             "note deploy",
@@ -2765,18 +3660,24 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
         if self.args.simulate_interrupt_after_spend_before_pool {
             bail!(
                 "simulated interruption after on-chain spend before final pool write. Recovery state is complete at {}; \
-                 run `dexdo note recover --recovery {} --pool {}` to finalize without re-spending.",
+                 run `{}` to finalize without re-spending.",
                 self.recovery_path.display(),
-                self.recovery_path.display(),
-                self.pool_path.display()
+                crate::cli::note::note_recover_finalize_command(
+                    self.recovery_path,
+                    self.pool_path
+                )
             );
         }
 
-        let n =
-            note_deploy_fold_state_into_pool(self.pool_path, state, self.funding_multisig_address)?;
+        let n = note_deploy_fold_state_into_pool(
+            self.pool_path,
+            state,
+            &recovery.funding_multisig_address,
+        )?;
+        let note_display = dexdo_core::address::display(&note_addr);
         refresh_note_deploy_recovery_after_success(self.recovery_path, recovery).map_err(|e| {
             anyhow::anyhow!(
-                "deployed PrivateNote {note_addr} is preserved in --pool {}, but the recovery file refresh was \
+                "deployed PrivateNote {note_display} is preserved in --pool {}, but the recovery file refresh was \
                  refused: {e}",
                 self.pool_path.display()
             )
@@ -2794,7 +3695,7 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             );
         } else {
             println!(
-                "note deployed -> PrivateNote {note_addr} ({} {}); folded into --pool {} ({} note(s)). Recovery state is \
+                "note deployed -> PrivateNote {note_display} ({} {}); folded into --pool {} ({} note(s)). Recovery state is \
                  at {}. The owner secret is stored in the pool for the seller/buyer -- keep both files private.",
                 state.nominal,
                 state.token_type,
@@ -2816,10 +3717,11 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
 pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     use crate::cli::note::{
         default_note_deploy_recovery_path, resolve_private_file_path, NoteDeployRecoveryRequest,
+        NoteNominal,
     };
     use dexdo_core::{
         params::SHELL_CURRENCY_LABEL,
-        private_note::{proof::ECC_SHELL_DEPOSIT_RAW, Halo2Paths, Nominal, TokenType},
+        private_note::{proof::ECC_SHELL_DEPOSIT_RAW, Halo2Paths, TokenType},
         ChainClient,
     };
 
@@ -2832,16 +3734,89 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     let pool_path = resolve_private_file_path(&args.pool, "--pool")?;
     note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &pool_path)?;
     validate_existing_pool_if_present(&pool_path)?;
-    let funding_multisig_address = dexdo_core::normalize_wallet_address(&args.multisig_address)
-        .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-    let nominal = Nominal::parse(&args.nominal)?;
+    // settle WHICH Hot this deploy spends from before anything reaches the chain. A passed-in
+    // `--multisig-address` wins and the binding is never read; without one the active binding
+    // answers; with neither this is `E_WALLET_NOT_CONFIGURED`. Everything above is local input
+    // validation and everything below eventually spends, so this is the last free point to refuse.
+    let mut args = args;
+    // Which chain this deploy is running on, from the manifest's own `network` field -- the same
+    // read, of the same field, that keys the funding-wallet lock below. Bindings are kept per
+    // network, so this decides WHICH binding may answer: a wallet bound on another chain is
+    // refused rather than spent. One read, used for both, so the wallet that
+    // is resolved and the wallet whose turn is taken can never be decided on different networks.
+    let funding_network = dexdo_core::Deployed::load(&args.contracts)
+        .map_err(|e| anyhow::anyhow!("--contracts {}: {e}", args.contracts.display()))?
+        .network;
+    let wallet_store = crate::cli::wallet::WalletStore::open()?;
+    let funding_wallet_network =
+        crate::cli::wallet::WalletNetwork::from_manifest_label(&funding_network)?;
+    let funding_wallet = crate::cli::wallet::resolve_funding_wallet(
+        &wallet_store,
+        funding_wallet_network,
+        args.multisig_address.as_deref(),
+        &args.multisig_key,
+        &args.multisig_seed_file,
+    )?;
+    // The binding is what selects a FUNDING flow, and it is read only when the binding is what
+    // chose the wallet. A `--multisig-address` wins outright and is used exactly as given, so it
+    // has no recorded provider - and forbids inferring one from an address, a code hash or any
+    // on-chain parameter, because all three providers hand out the same canonical contract.
+    let funding_binding = match args.multisig_address.as_deref() {
+        Some(_) => None,
+        None => wallet_store.load_active(funding_wallet_network)?,
+    };
+    args.multisig_key = funding_wallet.key;
+    args.multisig_seed_file = funding_wallet.seed_file;
+    let funding_multisig_identity =
+        crate::cli::note::normalize_funding_multisig_identity(&funding_wallet.address)
+            .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
+    let funding_multisig_address =
+        dexdo_core::CanonicalAddress::parse(&funding_multisig_identity)
+            .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?
+            .legacy();
+    let nominal = NoteNominal::parse(&args.nominal)?;
     let token_type = TokenType::parse(&args.token_type)?;
     let nominal_label = nominal.label().to_string();
     let token_type_label = token_type.label().to_string();
     let endpoint = note_endpoint_url(&args.endpoint)?;
     dexdo_core::shellnet_clock_skew_preflight(&endpoint).await?;
     let client = ChainClient::connect(&endpoint)?;
-    let _wallet_lock = acquire_note_deploy_wallet_lock(&funding_multisig_address)?;
+    // Held for the whole deploy, and deliberately not keyed to the wallet, the endpoint or the
+    // prover cache: what two concurrent deploys contend for is this machine's CPU, and losing that
+    // race costs the layer-0 history window. Taken before the first wallet spend, so a
+    // queued deploy waits with nothing paid rather than with a voucher whose window is expiring.
+    let _prover_serial_lock = acquire_note_deploy_serial_lock()?;
+    // The wallet's turn, shared with `note topup`: both commands spend from this multisig,
+    // so both take THIS lock under THIS key. Keyed on the manifest network read above -- the same
+    // field `note topup` reads, so the two agree on which chain the wallet is being spent on, and
+    // the same value that chose the binding, so the lock guards the wallet that was resolved.
+    // On the RESOLVED wallet, not on the argument: with `--multisig-address` is optional and
+    // the address can come from the durable binding, so `args.multisig_address` is an `Option` that
+    // may be empty while a real wallet is about to be spent. `funding_multisig_address` above is
+    // the resolved identity in its legacy form -- the same form the lock key is built from, so
+    // `note deploy` and `note topup` land on one lock whichever spelling either was given.
+    let _wallet_lock = acquire_funding_wallet_lock(&funding_network, &funding_multisig_address)?;
+    // the bound Hot is brought UP to what this deploy will spend before the deploy starts,
+    // through the provider the operator bound - the Vault -> Hot request for `ackinacki-wallet`, the
+    // top-up instruction and an on-chain wait for the others. Taken here, inside the wallet's turn
+    // and before any recovery file or prover work exists, so a Hot that is short waits with nothing
+    // paid rather than failing several minutes and one halo2 proof later.
+    // The figure is the one `dexdo note wallet` prints as the funding recipe, which is the same
+    // total the per-leg preflight checks: a user told to send X and a client that waits for
+    // Y would be two different numbers for one deploy. ECC[2] only, exactly as the preflight is -
+    // the native leg is not part of what either of them checks.
+    crate::cli::wallet_funding::fund_hot_for_money_command(
+        &client,
+        &endpoint,
+        funding_binding.as_ref(),
+        crate::cli::wallet_funding::FundingRequirements::new([(
+            SHELL_CURRENCY_ID,
+            crate::cli::note::operator_wallet_funding_raw(nominal),
+        )]),
+        "note deploy",
+        args.funding_timeout,
+    )
+    .await?;
     let recovery_path = args
         .recovery
         .clone()
@@ -2852,15 +3827,15 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
         endpoint: &endpoint,
         nominal: &nominal_label,
         token_type: token_type.id(),
-        raw_value: nominal.raw_value(token_type),
+        raw_value: nominal.raw_value(token_type.decimals()),
         ecc_shell_deposit: ECC_SHELL_DEPOSIT_RAW,
-        funding_multisig_address: &funding_multisig_address,
+        funding_multisig_address: &funding_multisig_identity,
     };
     let halo2_paths = Halo2Paths::from_env();
 
     eprintln!(
         "note deploy: in-process gosh.ackinacki -- wallet {} funds a {} {} PrivateNote on {} ...",
-        funding_multisig_address, nominal_label, token_type_label, endpoint
+        funding_multisig_identity, nominal_label, token_type_label, endpoint
     );
     let voucher_failpoints = NoteDeployVoucherFailpoints {
         before_voucher_event_wait: false,
@@ -2903,11 +3878,11 @@ pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
     let note = Address::parse(&args.note_addr)
         .map_err(|e| anyhow::anyhow!("--note-addr {}: {e}", args.note_addr))?;
-    let note_display = note.with_workchain();
+    let note_display = dexdo_core::address::display(&note.with_workchain());
     let chain = RealChainBackend::connect_with_endpoint(manifest, args.endpoint.as_deref())?;
     let account = chain
         .client()
-        .get_account(&note)
+        .get_account_retrying(&note)
         .await
         .map_err(|e| anyhow::anyhow!("read PrivateNote account {note_display}: {e}"))?;
     chain.assert_note_balance_private_note_account(&note, account.as_ref())?;
@@ -2916,7 +3891,7 @@ pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
         Err(e) => unknown_note_getter_balance_maps(format!("getDetails error: {e}")),
     };
     let account = account.map(|a| NoteAccountSnapshot {
-        address: a.address.with_workchain(),
+        address: dexdo_core::address::display(&a.address.with_workchain()),
         status: a.status,
         native_raw: a.balance,
         ecc: a.ecc,
@@ -2932,12 +3907,87 @@ pub(crate) async fn run_note_balance(_args: NoteBalanceArgs) -> Result<()> {
     bail!("note balance unavailable: build with `--features shellnet`")
 }
 
+/// Render the getter as an explicitly incomplete source of independently checked leads.
+/// The wording is part of the safety surface: neither an omitted live deal nor a retained destroyed
+/// deal may be mistaken for a verdict about the operator's funds.
+#[cfg(feature = "shellnet")]
+fn render_note_outstanding(
+    note: &str,
+    report: &dexdo_core::shellnet::PrivateNoteOutstandingReport,
+) -> String {
+    let mut rendered = format!(
+        "PrivateNote outstanding mirror for {note}\n\
+         Caveat: getOutstanding deal addresses are leads, not recovered deals. Because the fill \
+         mirror callback is bounce:false, a live deal can be missing from this note. Because the \
+         close mirror callback is bounce:false, a destroyed deal can remain in this note. Every \
+         deal lead offered below was independently checked through TokenContract.getParties/getState.\n\
+         Opaque outstanding order records: {} (count only; their hashes do not recover modelHash/orderId).\n",
+        report.opaque_order_count
+    );
+    if report.deal_leads.is_empty() {
+        rendered.push_str("Validated funded deal leads: none\n");
+    } else {
+        for lead in &report.deal_leads {
+            let role = match lead.role {
+                dexdo_core::DealRole::Buyer => "buyer",
+                dexdo_core::DealRole::Seller => "seller",
+            };
+            rendered.push_str(&format!(
+                "Validated funded deal lead: {} role={role} opened={} disputed={}\n",
+                lead.token_contract, lead.state.opened, lead.state.disputed
+            ));
+        }
+    }
+    for refusal in &report.refused_deal_leads {
+        rendered.push_str(&format!(
+            "Refused getOutstanding deal pointer: {}: {}\n",
+            refusal.token_contract, refusal.reason
+        ));
+    }
+    rendered
+}
+
+/// `dexdo note outstanding`: address-only, read-only diagnostic for the note's deal pointers.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_note_outstanding(args: NoteOutstandingArgs) -> Result<()> {
+    use dexdo_core::{Address, RealChainBackend};
+
+    let manifest = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    let note = Address::parse(&args.note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {}: {e}", args.note_addr))?;
+    let note_display = note.with_workchain();
+    let chain = RealChainBackend::connect_with_endpoint(manifest, args.endpoint.as_deref())?;
+    let report = chain.private_note_outstanding(&note).await?;
+    print!("{}", render_note_outstanding(&note_display, &report));
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_note_outstanding(_args: NoteOutstandingArgs) -> Result<()> {
+    bail!("note outstanding unavailable: build with `--features shellnet`")
+}
+
 /// `dexdo note withdraw`: submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's
 /// available token balances. It is one-shot and not a blanket proof that every native/ECC balance is retired
-/// without by-fact evidence on the current contract. `--to` accepts `half1::half2` or `0:<hex>`.
+/// without by-fact evidence on the current contract. `--to` requires `<dapp_id>::<account_id>` because both
+/// halves are withdrawal evidence.
+#[cfg(feature = "shellnet")]
+fn parse_note_withdraw_destination(value: &str) -> Result<dexdo_core::CanonicalAddress> {
+    let value = value.trim();
+    if value.starts_with("0:") {
+        bail!(
+            "--to: canonical `<dapp_id>::<account_id>` is required; legacy `0:<account_id>` is refused because it carries no destination DApp for `TokensWithdrawn.dapp_id`"
+        );
+    }
+    dexdo_core::CanonicalAddress::parse(value).map_err(|error| anyhow::anyhow!("--to: {error}"))
+}
+
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
-    use dexdo_core::{normalize_wallet_address, Address, KeyPair, RealChainBackend};
+    use dexdo_core::{Address, KeyPair, RealChainBackend};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!("real shellnet: --note-addr (the note to withdraw from) is required")
     })?;
@@ -2949,8 +3999,8 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // Normalize the destination before touching the chain.
-    let dest = normalize_wallet_address(&args.to).map_err(|e| anyhow::anyhow!("--to: {e}"))?;
+    let dest = parse_note_withdraw_destination(&args.to)?;
+    let dest_chain_address = dest.legacy();
     shellnet_doctor_preflight(&args.contracts, None).await?;
     let seed = read_secret_hex(note_key, "--note-key")?;
     let chain = RealChainBackend::connect(manifest)?;
@@ -2958,7 +4008,9 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note = dexdo_core::address::parse_chain_address(&note_addr)
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    let dest_addr = Address::parse(&dest).map_err(|e| anyhow::anyhow!("--to {dest}: {e}"))?;
+    let note_display = dexdo_core::address::display(&note_addr);
+    let dest_addr =
+        Address::parse(&dest_chain_address).map_err(|e| anyhow::anyhow!("--to {dest}: {e}"))?;
     chain
         .assert_note_owner_matches("note withdraw", &note, &keys)
         .await?;
@@ -2966,9 +4018,11 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     // zeroes its balance, but never credits the destination -- the SHELL is lost. Fail closed before
     // any on-chain write when the note's code_hash is not the current generation.
     chain.assert_note_withdraw_generation(&note).await?;
-    println!("withdrawing note {note_addr} token balances -> {dest}");
-    chain.withdraw_note_tokens(&note, &keys, &dest_addr).await?;
-    println!("withdrawTokens submitted for note {note_addr} -> {dest}");
+    println!("withdrawing note {note_display} token balances -> {dest}");
+    chain
+        .withdraw_note_tokens(&note, &keys, &dest_addr, dest.dapp_id())
+        .await?;
+    println!("withdrawTokens submitted for note {note_display} -> {dest}");
     Ok(())
 }
 
@@ -2977,6 +4031,651 @@ pub(crate) async fn run_note_withdraw(_args: NoteWithdrawArgs) -> Result<()> {
     bail!("note withdraw unavailable: build with `--features shellnet`")
 }
 
+/// What `note topup` must still send to reach `to_raw`, or `None` when the note is already there.
+/// Separated from the chain call because it is the whole of the command's arithmetic and it is the
+/// part that must not be got wrong: an amount computed against a stale or misread level is a spend
+/// that overshoots, and ECC[2] cannot be taken back off a note except by withdrawing the note.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn note_topup_shortfall_raw(current_raw: u128, to_raw: u128) -> Option<u128> {
+    to_raw
+        .checked_sub(current_raw)
+        .filter(|missing| *missing > 0)
+}
+
+/// What this command may conclude from a SECOND reading of the note, after the first said the level
+/// was already reached.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteTopupNoOpVerdict {
+    /// Both readings put the note at or above the target: there is nothing to send.
+    AlreadyAtTarget,
+    /// The two readings do not agree that the target is reached, so one of them is stale and this
+    /// command cannot tell which. Neither doing nothing nor sending a difference computed from
+    /// either figure is defensible.
+    ReadsDisagree,
+}
+
+/// Is ONE reading enough to justify submitting nothing? No -- and this is the whole of that decision
+/// .
+/// The idempotence stays: re-running "bring it to X" against a note genuinely at X must still send
+/// nothing, because that is what makes the command safe to repeat after a spend whose result the
+/// client never learned. What changes is the evidence required for it. A stale read that says the
+/// level is reached makes this command skip a top-up that was really needed AND report success, so
+/// the operator's proof that the note is funded is the very message the stale read produced; the
+/// note then fails a preflight an hour later, when the run it was funding is already under way.
+/// So the negative action is held to the same standard as the spend: the "already there" verdict is
+/// confirmed against a second, independent reading, and anything short of both readings agreeing is
+/// a refusal rather than a silent success. A refusal costs one re-run; the silent success costs the
+/// campaign. The disagreement is deliberately NOT resolved by preferring the lower figure and
+/// sending the difference: a spend sized from a stale-low reading overshoots, and ECC[2] cannot be
+/// taken back off a note except by withdrawing the note.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn note_topup_no_op_verdict(
+    first_raw: u128,
+    confirming_raw: Option<u128>,
+    to_raw: u128,
+) -> NoteTopupNoOpVerdict {
+    // `None` is the account read returning no account at all: an address that held the target a
+    // moment ago and now reads as absent is the strongest disagreement there is.
+    let Some(confirming_raw) = confirming_raw else {
+        return NoteTopupNoOpVerdict::ReadsDisagree;
+    };
+    if note_topup_shortfall_raw(first_raw, to_raw).is_none()
+        && note_topup_shortfall_raw(confirming_raw, to_raw).is_none()
+    {
+        return NoteTopupNoOpVerdict::AlreadyAtTarget;
+    }
+    NoteTopupNoOpVerdict::ReadsDisagree
+}
+
+/// `dexdo note topup`: raise an existing `PrivateNote`'s ECC[2] SHELL to exactly `--to-raw` from the
+/// funding wallet.
+/// WHICH OF THE NOTE'S TWO BALANCES THIS MOVES, because they are different money and only one of
+/// them is refillable. A note holds(a) physical ECC[2] on the ACCOUNT -- the coin pocket, which
+/// `fundUninitTargets` spends to stand up a `RootModel`/`TokenContract` and `fundDeal` converts into
+/// a deal's gas, and(b) `_balance`, the spendable trading record `placeInferenceBuy` and `fundDeal`
+/// draw their figures from. `withdrawTokens` says so itself: it drains the pocket separately from
+/// `_balance` because "this is no longer the same money as the inference escrow"
+/// (`contracts/dex/PrivateNote.sol`). This command refills(a). Nothing refills(b): the record is
+/// written once, by the constructor `_balance[tokenType] = value`, and the only inbound credits to
+/// it come from a deal, a book or another note -- never from a wallet. A note whose TRADING money is
+/// exhausted needs a new note; a note whose POCKET is empty needs this.
+/// WHY NOT `RootPN.sendEccShellToPrivateNote`, the path `note deploy` uses for the same plane. That
+/// one spends a SHELL_FEE voucher, and `generateVoucher` puts every voucher through
+/// `isAllowedNominal` -- for SHELL the smallest entry is 100 SHELL (`ALLOWED_NOMINALS` in
+/// `contracts/dex/modifiers/modifiers.sol`, times 1e9 decimals). A note that is 40 SHELL short
+/// cannot be brought back to its exact level by a mechanism whose smallest step is 100, and
+/// overshooting is not a smaller problem than undershooting when the level is being restored to an
+/// exact figure. ECC[2] arriving as plain currency has no such quantum: the note's `receive()`
+/// accepts what it is sent, so the wallet can send precisely the shortfall. That is also the cheaper
+/// path by a wide margin -- one wallet transaction against a halo2 proof, an event wait and a
+/// history-proof window.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_note_topup(args: crate::cli::args::NoteTopupArgs) -> Result<()> {
+    use dexdo_core::{Address, KeyPair, RealChainBackend};
+
+    let mut args = args;
+    // Owned so the wallet resolution below does not hold a borrow of `args`; the order of these
+    // input checks is unchanged.
+    let manifest = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?
+        .to_string();
+    let note = Address::parse(&args.note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {}: {e}", args.note_addr))?;
+    let note_display = dexdo_core::address::display(&note.with_workchain());
+    // the same rule `note deploy` follows, for the same reason -- this is the other command
+    // that spends the Hot. Settled before the chain backend is connected, and BEFORE the funding
+    // wallet's turn is taken, because until it is resolved this command does not yet know which
+    // wallet it will spend from: `--multisig-address` is optional now and the binding may supply it.
+    // Which chain this top-up is running on comes from the manifest's own `network` field -- the
+    // same read `note deploy` makes, of the same field that keys the lock below. Bindings are kept
+    // per network, so this decides WHICH binding may answer.
+    let funding_network = dexdo_core::Deployed::load(&args.contracts)
+        .map_err(|e| anyhow::anyhow!("--contracts {}: {e}", args.contracts.display()))?
+        .network;
+    let wallet_store = crate::cli::wallet::WalletStore::open()?;
+    let funding_wallet_network =
+        crate::cli::wallet::WalletNetwork::from_manifest_label(&funding_network)?;
+    let funding_wallet = crate::cli::wallet::resolve_funding_wallet(
+        &wallet_store,
+        funding_wallet_network,
+        args.multisig_address.as_deref(),
+        &args.multisig_key,
+        &args.multisig_seed_file,
+    )?;
+    // Read only when the binding chose the wallet, for the reason `note deploy` records: a provider
+    // is never inferred from a wallet somebody passed on the command line.
+    let funding_binding = match args.multisig_address.as_deref() {
+        Some(_) => None,
+        None => wallet_store.load_active(funding_wallet_network)?,
+    };
+    args.multisig_key = funding_wallet.key.clone();
+    args.multisig_seed_file = funding_wallet.seed_file.clone();
+    let multisig = Address::parse(&funding_wallet.address)
+        .map_err(|e| anyhow::anyhow!("--multisig-address {}: {e}", funding_wallet.address))?;
+    let wallet_display = dexdo_core::address::display_self_dapp(&multisig.with_workchain());
+
+    // The funding wallet's turn, the same lock under the same key `note deploy` takes. Held
+    // from BEFORE the level is read, not merely before the send: the decision to spend is made from
+    // that reading, so two runs that both read before either sends both compute the same shortfall
+    // and both send it. Taken before the client connects, so a queued run waits having done nothing.
+    // Keyed on the RESOLVED wallet, not on `args.multisig_address`: with that argument can be
+    // absent and the wallet come from the binding, and a lock keyed on what the operator typed
+    // rather than on what is about to be spent guards nothing.
+    let _wallet_lock = acquire_funding_wallet_lock(&funding_network, &funding_wallet.address)?;
+
+    let chain = RealChainBackend::connect_with_endpoint(&manifest, args.endpoint.as_deref())?;
+    let account = chain
+        .client()
+        .get_account_retrying(&note)
+        .await
+        .map_err(|e| anyhow::anyhow!("read PrivateNote account {note_display}: {e}"))?;
+    // Refuse to send SHELL anywhere that is not a live, current-generation PrivateNote, and refuse
+    // BEFORE the wallet spends. The same guard `note balance` reads with: an orphaned or stale-code
+    // note is exactly the address a top-up would strand money on, since nothing on the far side of a
+    // plain currency transfer reports that it went somewhere useless.
+    chain.assert_note_balance_private_note_account(&note, account.as_ref())?;
+    let current_raw = account
+        .as_ref()
+        .map(|acc| acc.ecc_balance(SHELL_CURRENCY_ID))
+        .unwrap_or_default();
+
+    let Some(missing_raw) = note_topup_shortfall_raw(current_raw, args.to_raw) else {
+        // doing NOTHING is an action, and one reading is not evidence enough for it. The
+        // confirming read is taken one funding-poll interval later -- the same spacing every other
+        // repeated ECC[2] reading in this file uses -- so the two are separate round trips against
+        // the network rather than one answer asked for twice.
+        tokio::time::sleep(NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL).await;
+        let confirming_raw = note_deploy_read_note_ecc_shell(chain.client(), &note)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("confirm PrivateNote {note_display} ECC[2] SHELL level: {e}")
+            })?;
+        match note_topup_no_op_verdict(current_raw, confirming_raw, args.to_raw) {
+            NoteTopupNoOpVerdict::AlreadyAtTarget => {
+                println!(
+                    "note {note_display} already holds {current_raw} raw ECC[2] SHELL (target {}); \
+                     confirmed by a second read {}s later: {} raw; no wallet spend was submitted.",
+                    args.to_raw,
+                    NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL.as_secs(),
+                    confirming_raw.unwrap_or_default()
+                );
+                return Ok(());
+            }
+            NoteTopupNoOpVerdict::ReadsDisagree => bail!(
+                "refusing to decide: two reads of PrivateNote {note_display} {}s apart disagree \
+                 about the target {} raw ECC[2] SHELL -- first={current_raw} raw, confirming={}. \
+                 One of them is stale and this client cannot tell which, so no wallet spend was \
+                 submitted and nothing was skipped on a single reading. Re-run the same `dexdo \
+                 note topup` command unchanged -- same `--to-raw {}`, same wallet flags: it \
+                 submits nothing once two reads agree the level is reached.",
+                NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL.as_secs(),
+                args.to_raw,
+                confirming_raw
+                    .map(|raw| format!("{raw} raw"))
+                    .unwrap_or_else(|| "no account".to_string()),
+                args.to_raw
+            ),
+        }
+    };
+
+    let (source, secret_hex) =
+        crate::cli::commands::multisig_secret_hex(&args.multisig_key, &args.multisig_seed_file)?;
+    let keys = KeyPair::from_secret_hex(secret_hex.trim())
+        .map_err(|e| anyhow::anyhow!("{source} (SDK secret hex): {e:?}"))?;
+    // the funding flow compares a chain clock with local time, so this client's own clock is
+    // established as sane BEFORE it reaches that comparison - the same helper `note deploy` already
+    // runs before it spends, not a second notion of the same question. `note_topup_submit` keeps
+    // its own call: that one guards the send, this one guards the reconciliation.
+    dexdo_core::shellnet_clock_skew_preflight(chain.client().endpoint()).await?;
+    // the same shared mechanism `note deploy` uses, with this command's own exact need - the
+    // ECC[2] the wallet is about to send. Inside the wallet's turn, and before the preflight below,
+    // which stays exactly as it was: it is step 7 of the specification, the re-read immediately
+    // before the spend, and it still refuses on its own terms when nothing topped the Hot up.
+    crate::cli::wallet_funding::fund_hot_for_money_command(
+        chain.client(),
+        chain.client().endpoint(),
+        funding_binding.as_ref(),
+        crate::cli::wallet_funding::FundingRequirements::new([(SHELL_CURRENCY_ID, missing_raw)]),
+        "note topup",
+        args.funding_timeout,
+    )
+    .await?;
+    note_topup_preflight_wallet_ecc(&chain, &multisig, missing_raw).await?;
+
+    println!(
+        "note topup: wallet {wallet_display} sends {missing_raw} raw ECC[2] SHELL to PrivateNote \
+         {note_display} ({current_raw} -> {})",
+        args.to_raw
+    );
+    note_topup_submit(&chain, &multisig, &keys, &note, missing_raw).await?;
+
+    if !note_deploy_wait_existing_shell_funding(
+        chain.client(),
+        &note,
+        args.to_raw,
+        NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT,
+    )
+    .await?
+    {
+        bail!(
+            "PrivateNote {note_display} held {current_raw} raw ECC[2] SHELL before the top-up and \
+             did not reach {} within {}s. The wallet transaction may still land; re-read the level \
+             with `dexdo note balance --note-addr {note_display}` and re-run the same `dexdo note \
+             topup` command unchanged -- same `--to-raw {}`, same wallet flags -- which submits \
+             nothing once the level is reached.",
+            args.to_raw,
+            NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT.as_secs(),
+            args.to_raw
+        );
+    }
+    println!(
+        "note topup: PrivateNote {note_display} now holds at least {} raw ECC[2] SHELL.",
+        args.to_raw
+    );
+    Ok(())
+}
+
+/// Fail before the wallet POST when the funding wallet cannot cover the shortfall, so an
+/// under-funded wallet reports what it is missing rather than a partial send.
+#[cfg(feature = "shellnet")]
+async fn note_topup_preflight_wallet_ecc(
+    chain: &dexdo_core::RealChainBackend,
+    multisig: &dexdo_core::Address,
+    missing_raw: u128,
+) -> Result<()> {
+    let wallet = dexdo_core::address::display_self_dapp(&multisig.with_workchain());
+    let available = chain
+        .client()
+        .get_account_retrying(multisig)
+        .await
+        .map_err(|e| anyhow::anyhow!("read funding wallet account {wallet}: {e}"))?
+        .map(|acc| acc.ecc_balance(SHELL_CURRENCY_ID))
+        .unwrap_or_default();
+    if available < missing_raw {
+        bail!(
+            "funding wallet {wallet} has insufficient SHELL ECC[2]: available={available} raw, \
+             required={missing_raw} raw, missing={} raw; no wallet POST was submitted.",
+            missing_raw - available
+        );
+    }
+    Ok(())
+}
+
+/// One `submitTransaction` carrying `cc:{2: missing_raw}` and an empty body, checked by its own
+/// finalized receipt.
+/// The empty payload is what makes this a plain currency transfer: the note sees no function to run,
+/// so `receive()` takes the message and the ECC[2] stays ECC[2]. `flag: 1` pays the message fees
+/// from the wallet instead of out of the amount being sent -- flag 16, which the uninit-deploy
+/// funding path uses, would convert the SHELL into the destination's NATIVE balance and the note
+/// would end up with gas it cannot spend as currency. `bounce: true` because the message carries
+/// money: on any refusal it comes home to the wallet rather than resting on an address that did not
+/// take it.
+#[cfg(feature = "shellnet")]
+async fn note_topup_submit(
+    chain: &dexdo_core::RealChainBackend,
+    multisig: &dexdo_core::Address,
+    multisig_keys: &dexdo_core::KeyPair,
+    note: &dexdo_core::Address,
+    missing_raw: u128,
+) -> Result<()> {
+    use dexdo_core::airegistry::{calls::encode_external_call, deploy::local_context};
+
+    let ctx = local_context()?;
+    let mut cc = serde_json::Map::new();
+    cc.insert(
+        SHELL_CURRENCY_ID.to_string(),
+        serde_json::json!(missing_raw.to_string()),
+    );
+    let boc = encode_external_call(
+        &ctx,
+        dexdo_core::canonical_multisig::MULTISIG_ABI_JSON,
+        &multisig.with_workchain(),
+        "submitTransaction",
+        dexdo_core::canonical_multisig::submit_transaction_params(
+            note.with_workchain(),
+            NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
+            cc,
+            true,
+            1,
+            String::new(),
+        ),
+        multisig_keys.public_hex(),
+        multisig_keys.secret_hex(),
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "encode UpdateCustodianMultisigWallet_v2.submitTransaction -> note ECC[2] top-up: {e}"
+        )
+    })?;
+
+    let endpoint = chain.client().endpoint();
+    let http = dexdo_core::shellnet_http_client()?;
+    dexdo_core::shellnet_clock_skew_preflight(endpoint).await?;
+    dexdo_core::ackinacki_wallet::query::send_message_routed(
+        &http,
+        endpoint,
+        &boc,
+        multisig.bare(),
+        multisig.bare(),
+        None,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> note ECC[2] top-up: {e}"
+        )
+    })?;
+
+    // The wallet's own finalized transaction is the answer about whether it sent anything. Without
+    // it an aborted submit is indistinguishable from a slow one, and the level poll that follows
+    // would spend its whole timeout waiting for money nobody sent.
+    let receipt = dexdo_core::shellnet::observe_note_deploy_wallet_action(
+        &http,
+        endpoint,
+        &boc,
+        multisig.bare(),
+        multisig.bare(),
+    )
+    .await?;
+    if let Some(receipt) = receipt {
+        if note_deploy_action_failed(receipt.aborted, receipt.action_result_code) {
+            bail!(
+                "UpdateCustodianMultisigWallet_v2.submitTransaction -> note ECC[2] top-up failed: \
+                 tx {} aborted={} action_result_code={} outmsg_count={}",
+                receipt.transaction_hash,
+                receipt.aborted,
+                receipt.action_result_code,
+                receipt.outmsg_count
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_note_topup(_args: crate::cli::args::NoteTopupArgs) -> Result<()> {
+    bail!("note topup unavailable: build with `--features shellnet`")
+}
+
+/// `dexdo note transfer`: move part of one `PrivateNote`'s spendable trading record into
+/// another's, bringing the DESTINATION up to exactly `--to-raw`.
+/// THE OTHER BALANCE FROM `note topup`, and the one that had no command. A note holds(a) physical
+/// ECC[2] on the account -- the coin pocket, refilled from a wallet by `note topup` -- and(b)
+/// `_balance`, the spendable trading record `placeInferenceBuy` and `fundDeal` draw their figures
+/// from. A wallet cannot reach(b) at all: the constructor writes it once
+/// (`_balance[tokenType] = value`) and the only inbound credits afterwards come from a deal, from
+/// the book, or from another note. `PrivateNote.initTransfer` is that third path, and until this
+/// command it had zero callers anywhere in the client.
+/// What that cost: every note was on a one-way trip. When its trading balance ran down the only
+/// remedy was a fresh mint -- minutes of proving, strictly sequential, and a funded multisig the CLI
+/// cannot create -- while three tired notes sat next to it holding, between them, more than enough.
+/// This consolidates them instead.
+/// IDEMPOTENT BY TARGET, and the target is the DESTINATION's level rather than an amount to move.
+/// The hazard is the same one `note topup` is shaped around and the consequence is worse here: a
+/// send whose outcome the client never learns, re-run as "move 40 again", moves it twice out of a
+/// record that has no wallet-side refill to correct an overshoot with. Sized against the
+/// destination's level, the second run computes a shortfall of zero and submits nothing.
+/// REFUSE BEFORE SPENDING. `initTransfer` runs `tvm.accept()` before every one of its `require`s, so
+/// a refusal on chain is not a cheap bounce -- it spends the sending note's gas to be told no. Both
+/// notes are proved to be live, current-generation `PrivateNote`s and every refusal readable from
+/// `getDetails()` is raised here, with the constant the contract would have reverted with. The four
+/// that are NOT readable (`_openOrderCount`, `_restingInf`, `_pendingInf`, `_liveDeals`, all
+/// `ERR_OPEN_ORDERS_EXIST`) are explained on the way out instead.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_note_transfer(args: crate::cli::args::NoteTransferArgs) -> Result<()> {
+    use dexdo_core::params::MIN_NOTE_TRANSFER_SHELL_RAW;
+    use dexdo_core::{Address, KeyPair, RealChainBackend};
+
+    let manifest = args
+        .contracts
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    let from = Address::parse(&args.note_addr)
+        .map_err(|e| anyhow::anyhow!("--note-addr {}: {e}", args.note_addr))?;
+    let to = Address::parse(&args.to_note_addr)
+        .map_err(|e| anyhow::anyhow!("--to-note-addr {}: {e}", args.to_note_addr))?;
+    let from_chain = from.with_workchain();
+    let to_chain = to.with_workchain();
+    let from_display = dexdo_core::address::display(&from_chain);
+    let to_display = dexdo_core::address::display(&to_chain);
+    // The contract's own `destDepositHash != _depositIdentifierHash` check, made here where it is
+    // free. On chain it costs the sending note's gas, because it sits after `accept`.
+    if from_chain == to_chain {
+        bail!(
+            "{}",
+            dexdo_core::NoteTransferRefusal::SelfTransfer { note: from_display }
+        );
+    }
+
+    let chain = RealChainBackend::connect_with_endpoint(manifest, args.endpoint.as_deref())?;
+
+    // Both ends first, before the key is even read. An orphaned or stale-generation note is exactly
+    // the address a transfer would strand a trading record on: the sender debits `_balance` the
+    // moment `initTransfer` runs, and a destination that cannot take the message returns the value
+    // only through the bounce path.
+    note_transfer_assert_live_note(&chain, &from, "--note-addr").await?;
+    note_transfer_assert_live_note(&chain, &to, "--to-note-addr").await?;
+
+    let from_details = note_transfer_details(&chain, &from, "--note-addr").await?;
+    let to_details = note_transfer_details(&chain, &to, "--to-note-addr").await?;
+    if let Some(refusal) = dexdo_core::note_transfer_sender_refusal(&from_details) {
+        bail!("note transfer refused before spending: sending note {from_display}: {refusal}");
+    }
+    if let Some(refusal) = dexdo_core::note_transfer_dest_refusal(&to_details) {
+        bail!("note transfer refused before spending: destination note {to_display}: {refusal}");
+    }
+    // Read from the destination's own getDetails, so the note inspected above and the note the
+    // contract will derive from this hash are the same account by construction. `_depositIdentifierHash`
+    // is a `static` StateInit field, so for a note of the pinned generation -- which both ends have
+    // just been proved to be -- the hash and the address determine each other.
+    let dest_deposit_hash = dexdo_core::note_transfer_deposit_identifier_hash(&to_details)
+        .map_err(|e| anyhow::anyhow!("--to-note-addr {to_display}: {e}"))?;
+
+    let to_current = note_transfer_read_record(&chain, &to, "--to-note-addr").await?;
+    let Some(amount_raw) = note_topup_shortfall_raw(to_current, args.to_raw) else {
+        // The same standard `note topup` holds its skip to: doing NOTHING is an action, and
+        // one reading is not evidence enough for it. A stale read here would report a consolidation
+        // that never happened, and the operator's proof that the destination is funded would be the
+        // message the stale read produced.
+        tokio::time::sleep(NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL).await;
+        let confirming = note_transfer_read_record_opt(&chain, &to).await?;
+        match note_topup_no_op_verdict(to_current, confirming, args.to_raw) {
+            NoteTopupNoOpVerdict::AlreadyAtTarget => {
+                println!(
+                    "note {to_display} already holds {to_current} raw SHELL in its spendable \
+                     trading record (target {}); confirmed by a second read {}s later: {} raw; no \
+                     transfer was submitted.",
+                    args.to_raw,
+                    NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL.as_secs(),
+                    confirming.unwrap_or_default()
+                );
+                return Ok(());
+            }
+            NoteTopupNoOpVerdict::ReadsDisagree => bail!(
+                "refusing to decide: two reads of PrivateNote {to_display} {}s apart disagree about \
+                 the target {} raw SHELL trading record -- first={to_current} raw, confirming={}. \
+                 One of them is stale and this client cannot tell which, so nothing was sent and \
+                 nothing was skipped on a single reading. Re-run the same `dexdo note transfer` \
+                 command unchanged -- same `--to-raw {}`, same notes and key: it submits nothing \
+                 once two reads agree the level is reached.",
+                NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL.as_secs(),
+                args.to_raw,
+                confirming
+                    .map(|raw| format!("{raw} raw"))
+                    .unwrap_or_else(|| "unreadable".to_string()),
+                args.to_raw
+            ),
+        }
+    };
+
+    let from_current = note_transfer_read_record(&chain, &from, "--note-addr").await?;
+    if let Some(refusal) = dexdo_core::note_transfer_amount_refusal(
+        from_current,
+        amount_raw,
+        MIN_NOTE_TRANSFER_SHELL_RAW,
+    ) {
+        bail!("note transfer refused before spending: {refusal}");
+    }
+
+    let secret = read_secret_hex(&args.note_key, "--note-key")?;
+    let keys = KeyPair::from_secret_hex(secret.trim())
+        .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+    chain
+        .assert_note_owner_matches("note transfer", &from, &keys)
+        .await?;
+
+    println!(
+        "note transfer: PrivateNote {from_display} sends {amount_raw} raw SHELL of its spendable \
+         trading record to PrivateNote {to_display} ({to_current} -> {}); sender record \
+         {from_current} -> {}",
+        args.to_raw,
+        from_current - amount_raw
+    );
+    // `eccAmount: 0` -- the record only. The ECC[2] pocket is a separate plane with its own command
+    // (`note topup`), and moving gas the operator did not ask to move out of a note that still needs
+    // it to run deals is not a convenience.
+    chain
+        .init_note_transfer(
+            &from,
+            &keys,
+            &dest_deposit_hash,
+            SHELL_CURRENCY_ID,
+            amount_raw,
+            0,
+        )
+        .await?;
+
+    if !note_transfer_wait_record(&chain, &to, args.to_raw, NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT)
+        .await?
+    {
+        bail!(
+            "PrivateNote {to_display} held {to_current} raw SHELL in its trading record before the \
+             transfer and did not reach {} within {}s. The transfer may still land -- it completes \
+             through `offerTransfer`/`onTransferAccepted` on the far side, and a refusal there \
+             returns the value to the sender by bounce. Re-read both with `dexdo note balance` and \
+             re-run the same `dexdo note transfer` command unchanged -- same `--to-raw {}`, same \
+             notes and key -- which submits nothing once the level is reached.",
+            args.to_raw,
+            NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT.as_secs(),
+            args.to_raw
+        );
+    }
+    let from_after = note_transfer_read_record(&chain, &from, "--note-addr").await?;
+    let to_after = note_transfer_read_record(&chain, &to, "--to-note-addr").await?;
+    println!(
+        "note transfer: spendable trading record by fact -- sender {from_display} {from_current} \
+         -> {from_after} raw SHELL, destination {to_display} {to_current} -> {to_after} raw SHELL."
+    );
+    Ok(())
+}
+
+/// Prove an end of the transfer is a live, current-generation `PrivateNote` before anything is
+/// signed -- the same guard `note balance` and `note topup` read with, applied to both ends because
+/// either one being wrong loses the record.
+#[cfg(feature = "shellnet")]
+async fn note_transfer_assert_live_note(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+    flag: &str,
+) -> Result<()> {
+    let display = dexdo_core::address::display(&note.with_workchain());
+    let account = chain
+        .client()
+        .get_account_retrying(note)
+        .await
+        .map_err(|e| anyhow::anyhow!("{flag} {display}: read PrivateNote account: {e}"))?;
+    chain
+        .assert_note_balance_private_note_account(note, account.as_ref())
+        .map_err(|e| anyhow::anyhow!("{flag} {display}: {e}"))
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_transfer_details(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+    flag: &str,
+) -> Result<serde_json::Value> {
+    let display = dexdo_core::address::display(&note.with_workchain());
+    chain
+        .private_note_details(note)
+        .await
+        .map_err(|e| anyhow::anyhow!("{flag} {display}: PrivateNote.getDetails(): {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{flag} {display}: PrivateNote.getDetails() returned no data, so neither its \
+                 refusals nor its spendable trading record can be read; refusing to transfer"
+            )
+        })
+}
+
+/// The note's spendable trading record(`_balance[2]`), which is the balance this command moves --
+/// NOT the account's ECC[2] pocket that `note balance` prints alongside it.
+#[cfg(feature = "shellnet")]
+async fn note_transfer_read_record(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+    flag: &str,
+) -> Result<u128> {
+    let display = dexdo_core::address::display(&note.with_workchain());
+    chain.private_note_shell_balance(note).await.map_err(|e| {
+        anyhow::anyhow!("{flag} {display}: read spendable SHELL trading record: {e}")
+    })
+}
+
+/// The same read as a confirmation: an unreadable note is `None`, which
+/// [`note_topup_no_op_verdict`] treats as a disagreement rather than as a level of zero.
+#[cfg(feature = "shellnet")]
+async fn note_transfer_read_record_opt(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+) -> Result<Option<u128>> {
+    Ok(chain.private_note_shell_balance(note).await.ok())
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_transfer_wait_record(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+    expected_raw: u128,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(record) = chain.private_note_shell_balance(note).await {
+            if record >= expected_raw {
+                return Ok(true);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_note_transfer(_args: crate::cli::args::NoteTransferArgs) -> Result<()> {
+    bail!("note transfer unavailable: build with `--features shellnet`")
+}
+
+#[cfg(all(test, feature = "shellnet"))]
+#[path = "note_topup_wallet_lock_1291.rs"]
+mod note_topup_wallet_lock_1291;
+
+/// the custodian check answers with the shared normalization, not a local copy of it.
+#[cfg(all(test, feature = "shellnet"))]
+#[path = "note_multisig_custodian_1305.rs"]
+mod note_multisig_custodian_1305;
+
+/// the shared Hot funding mechanism is reached by both commands that spend a Hot.
+#[cfg(all(test, feature = "shellnet"))]
+#[path = "note_funding_wiring_334.rs"]
+mod note_funding_wiring_334;
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
@@ -2984,6 +4683,27 @@ mod tests {
         NOTE_DEPLOY_SUBMIT_NATIVE_VALUE, NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS,
         NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS, SHELL_CURRENCY_ID,
     };
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_outstanding_surface_states_both_mirror_blind_spots() {
+        let report = dexdo_core::shellnet::PrivateNoteOutstandingReport::default();
+        let rendered = super::render_note_outstanding(
+            "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &report,
+        );
+
+        assert!(
+            rendered.contains("a live deal can be missing"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("a destroyed deal can remain"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("getParties/getState"), "{rendered}");
+        assert!(rendered.contains("leads, not recovered deals"), "{rendered}");
+    }
 
     #[test]
     fn note_deploy_runtime_policy_is_owned_by_core_params() {
@@ -3020,16 +4740,344 @@ mod tests {
         }
 
         let support = include_str!("support.rs");
-        for name in ["MIN_DEPLOY_SHELLS", "DEFAULT_DEPOSIT_SHELLS"] {
+        for name in ["min_deploy_shells", "default_deposit_shells"] {
             assert!(
                 support.matches(name).count() >= 2,
                 "funding helpers must consume params::{name}"
             );
             assert!(
-                !support.contains(&format!("pub(crate) const {name}")),
+                !support.contains(&format!("pub(crate) fn {name}")),
                 "funding helpers must not redeclare params::{name}"
             );
         }
+    }
+
+    /// and the third defect was left holding: the layer-0 history window closes while the
+    /// proof is still running, the SDK falls through to a layer whose boundary is tens of thousands
+    /// of blocks away, and the client used to await that bare -- the better part of an hour with the
+    /// voucher already paid and nothing said. The bound turns it into a verdict, and the abandoned
+    /// attempt takes its recovery state with it: that voucher is bound to an event whose window has
+    /// closed, so a resume would re-prove against the same stale window.
+    #[tokio::test(start_paused = true)]
+    async fn note_deploy_missed_layer0_window_reports_the_cost_and_discards_the_stale_attempt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("note-deploy-recovery.json");
+        std::fs::write(&recovery_path, "{\"paid\":\"voucher\"}").expect("write recovery");
+
+        let error = super::note_deploy_prove_within_history_window(
+            std::future::pending::<anyhow::Result<u8>>(),
+            "deposit",
+            "1",
+            &recovery_path,
+            None,
+            super::NoteDeployProofWindow::known(
+                Some(std::time::Duration::from_secs(600)),
+                super::NoteDeployProofWaitCost {
+                    target_layer: 1,
+                    target_block_delta: 2_400,
+                    observed_rate: Some(super::NoteDeployObservedBlockRate {
+                        blocks: 120,
+                        elapsed: std::time::Duration::from_secs(60),
+                    }),
+                },
+            ),
+        )
+        .await
+        .expect_err("a proof past the bound must be reported, not awaited");
+
+        let message = error.to_string();
+        for expected in [
+            "did not finish within 600s",
+            "attempt layers 1",
+            "layer 1 target is 2400 blocks away",
+            "derived wait is about 20 minutes",
+            "a fresh voucher starts again at layer 0",
+            "has been removed",
+            "DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS",
+        ] {
+            assert!(
+                message.contains(expected),
+                "operator verdict is missing {expected:?}: {message}"
+            );
+        }
+        assert!(
+            !recovery_path.exists(),
+            "an abandoned attempt must not leave recovery state bound to a closed window"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test(start_paused = true)]
+    async fn note_deploy_issue958_slow_observation_falls_back_to_no_estimate_verdict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an observation endpoint that never answers");
+        let endpoint = format!("http://{}", listener.local_addr().expect("bound endpoint"));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("note-deploy-recovery.json");
+        std::fs::write(&recovery_path, "{\"paid\":\"voucher\"}").expect("write recovery");
+
+        let error = tokio::time::timeout(
+            dexdo_core::params::TRANSIENT_READ_TOTAL_BUDGET,
+            super::note_deploy_prove_within_history_window(
+                std::future::pending::<anyhow::Result<u8>>(),
+                "deposit",
+                "1",
+                &recovery_path,
+                None,
+                super::NoteDeployProofWindow::observe(
+                    Some(std::time::Duration::ZERO),
+                    super::NoteDeployProofWaitObservation {
+                        endpoint,
+                        event_block_id: Some("stalled-event-block".to_string()),
+                        event_created_at: 1,
+                    },
+                    1,
+                ),
+            ),
+        )
+        .await
+        .expect("the timeout verdict must not consume the total transient-read budget")
+        .expect_err("a proof past the bound must report the unavailable observation");
+
+        let message = error.to_string();
+        for expected in [
+            "higher-layer target block delta could not be observed",
+            "no honest wall-clock estimate is available",
+            "has been removed",
+            "DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS",
+        ] {
+            assert!(
+                message.contains(expected),
+                "bounded-observation verdict is missing {expected:?}: {message}"
+            );
+        }
+    }
+
+    mod issue_958_derived_wait_cost {
+        fn wait_cost(
+            target_block_delta: u64,
+            observed_rate: Option<super::super::NoteDeployObservedBlockRate>,
+        ) -> super::super::NoteDeployProofWaitCost {
+            super::super::NoteDeployProofWaitCost {
+                target_layer: 1,
+                target_block_delta,
+                observed_rate,
+            }
+        }
+
+        #[test]
+        fn note_deploy_issue958_estimate_changes_with_block_delta() {
+            let rate = super::super::NoteDeployObservedBlockRate {
+                blocks: 120,
+                elapsed: std::time::Duration::from_secs(60),
+            };
+            let recovery_path = std::path::Path::new("/tmp/note-deploy-recovery.json");
+            let shorter = super::super::note_deploy_proof_window_missed_message(
+                "deposit",
+                "1",
+                std::time::Duration::from_secs(600),
+                recovery_path,
+                false,
+                Some(wait_cost(600, Some(rate))),
+            );
+            let longer = super::super::note_deploy_proof_window_missed_message(
+                "deposit",
+                "1",
+                std::time::Duration::from_secs(600),
+                recovery_path,
+                false,
+                Some(wait_cost(1_200, Some(rate))),
+            );
+
+            assert!(
+                shorter.contains("derived wait is about 5 minutes"),
+                "600 blocks at 120 blocks/60s must derive to 5 minutes: {shorter}"
+            );
+            assert!(
+                longer.contains("derived wait is about 10 minutes"),
+                "1200 blocks at 120 blocks/60s must derive to 10 minutes: {longer}"
+            );
+            assert_ne!(shorter, longer, "the block delta must change the verdict");
+        }
+
+        #[test]
+        fn note_deploy_issue958_no_rate_prints_delta_without_invented_minutes() {
+            let message = super::super::note_deploy_proof_window_missed_message(
+                "deposit",
+                "1",
+                std::time::Duration::from_secs(600),
+                std::path::Path::new("/tmp/note-deploy-recovery.json"),
+                false,
+                Some(wait_cost(9_876, None)),
+            );
+
+            assert!(
+                message.contains("layer 1 target is 9876 blocks away"),
+                "{message}"
+            );
+            assert!(message.contains("a long wait"), "{message}");
+            assert!(
+                !message.contains("minute") && !message.contains("hour"),
+                "no-rate verdict must not print an invented wall-clock duration: {message}"
+            );
+            for invented in [
+                "54 minutes",
+                "about 4",
+                "about four",
+                "128 blocks",
+                "two minutes",
+            ] {
+                assert!(
+                    !message.contains(invented),
+                    "no-rate verdict invented {invented:?}: {message}"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn note_deploy_issue958_proof_that_makes_window_is_unchanged() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let recovery_path = temp.path().join("note-deploy-recovery.json");
+            std::fs::write(&recovery_path, "{\"paid\":\"voucher\"}").expect("write recovery");
+
+            let proof = super::super::note_deploy_prove_within_history_window(
+                std::future::ready(Ok::<u8, anyhow::Error>(7)),
+                "deposit",
+                "SDK default plan",
+                &recovery_path,
+                None,
+                super::super::NoteDeployProofWindow::known(
+                    Some(std::time::Duration::from_secs(600)),
+                    wait_cost(600, None),
+                ),
+            )
+            .await
+            .expect("a proof inside the bound keeps the outer path unchanged")
+            .expect("the prover result is returned unchanged");
+
+            assert_eq!(proof, 7);
+            assert!(
+                recovery_path.exists(),
+                "a proof inside the window must not discard recovery state"
+            );
+        }
+    }
+
+    /// The same abandonment must never touch the recovery state of a note that already exists on
+    /// chain: the file is the only copy of that note's owner key, and the note holds money.
+    #[tokio::test(start_paused = true)]
+    async fn note_deploy_missed_window_keeps_the_recovery_state_of_a_deployed_note() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("note-deploy-recovery.json");
+        std::fs::write(&recovery_path, "{\"paid\":\"voucher\"}").expect("write recovery");
+
+        let error = super::note_deploy_prove_within_history_window(
+            std::future::pending::<anyhow::Result<u8>>(),
+            "shell gas",
+            "2",
+            &recovery_path,
+            Some(&format!("0:{}", "ab".repeat(32))),
+            Some(std::time::Duration::from_secs(600)),
+        )
+        .await
+        .expect_err("a proof past the bound must be reported, not awaited");
+
+        assert!(
+            error.to_string().contains("is KEPT"),
+            "the verdict must say the deployed note's recovery survives: {error}"
+        );
+        assert!(
+            recovery_path.exists(),
+            "a deployed note's owner key must never be removed by an aborted proof"
+        );
+    }
+
+    /// Waiting the escalation out stays available -- it is what a deliberate `HALO2_ATTEMPT_LAYERS=1`
+    /// run needs -- but it is the operator's choice, never the default and never a parse accident.
+    #[test]
+    fn note_deploy_proof_bound_is_canonical_and_operator_selectable() {
+        assert_eq!(
+            super::note_deploy_proof_timeout_from_env(None),
+            Some(super::NOTE_DEPLOY_PROOF_TIMEOUT)
+        );
+        assert_eq!(
+            super::note_deploy_proof_timeout_from_env(Some(" 90 ")),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(super::note_deploy_proof_timeout_from_env(Some("0")), None);
+        assert_eq!(
+            super::note_deploy_proof_timeout_from_env(Some("later")),
+            Some(super::NOTE_DEPLOY_PROOF_TIMEOUT),
+            "an unreadable override must not silently remove the bound"
+        );
+    }
+
+    /// The bound only helps if every proof runs under it, and taking turns only helps if the deploy
+    /// takes its turn before it spends. Both are single call-site facts a later edit could drop
+    /// without failing anything else, so they are pinned to the production text.
+    #[test]
+    fn every_note_deploy_proof_is_bounded_and_every_deploy_takes_its_turn() {
+        let production = include_str!("note_cmd.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("note_cmd unit-test module boundary")
+            .0;
+
+        let mut previous = "";
+        let mut proofs = 0;
+        for line in production.lines() {
+            if line.contains("prove_voucher_for_event(params)") {
+                proofs += 1;
+                assert!(
+                    line.contains("note_deploy_prove_within_history_window(")
+                        || previous.contains("note_deploy_prove_within_history_window("),
+                    "a voucher proof is awaited outside the history-window bound: {line}"
+                );
+            }
+            previous = line;
+        }
+        assert_eq!(proofs, 2, "both note-deploy voucher proofs must be covered");
+        assert!(
+            production.contains("acquire_note_deploy_serial_lock()?"),
+            "note deploy must take its turn on this machine before it spends"
+        );
+    }
+
+    /// item 3: three deploys, three separate prover workspaces, nothing shared and nothing
+    /// serialized -- so all three proofs collided and all three missed the window. The turn is now
+    /// taken on a lock that is keyed to the machine, and a deploy that cannot get it is told why.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_serial_lock_holds_a_second_deploy_back_and_says_why() {
+        const ADVICE: &str = "another `dexdo note deploy` is proving on this machine";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().to_path_buf();
+        let held = super::acquire_note_deploy_prover_lock_at(
+            &dir,
+            "prover",
+            ADVICE,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("first deploy takes the turn");
+
+        let contender = std::thread::spawn(move || {
+            super::acquire_note_deploy_prover_lock_at(
+                &dir,
+                "prover",
+                ADVICE,
+                std::time::Duration::from_secs(1),
+            )
+            .expect_err("a second deploy must not prove in parallel")
+        });
+        let error = contender.join().expect("contender thread");
+        assert!(
+            error
+                .to_string()
+                .contains("note deploy prover busy: waited 1s"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains(ADVICE), "{error:#}");
+        drop(held);
     }
 
     #[cfg(feature = "shellnet")]
@@ -3118,7 +5166,7 @@ mod tests {
             let recovery_path = temp.path().join(format!("{case}.recovery.json"));
             let args = super::NoteDeployArgs {
                 json: false,
-                multisig_address: "not-a-wallet".to_string(),
+                multisig_address: Some("not-a-wallet".to_string()),
                 multisig_key: Some(temp.path().join("must-not-read.key")),
                 multisig_seed_file: None,
                 nominal: "N100".to_string(),
@@ -3132,6 +5180,7 @@ mod tests {
                 simulate_interrupt_after_deposit_voucher_event: false,
                 simulate_interrupt_after_shell_voucher_submit: false,
                 simulate_interrupt_after_deploy_before_note_record: false,
+            funding_timeout: None,
             };
 
             let error = tokio::time::timeout(
@@ -3389,6 +5438,9 @@ mod tests {
     struct CountingVoucherBocBuilder {
         calls: std::cell::Cell<usize>,
         saw_nonempty_boc: std::cell::Cell<bool>,
+        /// The exact signed wallet message production built, kept so a test can decode what the
+        /// wallet would really have attached instead of trusting that a BOC exists.
+        last_boc: std::cell::RefCell<Option<String>>,
     }
 
     #[cfg(feature = "shellnet")]
@@ -3410,6 +5462,7 @@ mod tests {
             )
             .await?;
             self.saw_nonempty_boc.set(!boc.is_empty());
+            *self.last_boc.borrow_mut() = Some(boc.clone());
             Ok(boc)
         }
     }
@@ -3467,6 +5520,20 @@ mod tests {
         dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key")
     }
 
+    /// Wallet ECC[2] that exactly covers a `test_recovery_state()` deposit: its N100 nominal, the
+    /// `GAS_DEPOSIT` the root deducts from every non-gas deposit, and the 100 SHELL gas voucher the
+    /// same wallet funds on the next leg. Spelled out from those three figures rather than read back
+    /// from the preflight, so a preflight that stops charging the gas deposit fails here instead of
+    /// agreeing with itself -- and the gas figure is the CONTRACT's, not the client constant
+    /// under test.
+    #[cfg(feature = "shellnet")]
+    fn issue_678_required_deposit_ecc() -> u128 {
+        let recovery = test_recovery_state();
+        u128::from(recovery.raw_value)
+            + u128::from(crate::cli::note::contract_gas_deposit_raw())
+            + u128::from(recovery.ecc_shell_deposit)
+    }
+
     #[cfg(feature = "shellnet")]
     fn issue_678_wallet_reader(ecc_balances: Vec<(u32, u128)>) -> FixedFundingWalletReader {
         let keys = preflight_fixture_keys();
@@ -3490,7 +5557,7 @@ mod tests {
             aborted,
             action_result_code,
             outmsg_count: 0,
-            wallet_ecc_balances: Some(vec![(SHELL_CURRENCY_ID, 200_000_000_000)]),
+            wallet_ecc_balances: Some(vec![(SHELL_CURRENCY_ID, issue_678_required_deposit_ecc())]),
         }
     }
 
@@ -3502,12 +5569,31 @@ mod tests {
         submitter: &CountingVoucherSubmitter,
         failpoints: super::NoteDeployVoucherFailpoints,
     ) -> anyhow::Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+        run_issue_678_deposit_with_boc_builder(
+            recovery_path,
+            recovery,
+            wallet_reader,
+            submitter,
+            failpoints,
+            &CountingVoucherBocBuilder::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn run_issue_678_deposit_with_boc_builder(
+        recovery_path: &std::path::Path,
+        recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+        wallet_reader: &FixedFundingWalletReader,
+        submitter: &CountingVoucherSubmitter,
+        failpoints: super::NoteDeployVoucherFailpoints,
+        boc_builder: &CountingVoucherBocBuilder,
+    ) -> anyhow::Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
         use crate::cli::note::NoteDeployVoucherKind;
 
         let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")?;
         let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))?;
         let key_loader = FixedFundingKeyLoader::returning(&preflight_fixture_keys());
-        let boc_builder = CountingVoucherBocBuilder::default();
         let owner = recovery.owner_public_key_hex.clone();
         let token_type = recovery.token_type;
         let raw_value = recovery.raw_value;
@@ -3519,7 +5605,7 @@ mod tests {
             &multisig_address,
             &key_loader,
             wallet_reader,
-            &boc_builder,
+            boc_builder,
             submitter,
             &owner,
             token_type,
@@ -3607,6 +5693,34 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_wrong_funding_key_refusal_names_exact_key_and_wallet() {
+        let funding_wallet = format!("0:{}", "a".repeat(64));
+        let derived_pubkey = preflight_fixture_keys().public_hex().to_string();
+        let error = super::ensure_multisig_key_is_custodian(
+            &funding_wallet,
+            &derived_pubkey,
+            &serde_json::json!({
+                "custodians": [{
+                    "index": "0",
+                    "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                }]
+            }),
+        )
+        .expect_err("a foreign funding-wallet key must be rejected before submit")
+        .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "--multisig-key derives pubkey 0x{derived_pubkey}, but it is not a custodian of funding wallet \
+                 {funding_wallet}. Provide a custodian key \
+                 (--multisig-key / --multisig-seed-file); no wallet message was submitted."
+            )
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn note_deploy_preflight_accepts_matching_sole_custodian() {
         let keys = preflight_fixture_keys();
@@ -3620,18 +5734,26 @@ mod tests {
         .expect("the matching sole pubkey custodian must pass");
     }
 
+    /// The wallet ECC[2] the deposit leg demands is the nominal PLUS `RootPN.GAS_DEPOSIT` plus the
+    /// SHELL gas voucher -- 4.0.33 deducts the gas deposit before the remainder is matched against
+    /// `ALLOWED_NOMINALS`, so a wallet holding only nominal + gas voucher can no longer mint N100.
+    /// On the pre-4.0.33 arithmetic the required figure here is 200 SHELL and this test fails.
     #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn note_deploy_issue_678_ecc_preflight_stops_exact_shortfalls_before_post() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let wallet = format!("0:{}", "a".repeat(64));
-        let raw = 100_000_000_000u128;
+        // The recovery fixture's funding wallet, chain form `0:<account>`.: the refusal names it
+        // canonically, and an operator wallet is a self-DApp account, so its DApp half is its own
+        // account id.
+        let wallet_account = "a".repeat(64);
+        let wallet_rendered = format!("{wallet_account}::{wallet_account}");
+        let required_ecc = issue_678_required_deposit_ecc();
         for (case, balances, currency, available, required) in [(
             "combined-ecc-2",
-            vec![(SHELL_CURRENCY_ID, raw * 2 - 1)],
+            vec![(SHELL_CURRENCY_ID, required_ecc - 1)],
             "requested token and SHELL ECC[2]",
-            raw * 2 - 1,
-            raw * 2,
+            required_ecc - 1,
+            required_ecc,
         )] {
             let mut recovery = test_recovery_state();
             let reader = issue_678_wallet_reader(balances);
@@ -3652,15 +5774,364 @@ mod tests {
             assert_eq!(
                 error,
                 format!(
-                    "funding wallet {wallet} has insufficient {currency}: available={} raw, \
+                    "funding wallet {wallet_rendered} has insufficient {currency}: available={} raw, \
                      required={required} raw, missing=1 raw; no wallet POST was submitted. Fund \
-                     {currency} and retry the same `dexdo note deploy --recovery` command.",
+                     {currency} and retry the same `dexdo note deploy` command unchanged; it resumes from its recovery file.",
                     available
                 ),
                 "{case}"
             );
             assert_eq!(submitter.calls.get(), 0, "{case}");
         }
+    }
+
+    /// `note wallet` printed `nominal + GAS_DEPOSIT` while `note deploy` charges its deposit
+    /// leg `nominal + GAS_DEPOSIT + the SHELL gas voucher`, so the recipe was exactly one gas
+    /// voucher short for EVERY nominal -- and the shortfall was found by a user, on the chain, after
+    /// two manual transfers he could not take back.
+    /// This drives the deploy's OWN preflight, the site that produces the `required=` figure, and
+    /// pins the printed recipe to it from both sides for every nominal: one raw unit below what
+    /// `note wallet` prints must be refused before any wallet POST, and exactly what it prints must
+    /// pass. Both directions are needed -- a recipe that is merely LARGE enough would satisfy the
+    /// second alone, and the equality is what makes a user's two mainnet transfers sufficient
+    /// without being wasteful.
+    /// The expectation is read from `operator_wallet_funding_raw`, the recipe's own source, so this
+    /// cannot be satisfied by teaching the test the same wrong number: the refusal it compares
+    /// against is built by the deploy from the recovery state, not by this module.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_wallet_recipe_equals_the_note_deploy_requirement_for_every_nominal() {
+        use crate::cli::note::{
+            operator_wallet_funding_raw, NoteDeployRecoveryRequest, NoteDeployRecoveryState,
+            NoteDeployVoucherKind, NoteNominal,
+        };
+        use dexdo_core::private_note::proof::{TokenType, ECC_SHELL_DEPOSIT_RAW};
+
+        let wallet = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("fixture funding wallet");
+        let wallet_id = wallet.with_workchain();
+        let owner =
+            dexdo_core::KeyPair::from_secret_hex(&"2a".repeat(32)).expect("fixture owner key");
+
+        for nominal in NoteNominal::ALL {
+            let printed = operator_wallet_funding_raw(nominal);
+            let raw_value = nominal.raw_value(TokenType::Shell.decimals());
+            let recovery = NoteDeployRecoveryState::new(
+                NoteDeployRecoveryRequest {
+                    endpoint: "http://127.0.0.1:9",
+                    nominal: nominal.label(),
+                    token_type: SHELL_CURRENCY_ID,
+                    raw_value,
+                    ecc_shell_deposit: ECC_SHELL_DEPOSIT_RAW,
+                    funding_multisig_address: &wallet_id,
+                },
+                owner.public_hex(),
+                owner.secret_hex(),
+            )
+            .expect("per-nominal recovery state");
+
+            let error = super::note_deploy_preflight_wallet_ecc(
+                &issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, printed - 1)]),
+                &wallet,
+                NoteDeployVoucherKind::Deposit,
+                &recovery,
+                SHELL_CURRENCY_ID,
+                raw_value,
+                false,
+            )
+            .await
+            .expect_err("one raw unit below the printed recipe must not reach a wallet POST")
+            .to_string();
+            assert!(
+                error.contains(&format!("required={printed} raw")),
+                "{}: `note wallet` prints {printed} raw, but `note deploy` requires another \
+                 figure: {error}",
+                nominal.label()
+            );
+            assert!(error.contains("missing=1 raw"), "{}: {error}", nominal.label());
+
+            super::note_deploy_preflight_wallet_ecc(
+                &issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, printed)]),
+                &wallet,
+                NoteDeployVoucherKind::Deposit,
+                &recovery,
+                SHELL_CURRENCY_ID,
+                raw_value,
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: a wallet holding exactly what `note wallet` prints must satisfy \
+                     `note deploy`, but the deploy refused it: {error}",
+                    nominal.label()
+                )
+            });
+        }
+    }
+
+    /// the half the arithmetic tests cannot reach: the LINES a user reads. Every other test
+    /// added for this issue pins the values the recipe composes; none of them would notice a
+    /// formatting mistake, a summand printed in the wrong slot, or a stage-one figure rendered on
+    /// the stage-two line. This asserts whole rendered lines, byte for byte.
+    /// It lives in the bin's inline module so `--features shellnet --bins` executes it. The only
+    /// other test that reads these lines is `tests/operator_wallet_961.rs`, which is
+    /// `#![cfg(feature = "shellnet")]` and therefore runs `0 tests` under the default-feature CI
+    /// gate -- which is exactly how a wrong recipe reached a user.
+    /// Money figures come from the CONTRACT's `GAS_DEPOSIT` and the SDK's `ECC_SHELL_DEPOSIT_RAW`
+    /// never from a literal or from the client constant under test, so this
+    /// cannot agree with a client that has drifted from either.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_wallet_funding_recipe_renders_the_exact_lines_a_user_reads() {
+        use crate::cli::note::{contract_gas_deposit_raw, NoteNominal};
+        use dexdo_core::private_note::proof::{TokenType, ECC_SHELL_DEPOSIT_RAW};
+
+        let account = "a".repeat(64);
+        let address = dexdo_core::CanonicalAddress::parse(&format!("{account}::{account}"))
+            .expect("fixture canonical operator-wallet address");
+        let decimals = u128::from(TokenType::Shell.decimals());
+        let gas_deposit = u128::from(contract_gas_deposit_raw()) / decimals;
+        let gas_voucher = u128::from(ECC_SHELL_DEPOSIT_RAW) / decimals;
+        // N10000 is the nominal the reporter funded by hand, and the only one whose figures group
+        // with a comma -- so it also pins `grouped_whole_shells`.
+        // Stage one is no longer `nominal + GAS_DEPOSIT`: the flag-16 leg becomes native gas that
+        // can never be spent as currency again, so it is a flat measured figure. It has no contract
+        // or SDK oracle to be derived from -- it IS a client constant -- so it is pinned here as a
+        // literal, which keeps this test's rule intact: the expectation never reads the value under
+        // test, and a moved constant goes red here rather than moving the expectation with it.
+        let native = 1;
+        let ecc = 10_000 + gas_deposit + gas_voucher;
+
+        let rendered = super::render_operator_wallet_funding(&address, NoteNominal::N10000);
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(
+            lines[0],
+            format!("wallet is waiting for 1 SHELL at {address}"),
+            "stage-one headline; rendered:\n{rendered}"
+        );
+        assert_eq!(
+            native, 1,
+            "stage one is the flat deploy-gas figure, no longer nominal + GAS_DEPOSIT"
+        );
+        assert_eq!(ecc, 10_350, "stage two adds the gas voucher");
+        assert_eq!(
+            lines[1],
+            format!(
+                "Before deploy, send 1 SHELL to {address} with the non-bounceable ECC[2] \
+                 flag-16 form. It becomes native deploy gas, which is spendable only as gas and \
+                 never again as currency, so this stage asks for what the deploy costs and nothing \
+                 more; then rerun this command so dexdo can deploy the wallet."
+            ),
+            "stage-one instruction; rendered:\n{rendered}"
+        );
+        assert_eq!(
+            lines[2],
+            "After the wallet is Active, send 10,350 SHELL to the same address as ECC[2] with the \
+             active-account flag-1 form, then rerun this command. The two stages are not the same \
+             amount and only stage two depends on the nominal: stage one is the flat deploy-gas \
+             amount above, while stage two is the ECC[2] the deploy actually spends and so carries \
+             the nominal and the gas voucher. Across both stages, the two transfers move 10,351 \
+             SHELL from the funding source.",
+            "stage-two instruction, a DIFFERENT figure from stage one, and their true total; \
+             rendered:\n{rendered}"
+        );
+        assert_eq!(
+            lines[4],
+            format!(
+                "Note funding choices, the stage-two ECC[2] amount (nominal + {gas_deposit} SHELL \
+                 GAS_DEPOSIT + {gas_voucher} SHELL gas voucher):"
+            ),
+            "the wording must name every summand; rendered:\n{rendered}"
+        );
+        for (offset, (label, count, grouped_total)) in [
+            ("N100", 100u128, "450"),
+            ("N1000", 1_000, "1,350"),
+            ("N10000", 10_000, "10,350"),
+            ("N100000", 100_000, "100,350"),
+            ("N1000000", 1_000_000, "1,000,350"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                count + gas_deposit + gas_voucher,
+                grouped_total
+                    .replace(',', "")
+                    .parse::<u128>()
+                    .expect("pinned total parses"),
+                "{label} pinned total must be the three summands"
+            );
+            assert_eq!(
+                lines[5 + offset],
+                format!("  {label}={grouped_total} SHELL ({count} + {gas_deposit} + {gas_voucher})"),
+                "{label} row; rendered:\n{rendered}"
+            );
+        }
+        assert_eq!(lines.len(), 10, "recipe line count; rendered:\n{rendered}");
+    }
+
+    /// Decode a signed wallet message the way the chain would: against the canonical multisig ABI,
+    /// as `submitTransaction`. Returns its decoded inputs.
+    #[cfg(feature = "shellnet")]
+    fn decoded_submit_transaction(boc: &str) -> serde_json::Value {
+        let ctx = dexdo_core::airegistry::deploy::local_context().expect("local SDK context");
+        let decoded = tvm_client::abi::decode_message(
+            ctx,
+            tvm_client::abi::ParamsOfDecodeMessage {
+                abi: tvm_client::abi::Abi::Json(
+                    dexdo_core::canonical_multisig::MULTISIG_ABI_JSON.to_string(),
+                ),
+                message: boc.to_string(),
+                allow_partial: false,
+                function_name: None,
+                data_layout: None,
+            },
+        )
+        .expect("decode the signed wallet message");
+        assert_eq!(
+            decoded.name, "submitTransaction",
+            "the note-deploy wallet leg is a multisig submitTransaction"
+        );
+        decoded.value.expect("decoded submitTransaction inputs")
+    }
+
+    /// One attached currency out of a decoded `submitTransaction`, as raw units. ABI numbers arrive
+    /// either hex-prefixed or decimal depending on width, so both are accepted.
+    #[cfg(feature = "shellnet")]
+    fn decoded_attached_currency(inputs: &serde_json::Value, currency_id: u32) -> u128 {
+        let cc = inputs
+            .get("cc")
+            .and_then(serde_json::Value::as_object)
+            .expect("submitTransaction carries an attached-currency map");
+        assert_eq!(
+            cc.len(),
+            1,
+            "the deposit voucher attaches exactly one currency leg: {cc:?}"
+        );
+        let raw = cc
+            .get(&currency_id.to_string())
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("no ECC[{currency_id}] leg in {cc:?}"));
+        raw.strip_prefix("0x")
+            .map(|hex| u128::from_str_radix(hex, 16).expect("hex currency amount"))
+            .unwrap_or_else(|| raw.parse().expect("decimal currency amount"))
+    }
+
+    /// The money boundaries where the two figures actually part, observed on the real path rather
+    /// than by calling the map builder: this drives the production
+    /// `note_deploy_mint_voucher_recoverable` entry, keeps the exact signed wallet message
+    /// production built, decodes what the wallet would really have attached, and then re-reads the
+    /// checkpoint from the persisted recovery FILE -- the figure the halo2 prover and
+    /// `deployPrivateNote.value` carry.
+    /// Both mutations the split exists to prevent are red here, and both are invisible to a test
+    /// that calls `voucher_currency_map()` directly:
+    /// * the wallet message attaching the plain nominal -- every voucher refused on chain
+    /// (`ERR_NOT_ALLOWED` 141, or `ERR_BELOW_GAS_DEPOSIT` 408 at N100);
+    /// * the persisted/proven figure carrying nominal + `GAS_DEPOSIT` -- the wallet spends first and
+    /// the proof is then a public-input mismatch(`ERR_INVALID_ZKPROOF`, 137).
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_wallet_message_attaches_wire_while_the_persisted_checkpoint_keeps_nominal()
+    {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("wire-vs-nominal.json");
+        let reader =
+            issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, issue_678_required_deposit_ecc())]);
+        let submitter = CountingVoucherSubmitter::default();
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let failpoints = super::NoteDeployVoucherFailpoints {
+            before_voucher_event_wait: true,
+            ..Default::default()
+        };
+        let mut recovery = test_recovery_state();
+        let nominal = recovery.raw_value;
+
+        let error = run_issue_678_deposit_with_boc_builder(
+            &recovery_path,
+            &mut recovery,
+            &reader,
+            &submitter,
+            failpoints,
+            &boc_builder,
+        )
+        .await
+        .expect_err("the fixture stops at the VoucherGenerated wait, after the wallet leg");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated interruption before voucher event wait"),
+            "{error}"
+        );
+        assert_eq!(submitter.calls.get(), 1, "exactly one wallet submit");
+
+        let boc = boc_builder
+            .last_boc
+            .borrow()
+            .clone()
+            .expect("production built a signed wallet message");
+        let attached =
+            decoded_attached_currency(&decoded_submit_transaction(&boc), SHELL_CURRENCY_ID);
+        assert_eq!(
+            attached,
+            u128::from(nominal) + u128::from(crate::cli::note::contract_gas_deposit_raw()),
+            "the wallet must attach the nominal plus the contract's GAS_DEPOSIT"
+        );
+
+        let persisted = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("read back the persisted recovery")
+            .expect("recovery was persisted before the wallet spend");
+        let checkpoint = persisted
+            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+            .expect("persisted deposit checkpoint");
+        assert_eq!(
+            checkpoint.raw_value, nominal,
+            "the persisted/proven figure must stay the nominal, whatever the wallet attached"
+        );
+        assert!(
+            u128::from(checkpoint.raw_value) < attached,
+            "the two figures must differ by the gas deposit: attached={attached}, proven={}",
+            checkpoint.raw_value
+        );
+    }
+
+    /// The fourth boundary: `deployPrivateNote.value` is the nominal the proof was built over, never
+    /// what the wallet attached. A mutant adding the gas deposit here spends the wallet first and
+    /// then has RootPN reject the proof, so this asserts the real production params builder.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_private_note_value_is_the_proven_nominal() {
+        let keys = preflight_fixture_keys();
+        let recovery = test_recovery_state();
+        let nominal = recovery.raw_value;
+        let proof = persisted_voucher_checkpoint(
+            &recovery.owner_public_key_hex,
+            recovery.token_type,
+            nominal,
+            false,
+            'b',
+        )
+        .proof
+        .expect("fixture proof")
+        .to_halo2();
+
+        let params = super::note_deploy_private_note_params(keys.public_hex(), &proof, "4242")
+            .expect("deployPrivateNote params");
+
+        assert_eq!(
+            params["value"],
+            serde_json::json!(nominal),
+            "deployPrivateNote must carry the proven nominal"
+        );
+        assert_ne!(
+            params["value"],
+            serde_json::json!(nominal + crate::cli::note::contract_gas_deposit_raw()),
+            "deployPrivateNote must never carry the amount the wallet attached"
+        );
+        assert_eq!(params["tokenType"], serde_json::json!(recovery.token_type));
     }
 
     #[cfg(feature = "shellnet")]
@@ -3857,7 +6328,7 @@ mod tests {
         let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
         let args = super::NoteDeployArgs {
             json: false,
-            multisig_address: funding_wallet.clone(),
+            multisig_address: Some(funding_wallet.clone()),
             multisig_key: Some(key_path),
             multisig_seed_file: None,
             nominal: "N100".to_string(),
@@ -3871,6 +6342,7 @@ mod tests {
             simulate_interrupt_after_deposit_voucher_event: false,
             simulate_interrupt_after_shell_voucher_submit: false,
             simulate_interrupt_after_deploy_before_note_record: false,
+            funding_timeout: None,
         };
         let recovery_request = crate::cli::note::NoteDeployRecoveryRequest {
             endpoint: "http://127.0.0.1:9",
@@ -4159,8 +6631,8 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery_path = temp.path().join("action-38-recovery.json");
-        let raw = 100_000_000_000u128;
-        let reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, raw * 2)]);
+        let reader =
+            issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, issue_678_required_deposit_ecc())]);
         let failed_submitter =
             CountingVoucherSubmitter::returning(Some(issue_678_receipt(true, 38)));
         let failpoints = super::NoteDeployVoucherFailpoints {
@@ -4606,11 +7078,13 @@ mod tests {
     async fn note_deploy_issue_678_matching_effect_never_clears_submit_guard() {
         use crate::cli::note::NoteDeployVoucherKind;
 
-        let raw = 100_000_000_000u128;
         let mut outbound_effect = issue_678_receipt(true, 38);
         outbound_effect.outmsg_count = 1;
         let mut matching_ecc_effect = issue_678_receipt(true, 38);
-        matching_ecc_effect.wallet_ecc_balances = Some(vec![(SHELL_CURRENCY_ID, raw * 2 - 1)]);
+        matching_ecc_effect.wallet_ecc_balances = Some(vec![(
+            SHELL_CURRENCY_ID,
+            issue_678_required_deposit_ecc() - 1,
+        )]);
         let mut missing_ecc = issue_678_receipt(true, 38);
         missing_ecc.wallet_ecc_balances = None;
 
@@ -4625,7 +7099,10 @@ mod tests {
         ] {
             let temp = tempfile::tempdir().expect("temp dir");
             let recovery_path = temp.path().join(format!("{case}.json"));
-            let reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, raw * 2)]);
+            let reader = issue_678_wallet_reader(vec![(
+                SHELL_CURRENCY_ID,
+                issue_678_required_deposit_ecc(),
+            )]);
             let submitter = CountingVoucherSubmitter::returning(Some(receipt));
             let mut recovery = test_recovery_state();
 
@@ -4820,6 +7297,70 @@ mod tests {
         .expect_err("finalized RootPN failure")
     }
 
+    /// a note-deploy failure used to hand the operator a bare `exit_code=403`. 403 is the
+    /// single most-hit note-deploy revert, and the number alone says nothing -- the name and the
+    /// contract family that declares it are what make it actionable.
+    /// The name is asserted against the vendored Solidity through
+    /// [`dexdo_core::contract_error_names`], never against a literal here, so this test cannot go on
+    /// passing after a contract bundle renames or renumbers the constant.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn a_note_deploy_exit_code_is_reported_with_its_name_and_its_contract_family() {
+        let rendered = format!("{:#}", finalized_rootpn_error("deployPrivateNote", 403));
+
+        let declared = dexdo_core::contract_error_names(403);
+        assert_eq!(
+            declared,
+            ["dex::ERR_INVALID_HISTORY_PROOF"],
+            "fixture guard: 403 must still be exactly one declared constant"
+        );
+        assert!(
+            rendered.contains("exit_code=403 (dex::ERR_INVALID_HISTORY_PROOF)"),
+            "the code must be named, with the family that declares it: {rendered}"
+        );
+        // The family prefix is the load-bearing half: a bare `ERR_...` is not enough(below).
+        assert!(
+            rendered.contains(declared[0]),
+            "the name must be the one the .sol declares: {rendered}"
+        );
+    }
+
+    /// The trap this repo has already fallen into: the numbers are **not one namespace**. The same
+    /// name sits on different numbers in different contract families, and the same number carries
+    /// unrelated meanings -- 101 is `dex::ERR_INVALID_SENDER` and also `modelregistry::ERR_NO_PUBKEY`.
+    /// A receipt that does not say which contract answered cannot decide between them, so the
+    /// message must show both and mark them undecided. Naming one would be a guess printed as a
+    /// fact, which is strictly worse than the bare number this change replaced.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn a_code_two_contract_families_declare_is_marked_ambiguous_and_never_picks_a_side() {
+        assert_eq!(
+            dexdo_core::contract_error_names(101),
+            ["dex::ERR_INVALID_SENDER", "modelregistry::ERR_NO_PUBKEY"],
+            "fixture guard: 101 must still be declared by two families"
+        );
+
+        let rendered = format!("{:#}", finalized_rootpn_error("deployPrivateNote", 101));
+        assert!(
+            rendered.contains(
+                "exit_code=101 (ambiguous: dex::ERR_INVALID_SENDER|modelregistry::ERR_NO_PUBKEY)"
+            ),
+            "both candidates must be shown and marked undecided: {rendered}"
+        );
+
+        // A number no vendored source declares is said out loud rather than left bare, so an
+        // unknown code is never mistaken for one the client looked up and was content with.
+        assert!(
+            dexdo_core::contract_error_names(999).is_empty(),
+            "fixture guard: 999 must remain undeclared"
+        );
+        assert!(
+            format!("{:#}", finalized_rootpn_error("deployPrivateNote", 999))
+                .contains("exit_code=999 (unknown contract error code)"),
+            "an undeclared code must say so"
+        );
+    }
+
     #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_rootpn_final_receipt_overrides_block_manager_wrapper() {
@@ -4922,6 +7463,59 @@ mod tests {
                     403
                 ),
                 "{code}"
+            );
+        }
+    }
+
+    /// 403 and 137 sit next to each other and mean opposite things -- one is answered by
+    /// proving again, the other by never proving that voucher again -- so the operator must be able
+    /// to tell them apart from what the tool prints.
+    /// Neither is allowed to arrive as an undifferentiated "submit failed", and neither may be
+    /// decided from message text: both are keyed on the exact finalized compute exit code, which is
+    /// why the untyped strings below stay generic.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_403_and_137_are_told_apart_by_their_exact_exit_code() {
+        let history = crate::cli::commands::note_deploy_error(
+            "0:wallet",
+            finalized_rootpn_error("sendEccShellToPrivateNote", 403),
+        )
+        .to_string();
+        let zkproof = crate::cli::commands::note_deploy_error(
+            "0:wallet",
+            finalized_rootpn_error("sendEccShellToPrivateNote", 137),
+        )
+        .to_string();
+
+        assert!(
+            history.contains("history proof expired (exit 403)"),
+            "{history}"
+        );
+        assert!(!history.contains("do_not_retry_this_voucher"), "{history}");
+        assert!(
+            zkproof.contains("exit 137, dex::ERR_INVALID_ZKPROOF"),
+            "{zkproof}"
+        );
+        assert!(
+            zkproof.contains("action=do_not_retry_this_voucher"),
+            "{zkproof}"
+        );
+        assert!(
+            !zkproof.contains("history proof expired"),
+            "137 must never be advertised as the retriable race: {zkproof}"
+        );
+
+        // Text that merely mentions the number is not the code, and stays generic.
+        for raw in [
+            "RootPN.sendEccShellToPrivateNote: block manager rejected message; exit_code=137",
+            "prove SHELL gas voucher: ERR_INVALID_ZKPROOF in halo2 prover",
+        ] {
+            let error = crate::cli::commands::note_deploy_error("0:wallet", anyhow::anyhow!(raw))
+                .to_string();
+            assert_eq!(
+                error,
+                format!("deploy PrivateNote from wallet 0:wallet: {raw}"),
+                "{raw}"
             );
         }
     }
@@ -5345,6 +7939,135 @@ mod tests {
     #[tokio::test]
     async fn note_deploy_shell_exact_403_reproofs_same_paid_voucher_once() {
         assert_exact_403_reproof_for_kind(crate::cli::note::NoteDeployVoucherKind::ShellGas).await;
+    }
+
+    /// a `sendEccShellToPrivateNote` that the chain finalized `aborted=true` with zero
+    /// out-messages must never be read as "the money is already there".
+    /// `RootPN.deployPrivateNote` creates every note holding `GAS_DEPOSIT` ECC[2], and that is more
+    /// than the deposit the gas voucher owes it. The post-condition asked "does the note hold at
+    /// least the deposit?", which the note answered YES to at birth, before any voucher was paid --
+    /// so the failed submit was accepted, `shell_funded` was written, and `note deploy` printed
+    /// `note deployed` and exited 0 with the funding wallet debited 100 SHELL. It is deterministic:
+    /// with that question, every stage-two failure reads as success.
+    /// The failure injected here is the exact one observed on chain (403,
+    /// `dex::ERR_INVALID_HISTORY_PROOF`), and the note's level is read from the CONTRACT's own
+    /// declaration rather than restated, so a `GAS_DEPOSIT` that moves moves this
+    /// regression with it instead of leaving it quietly green.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_aborted_gas_voucher_is_not_funded_by_the_notes_birth_deposit() {
+        use dexdo_core::private_note::proof::ECC_SHELL_DEPOSIT_RAW;
+        use std::cell::Cell;
+
+        let birth_shell_ecc = u128::from(crate::cli::note::contract_gas_deposit_raw());
+        assert!(
+            birth_shell_ecc >= u128::from(ECC_SHELL_DEPOSIT_RAW),
+            "fixture guard:  exists precisely because a new note's birth deposit already \
+             clears the gas deposit on its own"
+        );
+
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let checkpoint = persisted_voucher_checkpoint(
+            &owner,
+            dexdo_core::params::SHELL_CURRENCY_ID,
+            recovery.ecc_shell_deposit,
+            true,
+            'f',
+        );
+        recovery
+            .set_voucher_checkpoint(
+                crate::cli::note::NoteDeployVoucherKind::ShellGas,
+                checkpoint.clone(),
+            )
+            .expect("persist paid gas voucher");
+        let proof = checkpoint.proof.as_ref().expect("proof").to_halo2();
+
+        // Zero out-messages: the note still holds exactly what RootPN gave it at birth.
+        let note_shell_ecc = Cell::new(birth_shell_ecc);
+        let target = crate::cli::note::note_shell_funding_target(
+            birth_shell_ecc,
+            recovery.ecc_shell_deposit,
+        );
+        let submits = Cell::new(0_usize);
+        let accepted = super::note_deploy_submit_proof_once(
+            &proof,
+            async |_proof| {
+                super::note_deploy_wait_note_shell_funding(
+                    async || Ok(Some(note_shell_ecc.get())),
+                    target,
+                    std::time::Duration::ZERO,
+                )
+                .await
+            },
+            async |_proof| {
+                submits.set(submits.get() + 1);
+                Err(finalized_rootpn_error("sendEccShellToPrivateNote", 403))
+            },
+        )
+        .await
+        .expect("an exact finalized 403 is classified for re-proof, not propagated");
+        assert_eq!(submits.get(), 1);
+        assert!(
+            !accepted,
+            "an aborted sendEccShellToPrivateNote must not be accepted as the effect having landed"
+        );
+
+        // And the corrected question must still answer yes once the voucher does arrive, so this is
+        // a post-condition that can be met rather than one that never can.
+        note_shell_ecc.set(birth_shell_ecc + u128::from(ECC_SHELL_DEPOSIT_RAW));
+        assert!(
+            super::note_deploy_wait_note_shell_funding(
+                async || Ok(Some(note_shell_ecc.get())),
+                target,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .expect("read the funded note"),
+            "the gas voucher arriving must be recognised"
+        );
+    }
+
+    /// the same defect on the branch that decides whether to SKIP the second wallet spend.
+    /// A resumed run has no reading from before the submit, so its baseline is the level the
+    /// contract hands every note it creates. The client's mirror of that constant is used for the
+    /// target and the contract's own declaration for the observation, so the two drifting apart is
+    /// caught here rather than by an under-funded note reaching a pool.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_resumed_note_at_its_birth_deposit_is_not_already_funded() {
+        use dexdo_core::private_note::proof::ECC_SHELL_DEPOSIT_RAW;
+
+        let birth_shell_ecc = u128::from(crate::cli::note::contract_gas_deposit_raw());
+        let target = crate::cli::note::note_shell_funding_target(
+            crate::cli::note::note_birth_shell_ecc(),
+            ECC_SHELL_DEPOSIT_RAW,
+        );
+        for (observed, expected, case) in [
+            (birth_shell_ecc, false, "birth deposit and nothing else"),
+            (
+                birth_shell_ecc + u128::from(ECC_SHELL_DEPOSIT_RAW) - 1,
+                false,
+                "one raw unit short of the voucher",
+            ),
+            (
+                birth_shell_ecc + u128::from(ECC_SHELL_DEPOSIT_RAW),
+                true,
+                "the gas voucher landed",
+            ),
+        ] {
+            assert_eq!(
+                super::note_deploy_wait_note_shell_funding(
+                    async || Ok(Some(observed)),
+                    target,
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .expect("read the resumed note"),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[cfg(feature = "shellnet")]
@@ -6545,6 +9268,61 @@ mod tests {
         );
     }
 
+    /// account-only input cannot supply the destination DApp recorded as withdrawal
+    /// evidence. A missing manifest and key make any progress past input parsing observable: the
+    /// required refusal must win before doctor, owner reads, or any submit path can run.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_withdraw_refuses_legacy_destination_before_chain_work() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let args = crate::cli::args::NoteWithdrawArgs {
+            identity: crate::cli::args::IdentityArgs {
+                note_key: Some(temp.path().join("missing-note-key.hex")),
+                note_index: 0,
+                note_addr: Some(format!("0:{}", "b".repeat(64))),
+            },
+            to: format!("0:{}", "a".repeat(64)),
+            contracts: temp.path().join("missing-contracts.json"),
+        };
+
+        let error = super::run_note_withdraw(args)
+            .await
+            .expect_err("legacy destination must be refused")
+            .to_string();
+        assert!(
+            error.contains("canonical `<dapp_id>::<account_id>`"),
+            "{error}"
+        );
+        assert!(error.contains("legacy `0:<account_id>`"), "{error}");
+        assert!(error.contains("destination DApp"), "{error}");
+        assert!(!error.contains("missing-contracts.json"), "{error}");
+
+        let source = include_str!("note_cmd.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_withdraw")
+            .expect("run_note_withdraw present");
+        let end = source[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("run_note_withdraw cfg end present");
+        let body = &source[start..end];
+        let input_guard = body
+            .find("parse_note_withdraw_destination")
+            .expect("canonical destination guard present");
+        let doctor = body
+            .find("shellnet_doctor_preflight")
+            .expect("doctor preflight present");
+        let owner = body
+            .find("assert_note_owner_matches")
+            .expect("owner preflight present");
+        let submit = body
+            .find("withdraw_note_tokens")
+            .expect("withdraw submit present");
+        assert!(input_guard < doctor, "input refusal must precede doctor");
+        assert!(input_guard < owner, "input refusal must precede owner reads");
+        assert!(input_guard < submit, "input refusal must precede submit");
+    }
+
     /// the command body is read-only and address-only: no key read and no signed/write helper.
     #[test]
     fn note_balance_command_path_is_read_only() {
@@ -6564,13 +9342,13 @@ mod tests {
             2,
             "expected both run_note_balance variants in the inspected range: {body}"
         );
-        assert!(body.contains(".get_account("), "{body}");
+        assert!(body.contains(".get_account_retrying("), "{body}");
         assert!(
             body.contains(".assert_note_balance_private_note_account("),
             "{body}"
         );
         assert!(body.contains(".private_note_details("), "{body}");
-        let get_account = body.find(".get_account(").unwrap();
+        let get_account = body.find(".get_account_retrying(").unwrap();
         let identity_guard = body
             .find(".assert_note_balance_private_note_account(")
             .unwrap();
@@ -6621,5 +9399,731 @@ mod tests {
         assert_eq!(value["note_count"], 1);
         assert!(value["error"].is_null());
         assert_eq!(value.as_object().expect("object").len(), 8);
+    }
+
+    /// `note topup` sends the shortfall and never more, and a note already at or above the target is
+    /// a no-op rather than another spend. The second half is what makes the command safe to repeat
+    /// after an uncertain submit, which is the only state an operator can be in when a top-up looks
+    /// like it failed.
+    #[test]
+    fn note_topup_sends_exactly_the_shortfall_and_nothing_at_or_above_target() {
+        assert_eq!(
+            super::note_topup_shortfall_raw(269_000_000_000, 350_000_000_000),
+            Some(81_000_000_000)
+        );
+        assert_eq!(
+            super::note_topup_shortfall_raw(349_999_999_999, 350_000_000_000),
+            Some(1)
+        );
+        assert_eq!(
+            super::note_topup_shortfall_raw(350_000_000_000, 350_000_000_000),
+            None
+        );
+        assert_eq!(
+            super::note_topup_shortfall_raw(369_000_000_000, 350_000_000_000),
+            None
+        );
+        assert_eq!(super::note_topup_shortfall_raw(0, 0), None);
+    }
+
+    /// dexdo-cli regression: the observed failure, and the idempotence it must not cost.
+    /// A note whose real ECC[2] was 310e9 read as 350e9 once, and `dexdo note topup` with
+    /// `--to-raw 350000000000`
+    /// answered "already holds 350000000000...; no wallet spend was submitted" -- skipping a top-up
+    /// that was genuinely needed and telling the operator the note was funded. That is how a pool
+    /// looks restored and then hard-fails a preflight an hour later, with the skip message as the
+    /// operator's evidence that it was fine.
+    /// So a single reading may no longer authorise doing nothing, while two agreeing readings still
+    /// must: `--to-raw` is a target, and re-running it against a note genuinely at that target has
+    /// to stay a no-op or the command stops being safe to repeat after an uncertain submit.
+    #[test]
+    fn note_topup_needs_two_agreeing_reads_before_it_skips_a_top_up() {
+        use super::NoteTopupNoOpVerdict::{AlreadyAtTarget, ReadsDisagree};
+
+        const TARGET: u128 = 350_000_000_000;
+
+        // The observed bug: the first read said the level was reached, the confirming read says the
+        // note is 40e9 short. Nothing is skipped on the strength of the stale one.
+        assert_eq!(
+            super::note_topup_no_op_verdict(TARGET, Some(310_000_000_000), TARGET),
+            ReadsDisagree
+        );
+        // ... and an account that reads as absent right after reading as funded is a disagreement
+        // too, not a level of zero and not a confirmation.
+        assert_eq!(
+            super::note_topup_no_op_verdict(TARGET, None, TARGET),
+            ReadsDisagree
+        );
+
+        // The idempotence, unchanged: two readings that agree the note is at -- or above -- the
+        // target still submit nothing.
+        assert_eq!(
+            super::note_topup_no_op_verdict(TARGET, Some(TARGET), TARGET),
+            AlreadyAtTarget
+        );
+        assert_eq!(
+            super::note_topup_no_op_verdict(369_000_000_000, Some(TARGET), TARGET),
+            AlreadyAtTarget
+        );
+        assert_eq!(
+            super::note_topup_no_op_verdict(TARGET, Some(390_000_000_000), TARGET),
+            AlreadyAtTarget
+        );
+        // A confirming read one raw unit short is short, at the same boundary
+        // `note_topup_shortfall_raw` draws.
+        assert_eq!(
+            super::note_topup_no_op_verdict(TARGET, Some(TARGET - 1), TARGET),
+            ReadsDisagree
+        );
+    }
+
+    /// The skip path must be as careful as the spend path, and must say what it acted on.
+    /// Shape rather than behaviour, because the two reads are chain round trips: what is pinned is
+    /// that the no-op branch takes a SECOND reading before returning, that the verdict is the shared
+    /// one, and that neither outcome is silent -- the no-op prints both readings and the
+    /// disagreement is a refusal, not an `Ok(())` that reads to an operator as success.
+    #[test]
+    fn note_topup_no_op_branch_reads_twice_and_reports_the_reads() {
+        let source = include_str!("note_cmd.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_topup")
+            .expect("run_note_topup present");
+        let end = source[start..]
+            .find("async fn note_topup_preflight_wallet_ecc")
+            .map(|offset| start + offset)
+            .expect("run_note_topup end marker present");
+        let body = &source[start..end];
+
+        let shortfall = body
+            .find("note_topup_shortfall_raw(current_raw, args.to_raw)")
+            .expect("note topup computes its shortfall from the first read");
+        let confirm = body
+            .find("note_deploy_read_note_ecc_shell(chain.client(), &note)")
+            .expect("the no-op branch takes a confirming read");
+        let verdict = body
+            .find("note_topup_no_op_verdict(current_raw, confirming_raw, args.to_raw)")
+            .expect("the no-op branch decides through the shared verdict");
+        let submit = body
+            .find("note_topup_submit(")
+            .expect("note topup submit present");
+        assert!(
+            shortfall < confirm && confirm < verdict && verdict < submit,
+            "the confirming read must happen after the first verdict and before any spend: {body}"
+        );
+        assert!(
+            body.contains("no wallet spend was submitted.")
+                && body.contains("confirmed by a second read"),
+            "the no-op message must name the readings it acted on: {body}"
+        );
+        assert!(
+            body.contains("refusing to decide: two reads of PrivateNote"),
+            "two readings that disagree must refuse rather than report success: {body}"
+        );
+    }
+
+    /// `note transfer` is idempotent by the DESTINATION's level, on the same arithmetic
+    /// `note topup` is, and skips only on two agreeing reads.
+    /// It shares the helpers rather than restating them, so what this pins is that the figures fed
+    /// in are the destination's: a transfer sized against the SENDER's balance would move the whole
+    /// remaining record on every run, and a transfer sized against an amount rather than a level
+    /// would move it twice after a send whose outcome the client never learned -- out of a record
+    /// with no wallet-side refill to correct the overshoot with.
+    #[test]
+    fn note_transfer_is_idempotent_by_the_destination_level() {
+        use super::NoteTopupNoOpVerdict::{AlreadyAtTarget, ReadsDisagree};
+
+        // Three tired notes into one working note: the destination holds 40e9 and is brought to
+        // 350e9, so 310e9 moves -- not "everything the sender has".
+        assert_eq!(
+            super::note_topup_shortfall_raw(40_000_000_000, 350_000_000_000),
+            Some(310_000_000_000)
+        );
+        // The second run of the identical command moves nothing.
+        assert_eq!(
+            super::note_topup_shortfall_raw(350_000_000_000, 350_000_000_000),
+            None
+        );
+        // ... and that no-op still needs two agreeing reads before it is allowed to be silent.
+        assert_eq!(
+            super::note_topup_no_op_verdict(
+                350_000_000_000,
+                Some(350_000_000_000),
+                350_000_000_000
+            ),
+            AlreadyAtTarget
+        );
+        assert_eq!(
+            super::note_topup_no_op_verdict(
+                350_000_000_000,
+                Some(40_000_000_000),
+                350_000_000_000
+            ),
+            ReadsDisagree
+        );
+        // An unreadable destination is a disagreement, not a level of zero -- treating it as zero
+        // would size a transfer of the full target at an address that just failed to answer.
+        assert_eq!(
+            super::note_topup_no_op_verdict(350_000_000_000, None, 350_000_000_000),
+            ReadsDisagree
+        );
+    }
+
+    /// nothing is signed or sent until both ends are proved to be live, current-generation
+    /// notes and every free refusal has been raised.
+    /// Shape rather than behaviour, because each step is a chain round trip. The ORDER is the whole
+    /// point: `initTransfer` runs `tvm.accept()` before all of its own `require`s, so a refusal
+    /// discovered on chain is paid for out of the sending note's gas, and a destination that is not
+    /// a current-generation note is an address a debited trading record can be stranded at.
+    #[test]
+    fn note_transfer_proves_both_notes_before_it_reads_a_key_or_sends() {
+        let source = include_str!("note_cmd.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_transfer")
+            .expect("run_note_transfer present");
+        let end = source[start..]
+            .find("async fn note_transfer_assert_live_note")
+            .map(|offset| start + offset)
+            .expect("run_note_transfer end marker present");
+        let body = &source[start..end];
+
+        let self_transfer = body
+            .find("NoteTransferRefusal::SelfTransfer")
+            .expect("the self-transfer refusal is raised");
+        let live_from = body
+            .find("note_transfer_assert_live_note(&chain, &from")
+            .expect("the sending note is proved live");
+        let live_to = body
+            .find("note_transfer_assert_live_note(&chain, &to")
+            .expect("the destination note is proved live");
+        let sender_refusal = body
+            .find("note_transfer_sender_refusal(")
+            .expect("sender getDetails refusals are raised");
+        let dest_refusal = body
+            .find("note_transfer_dest_refusal(")
+            .expect("destination getDetails refusals are raised");
+        let amount_refusal = body
+            .find("note_transfer_amount_refusal(")
+            .expect("amount refusals are raised");
+        let key_read = body
+            .find("read_secret_hex(&args.note_key")
+            .expect("the note key is read");
+        let owner_guard = body
+            .find(".assert_note_owner_matches(")
+            .expect("the signing key is checked against the note's owner key");
+        let submit = body
+            .find(".init_note_transfer(")
+            .expect("the transfer is submitted");
+
+        assert!(
+            self_transfer < live_from,
+            "a transfer to the sending note itself must be refused before any chain read: {body}"
+        );
+        assert!(
+            live_from < sender_refusal
+                && live_to < dest_refusal
+                && dest_refusal < amount_refusal
+                && amount_refusal < key_read
+                && key_read < owner_guard
+                && owner_guard < submit,
+            "both notes must be proved current, and every free refusal raised, before the owner \
+             key is read and before anything is sent: {body}"
+        );
+        // The destination's deposit hash is read off the destination itself, so the note whose
+        // state was just checked and the note the contract derives from that hash cannot be two
+        // different accounts.
+        let hash = body
+            .find("note_transfer_deposit_identifier_hash(&to_details)")
+            .expect("the destination hash comes from the destination's own getDetails");
+        assert!(
+            dest_refusal < hash && hash < submit,
+            "the destination hash must come from the note that was just validated: {body}"
+        );
+    }
+
+    /// this command moves the TRADING RECORD and must not quietly move the gas pocket too.
+    /// `initTransfer` takes `amount` and `eccAmount` as two adjacent `uint128`s. Passing anything
+    /// but 0 for the second would drain ECC[2] the operator did not ask to move, out of a note that
+    /// still needs it to run deals -- and it would compile, encode and submit exactly the same.
+    #[test]
+    fn note_transfer_moves_the_record_only() {
+        let source = include_str!("note_cmd.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_transfer")
+            .expect("run_note_transfer present");
+        let end = source[start..]
+            .find("async fn note_transfer_assert_live_note")
+            .map(|offset| start + offset)
+            .expect("run_note_transfer end marker present");
+        let body = &source[start..end];
+        let call = body
+            .find(".init_note_transfer(")
+            .expect("the transfer is submitted");
+        let args_end = body[call..]
+            .find(')')
+            .map(|offset| call + offset)
+            .expect("initTransfer argument list terminator");
+        let call_args = &body[call..args_end];
+        assert!(
+            call_args.contains("SHELL_CURRENCY_ID"),
+            "the token type must be the canonical SHELL currency id: {call_args}"
+        );
+        assert!(
+            call_args.contains("amount_raw"),
+            "the moved amount must be the computed shortfall: {call_args}"
+        );
+        // The last argument is `eccAmount`, and it is a literal zero. The list is written with a
+        // trailing comma, so the last SUPPLIED argument is the last non-empty segment.
+        let last = call_args
+            .rsplit(',')
+            .map(str::trim)
+            .find(|segment| !segment.is_empty())
+            .expect("initTransfer takes arguments");
+        assert_eq!(
+            last, "0",
+            "eccAmount must be a literal 0 -- this command moves the trading record, not the gas \
+             pocket: {call_args}"
+        );
+    }
+
+    /// WHY THIS COMMAND EXISTS AT ALL, pinned to the contract that decides it.
+    /// The other way to put ECC[2] on a live note is `RootPN.sendEccShellToPrivateNote`, which
+    /// spends a voucher, and `RootPN.generateVoucher` puts every voucher through `isAllowedNominal`.
+    /// So that path can only ever move a whole entry of `ALLOWED_NOMINALS` (times the token's
+    /// decimals), and a note that is 40 or 81 SHELL short of its level cannot be restored to that
+    /// exact level by it. If a smaller nominal is ever added to the contract this test fails and the
+    /// justification has to be rewritten rather than quietly surviving as folklore.
+    #[test]
+    fn smallest_voucher_nominal_cannot_restore_an_observed_note_shortfall() {
+        const MODIFIERS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/dex/modifiers/modifiers.sol"
+        ));
+        let list_start = MODIFIERS
+            .find("constant ALLOWED_NOMINALS")
+            .expect("modifiers.sol declares ALLOWED_NOMINALS");
+        let list_end = list_start
+            + MODIFIERS[list_start..]
+                .find("];")
+                .expect("ALLOWED_NOMINALS terminator");
+        let smallest_nominal = MODIFIERS[list_start..list_end]
+            .match_indices("uint128(")
+            .map(|(at, marker)| {
+                let rest = &MODIFIERS[list_start + at + marker.len()..];
+                rest[..rest.find(')').expect("nominal terminator")]
+                    .replace('_', "")
+                    .parse::<u128>()
+                    .expect("numeric ALLOWED_NOMINALS entry")
+            })
+            .min()
+            .expect("ALLOWED_NOMINALS is not empty");
+        // SHELL is not USDC, so `tokenDecimals` is the 1e9 branch.
+        let smallest_voucher_raw = smallest_nominal * 1_000_000_000;
+        assert_eq!(smallest_voucher_raw, 100_000_000_000);
+        // Measured shortfalls of canonical notes after one live campaign(350e9 start).
+        for spent_raw in [269_000_000_000u128, 300_000_000_000, 310_000_000_000] {
+            let missing = super::note_topup_shortfall_raw(spent_raw, 350_000_000_000)
+                .expect("a spent note is below the canonical level");
+            assert!(
+                missing < smallest_voucher_raw,
+                "a {missing} raw shortfall is not expressible as vouchers of {smallest_voucher_raw} raw"
+            );
+        }
+    }
+
+    /// The two ways this command could silently stop doing what it says: sending the SHELL under
+    /// flag 16 (which converts it into the destination's NATIVE balance, leaving the note with gas
+    /// it cannot spend as currency), or spending before the note-identity guard has established that
+    /// the destination is a live current-generation PrivateNote. Both are shape, not behaviour, so
+    /// they are checked as shape.
+    #[test]
+    fn note_topup_guards_the_note_before_spending_and_sends_plain_ecc() {
+        let source = include_str!("note_cmd.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_topup")
+            .expect("run_note_topup present");
+        let end = source[start..]
+            .find("async fn note_topup_preflight_wallet_ecc")
+            .map(|offset| start + offset)
+            .expect("run_note_topup end marker present");
+        let body = &source[start..end];
+        let guard = body
+            .find(".assert_note_balance_private_note_account(")
+            .expect("note topup note-identity guard present");
+        let key_read = body
+            .find("multisig_secret_hex(")
+            .expect("note topup funding-key read present");
+        let submit = body
+            .find("note_topup_submit(")
+            .expect("note topup submit present");
+        assert!(
+            guard < key_read && key_read < submit,
+            "note topup must prove the destination is a current PrivateNote before it reads the \
+             funding key or submits: {body}"
+        );
+
+        let submit_start = source
+            .find("async fn note_topup_submit")
+            .expect("note_topup_submit present");
+        let submit_end = source[submit_start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| submit_start + offset)
+            .expect("note_topup_submit end marker present");
+        let submit_body = &source[submit_start..submit_end];
+        let marker = "submit_transaction_params(";
+        let params = submit_body
+            .find(marker)
+            .expect("note topup uses the canonical multisig submitTransaction params");
+        // Balanced scan: the argument list contains calls of its own, so the first `)` is not the
+        // end of it.
+        let mut depth = 0usize;
+        let mut close = None;
+        for (at, ch) in submit_body[params + marker.len() - 1..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(params + marker.len() - 1 + at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &submit_body[params..close.expect("params terminator")];
+        assert!(
+            args.contains("String::new()"),
+            "note topup must send an EMPTY body so the note's receive() takes it as plain \
+             currency: {args}"
+        );
+        assert!(
+            !args.contains("16"),
+            "note topup must not use flag 16: it converts the sent SHELL into the note's NATIVE \
+             balance instead of crediting ECC[2]: {args}"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    mod issue_1169_voucher_wait_retry {
+        use dexdo_core::params::{
+            NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT, TRANSIENT_READ_INITIAL_BACKOFF,
+            TRANSIENT_READ_MAX_BACKOFF,
+        };
+        use std::{
+            cell::{Cell, RefCell},
+            collections::VecDeque,
+            time::Duration,
+        };
+
+        enum WaitStep {
+            Transient(anyhow::Error),
+            Event,
+            SdkTimeout,
+        }
+
+        struct ScriptedVoucherSubmitter {
+            submit_calls: Cell<usize>,
+            wait_calls: Cell<usize>,
+            wait_timeouts: RefCell<Vec<Duration>>,
+            wait_steps: RefCell<VecDeque<WaitStep>>,
+        }
+
+        impl ScriptedVoucherSubmitter {
+            fn steps(steps: impl IntoIterator<Item = WaitStep>) -> Self {
+                Self {
+                    submit_calls: Cell::new(0),
+                    wait_calls: Cell::new(0),
+                    wait_timeouts: RefCell::new(Vec::new()),
+                    wait_steps: RefCell::new(steps.into_iter().collect()),
+                }
+            }
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl super::super::NoteDeployVoucherSubmitter for ScriptedVoucherSubmitter {
+            async fn submit_voucher_boc(
+                &self,
+                _endpoint: &str,
+                _multisig_address: &dexdo_core::Address,
+                _boc: &str,
+                _http: &reqwest::Client,
+            ) -> anyhow::Result<Option<super::super::NoteDeployWalletActionReceipt>> {
+                self.submit_calls.set(self.submit_calls.get() + 1);
+                Ok(Some(super::issue_678_receipt(false, 0)))
+            }
+
+            async fn wait_for_voucher_event_by_sk_u_commit(
+                &self,
+                _http: &reqwest::Client,
+                _endpoint: &str,
+                _root_pn: &dexdo_core::Address,
+                _sk_u_commit_hex: &str,
+                timeout: Duration,
+            ) -> anyhow::Result<
+                dexdo_core::private_note::voucher_event::VoucherExtoutMessage,
+            > {
+                self.wait_calls.set(self.wait_calls.get() + 1);
+                self.wait_timeouts.borrow_mut().push(timeout);
+                let step = self
+                    .wait_steps
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("production made an unexpected voucher wait call");
+                match step {
+                    WaitStep::Transient(error) => Err(error),
+                    WaitStep::Event => Ok(fixture_event()),
+                    WaitStep::SdkTimeout => anyhow::bail!(
+                        "timed out waiting for VoucherGenerated event with skUCommit=fixture within {}s",
+                        timeout.as_secs()
+                    ),
+                }
+            }
+        }
+
+        struct FixedVoucherBocBuilder;
+
+        #[async_trait::async_trait(?Send)]
+        impl super::super::NoteDeployVoucherBocBuilder for FixedVoucherBocBuilder {
+            async fn build_voucher_submit_boc(
+                &self,
+                _multisig_address: &dexdo_core::Address,
+                _multisig_keys: &dexdo_core::KeyPair,
+                _root_pn: &dexdo_core::Address,
+                _checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+            ) -> anyhow::Result<String> {
+                Ok("fixture-signed-wallet-boc".to_string())
+            }
+        }
+
+        fn fixture_event() -> dexdo_core::private_note::voucher_event::VoucherExtoutMessage {
+            dexdo_core::private_note::voucher_event::VoucherExtoutMessage {
+                id: "issue-1169-event".to_string(),
+                boc: "fixture-event-boc".to_string(),
+                body: "fixture-event-body".to_string(),
+                dst: dexdo_core::private_note::voucher_event::VOUCHER_EVENT_DST.to_string(),
+                created_at: 1,
+                block_id: Some("issue-1169-block".to_string()),
+            }
+        }
+
+        async fn released_loopback_endpoint() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind transient-error fixture");
+            let endpoint = format!(
+                "http://{}/",
+                listener.local_addr().expect("read fixture address")
+            );
+            drop(listener);
+            endpoint
+        }
+
+        async fn transient_connect_error(
+            client: &reqwest::Client,
+            endpoint: &str,
+        ) -> anyhow::Error {
+            let error = client
+                .get(endpoint)
+                .send()
+                .await
+                .expect_err("the released loopback port must refuse connections");
+            assert!(
+                error.is_connect(),
+                "the fixture must produce the same structural error as a dropped connection: {error}"
+            );
+            anyhow::Error::new(error)
+        }
+
+        async fn run_deposit_entry(
+            recovery_path: &std::path::Path,
+            recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+            submitter: &ScriptedVoucherSubmitter,
+            failpoints: super::super::NoteDeployVoucherFailpoints,
+        ) -> anyhow::Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+            use crate::cli::note::NoteDeployVoucherKind;
+
+            let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")?;
+            let multisig_address =
+                dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))?;
+            let funding_keys = super::preflight_fixture_keys();
+            let key_loader = super::FixedFundingKeyLoader::returning(&funding_keys);
+            let wallet_reader = super::issue_678_wallet_reader(vec![(
+                dexdo_core::params::SHELL_CURRENCY_ID,
+                super::issue_678_required_deposit_ecc(),
+            )]);
+            let owner = recovery.owner_public_key_hex.clone();
+            let token_type = recovery.token_type;
+            let raw_value = recovery.raw_value;
+
+            super::super::note_deploy_mint_voucher_recoverable(
+                &client,
+                recovery_path,
+                recovery,
+                NoteDeployVoucherKind::Deposit,
+                &multisig_address,
+                &key_loader,
+                &wallet_reader,
+                &FixedVoucherBocBuilder,
+                submitter,
+                &owner,
+                token_type,
+                raw_value,
+                false,
+                &dexdo_core::private_note::Halo2Paths::from_env(),
+                failpoints,
+            )
+            .await
+        }
+
+        fn assert_paid_recovery_is_persisted_without_event(
+            recovery_path: &std::path::Path,
+        ) {
+            let persisted = crate::cli::note::load_note_deploy_recovery(recovery_path)
+                .expect("read persisted recovery")
+                .expect("wallet submit must leave recovery state on disk");
+            let checkpoint = persisted
+                .voucher_checkpoint(crate::cli::note::NoteDeployVoucherKind::Deposit)
+                .expect("persisted deposit checkpoint");
+            assert!(checkpoint.submit_maybe_sent);
+            assert!(checkpoint.event.is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn transient_wait_failure_is_retried_inside_one_deploy_and_wallet_spends_once() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let recovery_path = temp.path().join("transient-success.recovery.json");
+            let endpoint = released_loopback_endpoint().await;
+            let client = reqwest::Client::new();
+            let transient = transient_connect_error(&client, &endpoint).await;
+            let submitter =
+                ScriptedVoucherSubmitter::steps([WaitStep::Transient(transient), WaitStep::Event]);
+            let mut recovery = super::test_recovery_state();
+            let started = tokio::time::Instant::now();
+
+            let error = run_deposit_entry(
+                &recovery_path,
+                &mut recovery,
+                &submitter,
+                super::super::NoteDeployVoucherFailpoints {
+                    after_deposit_event: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the existing after-event failpoint stops before the expensive prover")
+            .to_string();
+
+            assert!(
+                error.contains("simulated interruption after deposit VoucherGenerated event"),
+                "the deploy must advance past the retried wait: {error}"
+            );
+            assert_eq!(submitter.submit_calls.get(), 1, "wallet spend count");
+            assert_eq!(submitter.wait_calls.get(), 2, "voucher wait count");
+            assert_eq!(started.elapsed(), TRANSIENT_READ_INITIAL_BACKOFF);
+            assert_eq!(
+                *submitter.wait_timeouts.borrow(),
+                vec![
+                    NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT,
+                    NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT - TRANSIENT_READ_INITIAL_BACKOFF,
+                ],
+                "the retry must receive only the original deadline's remainder"
+            );
+
+            let persisted = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+                .expect("read persisted recovery")
+                .expect("recovery must remain load-bearing");
+            let checkpoint = persisted
+                .voucher_checkpoint(crate::cli::note::NoteDeployVoucherKind::Deposit)
+                .expect("persisted deposit checkpoint");
+            assert!(checkpoint.submit_maybe_sent);
+            assert_eq!(
+                checkpoint.event.as_ref().map(|event| event.id.as_str()),
+                Some("issue-1169-event")
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sdk_wait_timeout_is_non_transient_and_keeps_paid_recovery_without_respending() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let recovery_path = temp.path().join("sdk-timeout.recovery.json");
+            let submitter = ScriptedVoucherSubmitter::steps([WaitStep::SdkTimeout]);
+            let mut recovery = super::test_recovery_state();
+
+            let error = run_deposit_entry(
+                &recovery_path,
+                &mut recovery,
+                &submitter,
+                Default::default(),
+            )
+            .await
+            .expect_err("the SDK's own wait exhaustion must take the existing refusal")
+            .to_string();
+
+            assert!(
+                error.contains("timed out waiting for VoucherGenerated event"),
+                "the structural non-reqwest error must be preserved: {error}"
+            );
+            assert!(
+                error.contains("refusing to submit a second wallet spend"),
+                "the existing refusal must remain: {error}"
+            );
+            assert_eq!(submitter.submit_calls.get(), 1, "wallet spend count");
+            assert_eq!(submitter.wait_calls.get(), 1, "SDK timeout must not retry");
+            assert_paid_recovery_is_persisted_without_event(&recovery_path);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn repeated_transient_wait_failures_stop_at_the_original_deadline() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let recovery_path = temp.path().join("deadline.recovery.json");
+            let endpoint = released_loopback_endpoint().await;
+            let client = reqwest::Client::new();
+            let mut transient_steps = Vec::new();
+            for _ in 0..NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT.as_secs() {
+                transient_steps.push(WaitStep::Transient(
+                    transient_connect_error(&client, &endpoint).await,
+                ));
+            }
+            let submitter = ScriptedVoucherSubmitter::steps(transient_steps);
+            let mut recovery = super::test_recovery_state();
+            let started = tokio::time::Instant::now();
+
+            let error = tokio::time::timeout(
+                NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT + TRANSIENT_READ_MAX_BACKOFF,
+                run_deposit_entry(
+                    &recovery_path,
+                    &mut recovery,
+                    &submitter,
+                    Default::default(),
+                ),
+            )
+            .await
+            .expect("the deploy must stop before a fresh voucher deadline could extend it")
+            .expect_err("transient failures cannot extend the voucher wait deadline")
+            .to_string();
+
+            assert!(
+                error.contains("refusing to submit a second wallet spend"),
+                "deadline exhaustion must keep the existing refusal: {error}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT,
+                "the whole retry must stop on the original 480-second budget"
+            );
+            assert_eq!(submitter.submit_calls.get(), 1, "wallet spend count");
+            assert!(submitter.wait_calls.get() > 1, "transient wait must retry");
+            let timeouts = submitter.wait_timeouts.borrow();
+            assert_eq!(timeouts.first(), Some(&NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT));
+            assert!(
+                timeouts.windows(2).all(|pair| pair[1] < pair[0]),
+                "every SDK wait must receive less of the same deadline: {timeouts:?}"
+            );
+            assert!(
+                timeouts.last().is_some_and(|timeout| *timeout <= TRANSIENT_READ_MAX_BACKOFF),
+                "the final wait must receive only the bounded remainder: {timeouts:?}"
+            );
+            assert_paid_recovery_is_persisted_without_event(&recovery_path);
+        }
     }
 }

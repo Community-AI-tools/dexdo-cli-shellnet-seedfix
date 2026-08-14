@@ -10,5 +10,5 @@ pub use v1::{
     gateway_client::GatewayClient,
     gateway_server::{Gateway, GatewayServer},
     CanonChunk, CanonRequest, Challenge, ChallengeRequest, ChatMessage, SamplingParams,
-    SignalManifest, StreamRequest, TokenLogprobs, TopLogprob,
+    SignalManifest, StreamRequest,
 };

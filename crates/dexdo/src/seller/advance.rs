@@ -20,11 +20,16 @@
 
 use dexdo_core::params::{MAX_CLAIM_DELTA, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL};
 use dexdo_core::{
-    ChainBackend, ChainError, ClaimBounds, DealChainState, Note, TokenContract, TICK_SIZE,
+    ChainBackend, ChainError, ClaimBounds, DealChainState, Note, TokenContract,
+    CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX, TICK_SIZE,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn display_token_contract(token_contract: &str) -> String {
+    dexdo_core::address::display_self_dapp(token_contract)
+}
 
 /// Per-deal claim cadence, mirrored from `TokenContract.getConfig()`.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +71,37 @@ impl AdvanceWindows {
 /// Observes the strict claim states already read by the ordinary-deal driver.
 /// The observer never polls or submits independently. Returning an error stops the driver before its next
 /// decision/write, which lets capacity persistence fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimDeliveryMeasurement {
+    /// The exact [`crate::seller::gateway::DealDelivery::count`] load used at this decision.
+    pub deal_delivery_count: u64,
+    /// The fresh-process probe snapshot. `None` on a resumed process because the historical snapshot was
+    /// never persisted; reporting the driver's restart anchor `0` as if it were that snapshot would lie.
+    pub delivery_at_probe: Option<u128>,
+    /// The exact cumulative argument passed to `claim_tokens`; absent at the probe decision.
+    pub cumulative_tokens: Option<u128>,
+}
+
+impl ClaimDeliveryMeasurement {
+    /// JSONL fields shared by the seller runtime event and the regression seam. Amounts are decimal strings,
+    /// matching the existing machine schemas without passing through a JSON floating-point representation.
+    pub fn event_fields(self) -> serde_json::Value {
+        let mut fields = serde_json::json!({
+            "deal_delivery_count": self.deal_delivery_count.to_string(),
+            "delivery_at_probe": self.delivery_at_probe.map(|value| value.to_string()),
+        });
+        if let (Some(fields), Some(cumulative_tokens)) =
+            (fields.as_object_mut(), self.cumulative_tokens)
+        {
+            fields.insert(
+                "cumulative_tokens".to_string(),
+                serde_json::Value::String(cumulative_tokens.to_string()),
+            );
+        }
+        fields
+    }
+}
+
 pub trait ClaimStateObserver: Send + Sync {
     fn observe(
         &self,
@@ -75,6 +111,27 @@ pub trait ClaimStateObserver: Send + Sync {
 
     fn observe_terminal(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
         Ok(())
+    }
+
+    /// One-way notification that a required claim-state read exhausted the existing transient-read policy.
+    fn observe_chain_unavailable(&self, _token_contract: &TokenContract, _error: &ChainError) {}
+
+    /// Read-only event hook at the fresh probe decision. It is deliberately infallible: losing an operator
+    /// output sink must never move, suppress, or duplicate a money-path action.
+    fn observe_probe_decision(
+        &self,
+        _token_contract: &TokenContract,
+        _measurement: ClaimDeliveryMeasurement,
+    ) {
+    }
+
+    /// Read-only event hook after a cumulative `claim_tokens` call returns. The measurement contains the same
+    /// counter load and `next` argument the driver already used; the hook cannot alter either.
+    fn observe_claim_submitted(
+        &self,
+        _token_contract: &TokenContract,
+        _measurement: ClaimDeliveryMeasurement,
+    ) {
     }
 }
 
@@ -93,14 +150,32 @@ async fn required_claim_state(
     token_contract: &TokenContract,
     observer: &dyn ClaimStateObserver,
 ) -> Result<DealChainState, ChainError> {
-    let state = chain.deal_state(token_contract).await?.ok_or_else(|| {
+    let state = match chain.deal_state(token_contract).await {
+        Ok(state) => state,
+        Err(error) => {
+            if exhausted_transient_read(&error) {
+                observer.observe_chain_unavailable(token_contract, &error);
+            }
+            return Err(error);
+        }
+    }
+    .ok_or_else(|| {
         ChainError::Chain(format!(
-            "TokenContract {token_contract}: getState returned no data while reconciling the \
-             cumulative claim high-water"
+            "TokenContract {}: getState returned no data while reconciling the \
+             cumulative claim high-water",
+            display_token_contract(token_contract)
         ))
     })?;
     observer.observe(token_contract, state)?;
     Ok(state)
+}
+
+fn exhausted_transient_read(error: &ChainError) -> bool {
+    matches!(
+        error,
+        ChainError::Chain(message) | ChainError::Transport(message)
+            if message.contains(CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX)
+    )
 }
 
 fn validated_claim_high_water(
@@ -108,6 +183,7 @@ fn validated_claim_high_water(
     state: DealChainState,
     token_budget: u128,
 ) -> Result<u128, ChainError> {
+    let token_contract = display_token_contract(token_contract);
     if !state.opened || state.disputed || !state.probe_accepted {
         return Err(ChainError::Chain(format!(
             "TokenContract {token_contract}: claim high-water is not actionable \
@@ -137,6 +213,17 @@ fn validated_claim_high_water(
         )));
     }
     Ok(state.tokens_pending)
+}
+
+fn delivery_target_from_probe_anchor(
+    probe_high_water: u128,
+    delivery_at_probe: u128,
+    delivered: u64,
+    token_budget: u128,
+) -> u128 {
+    probe_high_water
+        .saturating_add(u128::from(delivered).saturating_sub(delivery_at_probe))
+        .min(token_budget)
 }
 
 /// Drive one deal's claim loop: repeatedly claim the CUMULATIVE tokens actually delivered, then `finalize()`
@@ -196,6 +283,7 @@ pub async fn drive_advance_with_observer(
     // Ceiling in TOKENS. The deal's budget is expressed in ticks, so convert once; consumption itself is
     // claimed and disputed in raw tokens, which is why no rounding to whole ticks happens anywhere here.
     let token_budget = tick_budget.saturating_mul(u128::from(tick_size));
+    let token_contract_display = display_token_contract(token_contract);
     let mut waiting_event_emitted = false;
 
     if deal_closed_observed(chain, token_contract, observer).await? {
@@ -206,10 +294,10 @@ pub async fn drive_advance_with_observer(
     // repeats `acceptProbe`, then seed the local cumulative cursor from the authoritative on-chain value.
     let before_probe = required_claim_state(chain, token_contract, observer).await?;
     let resumed_after_probe = before_probe.probe_accepted;
-    if !resumed_after_probe {
+    let (delivery_at_probe, measured_delivery_at_probe) = if !resumed_after_probe {
         if !before_probe.opened || before_probe.disputed || before_probe.tokens_pending != 0 {
             return Err(ChainError::Chain(format!(
-                "TokenContract {token_contract}: malformed pre-probe claim state \
+                "TokenContract {token_contract_display}: malformed pre-probe claim state \
                  (opened={}, disputed={}, tokensPending={})",
                 before_probe.opened, before_probe.disputed, before_probe.tokens_pending
             )));
@@ -221,6 +309,53 @@ pub async fn drive_advance_with_observer(
         if deal_closed_observed(chain, token_contract, observer).await? {
             return Ok(0);
         }
+        // the probe tick is PAID on acceptance, so an elapsed window alone must never take it.
+        // Buyer silence accepts DELIVERED output; it does not create delivery from nothing
+        // . Wait here for the first delivered token; a TRUE
+        // zero-delivery terminal -- the session finished, or the deal closed, before any output -- accepts no
+        // probe and finalizes nothing. Any non-empty partial tick counts, so `delivered > 0` is the gate.
+        let mut first_tick_wait_emitted = false;
+        loop {
+            let delivered_tokens = delivered.load(Ordering::Acquire);
+            if delivered_tokens > 0 {
+                break;
+            }
+            // Acquire ordering: the producer publishes `delivered` then `delivery_done` with Release, so a
+            // `done` observed here implies the matching count is visible -- re-read before giving up, or a
+            // token delivered just before `done` would lose its probe(no premature zero).
+            if delivery_done.load(Ordering::Acquire) {
+                if delivered.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                return Ok(0);
+            }
+            if !first_tick_wait_emitted {
+                tracing::info!(
+                    event = "seller_waiting_for_first_delivered_tick",
+                    token_contract = %token_contract_display,
+                    delivered_tokens,
+                    finalized_ticks = 0u128,
+                    "seller waiting for first delivered canonical tick"
+                );
+                first_tick_wait_emitted = true;
+            }
+            // Poll for the first delivered token, but stay responsive to an external close.
+            if wait_claim_or_closed(chain, token_contract, windows.claim_interval).await {
+                return Ok(0);
+            }
+        }
+        // This is the seller's probe decision boundary. Output already delivered is absorbed by the
+        // full protocol probe tick; output delivered after this decision extends its cumulative high-water.
+        let deal_delivery_count = delivered.load(Ordering::Acquire);
+        let delivery_at_probe = u128::from(deal_delivery_count).min(TICK_SIZE);
+        observer.observe_probe_decision(
+            token_contract,
+            ClaimDeliveryMeasurement {
+                deal_delivery_count,
+                delivery_at_probe: Some(delivery_at_probe),
+                cumulative_tokens: None,
+            },
+        );
         let accept_error = chain.accept_probe(token_contract).await.err();
         let after_accept = required_claim_state(chain, token_contract, observer).await?;
         if !after_accept.probe_accepted {
@@ -231,20 +366,23 @@ pub async fn drive_advance_with_observer(
             }
             return Err(accept_error.unwrap_or_else(|| {
                 ChainError::Chain(format!(
-                    "TokenContract {token_contract}: acceptProbe returned but probeAccepted stayed false"
+                    "TokenContract {token_contract_display}: acceptProbe returned but probeAccepted stayed false"
                 ))
             }));
         }
-    }
+        (delivery_at_probe, Some(delivery_at_probe))
+    } else {
+        (0, None)
+    };
 
     let claim_state = required_claim_state(chain, token_contract, observer).await?;
     let mut claimed = validated_claim_high_water(token_contract, claim_state, token_budget)?;
-    let delivery_base = if resumed_after_probe { claimed } else { 0 };
+    let delivery_base = claimed;
     let mut needs_finalize = claim_state.tokens_pending > claim_state.tokens_final;
     if claimed > TICK_SIZE {
         tracing::info!(
             event = "seller_claim_high_water_resynced",
-            token_contract = %token_contract,
+            token_contract = %token_contract_display,
             on_chain_tokens = claimed,
             "seller resumed from the authoritative cumulative claim high-water"
         );
@@ -260,15 +398,22 @@ pub async fn drive_advance_with_observer(
 
         // Acquire ordering: the producer publishes `delivered` then `delivery_done` with Release, so a
         // `done` observed here implies the matching `delivered` count is visible(no stale under-read).
-        let target = delivery_base
-            .saturating_add(u128::from(delivered.load(Ordering::Acquire)))
-            .min(token_budget);
+        let deal_delivery_count = delivered.load(Ordering::Acquire);
+        let target = delivery_target_from_probe_anchor(
+            delivery_base,
+            delivery_at_probe,
+            deal_delivery_count,
+            token_budget,
+        );
         if claimed >= target {
             if delivery_done.load(Ordering::Acquire) {
                 // Re-read after observing `done`: tokens delivered just before it must still be claimed.
-                let refreshed = delivery_base
-                    .saturating_add(u128::from(delivered.load(Ordering::Acquire)))
-                    .min(token_budget);
+                let refreshed = delivery_target_from_probe_anchor(
+                    delivery_base,
+                    delivery_at_probe,
+                    delivered.load(Ordering::Acquire),
+                    token_budget,
+                );
                 if claimed >= refreshed {
                     break;
                 }
@@ -276,7 +421,7 @@ pub async fn drive_advance_with_observer(
                 if !waiting_event_emitted {
                     tracing::info!(
                         event = "seller_waiting_for_delivered_tokens",
-                        token_contract = %token_contract,
+                        token_contract = %token_contract_display,
                         claimed_tokens = claimed,
                         "seller waiting for delivered tokens to claim"
                     );
@@ -291,9 +436,13 @@ pub async fn drive_advance_with_observer(
 
         // Wait out the minimum interval, which is also what accrues the rate allowance.
         tokio::time::sleep(windows.claim_interval).await;
-        let target = delivery_base
-            .saturating_add(u128::from(delivered.load(Ordering::Acquire)))
-            .min(token_budget);
+        let deal_delivery_count = delivered.load(Ordering::Acquire);
+        let target = delivery_target_from_probe_anchor(
+            delivery_base,
+            delivery_at_probe,
+            deal_delivery_count,
+            token_budget,
+        );
         // Claim as much of the delivered backlog as BOTH the elapsed-time rate and hard per-call cap permit.
         // Anything above the combined allowance stays for the next round rather than being asserted and
         // rejected.
@@ -308,7 +457,16 @@ pub async fn drive_advance_with_observer(
         if next <= claimed {
             continue;
         }
-        match chain.claim_tokens(token_contract, seller_note, next).await {
+        let claim_result = chain.claim_tokens(token_contract, seller_note, next).await;
+        observer.observe_claim_submitted(
+            token_contract,
+            ClaimDeliveryMeasurement {
+                deal_delivery_count,
+                delivery_at_probe: measured_delivery_at_probe,
+                cumulative_tokens: Some(next),
+            },
+        );
+        match claim_result {
             Ok(()) => {
                 claimed = next;
                 needs_finalize = true;
@@ -323,14 +481,14 @@ pub async fn drive_advance_with_observer(
                     || on_chain > token_budget
                 {
                     return Err(ChainError::Chain(format!(
-                        "TokenContract {token_contract}: invalid claim resync \
+                        "TokenContract {token_contract_display}: invalid claim resync \
                          (attempted={attempted}, expected={next}, onChain={on_chain}, \
                          deliveryTarget={target}, budget={token_budget})"
                     )));
                 }
                 tracing::info!(
                     event = "seller_claim_high_water_resynced",
-                    token_contract = %token_contract,
+                    token_contract = %token_contract_display,
                     attempted_tokens = next,
                     on_chain_tokens = on_chain,
                     "a concurrent or lost-response claim advanced the chain; resynchronising explicitly"
@@ -361,7 +519,7 @@ pub async fn drive_advance_with_observer(
             }
             tracing::warn!(
                 event = "seller_finalize_pending_claim_failed",
-                token_contract = %token_contract,
+                token_contract = %token_contract_display,
                 claimed_tokens = claimed,
                 %error,
                 "the last claim stays contestable until finalize succeeds"
@@ -433,12 +591,10 @@ mod tests {
             deposit: 10_000,
             finalized_owed: 0,
             tokens_final,
-            tokens_superseded: tokens_final,
             tokens_pending,
             probe_tick: if probe_accepted { 0 } else { 1_000 },
             funded_time: Some(1),
             probe_time: 1,
-            prev_claim_time: 1,
             last_claim_time: 1,
             dispute_time: 0,
         }
@@ -452,8 +608,13 @@ mod tests {
         assert_eq!(w.seconds_per_tick, Duration::from_secs(60));
         assert_eq!(
             w.promote,
-            Duration::from_secs(120),
-            "promotion window is 2 * MIN_SECONDS_PER_TICK"
+            Duration::from_secs(60),
+            "4.0.35: CLAIM_PROMOTE_WINDOW is MIN_SECONDS_PER_TICK, not twice it"
+        );
+        assert_eq!(
+            w.promote, w.claim_interval,
+            "the window EQUALS the claim interval, which is what makes the next claim always \
+             arrive with the previous one ripe and leaves exactly one unpromoted tick"
         );
         assert_eq!(
             w.max_claim_delta(Duration::from_secs(60)),
@@ -485,8 +646,8 @@ mod tests {
         assert_eq!(w.seconds_per_tick, Duration::from_secs(120));
         assert_eq!(
             w.promote,
-            Duration::from_secs(240),
-            "promote window follows the deal's rate floor"
+            Duration::from_secs(120),
+            "4.0.35: the promote window IS the deal's rate floor, not twice it"
         );
         assert_eq!(
             w.max_claim_delta(Duration::from_secs(120)),
@@ -765,6 +926,120 @@ mod tests {
         .unwrap()
     }
 
+    /// money path: an elapsed `PROBE_WINDOW` alone must NEVER take the paid probe tick. With the
+    /// deal open and ZERO delivered output the driver keeps waiting -- `acceptProbe` is not called, nothing is
+    /// claimed or finalized -- and it reports the wait exactly once through its structured event, so a live
+    /// seller is visibly waiting rather than silently hung.
+    #[test]
+    fn zero_delivery_waits_for_first_token_instead_of_accepting_the_probe() {
+        struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture tracing output").extend(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let windows = AdvanceWindows {
+            claim_interval: Duration::from_millis(5),
+            seconds_per_tick: Duration::from_secs(60),
+            promote: Duration::ZERO,
+            probe: Duration::from_millis(1),
+        };
+        let backend = Arc::new(RecordingBackend::new());
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || SharedWriter(captured.clone()))
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build test runtime");
+        let driver_backend = backend.clone();
+        let wait_logs = logs.clone();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async move {
+                let task = tokio::spawn(async move {
+                    drive_advance(
+                        driver_backend.as_ref(),
+                        &"tc-zero-delivery".to_string(),
+                        &LocalNote::generate(),
+                        windows,
+                        4,
+                        TICK_SIZE as u64,
+                        true,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let seen = String::from_utf8_lossy(
+                        &wait_logs.lock().expect("read in-flight tracing output"),
+                    )
+                    .contains("seller_waiting_for_first_delivered_tick");
+                    if seen {
+                        break;
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "zero delivery must keep the seller waiting, not return"
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "driver never reported that it is waiting for the first delivered tick"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // Several further poll rounds: the wait stays silent and stays off the money path.
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                assert!(
+                    !task.is_finished(),
+                    "the open zero-delivery deal is not done"
+                );
+                task.abort();
+                let _ = task.await;
+                String::from_utf8_lossy(&wait_logs.lock().expect("read tracing output"))
+                    .into_owned()
+            })
+        });
+
+        assert_eq!(
+            outcome
+                .matches("seller_waiting_for_first_delivered_tick")
+                .count(),
+            1,
+            "the waiting event is emitted once per invocation, not once per poll: {outcome}"
+        );
+        assert!(
+            outcome.contains("delivered_tokens=0") && outcome.contains("finalized_ticks=0"),
+            "the waiting event must name the zero facts it is waiting on: {outcome}"
+        );
+        assert_eq!(
+            backend.accepts.load(Ordering::Relaxed),
+            0,
+            "an elapsed probe window with zero delivered output must not take the paid probe tick"
+        );
+        assert!(
+            backend.claims().is_empty(),
+            "nothing delivered, nothing claimed"
+        );
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+        let state = *backend.state.lock().unwrap();
+        assert!(!state.probe_accepted);
+        assert_eq!(state.tokens_pending, 0);
+        assert_eq!(state.tokens_final, 0);
+    }
+
     /// A failed final promotion with no authoritative terminal chain fact must remain a failed deal driver.
     /// Returning the claimed cursor here would let the ordinary seller unregister while its newest claim is
     /// still contestable.
@@ -967,6 +1242,74 @@ mod tests {
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
 
+    /// The live case: delivery grows while the stream is still open. Every other test here hands the
+    /// driver a `done` that is already set, so none of them exercises the branch a running seller
+    /// actually sits in: waiting, with more requests still to come. A buyer who keeps sending after
+    /// the probe must keep being billed.
+    #[tokio::test(start_paused = true)]
+    async fn delivery_after_the_probe_is_claimed_while_the_stream_stays_open() {
+        let backend = Arc::new(RecordingBackend::new());
+        let delivered = Arc::new(AtomicU64::new(TICK_SIZE as u64));
+        let delivery_done = Arc::new(AtomicBool::new(false));
+        let driver_backend = backend.clone();
+        let driver_delivered = delivered.clone();
+        let driver_done = delivery_done.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance(
+                driver_backend.as_ref(),
+                &"tc-open-delivery".to_string(),
+                &LocalNote::generate(),
+                AdvanceWindows {
+                    claim_interval: Duration::from_secs(1),
+                    seconds_per_tick: Duration::from_secs(1),
+                    promote: Duration::ZERO,
+                    probe: Duration::ZERO,
+                },
+                4,
+                TICK_SIZE as u64,
+                true,
+                driver_delivered,
+                driver_done,
+            )
+            .await
+        });
+
+        while backend.accepts.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            backend.claims().is_empty(),
+            "the driver is waiting after billing only the delivered probe"
+        );
+        assert!(!delivery_done.load(Ordering::Acquire));
+
+        delivered.store((3 * TICK_SIZE) as u64, Ordering::Release);
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!delivery_done.load(Ordering::Acquire));
+        assert!(
+            !driver.is_finished(),
+            "an open delivery stream keeps the claim driver running"
+        );
+        assert_eq!(
+            backend.claims(),
+            vec![2 * TICK_SIZE, 3 * TICK_SIZE],
+            "two ticks delivered after the probe are two further cumulative claims"
+        );
+
+        delivery_done.store(true, Ordering::Release);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let claimed = driver.await.unwrap().unwrap();
+        assert_eq!(claimed, 3 * TICK_SIZE);
+    }
+
     /// R20-03: a short response must never walk the cumulative cursor below the already-accepted full probe.
     #[tokio::test]
     async fn response_below_tick_keeps_probe_seeded_high_water() {
@@ -988,6 +1331,22 @@ mod tests {
         let claimed = drive_recording(&b, instant(), 4, TICK_SIZE as u64).await;
         assert_eq!(claimed, TICK_SIZE);
         assert!(b.claims().is_empty(), "the probe must not be re-stated");
+    }
+
+    #[test]
+    fn short_pre_probe_prefix_is_absorbed_once_then_post_probe_delivery_advances() {
+        let pre_probe = 40_799;
+        let budget = 3 * TICK_SIZE;
+        assert_eq!(
+            delivery_target_from_probe_anchor(TICK_SIZE, pre_probe, pre_probe as u64, budget),
+            TICK_SIZE,
+            "the protocol probe tick absorbs the already delivered prefix"
+        );
+        assert_eq!(
+            delivery_target_from_probe_anchor(TICK_SIZE, pre_probe, 2_100_000, budget),
+            budget,
+            "post-probe delivery must extend the probe-seeded cumulative high-water"
+        );
     }
 
     /// Consumption beyond the probe stays in raw tokens: a partial next tick is not rounded up.
@@ -1158,3 +1517,7 @@ mod tests {
         assert_eq!(b.claims(), vec![2 * TICK_SIZE]);
     }
 }
+
+#[cfg(all(test, feature = "shellnet"))]
+#[path = "advance_1196_drift_tests.rs"]
+mod issue_1196_drift_tests;

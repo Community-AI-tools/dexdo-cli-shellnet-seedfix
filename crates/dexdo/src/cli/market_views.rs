@@ -4,13 +4,16 @@ use crate::cli::args::*;
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     direct_chain_read_with_timeout, enforce_model_registry_policy, fold_snapshot_from_orders,
-    load_enabled_model_registry_policy, model_target_from_config, print_book_table,
-    read_book_target, read_executable_book_target, registry_requested_model,
+    load_enabled_model_registry_policy, model_target_from_config, preload_model_registry_policy,
+    print_book_table, read_book_target, read_executable_book_target, registry_requested_model,
     resolve_model_registry_target, resolve_order_book_target, retry_executable_read,
     snapshot_with_executable_orders, target_from_market, target_from_market_for_model, BookRow,
     BookTarget,
 };
-use crate::cli::commands::{mock_chain_for_machine, mock_orders_from_offers};
+use crate::cli::commands::{
+    declared_model_flags, mock_chain_for_machine, mock_orders_from_offers,
+    render_model_flags_field,
+};
 use crate::cli::indexer::{self, DepthQuery, IndexerClient, MarketsQuery};
 use crate::cli::machine;
 use anyhow::{bail, Result};
@@ -60,7 +63,10 @@ async fn read_indexer_market_context(order_book: &str) -> Result<IndexerMarketCo
             .inference_order_book_address
             .eq_ignore_ascii_case(order_book)
     }) {
-        bail!("Dodex indexer has no market context for {order_book}");
+        bail!(
+            "Dodex indexer has no market context for {}",
+            addr::display(order_book)
+        );
     }
     let depth = client
         .depth(DepthQuery {
@@ -146,7 +152,14 @@ async fn read_executable_market_view(
                 .fold_order_book_events(order_book, BookEventFold::default())
                 .await?;
             let last_update_id = fold.last_seen_id().unwrap_or("-").to_string();
-            let snapshot = fold_snapshot_from_orders(target, order_book, fold.live_orders());
+            // the deadline is applied HERE, before anything downstream can call these rows
+            // executable. The clock is read per attempt, not once per command, so a retry cannot
+            // carry a stale "still live" verdict past a deadline it crossed while retrying.
+            let snapshot = fold_snapshot_from_orders(
+                target,
+                order_book,
+                fold.live_orders_at(crate::cli::provenance::now_unix()?),
+            );
             let executable_orders = chain.executable_resting_asks(&snapshot).await?;
             let snapshot = snapshot_with_executable_orders(snapshot, executable_orders);
             Ok((snapshot, last_update_id))
@@ -189,6 +202,7 @@ fn quote_response_from_quote(
         network: network.to_string(),
         generated_at_unix: machine::now_unix()?,
         frame_model: frame_model.to_string(),
+        model_flags: declared_model_flags(frame_model),
         model_hash: model_hash_for(frame_model),
         order_book: order_book.to_string(),
         request: machine::QuoteRequest {
@@ -226,18 +240,25 @@ async fn run_quote_mock(args: QuoteArgs) -> Result<()> {
         )?);
     }
     if q.filled_ticks == 0 {
-        println!("quote model={frame_model} order_book=mock:order-book no_liquidity=true");
+        println!(
+            "quote model={frame_model}{} order_book=mock:order-book no_liquidity=true",
+            render_model_flags_field(frame_model)
+        );
         return Ok(());
     }
     println!(
-        "quote model={} order_book=mock:order-book filled_ticks={} total_with_fee={} complete={}",
-        frame_model, q.filled_ticks, q.total_with_fee, q.complete
+        "quote model={}{} order_book=mock:order-book filled_ticks={} total_with_fee={} complete={}",
+        frame_model,
+        render_model_flags_field(frame_model),
+        q.filled_ticks,
+        q.total_with_fee,
+        q.complete
     );
     for fill in q.fills {
         println!(
             "fill order_id={} token_contract={} ticks={} price_per_tick={} cost_with_fee={}",
             fill.order_id,
-            addr::display(&fill.token_contract),
+            addr::display_self_dapp(&fill.token_contract),
             fill.ticks,
             fill.price_per_tick,
             fill.cost_with_fee
@@ -246,10 +267,27 @@ async fn run_quote_mock(args: QuoteArgs) -> Result<()> {
     Ok(())
 }
 
+/// the rows are chosen at a clock read taken HERE, when they are rendered -- not at the shape
+/// of the book, and not at the age of the snapshot behind it.
+/// `resting_asks()` is deadline-blind on purpose(`chain/types.rs:159-162`): it answers "is this a
+/// well-formed SELL with capacity", which is exactly the question `is_resting_ask` was reported for.
+/// The snapshot reaching this function was gated at the chain read, but that read costs a book walk
+/// plus a `getState` and a balance read per ask, so it can be minutes old by the time it prints --
+/// and this is the single-model view a buyer reads immediately before buying. `dexdo markets`
+/// already re-filters at print time for precisely this reason; the
+/// single-model view did not, so an ask that lapsed during the reads was still printed as
+/// executable depth under an `as_of` stamp newer than the verdict.
+/// The clock is read here rather than passed in so that no future caller can render this table
+/// against no clock at all; the `as_of` the context line prints is a second sample taken in the same
+/// breath, which narrows the window to that statement instead of to the whole command.
 #[cfg(feature = "shellnet")]
-fn executable_market_rows(snapshot: &OrderBookSnapshot) -> Vec<BookRow> {
-    snapshot
-        .resting_asks()
+fn executable_market_rows_with_clock(
+    snapshot: &OrderBookSnapshot,
+    now_unix: std::result::Result<u64, dexdo_core::ChainError>,
+) -> Result<Vec<BookRow>> {
+    let now_unix = now_unix?;
+    Ok(snapshot
+        .live_resting_asks_at(now_unix)
         .map(|order| BookRow {
             price_per_tick: order.price_per_tick,
             max_ticks: order.ticks,
@@ -259,7 +297,12 @@ fn executable_market_rows(snapshot: &OrderBookSnapshot) -> Vec<BookRow> {
                 .map(|token_contract| token_contract.to_string())
                 .unwrap_or_else(|| "-".to_string()),
         })
-        .collect()
+        .collect())
+}
+
+#[cfg(feature = "shellnet")]
+fn executable_market_rows(snapshot: &OrderBookSnapshot) -> Result<Vec<BookRow>> {
+    executable_market_rows_with_clock(snapshot, crate::cli::provenance::now_unix())
 }
 
 /// say where these rows came from and how fresh they are, so a divergence from
@@ -287,16 +330,18 @@ fn render_quote_summary(
 ) -> String {
     if quote.filled_ticks == 0 {
         return format!(
-            "quote model={} order_book={} source={} lastUpdateId={} no_liquidity=true",
+            "quote model={}{} order_book={} source={} lastUpdateId={} no_liquidity=true",
             snapshot.frame_model,
+            render_model_flags_field(&snapshot.frame_model),
             addr::display(&snapshot.order_book),
             source,
             last_update_id
         );
     }
     format!(
-        "quote model={} order_book={} source={} lastUpdateId={} filled_ticks={} total_with_fee={} complete={}",
+        "quote model={}{} order_book={} source={} lastUpdateId={} filled_ticks={} total_with_fee={} complete={}",
         snapshot.frame_model,
+        render_model_flags_field(&snapshot.frame_model),
         addr::display(&snapshot.order_book),
         source,
         last_update_id,
@@ -306,8 +351,8 @@ fn render_quote_summary(
     )
 }
 
-/// `dexdo market <canonical-model>` -- render ONE model's order book as the human-readable box table
-/// (the same view the buyer shows before a buy). Read-only, keyed by the canonical model name.
+/// `dexdo market`, given one canonical model name -- render THAT model's order book as the
+/// human-readable box table(the same view the buyer shows before a buy). Read-only.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     let registry_policy =
@@ -348,11 +393,17 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     } else {
         let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
             .map_err(|e| {
-                anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
+                anyhow::anyhow!("{e}\n(pass --note-addr <dapp_id>::<account_id> so the per-model book can be derived)")
             })?;
         (target.frame_model.clone(), target)
     };
     let view = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        preload_model_registry_policy(
+            RegistryRole::Buyer,
+            registry_policy.as_ref(),
+            &args.contracts,
+        )
+        .await?;
         let target = resolve_model_registry_target(
             RegistryRole::Buyer,
             registry_policy.as_ref(),
@@ -379,13 +430,13 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     })
     .await?;
     let snapshot = &view.snapshot;
-    let rows = executable_market_rows(snapshot);
+    let rows = executable_market_rows(snapshot)?;
     println!(
         "{}",
         render_market_context(
             view.source,
             &view.last_update_id,
-            crate::cli::provenance::now_unix(),
+            crate::cli::provenance::now_unix()?,
             view.rows,
         )
     );
@@ -394,8 +445,9 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
         if raw_order_count > 0 {
             let tick_size = DobParams::canonical().tick_size;
             println!(
-                "inference order book -- {}  (1 tick = {tick_size} model tokens)",
-                snapshot.frame_model
+                "inference order book -- {}{}  (1 tick = {tick_size} model tokens)",
+                snapshot.frame_model,
+                render_model_flags_field(&snapshot.frame_model)
             );
             println!(
                 "  * no executable asks; raw order_count={raw_order_count} is blocked by stale/non-executable rows"
@@ -413,16 +465,14 @@ pub(crate) async fn run_market(_args: MarketArgs) -> Result<()> {
     bail!("market unavailable: build with `--features shellnet`")
 }
 
+/// Is this failure a state of the book (which `executable-book` reports as an empty listing plus a
+/// reason), or a failure to read it at all(which stays an error)?
+/// the shared classifier answers it. A hand-kept list of phrases here folded the states
+/// deliberately separated back into one bucket, and a new reason string could silently land in the
+/// wrong one.
 #[cfg(feature = "shellnet")]
 fn selection_error_is_empty_book_state(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("no executable matching ask")
-        || reason.contains("no submit-safe ask")
-        || reason.contains("best ask price")
-        || reason.contains("no resting asks")
-        || reason.contains("no matchable ask")
-        || reason.contains("raw order-book matcher")
-        || reason.contains("refusing multi-ask fill")
+    dexdo_core::params::book_refusal_class(reason).is_some()
 }
 
 #[cfg(feature = "shellnet")]
@@ -433,11 +483,12 @@ fn render_executable_book_line(
     max_price_per_tick: u128,
 ) -> String {
     format!(
-        "executable_ask model={} order_book={} order_id={} token_contract={} price_per_tick={} ticks={} requested_ticks={} max_price_per_tick={}",
+        "executable_ask model={}{} order_book={} order_id={} token_contract={} price_per_tick={} ticks={} requested_ticks={} max_price_per_tick={}",
         snapshot.frame_model,
+        render_model_flags_field(&snapshot.frame_model),
         addr::display(&snapshot.order_book),
         order.order_id,
-        addr::display_opt(order.token_contract.as_deref(), "-"),
+        addr::display_self_dapp_opt(order.token_contract.as_deref(), "-"),
         order.price_per_tick,
         order.ticks,
         ticks,
@@ -445,6 +496,13 @@ fn render_executable_book_line(
     )
 }
 
+/// Name the state this book is in, not a blanket "nothing matched".
+/// the class comes from `buy_refusal_class` -- the same function the buy preflight stamps its
+/// own refusal with -- so the listing and the buyer cannot describe one book at one ceiling with two
+/// different answers. `no_executable_ask` is now one of the four possible flags rather than the flag
+/// every empty result carries: an empty book prints `empty_model_book=true`, a short head prints
+/// `insufficient_head_ask=true`, an all-lapsed book prints `expired_counterparty_ask=true`, and only
+/// "rows exist, none of them usable" keeps `no_executable_ask=true`.
 #[cfg(feature = "shellnet")]
 fn render_no_executable_book_line(
     snapshot: &OrderBookSnapshot,
@@ -453,9 +511,11 @@ fn render_no_executable_book_line(
     reason: &str,
 ) -> String {
     format!(
-        "executable_ask model={} order_book={} none=true no_executable_ask=true requested_ticks={} max_price_per_tick={} reason={}",
+        "executable_ask model={}{} order_book={} none=true {}=true requested_ticks={} max_price_per_tick={} reason={}",
         snapshot.frame_model,
+        render_model_flags_field(&snapshot.frame_model),
         addr::display(&snapshot.order_book),
+        dexdo_core::params::buy_refusal_class(reason),
         ticks,
         max_price_per_tick,
         reason.replace('\n', " ")
@@ -485,7 +545,7 @@ fn render_executable_book_output(
         .join("\n")
 }
 
-/// `dexdo executable-book <model>`: show all currently executable asks for this tick count and ceiling.
+/// `dexdo executable-book`, given one model: show all currently executable asks for this tick count and ceiling.
 /// Rows hidden behind a stale cheaper raw row are intentionally not listed, because the model-wide matcher
 /// would hit that unsafe row first.
 #[cfg(feature = "shellnet")]
@@ -525,12 +585,18 @@ pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> 
     } else {
         let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
             .map_err(|e| {
-                anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
+                anyhow::anyhow!("{e}\n(pass --note-addr <dapp_id>::<account_id> so the per-model book can be derived)")
             })?;
         (target.frame_model.clone(), target)
     };
     let (snapshot, orders, empty_reason) =
         direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            preload_model_registry_policy(
+                RegistryRole::Buyer,
+                registry_policy.as_ref(),
+                &args.contracts,
+            )
+            .await?;
             let target = resolve_model_registry_target(
                 RegistryRole::Buyer,
                 registry_policy.as_ref(),
@@ -630,6 +696,12 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         (target.frame_model.clone(), target)
     };
     let (view, q) = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        preload_model_registry_policy(
+            RegistryRole::Buyer,
+            registry_policy.as_ref(),
+            &args.contracts,
+        )
+        .await?;
         let target = resolve_model_registry_target(
             RegistryRole::Buyer,
             registry_policy.as_ref(),
@@ -660,7 +732,7 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
     let snapshot = &view.snapshot;
     if args.json {
         let response = quote_response_from_quote(
-            "shellnet",
+            chain.network(),
             &snapshot.frame_model,
             &snapshot.order_book,
             args.ticks,
@@ -691,7 +763,7 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         println!(
             "fill order_id={} token_contract={} ticks={} price_per_tick={} cost_with_fee={}",
             fill.order_id,
-            addr::display(&fill.token_contract),
+            addr::display_self_dapp(&fill.token_contract),
             fill.ticks,
             fill.price_per_tick,
             fill.cost_with_fee
@@ -788,7 +860,11 @@ pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
                 MarketDataOutput::Table => {
                     print!(
                         "{}",
-                        indexer::render_depth_table(&response, client.base_url())
+                        indexer::render_depth_output(
+                            &response,
+                            client.base_url(),
+                            crate::cli::provenance::now_unix()?,
+                        )
                     );
                 }
                 MarketDataOutput::Json => {
@@ -799,6 +875,10 @@ pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "shellnet"))]
+#[path = "clock_sell_liveness_1042.rs"]
+mod clock_sell_liveness_1042;
 
 #[cfg(test)]
 mod tests {
@@ -856,6 +936,8 @@ mod tests {
             note: "0:seller".to_string(),
             token_contract: token_contract.to_string(),
             deadline: 1_900_000_000,
+            flags: 0,
+            expired_by_event: false,
         }
     }
 
@@ -1025,11 +1107,57 @@ mod tests {
         let raw = super::fold_snapshot_from_orders(&target, "0:book", folded_rows.iter());
         let executable = vec![raw.orders[0].clone()];
         let snapshot = super::snapshot_with_executable_orders(raw, executable);
-        let rows = super::executable_market_rows(&snapshot);
+        let rows = super::executable_market_rows(&snapshot).expect("render market rows");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].token_contract, "0:live");
         assert_eq!(rows[0].price_per_tick, 20);
+    }
+
+    /// at the render function the issue names.
+    /// Both rows below are well-formed resting SELLs with capacity, which is everything
+    /// `is_resting_ask` looks at -- so the deadline-blind `resting_asks()` returned both, and that is
+    /// how an ask which had been expired for hours was printed as this market's only executable
+    /// depth. The clock that retires the lapsed row is read when the row is RENDERED, not when the
+    /// book was read, because the reads in between cost a book walk plus a `getState` and a balance
+    /// read per ask.
+    /// The live row is the half that makes the assertion mean something: a build that printed no
+    /// depth at all would pass a lapsed-row-only test.
+    /// The last assertion is the dispatch half. A correct row builder that `run_market` does not
+    /// call is the failure this repo keeps shipping, and `run_market` has exactly one row source.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn market_rows_retire_an_ask_that_lapsed_before_it_was_rendered() {
+        let target = wire_read_target();
+        let live = wire_live_order(7, 20, "0:live");
+        let mut lapsed = wire_live_order(8, 5, "0:lapsed");
+        // A real second in the past, not the malformed zero deadline: this is expiry, not a
+        // rejected shape.
+        lapsed.deadline = 1;
+        let snapshot = super::fold_snapshot_from_orders(&target, "0:book", [&live, &lapsed]);
+
+        let rows = super::executable_market_rows(&snapshot).expect("render market rows");
+        let rendered = rows
+            .iter()
+            .map(|row| row.token_contract.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        assert_eq!(rendered, "0:live", "rendered depth was [{rendered}]");
+
+        let source = include_str!("market_views.rs");
+        let start = source
+            .find("pub(crate) async fn run_market(args: MarketArgs)")
+            .expect("the shellnet run_market declaration");
+        let body = &source[start..];
+        let body = &body[..body[1..]
+            .find("\n#[cfg(")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        assert!(
+            body.contains("executable_market_rows(snapshot)"),
+            "dexdo market must build its table through the gated row builder"
+        );
     }
 
     #[cfg(feature = "shellnet")]
@@ -1194,5 +1322,130 @@ mod tests {
         assert!(line.contains("max_price_per_tick=10"), "{line}");
         assert!(!line.contains('\n'), "{line}");
         assert!(line.contains("best ask price 11"), "{line}");
+    }
+
+    /// the line names the state the buy preflight names, for each of the four classes.
+    /// Observed live on the 4.0.35 acceptance campaign: `executable-book` printed
+    /// `none=true no_executable_ask=true` for a book the buyer refused, one ceiling and seconds
+    /// later, as `empty_model_book`. The class here is read from `buy_refusal_class` -- the same
+    /// function that stamps the buyer's refusal -- so this asserts AGREEMENT rather than the presence
+    /// of one string: exactly one class flag is set, and it is the one the buyer would report.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn no_executable_book_line_names_the_class_the_buyer_reports() {
+        use dexdo_core::params;
+
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: Vec::new(),
+        };
+        let all_classes = [
+            params::EXPIRED_COUNTERPARTY_ASK_CLASS,
+            params::INSUFFICIENT_HEAD_ASK_CLASS,
+            params::EMPTY_MODEL_BOOK_CLASS,
+            params::NO_EXECUTABLE_ASK_CLASS,
+        ];
+        // Each refusal is spelled with the literal its producer leads with, never a hand-copied
+        // sentence, so a reworded message moves this test with it instead of leaving it green.
+        let cases = [
+            (
+                format!(
+                    "{} 1785678525: every ask crossing this buy is out of the book by its own deadline",
+                    params::EXPIRED_COUNTERPARTY_ASK_REASON
+                ),
+                params::EXPIRED_COUNTERPARTY_ASK_CLASS,
+            ),
+            (
+                format!(
+                    "{} for max_price_per_tick 10, requested ticks 8: 1 resting ask(s) are past their deadline",
+                    params::LAPSED_MODEL_BOOK_REASON
+                ),
+                params::EXPIRED_COUNTERPARTY_ASK_CLASS,
+            ),
+            (
+                format!(
+                    "{}: {} order  tokenContract 0:tc has only 1 ticks, buyer requested 8",
+                    params::RAW_MATCHER_NO_SUBMIT_SAFE_ASK,
+                    params::INSUFFICIENT_HEAD_ASK_REASON
+                ),
+                params::INSUFFICIENT_HEAD_ASK_CLASS,
+            ),
+            (
+                format!(
+                    "{}: {} for max_price_per_tick 10, requested ticks 8",
+                    params::RAW_MATCHER_NO_SUBMIT_SAFE_ASK,
+                    params::EMPTY_MODEL_BOOK_REASON
+                ),
+                params::EMPTY_MODEL_BOOK_CLASS,
+            ),
+            (
+                "no executable matching ask for max_price_per_tick 10, requested ticks 8".to_string(),
+                params::NO_EXECUTABLE_ASK_CLASS,
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            let line = super::render_no_executable_book_line(&snapshot, 8, 10, &reason);
+
+            assert_eq!(
+                params::buy_refusal_class(&reason),
+                expected,
+                "the buy preflight would not report {expected} for {reason}"
+            );
+            assert!(line.contains("none=true"), "{line}");
+            assert!(
+                line.contains(&format!("{expected}=true")),
+                "executable-book must name {expected}, the class the buyer reports: {line}"
+            );
+            for other in all_classes.iter().filter(|class| **class != expected) {
+                assert!(
+                    !line.contains(&format!("{other}=true")),
+                    "executable-book named {other} as well as {expected}: {line}"
+                );
+            }
+        }
+    }
+
+    /// The predicate that decides "the book refused this buy" vs "the read failed" is the shared
+    /// classifier, so every state the buyer classifies is still folded into an empty listing with a
+    /// reason, and a genuine read failure still surfaces as an error.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn selection_error_is_empty_book_state_follows_the_shared_classifier() {
+        use dexdo_core::params;
+
+        for reason in [
+            format!("{} 1785678525: nearest ask is gone", params::EXPIRED_COUNTERPARTY_ASK_REASON),
+            format!("{} order  has only 1 ticks", params::INSUFFICIENT_HEAD_ASK_REASON),
+            format!(
+                "{}: {} for max_price_per_tick 10",
+                params::RAW_MATCHER_NO_SUBMIT_SAFE_ASK,
+                params::EMPTY_MODEL_BOOK_REASON
+            ),
+            format!("{} for max_price_per_tick 10", params::LAPSED_MODEL_BOOK_REASON),
+            "no executable matching ask for max_price_per_tick 10".to_string(),
+            "best ask price 11 is above buyer max_price_per_tick 10".to_string(),
+            "no matchable ask for max_price_per_tick 10".to_string(),
+            "raw order-book matcher would select order ".to_string(),
+        ] {
+            assert!(
+                super::selection_error_is_empty_book_state(&reason),
+                "{reason}"
+            );
+        }
+
+        for reason in [
+            "shellnet: GraphQL request failed: 502 Bad Gateway",
+            "InferenceOrderBook 0:book is not active",
+            "--contracts: non-printable path",
+        ] {
+            assert!(
+                !super::selection_error_is_empty_book_state(reason),
+                "{reason}"
+            );
+        }
     }
 }

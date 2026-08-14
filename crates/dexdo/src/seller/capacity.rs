@@ -14,14 +14,32 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const CAPACITY_RECORD_VERSION: u32 = 1;
+pub(super) const POISONED_LOCK_MESSAGE: &str = "seller runtime lock poisoned";
+const CAPACITY_ENTRIES_LOCK: &str = "seller capacity entries";
+const CAPACITY_ENTRY_STATE_LOCK: &str = "seller capacity entry state";
+const CAPACITY_REQUEST_LOCK: &str = "seller capacity reservation request";
+
+pub(super) fn lock_or_recover<'a, T>(
+    lock: &'a Mutex<T>,
+    lock_name: &'static str,
+) -> MutexGuard<'a, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("{POISONED_LOCK_MESSAGE}: {lock_name}");
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurableCapacityRecord {
     version: u32,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
     token_contract: TokenContract,
     #[serde(with = "decimal_u128")]
     funded_tokens: u128,
@@ -71,14 +89,57 @@ impl CapacitySnapshot {
     }
 }
 
+/// How many delivered tokens may sit in memory before the durable record is rewritten.
+/// `record_delivered` moves tokens from `outstanding_reservation` to `local_delivered_after_anchor`;
+/// their SUM -- `CapacitySnapshot::committed` -- is unchanged, and the whole request reservation was
+/// already made durable by `reserve` BEFORE the first token could be delivered. So the funded-capacity
+/// ceiling, the only invariant `validate_record` enforces against the chain, never depends on how often
+/// this split reaches disk. Rewriting the record per token bought no safety and cost two fsyncs, a file
+/// create and a rename per token, which floors delivery at roughly 13k tokens/min on a real disk.
+/// What a coalesced write does risk is losing the SPLIT on a crash: up to this many delivered tokens
+/// stay classified as outstanding reservation. That direction is conservative -- capacity is retained,
+/// never released(see [`CapacityReservation`]), so the seller can only under-claim its own revenue,
+/// and the buyer is never exposed to over-delivery. Every request terminal flushes, so the loss window
+/// exists only for a crash mid-request.
+const CAPACITY_PERSIST_TOKEN_INTERVAL: u128 = 1_000;
+
 struct CapacityEntryState {
     record: DurableCapacityRecord,
     terminal: bool,
+    /// Delivered tokens applied to `record` in memory but not yet written to disk.
+    unpersisted_delivered: u128,
 }
 
 struct CapacityEntry {
     path: Option<PathBuf>,
     state: Mutex<CapacityEntryState>,
+}
+
+impl CapacityEntry {
+    /// Apply any coalesced delivered tokens to the record and make it durable.
+    /// Until this runs the tokens stay classified as outstanding reservation, so `committed` -- and
+    /// therefore the funded ceiling -- reads the same either way; only the split moves. Returns how
+    /// many delivered tokens became durable, which is the amount the caller may now claim against.
+    fn flush_delivered(&self, locked: &mut CapacityEntryState) -> Result<u64> {
+        let pending = locked.unpersisted_delivered;
+        if pending == 0 {
+            return Ok(0);
+        }
+        let mut candidate = locked.record.clone();
+        candidate.outstanding_reservation = candidate
+            .outstanding_reservation
+            .checked_sub(pending)
+            .ok_or_else(|| anyhow!("aggregate reservation underflow"))?;
+        candidate.local_delivered_after_anchor = candidate
+            .local_delivered_after_anchor
+            .checked_add(pending)
+            .ok_or_else(|| anyhow!("local delivered counter overflows uint128"))?;
+        validate_record(&candidate)?;
+        persist_candidate(self.path.as_deref(), &candidate)?;
+        locked.record = candidate;
+        locked.unpersisted_delivered = 0;
+        u64::try_from(pending).map_err(|_| anyhow!("durable delivered delta does not fit u64"))
+    }
 }
 
 /// One capacity ledger per running gateway. Entries remain independently locked, so concurrent requests for
@@ -114,6 +175,7 @@ impl CapacityManager {
         state: DealChainState,
         deal: DealSubscription,
     ) -> Result<Option<CapacitySnapshot>> {
+        let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         if state.is_stopped() {
             self.mark_terminal(token_contract)?;
             return Ok(None);
@@ -123,7 +185,10 @@ impl CapacityManager {
         let subscription_term_ended = deal.is_subscription() && deal.week_index >= deal.sub_weeks;
 
         let entry = {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"))?;
             if let Some(entry) = entries.get(token_contract) {
                 entry.clone()
             } else {
@@ -137,8 +202,8 @@ impl CapacityManager {
                         if record.token_contract != *token_contract {
                             bail!(
                                 "seller capacity file is for TokenContract {}, not {}",
-                                record.token_contract,
-                                token_contract
+                                dexdo_core::address::display_self_dapp(&record.token_contract),
+                                token_contract_display
                             );
                         }
                         record
@@ -158,6 +223,7 @@ impl CapacityManager {
                     state: Mutex::new(CapacityEntryState {
                         record,
                         terminal: false,
+                        unpersisted_delivered: 0,
                     }),
                 });
                 entries.insert(token_contract.clone(), entry.clone());
@@ -165,28 +231,31 @@ impl CapacityManager {
             }
         };
 
-        let mut locked = entry.state.lock().unwrap();
+        let mut locked = entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
         if locked.terminal {
-            bail!("TokenContract {token_contract} capacity is terminal");
+            bail!("TokenContract {token_contract_display} capacity is terminal");
         }
         let old = &locked.record;
         if old.funded_tokens != deal.funded_tokens {
             bail!(
-                "TokenContract {token_contract} fundedTokens changed from {} to {}",
+                "TokenContract {token_contract_display} fundedTokens changed from {} to {}",
                 old.funded_tokens,
                 deal.funded_tokens
             );
         }
         if state.tokens_pending < old.tokens_pending_anchor {
             bail!(
-                "TokenContract {token_contract} tokensPending regressed from {} to {}",
+                "TokenContract {token_contract_display} tokensPending regressed from {} to {}",
                 old.tokens_pending_anchor,
                 state.tokens_pending
             );
         }
         if cap < old.authoritative_cap && !subscription_term_ended {
             bail!(
-                "TokenContract {token_contract} authoritative capacity regressed from {} to {}",
+                "TokenContract {token_contract_display} authoritative capacity regressed from {} to {}",
                 old.authoritative_cap,
                 cap
             );
@@ -210,7 +279,7 @@ impl CapacityManager {
         let backed_by_delivery = acknowledged - probe_seed;
         if backed_by_delivery > old.local_delivered_after_anchor && !subscription_term_ended {
             bail!(
-                "TokenContract {token_contract} tokensPending advanced by {acknowledged} \
+                "TokenContract {token_contract_display} tokensPending advanced by {acknowledged} \
                  ({backed_by_delivery} beyond the protocol probe seed), beyond durable local delivery {}",
                 old.local_delivered_after_anchor
             );
@@ -255,11 +324,19 @@ impl CapacityManager {
         let entry = self
             .entries
             .lock()
-            .unwrap()
+            .map_err(|_| {
+                ReserveError::InvalidState(anyhow!(
+                    "{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"
+                ))
+            })?
             .get(token_contract)
             .cloned()
             .ok_or(ReserveError::UnknownDeal)?;
-        let mut locked = entry.state.lock().unwrap();
+        let mut locked = entry.state.lock().map_err(|_| {
+            ReserveError::InvalidState(anyhow!(
+                "{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"
+            ))
+        })?;
         if locked.terminal {
             return Err(ReserveError::Terminal);
         }
@@ -280,6 +357,7 @@ impl CapacityManager {
         })?;
         validate_record(&candidate).map_err(ReserveError::InvalidState)?;
         persist_candidate(entry.path.as_deref(), &candidate).map_err(ReserveError::InvalidState)?;
+        locked.unpersisted_delivered = 0;
         locked.record = candidate;
         drop(locked);
 
@@ -294,10 +372,19 @@ impl CapacityManager {
     }
 
     pub fn snapshot(&self, token_contract: &TokenContract) -> Result<Option<CapacitySnapshot>> {
-        let Some(entry) = self.entries.lock().unwrap().get(token_contract).cloned() else {
+        let Some(entry) = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"))?
+            .get(token_contract)
+            .cloned()
+        else {
             return Ok(None);
         };
-        let locked = entry.state.lock().unwrap();
+        let locked = entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
         if locked.terminal {
             return Ok(None);
         }
@@ -306,9 +393,16 @@ impl CapacityManager {
     }
 
     pub fn mark_terminal(&self, token_contract: &TokenContract) -> Result<()> {
-        let entry = self.entries.lock().unwrap().remove(token_contract);
+        let entry = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"))?
+            .remove(token_contract);
         if let Some(entry) = entry {
-            let mut locked = entry.state.lock().unwrap();
+            let mut locked = entry
+                .state
+                .lock()
+                .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
             locked.terminal = true;
             if let Some(path) = &entry.path {
                 remove_if_present(path)?;
@@ -362,20 +456,54 @@ pub struct CapacityReservation {
 
 impl CapacityReservation {
     pub fn amount(&self) -> u64 {
-        let initial = self.request.lock().unwrap().initial;
+        let initial = lock_or_recover(&self.request, CAPACITY_REQUEST_LOCK).initial;
         u64::try_from(initial).expect("reservation is bounded by requested u64")
     }
 
     pub fn remaining(&self) -> u64 {
-        let remaining = self.request.lock().unwrap().remaining;
+        let remaining = lock_or_recover(&self.request, CAPACITY_REQUEST_LOCK).remaining;
         u64::try_from(remaining).expect("reservation is bounded by requested u64")
     }
 
-    pub fn record_delivered(&self, tokens: u64) -> Result<()> {
+    /// Authorize output whose authoritative token count can only arrive AFTER it.
+    /// The separate-usage shape -- content deltas first, one usage figure at the end -- is what every
+    /// shipped adapter produces, so on that branch there is no number to record before the chunk
+    /// crosses to the buyer. What there always is, is this reservation: it was made durable before the
+    /// upstream could observe the request, and it is the exact ceiling of what the request may still
+    /// bill. Once it holds nothing, every further token is output the seller can never claim
+    /// ([`Self::record_delivered`] refuses it), so the exposure must stop at the last token that could
+    /// still be paid for rather than continue and be reconciled into a refusal afterwards.
+    /// `min_billable` is what this upstream has already charged for one run of unaccounted output on
+    /// this stream, and zero before it has charged anything. Asking only whether the reservation is
+    /// non-empty refuses at exactly zero and nowhere else, so a reservation that lands short of the
+    /// next run rather than on top of it still exposes one run it cannot bill: the seller has to be
+    /// able to pay what this upstream has already shown a run costs, not merely one token.
+    pub fn authorize_exposure(
+        &self,
+        min_billable: u64,
+    ) -> std::result::Result<(), ReserveError> {
+        let request = self.request.lock().map_err(|_| {
+            ReserveError::InvalidState(anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))
+        })?;
+        if request.finished || request.remaining < u128::from(min_billable.max(1)) {
+            return Err(ReserveError::Exhausted);
+        }
+        Ok(())
+    }
+
+    /// Record delivered tokens and return how many became DURABLE in this call.
+    /// The caller must not advance the claim-driving counter past the returned total: `reconcile_deal`
+    /// refuses a `tokensPending` that ran beyond durable local delivery, so claiming a token whose
+    /// delivery a crash could erase would strand the deal. Coalescing therefore delays the counter, it
+    /// never lets it lead -- every request terminal flushes and returns the remainder.
+    pub fn record_delivered(&self, tokens: u64) -> Result<u64> {
         if tokens == 0 {
             bail!("authoritative delivered delta must be positive");
         }
-        let mut request = self.request.lock().unwrap();
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))?;
         if request.finished {
             bail!("capacity reservation already finished");
         }
@@ -386,40 +514,62 @@ impl CapacityReservation {
                 request.remaining
             );
         }
-        let mut locked = self.entry.state.lock().unwrap();
+        let mut locked = self
+            .entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
         if locked.terminal {
             bail!("deal capacity became terminal");
         }
-        let mut candidate = locked.record.clone();
-        candidate.outstanding_reservation =
-            candidate
-                .outstanding_reservation
-                .checked_sub(tokens)
-                .ok_or_else(|| anyhow!("aggregate reservation underflow"))?;
-        candidate.local_delivered_after_anchor = candidate
-            .local_delivered_after_anchor
+        // The tokens are held as an unapplied split: while they wait they stay counted as outstanding
+        // reservation, so `committed` and the funded ceiling read exactly as they would if each token
+        // had been written through. Only the flush moves them, and only the flush may be claimed.
+        let unpersisted = locked
+            .unpersisted_delivered
             .checked_add(tokens)
             .ok_or_else(|| anyhow!("local delivered counter overflows uint128"))?;
-        validate_record(&candidate)?;
-        persist_candidate(self.entry.path.as_deref(), &candidate)?;
-        locked.record = candidate;
+        if unpersisted > locked.record.outstanding_reservation {
+            bail!("aggregate reservation underflow");
+        }
+        locked.unpersisted_delivered = unpersisted;
+        // Coalescing exists only to avoid a disk write, so a ledger with no store never delays: it
+        // applies the split immediately and keeps the write-through semantics exactly.
+        let durable = if unpersisted >= CAPACITY_PERSIST_TOKEN_INTERVAL || self.entry.path.is_none()
+        {
+            self.entry.flush_delivered(&mut locked)?
+        } else {
+            0
+        };
         request.remaining -= tokens;
-        Ok(())
+        Ok(durable)
     }
 
     /// Release a request's exact unused remainder. Used for both clean completion and an interrupted stream
     /// whose every successfully forwarded output already had an authoritative token count.
-    pub fn finish_exact(&self) -> Result<()> {
-        let mut request = self.request.lock().unwrap();
+    /// Returns the delivered tokens that became durable in this call(see [`Self::record_delivered`]).
+    pub fn finish_exact(&self) -> Result<u64> {
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))?;
         if request.finished {
             bail!("capacity reservation already finished");
         }
-        let mut locked = self.entry.state.lock().unwrap();
+        let mut locked = self
+            .entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
         if locked.terminal {
             request.finished = true;
             request.remaining = 0;
-            return Ok(());
+            return Ok(0);
         }
+        // A request terminal owes the coalesced split a write, and it must land before the remainder
+        // is released so that a crash between the two cannot drop delivered tokens back into a
+        // reservation that has already been given away.
+        let durable = self.entry.flush_delivered(&mut locked)?;
         let mut candidate = locked.record.clone();
         candidate.outstanding_reservation = candidate
             .outstanding_reservation
@@ -430,19 +580,36 @@ impl CapacityReservation {
         locked.record = candidate;
         request.remaining = 0;
         request.finished = true;
-        Ok(())
+        Ok(durable)
     }
 
     /// Preserve all unresolved capacity. This is the only safe terminal when some output may have reached the
     /// buyer without a valid authoritative usage count.
-    pub fn finish_ambiguous(&self) -> Result<()> {
-        let mut request = self.request.lock().unwrap();
+    /// Returns the delivered tokens that became durable in this call(see [`Self::record_delivered`]).
+    pub fn finish_ambiguous(&self) -> Result<u64> {
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))?;
         if request.finished {
             bail!("capacity reservation already finished");
         }
+        // The unresolved remainder is deliberately kept committed, but any coalesced delivery split
+        // still owes a write: this is a request terminal, so nothing may stay only in memory.
+        let mut locked = self
+            .entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
+        let durable = if locked.terminal {
+            0
+        } else {
+            self.entry.flush_delivered(&mut locked)?
+        };
+        drop(locked);
         request.remaining = 0;
         request.finished = true;
-        Ok(())
+        Ok(durable)
     }
 }
 
@@ -468,6 +635,7 @@ fn validate_live_deal_shape(
     state: DealChainState,
     deal: DealSubscription,
 ) -> Result<()> {
+    let token_contract = dexdo_core::address::display_self_dapp(token_contract);
     if deal.is_subscription() != (deal.deal_flags & flags::SUBSCRIPTION != 0) {
         bail!("TokenContract {token_contract} has contradictory subscription flag/subWeeks shape");
     }
@@ -528,7 +696,7 @@ fn validate_record(record: &DurableCapacityRecord) -> Result<()> {
     if record.version != CAPACITY_RECORD_VERSION {
         bail!(
             "seller capacity {} has version {}; expected {}",
-            record.token_contract,
+            dexdo_core::address::display_self_dapp(&record.token_contract),
             record.version,
             CAPACITY_RECORD_VERSION
         );
@@ -727,6 +895,10 @@ mod decimal_u128 {
 }
 
 #[cfg(test)]
+#[path = "capacity_1157_tests.rs"]
+mod issue_1157_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use dexdo_core::SUBSCRIPTION_WEEKS;
@@ -748,12 +920,10 @@ mod tests {
             deposit: 1,
             finalized_owed: 0,
             tokens_final: pending,
-            tokens_superseded: pending,
             tokens_pending: pending,
             probe_tick: 0,
             funded_time: Some(1),
             probe_time: 1,
-            prev_claim_time: 1,
             last_claim_time: 1,
             dispute_time: 0,
         }
@@ -788,6 +958,156 @@ mod tests {
     fn assert_invariant(snapshot: CapacitySnapshot) {
         assert!(snapshot.committed().unwrap() <= snapshot.authoritative_cap);
         assert!(snapshot.authoritative_cap <= snapshot.funded_tokens);
+    }
+
+    /// Delivery must not rewrite the durable record once per token.
+    /// The pre-fix path fsynced the capacity file twice -- plus a file create and a rename -- for every
+    /// delivered token, which floored the gateway at ~13k tokens/min on a real disk no matter how fast
+    /// the model produced. Coalescing is only sound because `record_delivered` reclassifies reserved
+    /// tokens as delivered without moving `committed`, and `reserve` already made the whole request
+    /// durable; this pins all three halves of that argument: the write lags during the request, the
+    /// funded ceiling never moves, and the terminal is exact.
+    #[test]
+    fn delivery_coalesces_durable_writes_and_is_exact_at_the_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+        let tc = "0:coalesce".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+        let on_disk = || load_record(&path).unwrap().unwrap();
+
+        let total = 4 * CAPACITY_PERSIST_TOKEN_INTERVAL;
+        let reservation = manager.reserve(&tc, total as u64).unwrap();
+        let committed_at_reserve = CapacitySnapshot::from(&on_disk()).committed().unwrap();
+
+        // One token is held back -- a per-token durable rewrite is exactly the cost this removes.
+        reservation.record_delivered(1).unwrap();
+        assert_eq!(
+            on_disk().local_delivered_after_anchor,
+            0,
+            "the first delivered token must not trigger a durable rewrite"
+        );
+
+        for _ in 1..total {
+            reservation.record_delivered(1).unwrap();
+            assert_eq!(
+                CapacitySnapshot::from(&on_disk()).committed().unwrap(),
+                committed_at_reserve,
+                "committed capacity is invariant across delivery, flushed or not"
+            );
+        }
+        assert!(
+            on_disk().local_delivered_after_anchor >= total - CAPACITY_PERSIST_TOKEN_INTERVAL,
+            "the durable record must track delivery to within one coalescing interval"
+        );
+
+        // The request terminal is exact: nothing is left only in memory.
+        reservation.finish_exact().unwrap();
+        let snapshot = manager.snapshot(&tc).unwrap().unwrap();
+        let durable = on_disk();
+        assert_eq!(
+            durable.local_delivered_after_anchor, total,
+            "every delivered token is durable once the request ends"
+        );
+        assert_eq!(
+            durable.local_delivered_after_anchor,
+            snapshot.local_delivered_after_anchor
+        );
+        assert_eq!(
+            durable.outstanding_reservation,
+            snapshot.outstanding_reservation
+        );
+        assert_invariant(CapacitySnapshot::from(&durable));
+    }
+
+    /// The other request terminal: an ambiguous finish must also leave nothing only in memory.
+    #[test]
+    fn ambiguous_terminal_flushes_the_coalesced_delivery_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+        let tc = "0:coalesce-ambiguous".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+
+        let reservation = manager.reserve(&tc, 16).unwrap();
+        reservation.record_delivered(4).unwrap();
+        assert_eq!(
+            load_record(&path)
+                .unwrap()
+                .unwrap()
+                .local_delivered_after_anchor,
+            0,
+            "still coalesced below the interval"
+        );
+
+        reservation.finish_ambiguous().unwrap();
+        let durable = load_record(&path).unwrap().unwrap();
+        assert_eq!(
+            durable.local_delivered_after_anchor, 4,
+            "the ambiguous terminal flushes the delivered split"
+        );
+        // Ambiguous deliberately keeps the unresolved remainder committed.
+        assert_eq!(durable.outstanding_reservation, 12);
+        assert_invariant(CapacitySnapshot::from(&durable));
+    }
+
+    /// MEASUREMENT INSTRUMENT(not a CI gate): per-delivered-token cost of the durable capacity
+    /// record, reported by decade. `record_delivered(1)` is exactly what the gateway relay calls
+    /// once per forwarded chunk, and an OpenAI-compatible SSE stream is one token per chunk.
+    /// PERF_N=200000 cargo test -p dexdo --release --lib \
+    /// seller::capacity::tests::measure_delivery_persist_by_decade -- --ignored --nocapture
+    /// `PERF_INMEM=1` switches the store off(`CapacityManager::in_memory`) -- the A/B that
+    /// separates the disk cost from everything else.
+    #[test]
+    #[ignore = "measurement instrument; run explicitly with --ignored --nocapture"]
+    fn measure_delivery_persist_by_decade() {
+        let n: u64 = std::env::var("PERF_N")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let in_memory = std::env::var("PERF_INMEM").is_ok();
+        let manager = if in_memory {
+            CapacityManager::in_memory()
+        } else {
+            CapacityManager::in_deals_dir(dir.path().to_path_buf())
+        };
+        let tc = "0:perf".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+        let reservation = manager.reserve(&tc, n).unwrap();
+        assert_eq!(u128::from(reservation.amount()), u128::from(n));
+
+        let decade = (n / 10).max(1);
+        let start = std::time::Instant::now();
+        let mut mark = start;
+        println!("store={} n={n}", if in_memory { "memory" } else { "disk" });
+        println!("decade    tokens        ms      tokens/min");
+        for index in 1..=n {
+            reservation.record_delivered(1).unwrap();
+            if index % decade == 0 {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(mark).as_secs_f64();
+                println!(
+                    "{:>6}  {:>8}  {:>8.0}  {:>14.0}",
+                    index / decade,
+                    decade,
+                    elapsed * 1000.0,
+                    decade as f64 / elapsed * 60.0
+                );
+                mark = now;
+            }
+        }
+        let total = start.elapsed().as_secs_f64();
+        println!(
+            "TOTAL {n} tokens in {total:.2}s = {:.0} tokens/min",
+            n as f64 / total * 60.0
+        );
     }
 
     #[test]
@@ -1187,7 +1507,8 @@ mod tests {
                 .reconcile_deal(&tc, state(true, TICK_SIZE), subscription(0, 0))
                 .unwrap();
             let delivered = manager.reserve(&tc, 100).unwrap();
-            delivered.record_delivered(40).unwrap();
+            // Below one coalescing interval, so this delivery is still an unapplied split at the crash.
+            assert_eq!(delivered.record_delivered(40).unwrap(), 0);
             // Crash: neither the delivered remainder nor the outstanding reservation is released.
         }
         let restarted = CapacityManager::in_deals_dir(directory.path().to_path_buf());
@@ -1195,9 +1516,47 @@ mod tests {
             .reconcile_deal(&tc, state(true, TICK_SIZE), subscription(0, 0))
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.local_delivered_after_anchor, 40);
-        assert_eq!(snapshot.outstanding_reservation, 60);
+        // A crash mid-request loses the SPLIT, not the capacity: the 40 stay classified as reserved
+        // rather than delivered. That is the conservative direction -- the tokens remain committed and
+        // are never handed back out -- and it is sound only because the claim-driving counter is
+        // advanced by what `record_delivered` reports DURABLE, so nothing was ever claimed for them.
+        // What it does cost is revenue: up to one interval of genuinely delivered tokens the seller
+        // can no longer bill for. The invariant the deal depends on is the last assertion.
+        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+        assert_eq!(snapshot.outstanding_reservation, 100);
         assert_eq!(snapshot.available().unwrap(), TICK_SIZE - 100);
+    }
+
+    /// The flushed half of the same story: once a delivery crosses the interval it survives a crash,
+    /// and the claim-driving counter is told about exactly that amount.
+    #[test]
+    fn restart_keeps_flushed_local_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let tc = "0:restart-flushed".to_string();
+        let flushed = CAPACITY_PERSIST_TOKEN_INTERVAL as u64;
+        {
+            let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+            manager
+                .reconcile_deal(&tc, state(true, TICK_SIZE), subscription(0, 0))
+                .unwrap();
+            let delivered = manager.reserve(&tc, flushed + 60).unwrap();
+            assert_eq!(delivered.record_delivered(flushed).unwrap(), flushed);
+        }
+        let restarted = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+        let snapshot = restarted
+            .reconcile_deal(&tc, state(true, TICK_SIZE), subscription(0, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.local_delivered_after_anchor,
+            u128::from(flushed),
+            "a flushed delivery is durable across a crash"
+        );
+        assert_eq!(snapshot.outstanding_reservation, 60);
+        assert_eq!(
+            snapshot.available().unwrap(),
+            TICK_SIZE - u128::from(flushed) - 60
+        );
     }
 
     #[test]
@@ -1506,8 +1865,12 @@ mod tests {
                         reservation.record_delivered(delivered).unwrap();
                     }
                     match finish {
-                        0 => reservation.finish_exact().unwrap(),
-                        1 => reservation.finish_ambiguous().unwrap(),
+                        0 => {
+                            reservation.finish_exact().unwrap();
+                        }
+                        1 => {
+                            reservation.finish_ambiguous().unwrap();
+                        }
                         _ => drop(reservation),
                     }
                 }
@@ -1574,5 +1937,240 @@ mod tests {
                 prop_assert!(snapshot.authoritative_cap <= snapshot.funded_tokens);
             }
         }
+    }
+
+    // ----: what the served-model check may cost the buyer's reservation ----
+
+    /// A provider socket that answers one `chat/completions` with the given SSE body and closes.
+    /// A real socket and a real HTTP response, because the check under test reads PROVIDER frames: a
+    /// hand-built event would prove nothing about the path that runs in production.
+    async fn provider_serving(body: String) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        (address, handle)
+    }
+
+    /// The gateway's own recorder(`seller::gateway::CapacityDeliveryRecorder`) is private to that module,
+    /// so this reproduces exactly its reservation contract and nothing else: a delivered delta advances the
+    /// reservation, and the terminal CLASSIFICATION decides whether the unused remainder comes back
+    /// (`finish_exact`) or stays committed forever(`finish_ambiguous`). The classification itself is
+    /// asserted separately, so neither half can drift unnoticed.
+    #[derive(Clone)]
+    struct RelayRecorder {
+        reservation: std::sync::Arc<CapacityReservation>,
+        finish: std::sync::Arc<
+            std::sync::Mutex<Option<crate::seller::gateway::AuthoritativeDeliveryFinish>>,
+        >,
+    }
+
+    impl crate::seller::gateway::AuthoritativeDeliveryRecorder for RelayRecorder {
+        fn record_authoritative_delivery(
+            &self,
+            event: crate::seller::gateway::AuthoritativeDeliveryEvent,
+        ) -> std::result::Result<(), tonic::Status> {
+            use crate::seller::gateway::{AuthoritativeDeliveryEvent, AuthoritativeDeliveryFinish};
+            match event {
+                AuthoritativeDeliveryEvent::Delivered(tokens) => {
+                    self.reservation.record_delivered(tokens.get()).unwrap();
+                }
+                AuthoritativeDeliveryEvent::Finished(finish) => {
+                    *self.finish.lock().unwrap() = Some(finish);
+                    match finish {
+                        AuthoritativeDeliveryFinish::Clean
+                        | AuthoritativeDeliveryFinish::Interrupted => {
+                            self.reservation.finish_exact().unwrap()
+                        }
+                        AuthoritativeDeliveryFinish::AmbiguousUsage => {
+                            self.reservation.finish_ambiguous().unwrap()
+                        }
+                    };
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// What one buyer request against `body` leaves behind: everything the buyer received, the relay's
+    /// terminal classification, and the durable capacity record after the request terminal.
+    async fn relay_one_request(
+        upstream: impl FnOnce(String) -> crate::seller::OpenAiConfig,
+        body: String,
+    ) -> (
+        Vec<std::result::Result<dexdo_proto::CanonChunk, tonic::Status>>,
+        Option<crate::seller::gateway::AuthoritativeDeliveryFinish>,
+        DurableCapacityRecord,
+    ) {
+        use dexdo_proto::{CanonRequest, ChatMessage, SamplingParams};
+
+        const GRANT: u64 = 8;
+
+        let (address, provider) = provider_serving(body).await;
+        let cfg = upstream(format!("http://{address}"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+        let tc = "0:served-model".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+        let recorder = RelayRecorder {
+            reservation: std::sync::Arc::new(manager.reserve(&tc, GRANT).unwrap()),
+            finish: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        let request = CanonRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            params: Some(SamplingParams {
+                temperature: 0.0,
+                max_tokens: GRANT as u32,
+                stop: Vec::new(),
+                greedy: false,
+            }),
+        };
+        let (up_tx, up_rx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let adapter = tokio::spawn(async move {
+            crate::seller::UpstreamConfig::OpenAi(cfg)
+                .run(GRANT, Some(request), up_tx)
+                .await;
+        });
+        crate::seller::gateway::relay_counting(up_rx, tx, recorder.clone(), None).await;
+        adapter.await.unwrap();
+        provider.abort();
+
+        let mut received = Vec::new();
+        while let Some(item) = rx.recv().await {
+            received.push(item);
+        }
+        let finish = *recorder.finish.lock().unwrap();
+        (received, finish, load_record(&path).unwrap().unwrap())
+    }
+
+    /// The seller's committed identity in the shipped configuration: the Groq slug it sends upstream, the
+    /// canonical market id it sells under, and no declared extra spellings.
+    fn qwen_upstream(base_url: String) -> crate::seller::OpenAiConfig {
+        crate::seller::OpenAiConfig {
+            base_url,
+            model: "qwen/qwen3-32b".to_string(),
+            frame_model: "qwen--qwen3--32b".to_string(),
+            // `PATH` is always set and non-empty, so the adapter reaches the provider without mutating
+            // process-global environment while other tests run.
+            api_key_env: "PATH".to_string(),
+            ..crate::seller::OpenAiConfig::default()
+        }
+    }
+
+    /// (money): the served-model check must not fire once the buyer's capacity is in flight.
+    /// An error returned from the adapter after a chunk has been forwarded reaches the relay with output
+    /// delivered and its authoritative usage still outstanding -- which is `AmbiguousUsage`, and that
+    /// terminal deliberately keeps the unresolved remainder COMMITTED (pinned by
+    /// `ambiguous_terminal_flushes_the_coalesced_delivery_split` above). The buyer would lose capacity it
+    /// paid for and the seller could not claim the tokens it had already delivered: two-sided loss, in
+    /// answer to a misspelled `served_model`. So past the first delivered output the divergence is a
+    /// diagnostic, and the stream is carried to its honest terminal.
+    /// Nothing is given up by that bound: an OpenAI-compatible provider names the model in its FIRST frame,
+    /// so a real mismatch is always seen before any output -- including in seller readiness, where
+    /// E2E-ADV-02 refuses before `postSellOffer`(`upstream::tests`).
+    #[tokio::test]
+    async fn late_served_model_divergence_does_not_strand_the_reservation() {
+        let (received, finish, durable) = relay_one_request(
+            qwen_upstream,
+            "data: {\"model\":\"qwen/qwen3-32b\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"first \"}}]}\n\n\
+             data: {\"model\":\"meta-llama/llama-3.3-70b-versatile\",\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n\
+             data: [DONE]\n\n"
+                .to_string(),
+        )
+        .await;
+
+        let delivered: Vec<String> = received
+            .iter()
+            .map(|item| match item {
+                Ok(chunk) => chunk.text.clone(),
+                Err(status) => panic!(
+                    ": a provider that renamed itself after the first delivered chunk tore the \
+                     stream down: {status:?}"
+                ),
+            })
+            .collect();
+        assert_eq!(delivered, vec!["first ".to_string(), "second".to_string()]);
+        assert_eq!(
+            finish,
+            Some(crate::seller::gateway::AuthoritativeDeliveryFinish::Clean),
+            ": the classification that burns the reservation is AmbiguousUsage; a late identity \
+             divergence must never produce it"
+        );
+        assert_eq!(
+            durable.outstanding_reservation, 0,
+            ": the unused remainder of the buyer's grant came back"
+        );
+        assert_eq!(
+            durable.local_delivered_after_anchor, 2,
+            "the provider's own terminal total is what was delivered and is claimable"
+        );
+        assert_invariant(CapacitySnapshot::from(&durable));
+    }
+
+    /// an operator who declared the provider's own spelling the one supported way (`identity_aliases`
+    /// in `models.json`, the same field the buyer reconciles identity through) is served, not refused.
+    /// Here the provider answers `Qwen/Qwen3-32B` while the seller sends the slug `qwen3-32b` upstream and
+    /// sells under `alibaba--qwen3--32b`: the reported spelling is reachable ONLY through the declared
+    /// alias, so this fails the moment `identity_aliases` stops being part of the accepted set -- and it
+    /// fails at the first frame, taking an honest seller off the market for a spelling it declared.
+    #[tokio::test]
+    async fn a_declared_identity_alias_is_an_accepted_served_model() {
+        let (received, finish, durable) = relay_one_request(
+            |base_url| crate::seller::OpenAiConfig {
+                base_url,
+                model: "qwen3-32b".to_string(),
+                frame_model: "alibaba--qwen3--32b".to_string(),
+                api_key_env: "PATH".to_string(),
+                identity_aliases: vec!["Qwen/Qwen3-32B".to_string()],
+                ..crate::seller::OpenAiConfig::default()
+            },
+            "data: {\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"delta\":{\"content\":\"served\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n\
+             data: [DONE]\n\n"
+                .to_string(),
+        )
+        .await;
+
+        let delivered: Vec<String> = received
+            .iter()
+            .map(|item| match item {
+                Ok(chunk) => chunk.text.clone(),
+                Err(status) => panic!(
+                    ": a model declared through identity_aliases was refused as a substitution: \
+                     {status:?}"
+                ),
+            })
+            .collect();
+        assert_eq!(delivered, vec!["served".to_string()]);
+        assert_eq!(
+            finish,
+            Some(crate::seller::gateway::AuthoritativeDeliveryFinish::Clean),
+            ": the declared alias is the same model, so the request ends cleanly"
+        );
+        assert_eq!(durable.outstanding_reservation, 0);
+        assert_invariant(CapacitySnapshot::from(&durable));
     }
 }

@@ -8,16 +8,667 @@ use anyhow::{anyhow, Result};
 use gosh_ackinacki::airegistry::calls::{encode_external_call, encode_internal_payload};
 use gosh_ackinacki::airegistry::deploy::local_context;
 use gosh_ackinacki::sdk::{Address, KeyPair};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+const WALLET_REFILL_NOTE_COST_RAW: u128 = 450_000_000_000;
+const WALLET_REFILL_TARGET_RAW: u128 = 5_000_000_000_000;
+const WALLET_REFILL_DEPLOY_FUND_RAW: u128 = 200_000_000_000;
+const GIVER_SYSTEM_DAPP_ID: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Deserialize)]
+struct WalletRefillPlan {
+    wallet_files: Vec<PathBuf>,
+    evidence_file: PathBuf,
+    /// Desired total count in the dedicated add-wallet file. Re-running the same plan generates
+    /// zero further keys, so an uncertain live failure recovers the already-persisted wallets.
+    #[serde(default)]
+    add_wallets: usize,
+    add_wallet_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct WalletRefillRecord {
+    address: String,
+    secret_hex: String,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct WalletRefillFile {
+    wallets: Vec<WalletRefillRecord>,
+}
+
+struct PreparedWalletRefill {
+    wallet_file: PathBuf,
+    wallet_index: usize,
+    address: Address,
+    keys: KeyPair,
+    newly_added: bool,
+    before_active: bool,
+    before_ecc2: u128,
+    sent_ecc2: u128,
+}
+
+#[derive(Clone)]
+struct WalletRefillAccountObservation {
+    active: bool,
+    ecc2: u128,
+    code_hash: Option<String>,
+}
+
+struct SkippedWalletRefill {
+    wallet_file: PathBuf,
+    wallet_index: usize,
+    address: String,
+    reason: String,
+}
+
+struct WalletRefillValidation {
+    wallets: Vec<PreparedWalletRefill>,
+    skipped: Vec<SkippedWalletRefill>,
+    fleet_code_hash: String,
+}
+
+#[async_trait::async_trait(?Send)]
+trait WalletRefillChain {
+    async fn wallet_account(
+        &self,
+        address: &Address,
+    ) -> Result<Option<WalletRefillAccountObservation>>;
+
+    async fn wallet_custodian_pubkeys(&self, address: &Address) -> Result<Vec<String>>;
+
+    async fn deploy_wallet(&self, keys: &KeyPair) -> Result<Address>;
+
+    async fn send_shell(&self, address: &Address, amount: u128) -> Result<()>;
+}
+
+#[derive(Serialize)]
+struct WalletRefillEvidence {
+    note_cost_raw: u128,
+    target_raw: u128,
+    giver_address: String,
+    giver_dapp_id: String,
+    giver_native_raw: u128,
+    giver_stored_ecc2_raw: u128,
+    giver_code_hash: String,
+    giver_planned_mint_raw: u128,
+    wallets: Vec<WalletRefillWalletEvidence>,
+}
+
+struct GiverMintFaucetObservation {
+    dapp_id: String,
+    active: bool,
+    native_raw: u128,
+    stored_ecc2_raw: u128,
+    code_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WalletRefillWalletEvidence {
+    wallet_file: String,
+    wallet_index: usize,
+    address: String,
+    newly_added: bool,
+    before_active: bool,
+    before_ecc2: u128,
+    sent_ecc2: u128,
+    after_active: bool,
+    after_ecc2: u128,
+}
+
+#[cfg(unix)]
+fn require_private_regular_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| anyhow!("cannot inspect private file {}: {e}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "private input {} must be a regular file",
+            path.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(anyhow!(
+            "private input {} must have mode 0600, got {mode:04o}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_private_regular_file(_path: &Path) -> Result<()> {
+    Err(anyhow!(
+        "wallet refill is an operator-only Unix live-test tool"
+    ))
+}
+
+fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    require_private_regular_file(path)?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow!("cannot read private file {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("cannot parse private JSON {}: {e}", path.display()))
+}
+
+#[cfg(unix)]
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private output {} has no parent", path.display()))?;
+    if !parent.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(parent)
+            .map_err(|e| anyhow!("cannot create private directory {}: {e}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("private output {} has no file name", path.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow!("system clock before Unix epoch: {e}"))?
+        .as_nanos();
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|e| anyhow!("cannot create private temporary output: {e}"))?;
+    serde_json::to_writer_pretty(&mut output, value)
+        .map_err(|e| anyhow!("cannot encode private JSON output: {e}"))?;
+    output.write_all(b"\n")?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(&temporary, path)
+        .map_err(|e| anyhow!("cannot install private output {}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_json<T: Serialize>(_path: &Path, _value: &T) -> Result<()> {
+    Err(anyhow!(
+        "wallet refill is an operator-only Unix live-test tool"
+    ))
+}
+
+fn ensure_giver_mint_faucet_ready(
+    observation: Option<&GiverMintFaucetObservation>,
+    planned_mint_raw: u128,
+) -> Result<()> {
+    let Some(observation) = observation else {
+        return Err(anyhow!(
+            "configured shellnet Giver is missing; planned mint {planned_mint_raw} raw ECC[2] was not submitted"
+        ));
+    };
+    if observation.dapp_id != GIVER_SYSTEM_DAPP_ID {
+        return Err(anyhow!(
+            "configured shellnet Giver is in dapp {}, not the all-zero system dapp; planned mint {planned_mint_raw} raw ECC[2] was not submitted",
+            observation.dapp_id
+        ));
+    }
+    if !observation.active {
+        return Err(anyhow!(
+            "configured shellnet Giver is not Active; planned mint {planned_mint_raw} raw ECC[2] was not submitted"
+        ));
+    }
+    if observation.code_hash.as_deref().is_none_or(str::is_empty) {
+        return Err(anyhow!(
+            "configured shellnet Giver has no live code hash; planned mint {planned_mint_raw} raw ECC[2] was not submitted"
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_wallet_refill_plan(
+    plan: &WalletRefillPlan,
+) -> Result<(
+    Vec<PreparedWalletRefill>,
+    Option<(PathBuf, WalletRefillFile)>,
+)> {
+    use std::collections::{BTreeMap, HashSet};
+
+    if plan.wallet_files.is_empty() {
+        return Err(anyhow!("wallet refill plan has no wallet_files"));
+    }
+    if plan.add_wallets > 0 && plan.add_wallet_file.is_none() {
+        return Err(anyhow!(
+            "wallet refill plan with add_wallets > 0 requires add_wallet_file"
+        ));
+    }
+    if plan.wallet_files.contains(&plan.evidence_file)
+        || plan.add_wallet_file.as_ref() == Some(&plan.evidence_file)
+    {
+        return Err(anyhow!(
+            "evidence_file must not overwrite a wallet file containing secrets"
+        ));
+    }
+
+    let mut files = BTreeMap::<PathBuf, WalletRefillFile>::new();
+    for path in &plan.wallet_files {
+        if files.contains_key(path) {
+            return Err(anyhow!(
+                "wallet refill plan repeats wallet file {}",
+                path.display()
+            ));
+        }
+        files.insert(path.clone(), read_private_json(path)?);
+    }
+
+    let mut pending_new_file = None;
+    let mut new_wallet_start = None;
+    if plan.add_wallets > 0 {
+        let path = plan.add_wallet_file.as_ref().expect("checked above");
+        let mut file = if let Some(existing) = files.get(path) {
+            existing.clone()
+        } else if path.exists() {
+            read_private_json(path)?
+        } else {
+            WalletRefillFile::default()
+        };
+        let original_len = file.wallets.len();
+        let missing = plan.add_wallets.saturating_sub(original_len);
+        for _ in 0..missing {
+            let keys = KeyPair::generate();
+            let address = RealChainBackend::multisig_address(&keys).await?;
+            file.wallets.push(WalletRefillRecord {
+                address: address.with_workchain(),
+                secret_hex: keys.secret_hex().to_string(),
+            });
+        }
+        files.insert(path.clone(), file.clone());
+        if missing > 0 {
+            new_wallet_start = Some((path.clone(), original_len));
+            pending_new_file = Some((path.clone(), file));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut wallets = Vec::new();
+    for (path, file) in files {
+        let prior_len = new_wallet_start
+            .as_ref()
+            .filter(|(new_path, _)| new_path == &path)
+            .map(|(_, start)| *start)
+            .unwrap_or(file.wallets.len());
+        for (index, record) in file.wallets.into_iter().enumerate() {
+            let address = Address::parse(&record.address).map_err(|e| {
+                anyhow!("invalid wallet address in {}[{index}]: {e}", path.display())
+            })?;
+            let keys = KeyPair::from_secret_hex(record.secret_hex.trim()).map_err(|_| {
+                anyhow!(
+                    "invalid wallet secret in {}[{index}] (secret not shown)",
+                    path.display()
+                )
+            })?;
+            if index >= prior_len {
+                let canonical = RealChainBackend::multisig_address(&keys).await?;
+                if canonical.with_workchain() != address.with_workchain() {
+                    return Err(anyhow!(
+                        "new wallet {} in {}[{index}] does not match the canonical v2 deploy path",
+                        address,
+                        path.display()
+                    ));
+                }
+            }
+            if !seen.insert(address.with_workchain().to_ascii_lowercase()) {
+                return Err(anyhow!(
+                    "wallet {address} occurs more than once in the refill plan"
+                ));
+            }
+            wallets.push(PreparedWalletRefill {
+                wallet_file: path.clone(),
+                wallet_index: index,
+                address,
+                keys,
+                newly_added: index >= prior_len,
+                before_active: false,
+                before_ecc2: 0,
+                sent_ecc2: 0,
+            });
+        }
+    }
+    Ok((wallets, pending_new_file))
+}
+
+fn normalize_wallet_pubkey(raw: &str) -> Option<String> {
+    let key = raw
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| raw.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| raw.trim());
+    if key.is_empty() || key.len() > 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("{key:0>64}").to_ascii_lowercase())
+}
+
+fn custodian_pubkeys(address: &Address, output: Option<Value>) -> Result<Vec<String>> {
+    let custodians = output
+        .as_ref()
+        .and_then(|value| value.get("custodians"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!("wallet {address} is Active, but getCustodians returned no custodians array")
+        })?;
+    let pubkeys = custodians
+        .iter()
+        .filter_map(|custodian| custodian.get("owner_pubkey"))
+        .filter_map(Value::as_str)
+        .filter_map(normalize_wallet_pubkey)
+        .collect::<Vec<_>>();
+    if pubkeys.is_empty() {
+        return Err(anyhow!(
+            "wallet {address} is Active, but getCustodians returned no pubkey custodians"
+        ));
+    }
+    Ok(pubkeys)
+}
+
+#[async_trait::async_trait(?Send)]
+impl WalletRefillChain for RealChainBackend {
+    async fn wallet_account(
+        &self,
+        address: &Address,
+    ) -> Result<Option<WalletRefillAccountObservation>> {
+        Ok(self.client().get_account(address).await?.map(|account| {
+            WalletRefillAccountObservation {
+                active: account.is_active(),
+                ecc2: account.ecc_balance(2),
+                code_hash: account.code_hash,
+            }
+        }))
+    }
+
+    async fn wallet_custodian_pubkeys(&self, address: &Address) -> Result<Vec<String>> {
+        let output = self
+            .client()
+            .run_getter_retrying(
+                address,
+                canonical_multisig::MULTISIG_ABI_JSON,
+                "getCustodians",
+                json!({}),
+            )
+            .await
+            .map_err(|error| anyhow!("cannot read custodians of wallet {address}: {error}"))?;
+        custodian_pubkeys(address, output)
+    }
+
+    async fn deploy_wallet(&self, keys: &KeyPair) -> Result<Address> {
+        self.deploy_multisig(keys).await
+    }
+
+    async fn send_shell(&self, address: &Address, amount: u128) -> Result<()> {
+        self.giver_send_shell(&address.with_workchain(), amount)
+            .await
+    }
+}
+
+struct ObservedWalletRefill {
+    wallet: PreparedWalletRefill,
+    account: Result<Option<WalletRefillAccountObservation>>,
+}
+
+fn fleet_code_hash(observed: &[ObservedWalletRefill]) -> Result<String> {
+    use std::collections::BTreeMap;
+
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut voters = 0usize;
+    for observation in observed {
+        let Ok(Some(account)) = &observation.account else {
+            continue;
+        };
+        if !account.active {
+            continue;
+        }
+        let Some(code_hash) = account.code_hash.as_deref().and_then(normalize_code_hash) else {
+            continue;
+        };
+        *counts.entry(code_hash).or_default() += 1;
+        voters += 1;
+    }
+
+    // A plan containing only records generated in this run has no account to vote yet. Its
+    // identity comes from the exact TVC used by the deploy path, never from a copied hash.
+    if voters == 0 && observed.iter().all(|entry| entry.wallet.newly_added) {
+        return code_hash(canonical_multisig::MULTISIG_TVC);
+    }
+    let Some(max_count) = counts.values().copied().max() else {
+        return Err(anyhow!(
+            "cannot determine wallet fleet code_hash: no existing Active entry reported one"
+        ));
+    };
+    let leaders = counts
+        .iter()
+        .filter(|(_, count)| **count == max_count)
+        .map(|(hash, _)| hash)
+        .collect::<Vec<_>>();
+    if leaders.len() != 1 || max_count * 2 <= voters {
+        let summary = counts
+            .iter()
+            .map(|(hash, count)| format!("{hash}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "wallet fleet has no majority code_hash across {voters} Active entries ({summary})"
+        ));
+    }
+    Ok(leaders[0].clone())
+}
+
+fn skipped_wallet(wallet: &PreparedWalletRefill, reason: impl Into<String>) -> SkippedWalletRefill {
+    SkippedWalletRefill {
+        wallet_file: wallet.wallet_file.clone(),
+        wallet_index: wallet.wallet_index,
+        address: wallet.address.with_workchain(),
+        reason: reason.into(),
+    }
+}
+
+async fn validate_wallet_refill_fleet<C: WalletRefillChain>(
+    chain: &C,
+    wallets: Vec<PreparedWalletRefill>,
+) -> Result<WalletRefillValidation> {
+    let mut observed = Vec::with_capacity(wallets.len());
+    for wallet in wallets {
+        let account = chain.wallet_account(&wallet.address).await;
+        observed.push(ObservedWalletRefill { wallet, account });
+    }
+    let fleet_code_hash = fleet_code_hash(&observed)?;
+    let mut accepted = Vec::with_capacity(observed.len());
+    let mut skipped = Vec::new();
+
+    for observation in observed {
+        let mut wallet = observation.wallet;
+        let account = match observation.account {
+            Ok(Some(account)) => account,
+            // Only records generated in this invocation may be absent: prepare_wallet_refill_plan
+            // already tied their address and key to the exact deploy path. Existing records must
+            // pass the chain-backed checks below.
+            Ok(None) if wallet.newly_added => {
+                accepted.push(wallet);
+                continue;
+            }
+            Ok(None) => {
+                skipped.push(skipped_wallet(&wallet, "account does not exist"));
+                continue;
+            }
+            Err(error) => {
+                skipped.push(skipped_wallet(
+                    &wallet,
+                    format!("account query failed: {error}"),
+                ));
+                continue;
+            }
+        };
+        if !account.active {
+            if wallet.newly_added {
+                accepted.push(wallet);
+            } else {
+                skipped.push(skipped_wallet(&wallet, "account is not Active"));
+            }
+            continue;
+        }
+        let Some(actual_code_hash) = account.code_hash.as_deref().and_then(normalize_code_hash)
+        else {
+            skipped.push(skipped_wallet(
+                &wallet,
+                "Active account has no valid code_hash",
+            ));
+            continue;
+        };
+        if actual_code_hash != fleet_code_hash {
+            skipped.push(skipped_wallet(
+                &wallet,
+                format!(
+                    "code_hash {actual_code_hash} does not match fleet code_hash {fleet_code_hash}"
+                ),
+            ));
+            continue;
+        }
+        let custodians = match chain.wallet_custodian_pubkeys(&wallet.address).await {
+            Ok(custodians) => custodians,
+            Err(error) => {
+                skipped.push(skipped_wallet(
+                    &wallet,
+                    format!("custodian query failed: {error}"),
+                ));
+                continue;
+            }
+        };
+        let recorded_pubkey = normalize_wallet_pubkey(wallet.keys.public_hex())
+            .expect("KeyPair public key is canonical hex");
+        if !custodians.contains(&recorded_pubkey) {
+            skipped.push(skipped_wallet(
+                &wallet,
+                "recorded key's public key is not an on-chain custodian",
+            ));
+            continue;
+        }
+        wallet.before_active = true;
+        wallet.before_ecc2 = account.ecc2;
+        accepted.push(wallet);
+    }
+
+    Ok(WalletRefillValidation {
+        wallets: accepted,
+        skipped,
+        fleet_code_hash,
+    })
+}
+
+fn fail_if_wallets_skipped(skipped: &[SkippedWalletRefill]) -> Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    let list = skipped
+        .iter()
+        .map(|wallet| {
+            format!(
+                "{}[{}] ({}) -- {}",
+                wallet.wallet_file.display(),
+                wallet.wallet_index,
+                wallet.address,
+                wallet.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(anyhow!(
+        "wallet refill skipped {} wallet(s) after funding the valid entries: {list}",
+        skipped.len()
+    ))
+}
+
+async fn self_dapp_wallet_ecc2(be: &RealChainBackend, address: &Address) -> Result<(bool, u128)> {
+    // ChainClient::get_account deliberately queries account_id=<wallet> and dapp_id=<wallet>.
+    // Operational wallets are self-dapp accounts, not DApp 4 children.
+    let Some(account) = be.wallet_account(address).await? else {
+        return Ok((false, 0));
+    };
+    Ok((account.active, account.ecc2))
+}
+
+async fn wait_for_wallet_target<C: WalletRefillChain>(chain: &C, address: &Address) -> Result<()> {
+    for _ in 0..40 {
+        let account = chain.wallet_account(address).await?;
+        if account.is_some_and(|account| account.active && account.ecc2 >= WALLET_REFILL_TARGET_RAW)
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    Err(anyhow!(
+        "wallet {address} did not reach target {} raw ECC[2] within 120 seconds",
+        WALLET_REFILL_TARGET_RAW
+    ))
+}
+
+async fn fund_wallet_refills<C: WalletRefillChain>(
+    chain: &C,
+    wallets: &mut [PreparedWalletRefill],
+) -> Result<()> {
+    for wallet in wallets {
+        if !wallet.before_active {
+            let deployed = chain.deploy_wallet(&wallet.keys).await?;
+            if deployed.with_workchain() != wallet.address.with_workchain() {
+                return Err(anyhow!(
+                    "canonical v2 deploy returned {deployed}, expected {}",
+                    wallet.address
+                ));
+            }
+            println!("WALLET_DEPLOYED address={}", wallet.address);
+        }
+
+        let account = chain.wallet_account(&wallet.address).await?;
+        let Some(account) = account.filter(|account| account.active) else {
+            return Err(anyhow!(
+                "wallet {} is not active after deploy/recheck",
+                wallet.address
+            ));
+        };
+        let shortfall = WALLET_REFILL_TARGET_RAW.saturating_sub(account.ecc2);
+        if shortfall > 0 {
+            if shortfall > WALLET_REFILL_TARGET_RAW {
+                return Err(anyhow!(
+                    "wallet {} single giver request {shortfall} exceeds proven limit {}",
+                    wallet.address,
+                    WALLET_REFILL_TARGET_RAW
+                ));
+            }
+            chain.send_shell(&wallet.address, shortfall).await?;
+            wallet.sent_ecc2 = shortfall;
+            println!(
+                "WALLET_SENT address={} before_send={} sent={} target={}",
+                wallet.address, account.ecc2, shortfall, WALLET_REFILL_TARGET_RAW
+            );
+            wait_for_wallet_target(chain, &wallet.address).await?;
+        }
+    }
+    Ok(())
+}
 
 /// LIVE: the seller note posts the exact `2P` seller bond to its already-deployed per-deal
-/// `TokenContract` from its OWN ECC[2](`postSellerBond` -> `TC.fundSellerBond`) -- **no operator
+/// `TokenContract` from its OWN ECC[2](`fundDeal` -> `TC.fundDeal`) -- **no operator
 /// wallet**. Asserts `getSellerBond().bondFunded == true`. Needs a note that already provisioned the deal TC
 /// (`dexdo provision`), passed via env. Run:
 /// `DEXDO_PROOF_NOTE_ADDR=0:.. DEXDO_PROOF_NOTE_KEY=/path/key DEXDO_PROOF_NONCE=7 \
 /// cargo test -p dexdo-core --features shellnet,test-giver live_post_seller_bond -- --ignored --nocapture`
 #[tokio::test]
-#[ignore = "live : postSellerBond funds the probe on the deployed TC from the note (no wallet)"]
+#[ignore = "live : fundDeal funds the probe on the deployed TC from the note (no wallet)"]
 async fn live_post_seller_bond_note_funded() {
     let manifest = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -54,9 +705,9 @@ async fn live_post_seller_bond_note_funded() {
         })
         .expect("getSellerBond().bondRequired");
     // Post the exact contract-derived seller bond from the note's OWN ECC[2] -- no operator wallet.
-    be.note_post_seller_bond(&note, &keys, nonce, bond_required)
+    be.note_fund_deal(&note, &keys, nonce, 0, bond_required)
         .await
-        .expect("postSellerBond");
+        .expect("fundDeal");
 
     // The internal message settles in a few blocks -> poll getSellerBond() until bondFunded.
     let mut funded = false;
@@ -72,7 +723,7 @@ async fn live_post_seller_bond_note_funded() {
     }
     assert!(
         funded,
-        "postSellerBond set bondFunded==true on the deployed TC (note-funded, no wallet)"
+        "fundDeal set bondFunded==true on the deployed TC (note-funded, no wallet)"
     );
 }
 
@@ -175,6 +826,10 @@ async fn live_giver_funds_fresh_wallet() {
             "reqConfirms": 1,
             "reqConfirmsData": 1,
             "value": "0",
+            // Auto top-up is deliberately disabled: these wallets are funded externally;
+            // enabling it with a non-zero pair is a separate decision.
+            "minBalance": "0",
+            "targetBalance": "0",
         }),
         kp.public_hex(),
         kp.secret_hex(),
@@ -239,6 +894,341 @@ async fn live_giver_funds_fresh_wallet() {
         active,
         "the wallet is deployed and active -- the giver funds, self-provisioning works"
     );
+}
+
+/// Operator live tool: validate every wallet listed by a private plan against its self-dapp chain
+/// account(`account_id == dapp_id`), then refill every accepted wallet to 5_000e9 raw ECC[2] using
+/// the existing test-only [`RealChainBackend::giver_send_shell`] primitive. Invalid entries are
+/// named and skipped; accepted entries are funded sequentially and the run fails with the complete
+/// skipped list after postflight. The plan path is the only input passed through the environment;
+/// wallet secrets remain solely in mode-0600 JSON files and are never printed.
+/// Run through `dexdo-executors/pools/work/refill_wallets.sh`; do not invoke this test while a minter
+/// is consuming the same wallets.
+#[tokio::test]
+#[ignore = "live: refill operational wallet stock from the shellnet test giver"]
+async fn live_refill_wallet_stock_from_giver() -> Result<()> {
+    use gosh_ackinacki::config::AiRegistryConfig;
+    use gosh_ackinacki::wallet::query::fetch_dapp_id;
+
+    let plan_path = std::env::var("DEXDO_WALLET_REFILL_PLAN")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow!("DEXDO_WALLET_REFILL_PLAN must name a mode-0600 plan file"))?;
+    let plan: WalletRefillPlan = read_private_json(&plan_path)?;
+    let (wallets, pending_new_file) = prepare_wallet_refill_plan(&plan).await?;
+    if wallets.is_empty() {
+        return Err(anyhow!("wallet refill plan resolved to zero wallets"));
+    }
+    if WALLET_REFILL_TARGET_RAW < WALLET_REFILL_NOTE_COST_RAW {
+        return Err(anyhow!(
+            "wallet refill target {} is below note cost {}",
+            WALLET_REFILL_TARGET_RAW,
+            WALLET_REFILL_NOTE_COST_RAW
+        ));
+    }
+
+    let manifest = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/deployed.shellnet.json"
+    );
+    let be = RealChainBackend::connect(manifest)?;
+
+    let validation = validate_wallet_refill_fleet(&be, wallets).await?;
+    println!(
+        "WALLET_FLEET code_hash={} accepted={} skipped={}",
+        validation.fleet_code_hash,
+        validation.wallets.len(),
+        validation.skipped.len()
+    );
+    for skipped in &validation.skipped {
+        println!(
+            "WALLET_SKIPPED file={} index={} address={} reason={}",
+            skipped.wallet_file.display(),
+            skipped.wallet_index,
+            skipped.address,
+            skipped.reason
+        );
+    }
+    let WalletRefillValidation {
+        mut wallets,
+        skipped,
+        ..
+    } = validation;
+    if wallets.is_empty() {
+        return fail_if_wallets_skipped(&skipped);
+    }
+
+    for wallet in &wallets {
+        println!(
+            "WALLET_BEFORE file={} index={} address={} account_id={} dapp_id={} active={} ecc2={}",
+            wallet.wallet_file.display(),
+            wallet.wallet_index,
+            wallet.address,
+            wallet.address.bare(),
+            wallet.address.bare(),
+            wallet.before_active,
+            wallet.before_ecc2
+        );
+    }
+
+    let wallet_shortfalls = wallets.iter().try_fold(0u128, |total, wallet| {
+        total
+            .checked_add(WALLET_REFILL_TARGET_RAW.saturating_sub(wallet.before_ecc2))
+            .ok_or_else(|| anyhow!("wallet refill shortfall total overflow"))
+    })?;
+    // `deploy_multisig` uses the canonical v2 path from `test_giver.rs`: two 200e9
+    // fund_deploy_address sends(flags 16 and 2) before the signed deploy message.
+    let deploy_reserve = wallets
+        .iter()
+        .filter(|wallet| !wallet.before_active)
+        .count() as u128
+        * 2
+        * WALLET_REFILL_DEPLOY_FUND_RAW;
+    let giver_planned_mint = wallet_shortfalls
+        .checked_add(deploy_reserve)
+        .ok_or_else(|| anyhow!("wallet refill planned giver mint overflow"))?;
+
+    let cfg = AiRegistryConfig::shellnet();
+    let giver_text = cfg
+        .giver_address
+        .as_deref()
+        .ok_or_else(|| anyhow!("shellnet config has no giver address"))?;
+    let giver = Address::parse(giver_text)?;
+    let giver_dapp_id = fetch_dapp_id(&be.http, be.client().endpoint(), giver.bare()).await?;
+    let giver_dapp = Address::parse(&format!("0:{giver_dapp_id}"))?;
+    let giver_account = be
+        .client()
+        .get_account_in_dapp(&giver, &giver_dapp)
+        .await
+        .map_err(|e| anyhow!("cannot query configured shellnet Giver {giver}: {e}"))?;
+    let giver_observation = giver_account
+        .as_ref()
+        .map(|account| GiverMintFaucetObservation {
+            dapp_id: giver_dapp_id.clone(),
+            active: account.is_active(),
+            native_raw: account.balance,
+            stored_ecc2_raw: account.ecc_balance(2),
+            code_hash: account.code_hash.clone(),
+        });
+    let readiness = ensure_giver_mint_faucet_ready(giver_observation.as_ref(), giver_planned_mint);
+    match &giver_observation {
+        Some(observation) => println!(
+            "GIVER_PREFLIGHT address={} dapp_id={} active={} native={} stored_ecc2={} code_hash={} wallet_shortfalls={} deploy_reserve={} planned_mint={} status={}",
+            giver,
+            observation.dapp_id,
+            observation.active,
+            observation.native_raw,
+            observation.stored_ecc2_raw,
+            observation.code_hash.as_deref().unwrap_or("MISSING"),
+            wallet_shortfalls,
+            deploy_reserve,
+            giver_planned_mint,
+            if readiness.is_ok() { "READY" } else { "NOT_READY" }
+        ),
+        None => println!(
+            "GIVER_PREFLIGHT address={} dapp_id={} wallet_shortfalls={} deploy_reserve={} planned_mint={} status=MISSING",
+            giver, giver_dapp_id, wallet_shortfalls, deploy_reserve, giver_planned_mint
+        ),
+    };
+    readiness?;
+    let giver_observation = giver_observation.expect("readiness requires a live Giver account");
+    let giver_code_hash = giver_observation
+        .code_hash
+        .expect("readiness requires a live Giver code hash");
+
+    // Persist generated key material only after the mint-faucet preflight succeeds and before the
+    // first write. If a later live call fails, the next run can recover/deploy the same wallets.
+    if let Some((path, file)) = pending_new_file {
+        write_private_json(&path, &file)?;
+        let generated = wallets.iter().filter(|wallet| wallet.newly_added).count();
+        println!(
+            "WALLET_FILE_UPDATED file={} added={} mode=0600",
+            path.display(),
+            generated
+        );
+    }
+
+    // This remains the sole ECC[2] funding path: the real adapter delegates to
+    // GiverClient::send_shell behind the non-default test-giver feature.
+    fund_wallet_refills(&be, &mut wallets).await?;
+
+    let mut evidence_wallets = Vec::with_capacity(wallets.len());
+    for wallet in &wallets {
+        let (active, after_ecc2) = self_dapp_wallet_ecc2(&be, &wallet.address).await?;
+        println!(
+            "WALLET_AFTER file={} index={} address={} account_id={} dapp_id={} active={} before={} sent={} after={}",
+            wallet.wallet_file.display(),
+            wallet.wallet_index,
+            wallet.address,
+            wallet.address.bare(),
+            wallet.address.bare(),
+            active,
+            wallet.before_ecc2,
+            wallet.sent_ecc2,
+            after_ecc2
+        );
+        if !active || after_ecc2 < WALLET_REFILL_TARGET_RAW {
+            return Err(anyhow!(
+                "wallet {} postflight ECC[2] {after_ecc2} is below target {}",
+                wallet.address,
+                WALLET_REFILL_TARGET_RAW
+            ));
+        }
+        evidence_wallets.push(WalletRefillWalletEvidence {
+            wallet_file: wallet.wallet_file.display().to_string(),
+            wallet_index: wallet.wallet_index,
+            address: wallet.address.with_workchain(),
+            newly_added: wallet.newly_added,
+            before_active: wallet.before_active,
+            before_ecc2: wallet.before_ecc2,
+            sent_ecc2: wallet.sent_ecc2,
+            after_active: active,
+            after_ecc2,
+        });
+    }
+
+    let evidence = WalletRefillEvidence {
+        note_cost_raw: WALLET_REFILL_NOTE_COST_RAW,
+        target_raw: WALLET_REFILL_TARGET_RAW,
+        giver_address: giver.with_workchain(),
+        giver_dapp_id,
+        giver_native_raw: giver_observation.native_raw,
+        giver_stored_ecc2_raw: giver_observation.stored_ecc2_raw,
+        giver_code_hash,
+        giver_planned_mint_raw: giver_planned_mint,
+        wallets: evidence_wallets,
+    };
+    write_private_json(&plan.evidence_file, &evidence)?;
+    if skipped.is_empty() {
+        println!(
+            "WALLET_REFILL_COMPLETE wallets={} target={} evidence={}",
+            wallets.len(),
+            WALLET_REFILL_TARGET_RAW,
+            plan.evidence_file.display()
+        );
+        Ok(())
+    } else {
+        println!(
+            "WALLET_REFILL_PARTIAL funded={} skipped={} target={} evidence={}",
+            wallets.len(),
+            skipped.len(),
+            WALLET_REFILL_TARGET_RAW,
+            plan.evidence_file.display()
+        );
+        fail_if_wallets_skipped(&skipped)
+    }
+}
+
+#[cfg(test)]
+#[path = "legacy_giver_1151_tests.rs"]
+mod wallet_refill_1151_tests;
+
+#[cfg(test)]
+mod wallet_refill_tests {
+    use super::*;
+
+    #[test]
+    fn mint_faucet_preflight_accepts_zero_stored_ecc2_and_fails_closed() {
+        let ready = GiverMintFaucetObservation {
+            dapp_id: GIVER_SYSTEM_DAPP_ID.to_owned(),
+            active: true,
+            native_raw: 1_000_000_000_000,
+            stored_ecc2_raw: 0,
+            code_hash: Some("live-code".to_owned()),
+        };
+        ensure_giver_mint_faucet_ready(Some(&ready), 105_223_000_000_000)
+            .expect("active system-dapp mint faucet accepts zero stored ECC[2]");
+
+        let missing = ensure_giver_mint_faucet_ready(None, 1)
+            .expect_err("missing Giver must fail before writes");
+        assert!(missing.to_string().contains("was not submitted"));
+
+        let inactive = GiverMintFaucetObservation {
+            dapp_id: GIVER_SYSTEM_DAPP_ID.to_owned(),
+            active: false,
+            native_raw: 1_000_000_000_000,
+            stored_ecc2_raw: 0,
+            code_hash: Some("live-code".to_owned()),
+        };
+        let inactive_error = ensure_giver_mint_faucet_ready(Some(&inactive), 1)
+            .expect_err("inactive Giver must fail before writes");
+        assert!(inactive_error.to_string().contains("not Active"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_wallet_plan_persists_only_canonical_records_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("private tempdir");
+        let existing = directory.path().join("wallets.json");
+        let added = directory.path().join("wallets4.json");
+        let evidence = directory.path().join("evidence.json");
+        write_private_json(&existing, &WalletRefillFile::default()).expect("empty wallet file");
+        let plan = WalletRefillPlan {
+            wallet_files: vec![existing],
+            evidence_file: evidence,
+            add_wallets: 1,
+            add_wallet_file: Some(added.clone()),
+        };
+        let (wallets, pending) = prepare_wallet_refill_plan(&plan)
+            .await
+            .expect("prepare one canonical wallet");
+        assert_eq!(wallets.len(), 1);
+        assert!(wallets[0].newly_added);
+        let (path, file) = pending.expect("pending private wallet file");
+        write_private_json(&path, &file).expect("persist private wallet file");
+
+        let mode = std::fs::metadata(&added)
+            .expect("wallet metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(&added).expect("read wallet file"))
+                .expect("parse wallet file");
+        let record = &stored["wallets"][0];
+        let keys = record.as_object().expect("wallet record fields");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains_key("address"));
+        assert!(keys.contains_key("secret_hex"));
+        assert!(KeyPair::from_secret_hex(
+            record["secret_hex"].as_str().expect("stored secret string")
+        )
+        .is_ok());
+
+        let rerun_plan = WalletRefillPlan {
+            wallet_files: vec![added],
+            evidence_file: directory.path().join("rerun-evidence.json"),
+            add_wallets: 1,
+            add_wallet_file: Some(path),
+        };
+        let (rerun_wallets, rerun_pending) = prepare_wallet_refill_plan(&rerun_plan)
+            .await
+            .expect("same desired count reuses the persisted wallet");
+        assert_eq!(rerun_wallets.len(), 1);
+        assert!(!rerun_wallets[0].newly_added);
+        assert!(
+            rerun_pending.is_none(),
+            "rerun must not generate another key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_wallet_file_is_rejected_without_reading_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("wallets.json");
+        std::fs::write(&path, b"{\"wallets\":[]}").expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set insecure fixture mode");
+        let error = read_private_json::<WalletRefillFile>(&path)
+            .err()
+            .expect("insecure input must fail");
+        assert!(error.to_string().contains("must have mode 0600"));
+    }
 }
 
 /// A LIVE deal test, step 1: a minted note(`mint_pn_pool`) is an **inference `PrivateNote`**
@@ -1810,7 +2800,7 @@ async fn live_stream_open_and_probe_burn() {
         .deploy_multisig(&wallet_keys)
         .await
         .expect("deploy wallet");
-    // The wallet needs ECC[2] SHELL to attach to `fundSellerBond` -- we top it up from the
+    // The wallet needs ECC[2] SHELL to attach to `fundDeal` -- we top it up from the
     // giver(flag 1; deploy-funding only gives native gas).
     be.giver_send_shell(&wallet.with_workchain(), 2 * price)
         .await

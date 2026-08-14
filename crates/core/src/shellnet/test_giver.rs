@@ -1,50 +1,30 @@
+use super::operator_wallet::prepare_operational_multisig_deploy;
 use super::*;
 use crate::canonical_multisig;
 use gosh_ackinacki::airegistry::calls::encode_internal_payload;
-use gosh_ackinacki::airegistry::deploy::DeployMessage;
 use gosh_ackinacki::config::AiRegistryConfig;
 use gosh_ackinacki::wallet::giver::GiverClient;
 
-const OPERATIONAL_WALLET_REQ_CONFIRMS: u8 = 1;
-
 impl RealChainBackend {
     /// Provision an operational multisig wallet(1-of-1) for a key: deterministic deploy address
-    /// -> giver fund -> submit -> `Active`. Needed to send INTERNAL calls with ECC -- e.g.
-    /// `fundSellerBond` requires SHELL in `msg.currencies`(an external message cannot attach currency).
+    /// -> giver fund -> submit -> `Active`. Needed to send INTERNAL calls with ECC -- e.g. the deal's
+    /// funding door requires SHELL in `msg.currencies`(an external message cannot attach currency).
     pub async fn deploy_multisig(&self, keys: &KeyPair) -> Result<Address> {
         let prepared = prepare_operational_multisig_deploy(keys).await?;
         self.fund_deploy_wait(&prepared.address, &prepared.message_boc_b64)
             .await
     }
 
-    /// The **deterministic** address of the owner's operational multisig for `keys` -- WITHOUT a deploy
-    /// (the prepared deploy computes the address from the key+code).: one `--note-key` seed controls both the
-    /// note and the operational wallet, so the wallet address is derived from the seed -- no separate
-    /// `--wallet-addr` is needed.
-    pub async fn multisig_address(keys: &KeyPair) -> Result<Address> {
-        let prepared = prepare_operational_multisig_deploy(keys).await?;
-        let derived = Address::parse(&prepared.address)?;
-        // accept an explicit operator wallet address via env `DEXDO_WALLET_ADDRESS`,
-        // possibly in the GOSH `half1::half2` display form. Normalize through the single
-        // `normalize_wallet_address` and fail loud if it disagrees with the seed-derived wallet -- one
-        // `--note-key` seed controls both the note and the wallet, so a user-supplied address must match.
-        if let Ok(env_addr) = std::env::var("DEXDO_WALLET_ADDRESS") {
-            let want =
-                crate::wallet::normalize_wallet_address(&env_addr).map_err(|e| anyhow!(e))?;
-            if want != derived.with_workchain().to_ascii_lowercase() {
-                return Err(anyhow!(
-                    "DEXDO_WALLET_ADDRESS {want} does not match the seed-derived operator wallet {} \
-                     (one --note-key seed controls both the note and the wallet -- the addresses must agree)",
-                    derived.with_workchain()
-                ));
-            }
-        }
-        Ok(derived)
-    }
-
     /// The seller posts the exact `2P` seller bond: the canonical v2 wallet sends an INTERNAL
-    /// `fundSellerBond()` to the TC with `shell_ecc` SHELL(ECC[2]) via direct `sendTransaction`.
+    /// `fundDeal(amount)` to the TC with `shell_ecc` SHELL(ECC[2]) via direct `sendTransaction`.
     /// Excess SHELL over the required seller bond is returned.
+    /// Contracts 4.0.33 renamed `fundSellerBond()` to `fundDeal(uint128 amount)` and made the bond a
+    /// figure on the call instead of the attached `msg.currencies[SHELL_ECC_ID]`; the attached ECC
+    /// now only pays the deal's gas. The name and the argument are moved here so this legacy giver
+    /// keeps encoding against the deployed ABI. **This wallet path is not the production path and
+    /// does not settle on either generation:** both `fundSellerBond`(4.0.32) and `fundDeal`(4.0.33)
+    /// require `msg.sender == _sellerNote`, and a multisig is not the seller note -- the live seller
+    /// bond goes through [`RealChainBackend::note_fund_deal`].
     pub async fn fund_seller_bond(
         &self,
         wallet: &Address,
@@ -53,8 +33,13 @@ impl RealChainBackend {
         shell_ecc: u128,
     ) -> Result<Value> {
         let ctx = local_context()?;
-        let payload =
-            encode_internal_payload(&ctx, TOKENCONTRACT_ABI, "fundSellerBond", json!({})).await?;
+        let payload = encode_internal_payload(
+            &ctx,
+            TOKENCONTRACT_ABI,
+            DEAL_FUND_DEAL_METHOD,
+            deal_fund_deal_params(shell_ecc),
+        )
+        .await?;
         let mut cc = serde_json::Map::new();
         cc.insert("2".to_string(), json!(shell_ecc.to_string()));
         let msg = encode_external_call(
@@ -79,7 +64,7 @@ impl RealChainBackend {
 
     /// Fund a deploy address from the shellnet giver(test SHELL) -- self-provisioning of
     /// deal contracts(directive: "the executor provisions gas/keys ITSELF"). The same giver
-    /// (`AiRegistryConfig::shellnet`) and browser-UA path as in wallet self-provisioning.
+    /// (`AiRegistryConfig::shellnet`) and `DEXDO_USER_AGENT` path as in wallet self-provisioning.
     pub async fn giver_fund(&self, address: &str, amount: u128) -> Result<()> {
         self.giver_client()?
             .fund_deploy_address(address, amount)
@@ -88,13 +73,13 @@ impl RealChainBackend {
 
     /// Send an active account additional **ECC[2] SHELL** from the giver(flag 1). `fund_deploy_address` gives
     /// native gas to an uninit address, but NOT ECC[2]; a wallet that sends SHELL in internal calls
-    /// (e.g. `fundSellerBond`) needs ECC[2] sent separately, after activation.
+    /// (e.g. `fundDeal`) needs ECC[2] sent separately, after activation.
     pub async fn giver_send_shell(&self, address: &str, amount: u128) -> Result<()> {
         self.giver_client()?.send_shell(address, amount).await
     }
 
     /// Construct the shellnet giver's `GiverClient`(keys from `AiRegistryConfig::shellnet`),
-    /// on top of the backend's browser-UA http client.
+    /// on top of the backend's `DEXDO_USER_AGENT` http client.
     fn giver_client(&self) -> Result<GiverClient> {
         let ctx = local_context()?;
         let cfg = AiRegistryConfig::shellnet();
@@ -233,43 +218,31 @@ impl RealChainBackend {
         ))
     }
 
-    /// Operator-path `RootModel` deploy: same message as [`deploy_root_model`](Self::deploy_root_model)
-    /// but funded by the operator multisig(`wallet`), not the giver.
+    /// Operator-path `RootModel` deploy -- **this operation no longer exists.**
+    /// It funded the RootModel's uninit deploy address from the operator multisig and then sent an
+    /// external seller-signed deploy. 4.0.34 refuses that deploy outright: `RootModel`'s constructor
+    /// opens with `require(msg.sender == _superRootAddress, ERR_INVALID_SENDER)`
+    /// (`contracts/airegistry/RootModel.sol:67`, 302), so no amount of funding from any wallet makes it
+    /// land. Funding it anyway would place ECC[2] at an address that will never activate.
+    /// Refused here rather than silently redirected to [`deploy_root_model`](Self::deploy_root_model):
+    /// the caller supplied a wallet and a gas figure, and quietly ignoring both while performing a
+    /// different, unfunded operation would report success for a spend that never happened.
     pub async fn deploy_root_model_from_wallet(
         &self,
-        owner: &KeyPair,
+        _owner: &KeyPair,
         wallet: &Address,
-        wallet_keys: &KeyPair,
+        _wallet_keys: &KeyPair,
         gas: u128,
     ) -> Result<Address> {
-        let ctx = local_context()?;
-        let tc_code = code_boc_b64(TOKENCONTRACT_TVC)?;
-        let init_data = json!({
-            "_ownerPubkey": format!("0x{}", owner.public_hex()),
-            "_superRootAddress": self.superroot.with_workchain(),
-        });
-        let ctor = json!({ "tokenContractCode": tc_code });
-        let msg = build_deploy(
-            &ctx,
-            ROOTMODEL_ABI,
-            ROOTMODEL_TVC,
-            init_data,
-            ctor,
-            owner.public_hex(),
-            owner.secret_hex(),
-        )
-        .await?;
-        // (4.0.5): RootModel is a self-dapp contract(`dapp_id == address`); native funding of its
-        // uninit cross-dapp address needs the privileged giver(the 404). Fund with ECC[2] SHELL from the
-        // operator wallet instead -- same as the per-deal TC. `gas` carries the ECC[2] amount here.
-        self.fund_deploy_from_wallet_ecc(
-            wallet,
-            wallet_keys,
-            &msg.address,
-            &msg.message_boc_b64,
-            gas,
-        )
-        .await
+        Err(anyhow!(
+            "operator-wallet RootModel deploy is not available on contracts 4.0.34: an external \
+             RootModel deploy is refused with ERR_INVALID_SENDER = 302 \
+             (contracts/airegistry/RootModel.sol:67), so funding its uninit address from wallet \
+             {wallet} with {gas} raw ECC[2] would strand the value at an address that never \
+             activates. SuperRoot deploys the RootModel and carries its own \
+             ROOT_MODEL_DEPLOY_VALUE = 5 vmshell (contracts/airegistry/SuperRoot.sol:58) -- use \
+             deploy_root_model, which needs no wallet and no gas."
+        ))
     }
 
     /// Operator-path per-deal `TokenContract` deploy: same message as
@@ -330,75 +303,19 @@ impl RealChainBackend {
         .await
     }
 
-    /// Operator-path multisig deploy: the wallet address is funded by the operator
-    /// **externally**(production has no giver), so we just send the prepared deploy message and
-    /// wait for `Active` -- the pre-funded balance pays. The idempotent caller checks `is_active` first.
-    pub async fn deploy_multisig_self_funded(&self, keys: &KeyPair) -> Result<Address> {
-        let prepared = prepare_operational_multisig_deploy(keys).await?;
-        let addr = Address::parse(&prepared.address)?;
-        self.send_deploy_with_retry(&prepared.message_boc_b64)
-            .await?;
-        for _ in 0..40 {
-            if let Some(a) = self.client.get_account(&addr).await? {
-                if a.is_active() {
-                    return Ok(addr);
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-        Err(anyhow!(
-            "multisig {addr} did not activate -- is it funded? (operator funds the wallet externally)"
-        ))
-    }
-
-    /// The seller(model owner) provisions their `RootModel` under SuperRoot: `build_deploy`
-    /// (varInit `{_ownerPubkey,_superRootAddress}` + ctor `{tokenContractCode}`, signed with the owner key)
-    /// -> giver-fund -> submit -> `Active`. The address = `getRootModelAddress(ownerPubkey)`; in its ctor the RootModel
-    /// registers itself in SuperRoot(`registerRoot`, msg.sender == derived). `tokenContractCode` is the
-    /// `TokenContract` code-cell(RootModel verifies its hash against `TOKEN_CONTRACT_CODE_HASH`).
+    /// The seller(model owner) provisions their `RootModel` under SuperRoot.
+    /// **THE GIVER HAS NO PART IN THIS ANY MORE.** It used to be `build_deploy` (varInit
+    /// `{_ownerPubkey,_superRootAddress}` + ctor `{tokenContractCode}`, signed with the owner key) ->
+    /// giver-fund -> submit -> `Active`, and the newborn announced itself to SuperRoot via `registerRoot`.
+    /// In 4.0.34 that shape is refused, not merely obsolete: `RootModel`'s constructor opens with
+    /// `require(msg.sender == _superRootAddress, ERR_INVALID_SENDER)`
+    /// (`contracts/airegistry/RootModel.sol:67`, 302), and an external message has no sender.
+    /// `SuperRoot.deployRootModel` performs the deploy and carries its own value, so there is nothing to
+    /// fund and nothing to sign for. This now delegates to the production path -- the same call the
+    /// seller makes -- and the giver-funded variant is not reachable for a RootModel at all.
     pub async fn deploy_root_model(&self, owner: &KeyPair) -> Result<Address> {
-        let ctx = local_context()?;
-        let tc_code = code_boc_b64(TOKENCONTRACT_TVC)?;
-        let init_data = json!({
-            "_ownerPubkey": format!("0x{}", owner.public_hex()),
-            "_superRootAddress": self.superroot.with_workchain(),
-        });
-        let ctor = json!({ "tokenContractCode": tc_code });
-        let msg = build_deploy(
-            &ctx,
-            ROOTMODEL_ABI,
-            ROOTMODEL_TVC,
-            init_data,
-            ctor,
-            owner.public_hex(),
-            owner.secret_hex(),
-        )
-        .await?;
-        self.fund_deploy_wait(&msg.address, &msg.message_boc_b64)
-            .await
+        self.deploy_root_model_note_funded(owner).await
     }
-}
-
-/// Test-giver deploy of the sole canonical v2 wallet with one pubkey custodian.
-async fn prepare_operational_multisig_deploy(keys: &KeyPair) -> Result<DeployMessage> {
-    let ctx = local_context()?;
-    let owner = format!("0x{}", keys.public_hex());
-    build_deploy(
-        &ctx,
-        canonical_multisig::MULTISIG_ABI_JSON,
-        canonical_multisig::MULTISIG_TVC,
-        json!({}),
-        json!({
-            "owners_pubkey": [owner],
-            "owners_address": [],
-            "reqConfirms": OPERATIONAL_WALLET_REQ_CONFIRMS,
-            "reqConfirmsData": OPERATIONAL_WALLET_REQ_CONFIRMS,
-            "value": "0",
-        }),
-        keys.public_hex(),
-        keys.secret_hex(),
-    )
-    .await
 }
 
 #[cfg(test)]

@@ -1,21 +1,25 @@
 //! Canonical Acki Nacki addresses: `<dapp_id>::<account_id>`.
-//! The legacy TVM form `0:<account_id>` names only the workchain and drops the DApp identity, so it is
-//! not sufficient as the address a user reads, pastes, or stores. Everything dexdo shows or persists uses
-//! the canonical form; the legacy form stays accepted on input and in files written by older versions, and
-//! is normalized before it is displayed again.
+//! The legacy TVM form `0:<account_id>` names only the workchain and carries no DApp identity. It remains
+//! accepted by the shared parser and in files written by older versions, while callers that need complete
+//! identity evidence may require the DApp-qualified form.
 //! Two directions, deliberately separate:
 //! - **out**([`display`], [`to_canonical`]) - the public form, `<dapp_id>::<account_id>`;
-//! - **in**([`CanonicalAddress::parse`], [`to_chain_param`], `parse_chain_address`) - accepts both forms
-//! and yields the workchain form the chain client and the contract parameters take.
-//! A supplied DApp id is never discarded: it is carried on [`CanonicalAddress`] and re-emitted on output.
+//! - **in**([`CanonicalAddress::parse`]) - accepts both forms and keeps the parsed halves;
+//! - **chain boundary**([`to_chain_param`]) - yields the account-only workchain form required by chain
+//! clients and address-valued contract parameters, as a `String` with nothing else attached;
+//! - **chain boundary, DApp kept**(`parse_chain_address` -> `ChainAddress`) - the same account-only
+//! chain address for the client, with the DApp id the input named carried beside it.
+//! A supplied DApp id survives on [`CanonicalAddress`] and on `ChainAddress` until a caller explicitly
+//! crosses that boundary by taking the chain half alone.
 
 use std::fmt;
 
-/// The dexdo DApp id in canonical 64-hex form.
-/// dexdo contracts - private notes, order books, root models, token contracts - all live in the system
-/// Dex DApp(`4`). This is protocol-defined, not a per-deployment guess: it is what
-/// `contracts/deployed.shellnet.json` pins as `dapp_id` and what the deployed contracts compile in as
-/// `ROOT_PN_DAPP_ID`. It is the DApp assumed for a legacy `0:<account_id>` that carries no DApp of its own.
+/// The shared dexdo system DApp id in canonical 64-hex form.
+/// RootPN/PrivateNote/PMP/order-book and RootOracle/Oracle contracts use DApp `4`, as pinned by
+/// `contracts/deployed.shellnet.json` and the deployed `ROOT_PN_DAPP_ID`/`ORACLE_DAPP_ID` constants.
+/// Per-deal TokenContracts do not: they are self-DApp accounts and must be rendered with
+/// [`display_self_dapp`]. This constant is the compatibility default only when a legacy
+/// `0:<account_id>` carries no DApp of its own.
 pub const DEXDO_DAPP_ID: &str = "0000000000000000000000000000000000000000000000000000000000000004";
 
 /// A blockchain address in canonical form: a DApp id plus an account id, both 256-bit.
@@ -32,7 +36,8 @@ impl CanonicalAddress {
     /// Parse either accepted form, fail-loud on anything else.
     /// - `<dapp_id>::<account_id>` - both halves exactly 64 hex chars; the DApp id is kept.
     /// - `0:<account_id>` - the legacy form; the account must be exactly 64 hex chars and the DApp is
-    /// taken to be [`DEXDO_DAPP_ID`], the DApp every dexdo contract lives in.
+    /// taken to be [`DEXDO_DAPP_ID`]. Callers rendering a self-DApp account must instead use the
+    /// account-aware [`display_self_dapp`] seam.
     /// Both halves are lowercased. A short/over-long half, a bare hex without a prefix, non-hex, and
     /// extra `::` are rejected rather than being coerced into an address that would move money elsewhere.
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -114,24 +119,116 @@ pub fn display(s: &str) -> String {
     }
 }
 
+/// Render a self-DApp account, whose DApp id is its own account id.
+/// A supplied canonical address is authoritative and survives unchanged. For a legacy
+/// `0:<account_id>`, the account's protocol-defined self-DApp identity is reconstructed as
+/// `<account_id>::<account_id>`. Non-address placeholders remain visible unchanged, matching [`display`].
+pub fn display_self_dapp(s: &str) -> String {
+    let raw = s.trim();
+    match CanonicalAddress::parse(raw) {
+        Ok(addr) if raw.contains("::") => addr.to_string(),
+        Ok(addr) => format!("{}::{}", addr.account_id(), addr.account_id()),
+        Err(_) => raw.to_string(),
+    }
+}
+
 /// [`display`] over an optional address, with `placeholder` for `None`(the `-` a table column shows).
 pub fn display_opt(s: Option<&str>, placeholder: &str) -> String {
     s.map_or_else(|| placeholder.to_string(), display)
 }
 
-/// Parse any accepted form into a chain [`Address`](crate::Address).
+/// [`display_self_dapp`] over an optional address, with `placeholder` for `None`.
+pub fn display_self_dapp_opt(s: Option<&str>, placeholder: &str) -> String {
+    s.map_or_else(|| placeholder.to_string(), display_self_dapp)
+}
+
+/// An address parsed at the chain boundary: the account-only chain [`Address`](crate::Address) that the
+/// chain client and address-valued contract parameters take, together with the DApp id the input named.
+/// [`parse_chain_address`] used to return the chain half alone. The SDK's `Address` is a single bare
+/// 64-hex account id with derived `PartialEq`/`Hash`, so `<dapp_a>::<account>` and `<dapp_b>::<account>`
+/// came back equal and every consumer had to re-derive the DApp from surrounding context. That is not
+/// derivable from an account id: a `PrivateNote`, a `RootModel` and the order book live in the shared
+/// [`DEXDO_DAPP_ID`], while a per-deal `TokenContract` and an operator multisig are self-DApp accounts
+/// whose DApp id **is** their own account id. Carrying the pair is how the SDK itself models an
+/// account, and it is what makes two DApps holding one account id stop comparing equal.
+/// [`ChainAddress::dapp_id`] is `None` when the input was the legacy `0:<account_id>`, which names no
+/// DApp at all. An absent DApp is recorded as absent rather than guessed, so a self-DApp account read
+/// from an older file is never re-labelled as a shared-DApp one.
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChainAddress {
+    dapp_id: Option<String>,
+    chain: crate::Address,
+}
+
+#[cfg(feature = "shellnet")]
+impl ChainAddress {
+    /// The DApp id the input named, 64-hex lowercase; `None` for a legacy `0:<account_id>`.
+    pub fn dapp_id(&self) -> Option<&str> {
+        self.dapp_id.as_deref()
+    }
+
+    /// The account id, 64-hex lowercase, with no prefix.
+    pub fn account_id(&self) -> &str {
+        self.chain.bare()
+    }
+
+    /// The chain half, borrowed - what the chain client and contract address parameters take.
+    pub fn chain(&self) -> &crate::Address {
+        &self.chain
+    }
+
+    /// The chain half, owned, for a caller that stores or forwards it by value.
+    pub fn into_chain(self) -> crate::Address {
+        self.chain
+    }
+}
+
+/// Renders the DApp-qualified `<dapp_id>::<account_id>` when the input named a DApp, and the legacy
+/// `0:<account_id>` when it did not. The DApp id a caller supplied survives the round trip in both the
+/// shared and the self-DApp case, instead of being replaced by whichever one the renderer assumed.
+#[cfg(feature = "shellnet")]
+impl fmt::Display for ChainAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.dapp_id {
+            Some(dapp_id) => write!(f, "{dapp_id}::{}", self.account_id()),
+            None => write!(f, "0:{}", self.account_id()),
+        }
+    }
+}
+
+/// The chain half is the whole of what this function used to return, so every existing chain call -
+/// `get_account(&addr)`, `.with_workchain()`, a contract parameter - keeps its exact previous meaning
+/// without a conversion at the call site. The DApp id is deliberately NOT reachable through this seam:
+/// it is an addition beside the chain address, never a silent substitute for it.
+#[cfg(feature = "shellnet")]
+impl std::ops::Deref for ChainAddress {
+    type Target = crate::Address;
+
+    fn deref(&self) -> &Self::Target {
+        &self.chain
+    }
+}
+
+/// Parse any accepted form into a [`ChainAddress`] - the chain address plus the DApp id it named.
 /// A strict widening of `Address::parse`: everything the SDK already accepts (`0:<hex>`, `0x<hex>`, bare
 /// hex) still parses, and the canonical `<dapp_id>::<account_id>` - which the SDK reads as workchain
 /// `<dapp_id>` and rejects - is accepted too. Use this wherever an address arrives from a person or a
 /// file(a CLI argument, a manifest, a deal handle) instead of `Address::parse`.
 #[cfg(feature = "shellnet")]
-pub fn parse_chain_address(s: &str) -> anyhow::Result<crate::Address> {
+pub fn parse_chain_address(s: &str) -> anyhow::Result<ChainAddress> {
     let s = s.trim();
     if s.contains("::") {
         let canonical = CanonicalAddress::parse(s).map_err(|e| anyhow::anyhow!(e))?;
-        return crate::Address::parse(&canonical.legacy());
+        return Ok(ChainAddress {
+            dapp_id: Some(canonical.dapp_id().to_string()),
+            chain: crate::Address::parse(&canonical.legacy())?,
+        });
     }
-    crate::Address::parse(s)
+    Ok(ChainAddress {
+        dapp_id: None,
+        chain: crate::Address::parse(s)?,
+    })
 }
 
 /// Serde for an address field that is **written** canonically and **read** in either form.
@@ -181,6 +278,81 @@ pub mod serde_canonical_opt {
                 .map(|addr| addr.legacy())
                 .unwrap_or(raw)
         }))
+    }
+}
+
+/// Serde for a self-DApp address such as a per-deal TokenContract.
+/// New writes carry `<account_id>::<account_id>`. Reads remain migration-compatible and keep the
+/// account-only chain form in memory, just like [`serde_canonical`].
+pub mod serde_self_dapp {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Emit the canonical self-DApp public form.
+    pub fn serialize<S: Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&super::display_self_dapp(value))
+    }
+
+    /// Accept either form; keep the workchain form in memory.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(super::CanonicalAddress::parse(&raw)
+            .map(|addr| addr.legacy())
+            .unwrap_or(raw))
+    }
+}
+
+/// [`serde_self_dapp`] for an optional address field; `null`/absent is untouched.
+pub mod serde_self_dapp_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Emit the canonical self-DApp public form, or `null`.
+    pub fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&super::display_self_dapp(value)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Accept either form; keep the workchain form in memory.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Ok(Option::<String>::deserialize(deserializer)?.map(|raw| {
+            super::CanonicalAddress::parse(&raw)
+                .map(|addr| addr.legacy())
+                .unwrap_or(raw)
+        }))
+    }
+}
+
+/// [`serde_self_dapp`] for a list of TokenContract addresses.
+pub mod serde_self_dapp_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Emit every self-DApp address canonically.
+    pub fn serialize<S: Serializer>(values: &[String], serializer: S) -> Result<S::Ok, S::Error> {
+        values
+            .iter()
+            .map(|value| super::display_self_dapp(value))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    /// Accept either representation and keep account-only chain forms in memory.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        Ok(Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|raw| {
+                super::CanonicalAddress::parse(&raw)
+                    .map(|addr| addr.legacy())
+                    .unwrap_or(raw)
+            })
+            .collect())
     }
 }
 
@@ -354,6 +526,53 @@ mod tests {
         );
     }
 
+    /// Issues ** /** -- a stored foreign-dapp address is silently REWRITTEN to dexdo's.
+    /// This row deliberately does NOT assert that `to_chain_param` or `parse_chain_address`
+    /// preserve the dapp id. Both are documented to yield the workchain form `0:<account_id>`, so
+    /// asserting otherwise would be asserting against a conversion the code intends. The consumer
+    /// where the collapsed identity DECIDES something is rowed separately, at
+    /// `validate_resting_offer`(`crates/dexdo/src/seller/mod.rs`).
+    /// What is asserted here is a violation of this module's OWN stated contract, at the top of
+    /// this file: *"A supplied DApp id is never discarded: it is carried on [`CanonicalAddress`]
+    /// and re-emitted on output."* [`serde_canonical::deserialize`](`:162-167`) stores `.legacy()`
+    /// in memory and `serialize`(`:157-159`) re-emits it through [`display`], which re-attaches
+    /// [`DEXDO_DAPP_ID`]. So loading and re-saving a record rewrites a foreign dapp id to dexdo's
+    /// -- silently, with no error and no diagnostic. The record afterwards names a different account
+    /// from the one that was stored, and every deal handle and pool record goes through this seam.
+    /// RED on this head.
+    #[test]
+    #[ignore = "issues : the serde seam rewrites a stored foreign-dapp address to \
+                dexdo's, so a persisted record silently names a different account. RED until the \
+                code PR carries the dapp id through. UN-IGNORE there."]
+    fn a_stored_foreign_dapp_address_is_not_rewritten_to_ours() {
+        let account = h64('9');
+        let foreign_dapp = h64('3');
+        assert_ne!(foreign_dapp, DEXDO_DAPP_ID, "the fixture must be a FOREIGN dapp");
+        let ours = format!("{DEXDO_DAPP_ID}::{account}");
+        let theirs = format!("{foreign_dapp}::{account}");
+
+        // The two are distinct addresses, and `CanonicalAddress` itself agrees.
+        assert_ne!(
+            CanonicalAddress::parse(&ours).unwrap(),
+            CanonicalAddress::parse(&theirs).unwrap()
+        );
+
+        // Persistence. A stored foreign-dapp address must come back as itself.
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+        struct Holder {
+            #[serde(with = "serde_canonical")]
+            address: String,
+        }
+        let stored = format!("{{\"address\":\"{theirs}\"}}");
+        let read: Holder = serde_json::from_str(&stored).unwrap();
+        let rewritten = serde_json::to_string(&read).unwrap();
+        assert_eq!(
+            rewritten, stored,
+            "loading and re-saving a foreign-dapp address rewrote it to the dexdo dapp; the \
+             record now names a different account than the one that was stored"
+        );
+    }
+
     /// The optional variant behaves the same and leaves an absent address absent.
     #[test]
     fn serde_opt_writes_canonical_and_keeps_none() {
@@ -386,5 +605,136 @@ mod tests {
             serde_json::from_str::<Holder>("{\"address\":null}").unwrap(),
             none
         );
+    }
+}
+
+/// Issue **** - the DApp id must survive [`parse_chain_address`], for BOTH address classes.
+/// Which DApp an account belongs to is not derivable from its account id, and both classes are real
+/// here:
+/// - **shared** - a `PrivateNote`, a `RootModel`, the order book: DApp [`DEXDO_DAPP_ID`];
+/// - **self-DApp** - a per-deal `TokenContract`, an operator multisig: DApp id **is** its account id.
+/// Before this change `parse_chain_address` returned the SDK `Address`, a single bare account id with
+/// derived `PartialEq`/`Hash`. Both classes came back byte-identical, and the DApp a caller supplied
+/// was replaced by whichever one the next renderer assumed - `display` re-attaches [`DEXDO_DAPP_ID`]
+/// to every account, so a self-DApp `TokenContract` was rendered as a shared-DApp account.
+/// Every assertion below is written against API that existed BEFORE the change as well, so on the
+/// pre-fix code it fails as an assertion rather than as a compile error.
+#[cfg(all(test, feature = "shellnet"))]
+mod parse_chain_address_keeps_the_dapp {
+    use super::{parse_chain_address, DEXDO_DAPP_ID};
+
+    fn h64(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// The shared class round-trips: a `PrivateNote` address goes in as `<DEXDO_DAPP_ID>::<account>`
+    /// and comes back naming that same DApp.
+    /// Separate from the self-DApp case below on purpose: one test asserting both classes stops at
+    /// whichever fails first, which would leave the other class unproven.
+    #[test]
+    fn a_shared_dapp_address_survives_a_round_trip() {
+        let note_account = h64('9');
+        let shared = format!("{DEXDO_DAPP_ID}::{note_account}");
+
+        assert_eq!(
+            parse_chain_address(&shared).unwrap().to_string(),
+            shared,
+            "a shared-DApp address lost its DApp id crossing the chain boundary"
+        );
+    }
+
+    /// The self-DApp class round-trips: a per-deal `TokenContract` goes in as `<account>::<account>`
+    /// and comes back naming its own account id as its DApp, not the shared dexdo one.
+    #[test]
+    fn a_self_dapp_address_survives_a_round_trip() {
+        let token_contract_account = h64('c');
+        let self_dapp = format!("{token_contract_account}::{token_contract_account}");
+
+        assert_eq!(
+            parse_chain_address(&self_dapp).unwrap().to_string(),
+            self_dapp,
+            "a self-DApp address came back naming a different DApp than the one it was given"
+        );
+    }
+
+    /// Two DApps holding one account id are two different accounts, and must not compare equal.
+    /// This is the comparison the defect turns into a false match: the SDK `Address` derives equality
+    /// over the account id alone, so before this change these two were the same value.
+    #[test]
+    fn a_foreign_dapp_address_does_not_compare_equal_to_ours() {
+        let account = h64('9');
+        let foreign_dapp = h64('3');
+        assert_ne!(
+            foreign_dapp, DEXDO_DAPP_ID,
+            "the fixture must name a FOREIGN dapp"
+        );
+
+        let ours = parse_chain_address(&format!("{DEXDO_DAPP_ID}::{account}")).unwrap();
+        let theirs = parse_chain_address(&format!("{foreign_dapp}::{account}")).unwrap();
+
+        assert_ne!(
+            ours, theirs,
+            "an address in a foreign DApp compared equal to ours; they are different accounts, \
+             holding different money, and only the DApp half distinguishes them"
+        );
+    }
+
+    /// The chain half is exactly what it was, so this fix moves no chain call.
+    /// Every accepted input form still yields the account-only workchain address the chain client and
+    /// address-valued contract parameters take, and a legacy `0:<account_id>` - which names no DApp -
+    /// is not handed one it never carried.
+    #[test]
+    fn the_chain_half_and_the_legacy_form_are_unchanged() {
+        let account = h64('9');
+        let legacy = format!("0:{account}");
+
+        for form in [
+            legacy.clone(),
+            account.clone(),
+            format!("0x{account}"),
+            format!("{DEXDO_DAPP_ID}::{account}"),
+            format!("{account}::{account}"),
+        ] {
+            assert_eq!(
+                parse_chain_address(&form).unwrap().with_workchain(),
+                legacy,
+                "chain half changed for input `{form}`"
+            );
+        }
+
+        assert_eq!(
+            parse_chain_address(&legacy).unwrap().to_string(),
+            legacy,
+            "a legacy address names no DApp and must not be given one"
+        );
+    }
+
+    /// The retained DApp is readable, and an absent one reads as absent rather than as dexdo's.
+    /// This is the only test here that names API introduced by the fix, so unlike the three above it
+    /// cannot be run against the pre-fix code; it covers the accessors rather than the defect.
+    #[test]
+    fn the_retained_dapp_id_is_readable_and_absent_when_unstated() {
+        let account = h64('9');
+        let foreign_dapp = h64('3');
+
+        let shared = parse_chain_address(&format!("{DEXDO_DAPP_ID}::{account}")).unwrap();
+        assert_eq!(shared.dapp_id(), Some(DEXDO_DAPP_ID));
+        assert_eq!(shared.account_id(), account);
+
+        let self_dapp = parse_chain_address(&format!("{account}::{account}")).unwrap();
+        assert_eq!(self_dapp.dapp_id(), Some(account.as_str()));
+
+        let foreign = parse_chain_address(&format!("{foreign_dapp}::{account}")).unwrap();
+        assert_eq!(foreign.dapp_id(), Some(foreign_dapp.as_str()));
+
+        // A legacy address states no DApp. Reporting `None` is what stops a self-DApp account read
+        // from an older file being re-labelled with the shared dexdo DApp.
+        let legacy = parse_chain_address(&format!("0:{account}")).unwrap();
+        assert_eq!(legacy.dapp_id(), None);
+        assert_eq!(legacy.account_id(), account);
+
+        // The chain half stays reachable both borrowed and owned.
+        assert_eq!(shared.chain().bare(), account);
+        assert_eq!(shared.into_chain().bare(), account);
     }
 }

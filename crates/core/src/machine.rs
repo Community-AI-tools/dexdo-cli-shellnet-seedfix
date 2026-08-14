@@ -9,7 +9,7 @@
 //! claim after a longer silence; what bounds it is the on-chain rate limit plus the buyer's own attention.
 //! Every transition checks that the tail never goes negative and that trusted consumption never regresses.
 
-use crate::chain::SettlementActionReceipt;
+use crate::chain::{BuyerStopTerminalReceipt, SettlementActionReceipt};
 use crate::params::{DobParams, Shell};
 use crate::settle::{contested_burn, probe_burn, ContestedBurn};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,9 @@ pub enum Settlement {
     /// A production shellnet action proved by one new immutable TokenContract event plus a strict
     /// post-read. The pure state-machine variants below remain mock-only projections.
     AuthoritativeReceipt(Box<SettlementActionReceipt>),
+    /// A terminal chain event observed by a buyer STOP path, carrying the exact attribution fact
+    /// proved for this invocation.
+    BuyerStopTerminal(Box<BuyerStopTerminalReceipt>),
     /// An unresolved dispute timed out: the contested value burns on both sides, so a claim nobody
     /// can defend profits neither party. Trusted value and the unspent deposit are unaffected.
     BurnBoth(ContestedBurn),
@@ -85,6 +88,7 @@ impl fmt::Display for Settlement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AuthoritativeReceipt(receipt) => receipt.fmt(formatter),
+            Self::BuyerStopTerminal(receipt) => receipt.fmt(formatter),
             mock_projection => write!(formatter, "{mock_projection:?}"),
         }
     }
@@ -196,12 +200,30 @@ impl StreamMachine {
         }
     }
 
+    /// Refuse a transition the current state has no room for, leaving that state untouched.
+    /// `Opening` was never opened and `Stopping`/`Closed` are ends, so a terminal transition taken from one
+    /// of them would mint a SECOND terminal record for one deal -- and, with `trusted_ticks()` reading 0
+    /// there, one whose zero amounts are indistinguishable from a legitimate clean close. The
+    /// contract refuses the same calls outright: `stop`, `sellerStop` and `releaseDispute` each open with
+    /// `require(_opened, ERR_NOT_OPEN)`(`contracts/airegistry/TokenContract.sol`), so refusing here keeps
+    /// the projection on the contract's own footing instead of answering where the chain would revert.
+    /// It panics rather than returning an error because these transitions answer with `Settlement`, not
+    /// `Result`: there is no settlement to hand back, and a well-formed zero-amount one is precisely the
+    /// fail-open being closed. It is the same refusal the machine's own `Result` guards
+    /// (`on_probe_accepted`, `on_claim`, `on_promote`) already express for the non-terminal steps.
+    fn refuse_when_not_live(&self, transition: &'static str) -> ! {
+        panic!(
+            "{transition} is not a transition of a deal in state {:?}",
+            self.state
+        )
+    }
+
     /// Buyer STOP.
     /// On the PROBE the buyer is walking away from the trial itself, so the tick burns together with a mirror
     /// tick of the bond: a seller who meant to take the first tick and vanish collects nothing and
     /// pays a tick for the attempt. After acceptance it settles by fact -- trusted consumption to the
     /// seller, the rest refunded, and the contested tail dropped, since walking away IS the statement that it
-    /// is disputed.
+    /// is disputed. From a state that is not a live deal it is refused(see `refuse_when_not_live`).
     pub fn buyer_stop(&mut self) -> Settlement {
         let settlement = match &self.state {
             StreamState::Probe { tick } => {
@@ -209,22 +231,42 @@ impl StreamMachine {
                 let bond = Shell::try_from(self.seller_bond).unwrap_or(Shell::MAX);
                 Settlement::BurnBoth(probe_burn(price, bond))
             }
-            _ => Settlement::AmicableSplit {
-                to_seller_ticks: self.trusted_ticks(),
-                to_buyer_refund: 0,
-            },
+            StreamState::Streaming { .. } | StreamState::Disputed { .. } => {
+                Settlement::AmicableSplit {
+                    to_seller_ticks: self.trusted_ticks(),
+                    to_buyer_refund: 0,
+                }
+            }
+            StreamState::Opening | StreamState::Stopping | StreamState::Closed => {
+                self.refuse_when_not_live("buyer_stop")
+            }
         };
         self.state = StreamState::Stopping;
         settlement
     }
 
-    /// The seller abandons the deal(`sellerStop`). Identical settlement shape to a buyer stop: pay the
-    /// trusted consumption, refund the rest. He forfeits the pending tail exactly as the buyer would, so
-    /// quitting never pays better than delivering.
+    /// The seller abandons the deal(`sellerStop`). Pay the trusted consumption, refund the rest. He
+    /// forfeits the pending tail exactly as the buyer would, so quitting never pays better than delivering,
+    /// and from a state that is not a live deal it is refused just like a buyer stop.
+    /// On the PROBE the settlement shape stays this one and does NOT mirror the buyer's `BurnBoth`. The
+    /// walk-out still costs the seller the same one tick -- the contract burns it out of his bond
+    /// (`sellerStop`, `bondBurn = min(P, _sellerBond)`) -- but the trial tick itself is the buyer's until
+    /// acceptance and he is not the one ending the deal, so it is released back into the escrow and refunded
+    /// whole: spec, design and matrix row `E2E-TERM-03` (`contracts/test-specification.md`:
+    /// `AmicableSplit { to_seller_ticks: 0, to_buyer_refund: escrow }`, `burned == P`) all state it that
+    /// way, against `E2E-TERM-02`'s `burned == 2P` for the buyer's stop. The seller's bond burn is a chain
+    /// fact; this variant carries no field for it, which is why the projection reports the split.
     pub fn seller_stop(&mut self) -> Settlement {
-        let settlement = Settlement::AmicableSplit {
-            to_seller_ticks: self.trusted_ticks(),
-            to_buyer_refund: 0,
+        let settlement = match &self.state {
+            StreamState::Probe { .. }
+            | StreamState::Streaming { .. }
+            | StreamState::Disputed { .. } => Settlement::AmicableSplit {
+                to_seller_ticks: self.trusted_ticks(),
+                to_buyer_refund: 0,
+            },
+            StreamState::Opening | StreamState::Stopping | StreamState::Closed => {
+                self.refuse_when_not_live("seller_stop")
+            }
         };
         self.state = StreamState::Stopping;
         settlement
@@ -254,11 +296,19 @@ impl StreamMachine {
     }
 
     /// The seller CONCEDES the dispute(`releaseDispute`): the contested tail is dropped, the bond returns
-    /// in full and nothing burns. Everything already trusted stays his -- it was never in dispute.
+    /// in full and nothing burns. Everything already trusted stays his -- it was never in dispute. From a
+    /// state that is not a live deal it is refused(see `refuse_when_not_live`).
     pub fn release_dispute(&mut self) -> Settlement {
-        let settlement = Settlement::AmicableSplit {
-            to_seller_ticks: self.trusted_ticks(),
-            to_buyer_refund: 0,
+        let settlement = match &self.state {
+            StreamState::Probe { .. }
+            | StreamState::Streaming { .. }
+            | StreamState::Disputed { .. } => Settlement::AmicableSplit {
+                to_seller_ticks: self.trusted_ticks(),
+                to_buyer_refund: 0,
+            },
+            StreamState::Opening | StreamState::Stopping | StreamState::Closed => {
+                self.refuse_when_not_live("release_dispute")
+            }
         };
         self.state = StreamState::Closed;
         settlement
@@ -309,254 +359,5 @@ impl StreamMachine {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn params() -> DobParams {
-        DobParams::canonical()
-    }
-
-    /// Opening freezes the TRIAL tick and nothing else: it is owed to nobody, so the buyer's exposure is
-    /// exactly that one tick and the seller has earned nothing.
-    #[test]
-    fn open_starts_on_the_probe_with_one_tick_at_risk() {
-        let m = StreamMachine::open(1000, &params());
-        assert!(m.on_probe(), "a fresh deal is on the trial tick");
-        assert_eq!(m.max_buyer_loss(), 1000, "exactly the probe is at risk");
-        assert_eq!(m.trusted_ticks(), 0, "the probe is not earned yet");
-    }
-
-    /// Accepting the probe makes the deal claimable and seeds it as the first trusted cumulative tick.
-    #[test]
-    fn accepting_the_probe_seeds_the_cumulative_pipeline() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        assert!(!m.on_probe());
-        assert!(matches!(
-            m.state(),
-            StreamState::Streaming {
-                trusted: 1,
-                pending: 1
-            }
-        ));
-        assert_eq!(
-            m.max_buyer_loss(),
-            0,
-            "nothing claimed yet -> nothing at risk"
-        );
-    }
-
-    /// Nothing is claimable while the probe stands -- the contract rejects such a claim outright.
-    #[test]
-    fn claims_are_refused_while_on_the_probe() {
-        let mut m = StreamMachine::open(1000, &params());
-        assert_eq!(
-            m.on_claim(1),
-            Err(InvariantError("on_claim requires an open stream"))
-        );
-    }
-
-    /// Walking away from the trial burns it on both sides, and the rest of the bond returns.
-    #[test]
-    fn stop_on_the_probe_burns_the_trial_tick() {
-        let mut m = StreamMachine::open(1000, &params());
-        match m.buyer_stop() {
-            Settlement::BurnBoth(b) => {
-                assert_eq!(b.buyer, 1000, "the trial tick is destroyed");
-                assert_eq!(b.seller, 1000, "a mirror tick of the bond goes with it");
-                assert_eq!(b.seller_refund, 1000, "the rest of the 2P bond returns");
-            }
-            other => panic!("a probe stop must burn, got {other:?}"),
-        }
-    }
-
-    /// The first claim is contestable; the second promotes the first. That lag is the whole safety
-    /// property -- the seller can never cash a figure the buyer had no window to challenge.
-    #[test]
-    fn a_claim_promotes_only_the_previous_one() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(3).unwrap();
-        assert_eq!(
-            m.trusted_ticks(),
-            1,
-            "only the already-paid probe is trusted"
-        );
-        assert_eq!(
-            m.max_buyer_loss(),
-            2000,
-            "only consumption beyond the trusted probe is contestable"
-        );
-
-        m.on_claim(5).unwrap();
-        assert_eq!(m.trusted_ticks(), 3, "the superseded claim became trusted");
-        assert_eq!(m.max_buyer_loss(), 2000, "only the new delta is at risk");
-    }
-
-    /// `finalize()` is what makes the LAST claim payable: nothing supersedes it.
-    #[test]
-    fn promote_drains_the_tail() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(4).unwrap();
-        m.on_promote().unwrap();
-        assert_eq!(m.trusted_ticks(), 4);
-        assert_eq!(m.max_buyer_loss(), 0, "nothing left to contest");
-    }
-
-    /// Cumulative means cumulative: a seller must not be able to walk a claim back.
-    #[test]
-    fn claims_cannot_regress() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(7).unwrap();
-        assert_eq!(
-            m.on_claim(6),
-            Err(InvariantError("claims are cumulative and cannot decrease"))
-        );
-    }
-
-    /// A stop settles by FACT -- trusted only. The pending tail is forfeited, not paid.
-    #[test]
-    fn stop_pays_trusted_and_drops_the_tail() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(2).unwrap();
-        m.on_claim(9).unwrap(); // trusted=2, pending=9
-        assert_eq!(
-            m.buyer_stop(),
-            Settlement::AmicableSplit {
-                to_seller_ticks: 2,
-                to_buyer_refund: 0
-            }
-        );
-        assert_eq!(m.max_buyer_loss(), 0);
-    }
-
-    /// A seller who quits is settled exactly like a buyer stop, so quitting never beats delivering.
-    #[test]
-    fn seller_stop_matches_buyer_stop() {
-        let mut a = StreamMachine::open(1000, &params());
-        a.on_probe_accepted().unwrap();
-        a.on_claim(2).unwrap();
-        a.on_claim(9).unwrap();
-        let mut b = a.clone();
-        assert_eq!(a.buyer_stop(), b.seller_stop());
-    }
-
-    /// A no-show is not slashed: the full bond returns.
-    #[test]
-    fn seller_noshow_returns_the_whole_bond() {
-        let mut m = StreamMachine::open(1000, &params());
-        assert_eq!(
-            m.seller_no_show(),
-            Settlement::SellerNoShow {
-                to_buyer_refund: 0,
-                seller_bond_returned: 2000,
-            }
-        );
-    }
-
-    /// Conceding costs the seller only the tail he could not defend -- and no burn.
-    #[test]
-    fn release_dispute_keeps_trusted_and_burns_nothing() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(2).unwrap();
-        m.on_claim(9).unwrap();
-        m.buyer_dispute();
-        assert!(matches!(
-            m.state(),
-            StreamState::Disputed {
-                trusted: 2,
-                contested: 7
-            }
-        ));
-        assert_eq!(
-            m.release_dispute(),
-            Settlement::AmicableSplit {
-                to_seller_ticks: 2,
-                to_buyer_refund: 0
-            }
-        );
-    }
-
-    /// An unresolved dispute costs each side the SAME: the seller's whole bond, mirrored on the buyer's
-    /// side. Equal cost is what stops either party from preferring deadlock.
-    #[test]
-    fn dispute_timeout_burns_the_whole_bond_symmetrically() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(1).unwrap();
-        m.on_claim(2).unwrap();
-        m.buyer_dispute();
-        match m.resolve_dispute_timeout() {
-            Settlement::BurnBoth(b) => {
-                assert_eq!(b.seller, 2000, "the whole 2P bond is destroyed");
-                assert_eq!(b.seller_refund, 0, "nobody conceded -> none of it returns");
-                assert_eq!(b.buyer, 2000, "an equal amount of the buyer's escrow burns");
-                assert_eq!(b.total(), 4000);
-            }
-            other => panic!("expected BurnBoth, got {other:?}"),
-        }
-    }
-
-    /// The burn does not scale with the claim: a wildly inflated claim costs the seller exactly the same as
-    /// a small one, so the size of the lie does not shift the balance of the argument.
-    #[test]
-    fn dispute_burn_does_not_scale_with_the_claim() {
-        let mut small = StreamMachine::open(1000, &params());
-        small.on_probe_accepted().unwrap();
-        small.on_claim(1).unwrap();
-        small.buyer_dispute();
-
-        let mut huge = StreamMachine::open(1000, &params());
-        huge.on_probe_accepted().unwrap();
-        huge.on_claim(5_000).unwrap();
-        huge.buyer_dispute();
-
-        assert_eq!(
-            small.resolve_dispute_timeout(),
-            huge.resolve_dispute_timeout()
-        );
-    }
-
-    /// A dispute must not INCREASE the buyer's exposure -- it only freezes what was already contested.
-    #[test]
-    fn dispute_does_not_grow_exposure() {
-        let mut m = StreamMachine::open(1000, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(2).unwrap();
-        m.on_claim(5).unwrap();
-        let before = m.max_buyer_loss();
-        m.buyer_dispute();
-        assert_eq!(m.max_buyer_loss(), before);
-        assert_eq!(before, 3000);
-    }
-
-    /// A high but valid price must not overflow the bond or the exposure arithmetic.
-    #[test]
-    fn high_valid_price_preserves_exact_two_p_bond() {
-        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let price = u64::MAX - (u64::MAX % step);
-        assert!(price > u64::MAX / 2);
-
-        let mut m = StreamMachine::open(price, &params());
-        m.on_probe_accepted().unwrap();
-        m.on_claim(2).unwrap();
-        assert_eq!(m.max_buyer_loss(), u128::from(price));
-
-        let mut unopened = StreamMachine::open(price, &params());
-        assert_eq!(
-            unopened.seller_no_show(),
-            Settlement::SellerNoShow {
-                to_buyer_refund: 0,
-                seller_bond_returned: u128::from(price) * 2,
-            }
-        );
     }
 }

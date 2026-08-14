@@ -5,11 +5,17 @@ use serde_json::{json, Map, Value};
 
 pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v1";
 pub(crate) const QUOTE_SCHEMA: &str = "dexdo.quote.v1";
-pub(crate) const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v1";
+pub(crate) const BUYER_EVENT_SCHEMA: &str = dexdo::runtime_events::BUYER_EVENT_SCHEMA;
 pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v2";
 pub(crate) const CLOSE_SCHEMA: &str = "dexdo.close.v1";
 #[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_SCHEMA: &str = "dexdo.note_deploy.v1";
+/// One schema for `subscription place`, `subscription status` and `subscription cancel`.
+/// Three commands, ONE object shape and ONE version, because they are three moves in a single
+/// pre-match lifecycle and an orchestrator branches on `operation`, not on a shape. A field that
+/// does not exist for this command at this moment is `null` -- never omitted, never a placeholder --
+/// so "no fill yet" and "no refund observed" are readable facts instead of missing keys.
+pub(crate) const SUBSCRIPTION_SCHEMA: &str = "dexdo.subscription.v1";
 pub(crate) const ERROR_SCHEMA: &str = "dexdo.error.v1";
 
 pub(crate) const OP_MARKETS: &str = "markets";
@@ -20,11 +26,33 @@ pub(crate) const OP_BUYER_SHUTDOWN: &str = "buyer_shutdown";
 pub(crate) const OP_STATUS: &str = "status";
 pub(crate) const OP_CLOSE: &str = "close";
 pub(crate) const OP_NOTE_DEPLOY: &str = "note_deploy";
+pub(crate) const OP_SETTLEMENT_RECEIPT: &str = "settlement_receipt";
+pub(crate) const OP_SUBSCRIPTION_PLACE: &str = "subscription_place";
+pub(crate) const OP_SUBSCRIPTION_STATUS: &str = "subscription_status";
+pub(crate) const OP_SUBSCRIPTION_CANCEL: &str = "subscription_cancel";
 #[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MARKER: &str = "NETWORK_GENERATION_MISMATCH";
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE: &str =
     "NETWORK_GENERATION_MISMATCH: upgrade dexdo or use a matching --contracts manifest, then retry; \
      no wallet transaction was signed or submitted, no voucher was generated, and no funds were spent";
+
+/// the stable machine-readable name for "this instance has no funding wallet bound".
+pub(crate) const WALLET_NOT_CONFIGURED_CODE: &str = "WALLET_NOT_CONFIGURED";
+
+/// The remediation, carried on `message` rather than only inside `cause`.
+/// `message` is the field an orchestrator surfaces to a human, and the whole point of this code is
+/// that the next move is a setup command the operator runs once. It names the command and every
+/// provider it accepts, because a provider is never chosen for the operator: it is recorded at bind
+/// time and is not recoverable from an address or a code hash afterwards.
+/// The providers are spelled out instead of a placeholder for a mechanical reason as well as a
+/// readable one -- `no_command_line_in_these_sources_is_rejected_by_the_parser` rejects a printed
+/// command line the shipped parser cannot run, and an unquoted placeholder after the subcommand is
+/// a shell redirect, not an argument. This is the same wording `E_WALLET_NOT_CONFIGURED.fix()`
+/// already uses, so the two say one thing.
+pub(crate) const WALLET_NOT_CONFIGURED_MESSAGE: &str =
+    "no funding wallet is bound to this instance; bind one with `dexdo wallet onboard` followed by \
+     a provider -- `ackinacki-wallet`, `gosh-ai` or `manual` -- which is never chosen for you. \
+     Nothing was submitted and no funds were spent";
 
 #[derive(Debug)]
 pub(crate) struct MachineErrorPrinted;
@@ -45,15 +73,33 @@ pub(crate) fn is_printed_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<MachineErrorPrinted>().is_some()
 }
 
+#[derive(Debug)]
+pub(crate) struct SubscriptionStatusOrderNotFound {
+    message: String,
+}
+
+impl SubscriptionStatusOrderNotFound {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SubscriptionStatusOrderNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SubscriptionStatusOrderNotFound {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorCode {
     InvalidArgument,
     FeatureUnavailable,
     StaleClient,
-    #[allow(dead_code)]
-    MarketNotFound,
-    #[allow(dead_code)]
-    MarketInactive,
+    DealRecordSchemaTooNew,
     NoLiquidity,
     IncompleteQuote,
     InsufficientBalance,
@@ -69,8 +115,23 @@ pub(crate) enum ErrorCode {
     SettlementFailed,
     NotRecoverableYet,
     DisputedDeal,
-    #[allow(dead_code)]
-    PolicyFailClosed,
+    /// The named order is not a resting order this note owns. Covers absent, wrong owner
+    /// and wrong shape together, because an orchestrator's next move is the same for all three and
+    /// telling them apart would leak whose order it is.
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+    OrderNotFound,
+    /// A cancel lost the race: the order filled before the book removed it. Distinct from
+    /// `AMBIGUOUS_SUBMIT` -- the outcome is known, and it is not a refund.
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+    OrderAlreadyMatched,
+    /// Durable and on-chain facts disagree, e.g. one order id is simultaneously resting and
+    /// filled. Distinct from `AMBIGUOUS_SUBMIT`: nothing is in flight, the two records conflict.
+    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+    ContradictoryState,
+    /// the command needs a funding(Hot) wallet and this instance has none bound. It is the
+    /// operator's own configuration state, not a client fault, and the fix is a setup command -- so
+    /// it is its own code rather than `INTERNAL`, which tells an orchestrator to escalate a bug.
+    WalletNotConfigured,
     Internal,
 }
 
@@ -80,8 +141,7 @@ impl ErrorCode {
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::FeatureUnavailable => "FEATURE_UNAVAILABLE",
             Self::StaleClient => "STALE_CLIENT",
-            Self::MarketNotFound => "MARKET_NOT_FOUND",
-            Self::MarketInactive => "MARKET_INACTIVE",
+            Self::DealRecordSchemaTooNew => "DEAL_RECORD_SCHEMA_TOO_NEW",
             Self::NoLiquidity => "NO_LIQUIDITY",
             Self::IncompleteQuote => "INCOMPLETE_QUOTE",
             Self::InsufficientBalance => "INSUFFICIENT_BALANCE",
@@ -97,7 +157,10 @@ impl ErrorCode {
             Self::SettlementFailed => "SETTLEMENT_FAILED",
             Self::NotRecoverableYet => "NOT_RECOVERABLE_YET",
             Self::DisputedDeal => "DISPUTED_DEAL",
-            Self::PolicyFailClosed => "POLICY_FAIL_CLOSED",
+            Self::OrderNotFound => "ORDER_NOT_FOUND",
+            Self::OrderAlreadyMatched => "ORDER_ALREADY_MATCHED",
+            Self::ContradictoryState => "CONTRADICTORY_STATE",
+            Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_CODE,
             Self::Internal => "INTERNAL",
         }
     }
@@ -105,9 +168,7 @@ impl ErrorCode {
     pub(crate) fn retryable(self) -> bool {
         matches!(
             self,
-            Self::MarketNotFound
-                | Self::MarketInactive
-                | Self::NoLiquidity
+            Self::NoLiquidity
                 | Self::IncompleteQuote
                 | Self::HandoverTimeout
                 | Self::EndpointBindFailed
@@ -124,8 +185,7 @@ impl ErrorCode {
             Self::InvalidArgument => "invalid or missing command input",
             Self::FeatureUnavailable => "requested feature is unavailable in this binary",
             Self::StaleClient => NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE,
-            Self::MarketNotFound => "market was not found",
-            Self::MarketInactive => "market is inactive",
+            Self::DealRecordSchemaTooNew => "durable deal record schema is newer than this runtime",
             Self::NoLiquidity => "no executable liquidity is available",
             Self::IncompleteQuote => "liquidity is insufficient for the requested quote",
             Self::InsufficientBalance => "balance is insufficient for the selected action",
@@ -141,15 +201,40 @@ impl ErrorCode {
             Self::SettlementFailed => "settlement submission failed",
             Self::NotRecoverableYet => "deal is not recoverable yet",
             Self::DisputedDeal => "deal is disputed and needs dispute resolution",
-            Self::PolicyFailClosed => "runtime policy failed closed",
+            Self::OrderNotFound => "order is not resting under this owner in this book",
+            Self::OrderAlreadyMatched => "order matched before it could be cancelled",
+            Self::ContradictoryState => "durable and on-chain records contradict each other",
+            Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_MESSAGE,
             Self::Internal => "internal invariant failed",
         }
     }
 }
 
 pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode {
-    let msg = format!("{err:#}").to_ascii_lowercase();
     for cause in err.chain() {
+        if cause
+            .downcast_ref::<super::deals::DealHandleSchemaTooNew>()
+            .is_some()
+        {
+            return ErrorCode::DealRecordSchemaTooNew;
+        }
+        if let Some(gateway) = cause.downcast_ref::<dexdo_core::DexdoError>() {
+            if gateway.code() == dexdo_core::error_codes::E_GATEWAY_UNREACHABLE.code() {
+                return ErrorCode::GatewayConnectFailed;
+            }
+            if gateway.code() == dexdo_core::error_codes::E_GATEWAY_WRONG_ENDPOINT.code() {
+                return ErrorCode::GatewayAuthFailed;
+            }
+            // the wallet fail-fast is a TYPED error carrying a stable code, so it is read
+            // from the code and never from its wording. Without this it fell past every rule below
+            // to `INTERNAL` -- which tells an orchestrator "this client has a bug" when the true
+            // instruction is "bind a wallet", and which no script can branch on. Matching by type
+            // here cannot weaken any other mapping: it fires only on this one code, and every
+            // classification below still runs for everything else.
+            if gateway.code() == dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED.code() {
+                return ErrorCode::WalletNotConfigured;
+            }
+        }
         if let Some(chain) = cause.downcast_ref::<dexdo_core::ChainError>() {
             match chain {
                 dexdo_core::ChainError::Transport(_) => return ErrorCode::ChainTransport,
@@ -160,6 +245,13 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
                 _ => {}
             }
         }
+        if operation == OP_SUBSCRIPTION_STATUS
+            && cause
+                .downcast_ref::<SubscriptionStatusOrderNotFound>()
+                .is_some()
+        {
+            return ErrorCode::OrderNotFound;
+        }
         if cause
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest_error_is_transport)
@@ -167,6 +259,10 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
             return ErrorCode::ChainTransport;
         }
     }
+
+    // Below this boundary, rules are best-effort classification of arbitrary failure text,
+    // including third-party messages. Rewording a message here may change its emitted code.
+    let msg = format!("{err:#}").to_ascii_lowercase();
     if operation == OP_NOTE_DEPLOY && msg.contains("network_generation_mismatch") {
         return ErrorCode::StaleClient;
     }
@@ -178,7 +274,6 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     }
     if msg.contains("no executable matching ask")
         || msg.contains("no matchable ask")
-        || msg.contains("executable quote depth has no matching")
         || msg.contains("refusing multi-ask fill")
         || msg.contains("placeinferencebuy cannot target")
         || msg.contains("raw order-book matcher")
@@ -187,7 +282,7 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     {
         return ErrorCode::NoLiquidity;
     }
-    if msg.contains("incomplete quote") || msg.contains("not enough") {
+    if msg.contains("incomplete quote") {
         return ErrorCode::IncompleteQuote;
     }
     if msg.contains("selected tokencontract") || msg.contains("refusing to move escrow") {
@@ -198,8 +293,6 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     }
     if msg.contains("buyer model-only preflight failed")
         || msg.contains("buyer target preflight failed")
-        || msg.contains("placeinferencebuy cannot target")
-        || msg.contains("refusing to send escrow into the wrong deal")
     {
         return ErrorCode::ChainRevert;
     }
@@ -222,7 +315,7 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("malformed handover") || msg.contains("handover decrypt failed") {
         return ErrorCode::HandoverDecryptFailed;
     }
-    if operation == OP_BUYER_START && (msg.contains("address in use") || msg.contains("bind")) {
+    if operation == OP_BUYER_START && msg.contains("bind") {
         return ErrorCode::EndpointBindFailed;
     }
     if msg.contains("readiness") || msg.contains("/v1/models") {
@@ -243,6 +336,12 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("settlement") || msg.contains("streamstop") || msg.contains("cleanup") {
         return ErrorCode::SettlementFailed;
     }
+    // an error that names a contract exit code IS a chain revert, even when the typed
+    // `ChainError` was flattened into a string on its way out (the on-demand deal initializer does
+    // that). Last resort, so every more specific rule above still wins.
+    if msg.contains("exit_code=") {
+        return ErrorCode::ChainRevert;
+    }
     ErrorCode::Internal
 }
 
@@ -255,7 +354,7 @@ pub(crate) fn reqwest_error_is_transport(error: &reqwest::Error) -> bool {
             .is_some_and(|status| status.is_server_error() || status.as_u16() == 429)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct MachineError {
     pub(crate) schema: &'static str,
     pub(crate) operation: &'static str,
@@ -301,6 +400,30 @@ impl MachineError {
 
     pub(crate) fn with_cause(mut self, cause: impl Into<String>) -> Self {
         self.cause = Some(cause.into());
+        self
+    }
+
+    /// Attach the public identity the failing command already had in hand.
+    /// A cancel that loses its race must hand the orchestrator the deal it lost to -- the contract
+    /// already reserves `token_contract`/`deal_handle` on the error object for exactly that, and a
+    /// consumer driving the lifecycle from JSON alone has no other way to reach it.
+    #[cfg(feature = "shellnet")]
+    pub(crate) fn with_market(
+        mut self,
+        network: &str,
+        frame_model: &str,
+        order_book: &str,
+    ) -> Self {
+        self.network = Some(network.to_string());
+        self.frame_model = Some(frame_model.to_string());
+        self.order_book = Some(order_book.to_string());
+        self
+    }
+
+    #[cfg(feature = "shellnet")]
+    pub(crate) fn with_deal(mut self, token_contract: &str, deal_handle: &str) -> Self {
+        self.token_contract = Some(token_contract.to_string());
+        self.deal_handle = Some(deal_handle.to_string());
         self
     }
 }
@@ -412,7 +535,7 @@ pub(crate) fn amount<T: ToString>(value: T) -> String {
     value.to_string()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct MarketsResponse {
     pub(crate) schema: &'static str,
     pub(crate) network: String,
@@ -420,9 +543,11 @@ pub(crate) struct MarketsResponse {
     pub(crate) markets: Vec<MarketEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct MarketEntry {
     pub(crate) frame_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_flags: Option<dexdo_core::CanonicalModelFlags>,
     pub(crate) model_hash: String,
     pub(crate) order_book: String,
     pub(crate) root_model: Option<String>,
@@ -436,12 +561,14 @@ pub(crate) struct MarketEntry {
     pub(crate) source: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct QuoteResponse {
     pub(crate) schema: &'static str,
     pub(crate) network: String,
     pub(crate) generated_at_unix: u64,
     pub(crate) frame_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_flags: Option<dexdo_core::CanonicalModelFlags>,
     pub(crate) model_hash: String,
     pub(crate) order_book: String,
     pub(crate) request: QuoteRequest,
@@ -454,14 +581,14 @@ pub(crate) struct QuoteResponse {
     pub(crate) fills: Vec<QuoteFillEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct QuoteRequest {
     pub(crate) kind: &'static str,
     pub(crate) ticks: Option<String>,
     pub(crate) budget: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct QuoteFillEntry {
     pub(crate) order_id: String,
     pub(crate) token_contract: String,
@@ -472,7 +599,7 @@ pub(crate) struct QuoteFillEntry {
     pub(crate) cost_with_fee: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct StatusResponse {
     pub(crate) schema: &'static str,
     pub(crate) network: String,
@@ -491,7 +618,7 @@ pub(crate) struct StatusResponse {
     pub(crate) next: StatusNext,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct StatusAccounting {
     pub(crate) finalized_owed: String,
     pub(crate) buyer_locked: String,
@@ -500,23 +627,21 @@ pub(crate) struct StatusAccounting {
     pub(crate) buyer_bond: String,
     pub(crate) buyer_bond_required: String,
     pub(crate) tokens_final: String,
-    pub(crate) tokens_superseded: String,
     pub(crate) tokens_pending: String,
     pub(crate) probe_time_unix: Option<u64>,
-    pub(crate) prev_claim_time_unix: Option<u64>,
     pub(crate) last_claim_time_unix: Option<u64>,
     pub(crate) dispute_time_unix: Option<u64>,
     pub(crate) funded_time_unix: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct StatusNext {
     pub(crate) action: String,
     pub(crate) retryable_after_unix: Option<u64>,
     pub(crate) command: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct CloseResponse {
     pub(crate) schema: &'static str,
     pub(crate) network: String,
@@ -530,7 +655,150 @@ pub(crate) struct CloseResponse {
     pub(crate) reason: Option<String>,
     pub(crate) state_before: String,
     pub(crate) state_after: String,
+    pub(crate) last_observed_promotion: Option<super::deals::LastObservedPromotion>,
     pub(crate) tx: Option<Value>,
+}
+
+/// The one machine object all three `dexdo subscription` lifecycle commands emit.
+/// `operation` says which command produced it; `action` says what that command did; `submitted`
+/// says whether THIS invocation put a message on the chain. Those three together are what stops an
+/// orchestrator from sending a second BUY after an ambiguous first one.
+/// Every field is always present. `null` is the honest answer for a value that does not exist at
+/// this moment -- no fill yet, no refund observed, no live deal to read -- and never a placeholder
+/// standing in for one.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionResponse {
+    pub(crate) schema: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) network: String,
+    pub(crate) generated_at_unix: u64,
+    /// What this invocation did: `placed`, `reconciled`, `read` or `cancelled`.
+    pub(crate) action: &'static str,
+    /// Did this invocation submit at least one chain message? `subscription status` sets this when
+    /// it booked a due weekly settlement while reading.
+    pub(crate) submitted: bool,
+    pub(crate) frame_model: String,
+    pub(crate) model_hash: String,
+    pub(crate) order_book: String,
+    pub(crate) note_addr: String,
+    pub(crate) order_id: String,
+    /// `resting`, `matched`, `cancelled`, `expired`, `terminal` or
+    /// `absent_without_authenticated_fill`.
+    /// The human line's separate `resting=` boolean is deliberately not mirrored here: it is
+    /// `state == "resting"` in every case the CLI can produce, and a second spelling of one fact is
+    /// a second thing that can drift.
+    pub(crate) state: &'static str,
+    pub(crate) terms: SubscriptionTerms,
+    /// The fill, once one is provable. `null` while the order rests.
+    pub(crate) matched: Option<SubscriptionMatched>,
+    /// Did the book confirm the order left it? `null` while the order is still resting, and on
+    /// outcomes that never asked -- a `place`, or a matched deal whose order left by filling.
+    pub(crate) removal_confirmed: Option<bool>,
+    /// The note credit this client OBSERVED. `null` outside `cancel`, and `null` on a backend that
+    /// exposes no note balance to read it from.
+    pub(crate) refund: Option<SubscriptionRefund>,
+    /// Which of the two facts behind `state == "expired"` this client actually observed.
+    /// `null` while the order is still in the book, and on outcomes expiry cannot explain.
+    pub(crate) expiry: Option<SubscriptionExpiry>,
+    /// Live TokenContract facts for a matched subscription. `null` when there is no matched deal to
+    /// read, and after a terminal close destroys the account.
+    pub(crate) live: Option<SubscriptionLive>,
+}
+
+/// The exact order terms this BUY carries, as the book holds them.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionTerms {
+    pub(crate) max_price_per_tick: String,
+    pub(crate) ticks: String,
+    pub(crate) deposit: String,
+    pub(crate) buyer_bond: String,
+    /// Total escrow committed: `deposit` + `buyer_bond`.
+    pub(crate) escrow: String,
+    /// Raw order-flag bitmask. A subscription BUY is `AON|SUBSCRIPTION`.
+    pub(crate) flags: u8,
+    pub(crate) deadline_unix: u64,
+}
+
+/// The deal one fill produced.
+/// It carries no separate seller order id: the fill's own order id is asserted equal to this
+/// buyer's order id before the record is ever persisted, so a second id field would be either
+/// redundant or the foreign id removed from the preflight line.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionMatched {
+    pub(crate) token_contract: String,
+    pub(crate) deal_handle: String,
+    /// Matched volume in ticks.
+    pub(crate) ticks: String,
+    pub(crate) clearing_price: String,
+    /// SHELL returned because the deal cleared below `max_price_per_tick`.
+    pub(crate) price_improvement_refund: String,
+}
+
+/// The evidence behind an `expired` verdict, and -- when there is not enough of it -- the name of the
+/// fact that is missing.
+/// A passed `deadline_unix` proves an order is ELIGIBLE for expiry and nothing more. Two further
+/// facts decide it, and the book announces them separately on purpose
+/// (`InferenceOrderBook.sol:387-393`): that the book removed the row, and that the escrow came
+/// back. `state` is `expired` only when both were observed. One of them alone leaves the weaker
+/// state standing, with `missing_fact` naming what is still unknown -- because an orchestrator
+/// deciding whether an order still holds its escrow must not have to infer that from a clock.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionExpiry {
+    /// The book itself took the row out -- its own expiry announcement, not the row's absence, which
+    /// says nothing about WHICH way an order left the book.
+    pub(crate) removal_observed: bool,
+    /// The escrow came back: a refund this client read from the book, never one it derived from the
+    /// order row's own `escrow` field.
+    pub(crate) refund_observed: bool,
+    /// The refunded amount, as the payer announced it. `null` until `refund_observed`.
+    pub(crate) refunded: Option<String>,
+    /// `removal` or `refund` -- which fact is still missing, and therefore why this is not `expired`.
+    /// `null` when both were observed.
+    pub(crate) missing_fact: Option<&'static str>,
+}
+
+/// A refund this client read, never one it computed from the order row.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionRefund {
+    /// `balance_after - balance_before`, both of which are reported here.
+    pub(crate) observed: String,
+    pub(crate) balance_before: String,
+    pub(crate) balance_after: String,
+}
+
+/// Routing and capacity facts read from the matched deal's TokenContract.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubscriptionLive {
+    /// a settlement is owed for the recorded week. `status` reports this WITHOUT booking it,
+    /// so a poller can learn that money is due without signing anything; `--settle` is what books
+    /// it. Reported after any booking this invocation did, so it is the state as of the answer.
+    pub(crate) settlement_due: bool,
+    /// When the recorded week ran out -- the "since when" of `settlement_due`. `u64::MAX` when the
+    /// deal is not a subscription or its term is over.
+    pub(crate) recorded_week_expires_at_unix: u64,
+    pub(crate) funded: bool,
+    pub(crate) opened: bool,
+    pub(crate) probe_accepted: bool,
+    pub(crate) disputed: bool,
+    pub(crate) terminal: bool,
+    pub(crate) sub_weeks: u8,
+    pub(crate) week_index: u8,
+    pub(crate) period_start_unix: u64,
+    pub(crate) week_base_tokens: String,
+    pub(crate) tokens_per_week: String,
+    pub(crate) tokens_final: String,
+    pub(crate) tokens_pending: String,
+    pub(crate) used_current_week: String,
+    pub(crate) remaining_current_week: String,
+    pub(crate) funded_tokens: String,
+    pub(crate) tokens_paid: String,
+    pub(crate) deposit: String,
+    pub(crate) probe_tick: String,
+    pub(crate) buyer_bond_held: String,
+    pub(crate) buyer_bond_required: String,
+    pub(crate) buyer_locked_total: String,
+    pub(crate) seller_bond_held: String,
+    pub(crate) seller_bond_required: String,
 }
 
 pub(crate) struct BuyerEventWriter {
@@ -571,6 +839,25 @@ impl BuyerEventWriter {
         obj.insert("event".to_string(), json!(event));
         merge_fields(&mut obj, fields);
         self.write(Value::Object(obj))
+    }
+
+    pub(crate) fn claim_observation(
+        &mut self,
+        observation: &dexdo::buyer::api::BuyerClaimObservation,
+    ) -> Result<()> {
+        self.seq = self.seq.saturating_add(1);
+        let deal_handle = super::deals::make_handle_id(
+            &observation.token_contract,
+            super::deals::DealHandleRole::Buyer,
+        );
+        self.write(dexdo::runtime_events::buyer_claim_event(
+            self.seq,
+            now_unix()?,
+            &self.session_id,
+            OP_BUYER_RUNTIME,
+            &deal_handle,
+            observation,
+        ))
     }
 
     pub(crate) fn error(
@@ -636,7 +923,7 @@ fn merge_fields(obj: &mut Map<String, Value>, fields: Value) {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn forbidden_machine_fragment(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
     let forbidden = [
@@ -656,6 +943,19 @@ pub(crate) fn forbidden_machine_fragment(text: &str) -> Option<&'static str> {
         .find(|needle| lower.contains(needle))
         .or_else(|| (redact_local_paths(text) != text).then_some("absolute local path"))
 }
+
+#[cfg(test)]
+#[path = "typed_subscription_status_error_code_is_message_invariant.rs"]
+mod typed_subscription_status_error_code_is_message_invariant;
+
+#[cfg(test)]
+#[path = "gateway_error_code_is_message_invariant.rs"]
+mod gateway_error_code_is_message_invariant;
+
+/// an unbound wallet is its own code, carrying its own remediation -- never `INTERNAL`.
+#[cfg(test)]
+#[path = "wallet_not_configured_error_code.rs"]
+mod wallet_not_configured_error_code;
 
 #[cfg(test)]
 mod tests {
@@ -682,7 +982,27 @@ mod tests {
         assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v1");
         assert_eq!(STATUS_SCHEMA, "dexdo.status.v2");
         assert_eq!(CLOSE_SCHEMA, "dexdo.close.v1");
+        assert_eq!(SUBSCRIPTION_SCHEMA, "dexdo.subscription.v1");
         assert_eq!(ERROR_SCHEMA, "dexdo.error.v1");
+        assert_eq!(OP_SUBSCRIPTION_PLACE, "subscription_place");
+        assert_eq!(OP_SUBSCRIPTION_STATUS, "subscription_status");
+        assert_eq!(OP_SUBSCRIPTION_CANCEL, "subscription_cancel");
+    }
+
+    /// The three codes added are stable strings, and none of them is retryable: retrying an
+    /// absent order, a lost cancel race or a contradictory pair of records repeats a money action
+    /// against facts that will not change on their own.
+    #[test]
+    fn subscription_error_codes_are_stable_and_not_retryable() {
+        for (code, text) in [
+            (ErrorCode::OrderNotFound, "ORDER_NOT_FOUND"),
+            (ErrorCode::OrderAlreadyMatched, "ORDER_ALREADY_MATCHED"),
+            (ErrorCode::ContradictoryState, "CONTRADICTORY_STATE"),
+        ] {
+            assert_eq!(code.as_str(), text);
+            assert!(!code.retryable(), "{text}");
+            assert!(!code.safe_message().is_empty(), "{text}");
+        }
     }
 
     #[test]

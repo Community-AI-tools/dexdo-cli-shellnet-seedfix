@@ -16,8 +16,16 @@
 			]
 		},
 		{
+			"name": "touchDeal",
+			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
 			"name": "fundFromOrderBook",
 			"inputs": [
+				{"name":"paid","type":"uint128"},
 				{"name":"buyerNote","type":"address"},
 				{"name":"buyerPubkey","type":"uint256"},
 				{"name":"dealFlags","type":"uint8"}
@@ -47,14 +55,23 @@
 		{
 			"name": "close",
 			"inputs": [
-				{"name":"payoutAddress","type":"address"}
 			],
 			"outputs": [
 			]
 		},
 		{
-			"name": "fundSellerBond",
+			"name": "fundDeal",
 			"inputs": [
+				{"name":"amount","type":"uint128"},
+				{"name":"endpointCipher","type":"optional(bytes)"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "fundBuyerBond",
+			"inputs": [
+				{"name":"amount","type":"uint128"}
 			],
 			"outputs": [
 			]
@@ -141,8 +158,7 @@
 		{
 			"name": "withdrawShell",
 			"inputs": [
-				{"name":"amount","type":"uint128"},
-				{"name":"recipient","type":"address"}
+				{"name":"amount","type":"uint128"}
 			],
 			"outputs": [
 			]
@@ -150,7 +166,6 @@
 		{
 			"name": "destroy",
 			"inputs": [
-				{"name":"payoutAddress","type":"address"}
 			],
 			"outputs": [
 			]
@@ -168,10 +183,8 @@
 				{"name":"probeTick","type":"uint128"},
 				{"name":"finalizedOwed","type":"uint128"},
 				{"name":"tokensFinal","type":"uint128"},
-				{"name":"tokensSuperseded","type":"uint128"},
 				{"name":"tokensPending","type":"uint128"},
 				{"name":"probeTime","type":"uint64"},
-				{"name":"prevClaimTime","type":"uint64"},
 				{"name":"lastClaimTime","type":"uint64"},
 				{"name":"disputeTime","type":"uint64"},
 				{"name":"fundedTime","type":"uint64"}
@@ -197,8 +210,7 @@
 			"inputs": [
 			],
 			"outputs": [
-				{"name":"offerPosted","type":"bool"},
-				{"name":"closing","type":"bool"}
+				{"name":"offerPosted","type":"bool"}
 			]
 		},
 		{
@@ -349,10 +361,26 @@
 			]
 		},
 		{
+			"name": "BuyerBondFunded",
+			"inputs": [
+				{"name":"amount","type":"uint128"}
+			],
+			"outputs": [
+			]
+		},
+		{
 			"name": "StreamOpened",
 			"inputs": [
 				{"name":"buyer","type":"address"},
 				{"name":"pricePerTick","type":"uint128"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "EndpointSet",
+			"inputs": [
+				{"name":"endpointCipher","type":"bytes"}
 			],
 			"outputs": [
 			]
@@ -426,15 +454,6 @@
 			]
 		},
 		{
-			"name": "StreamReclaimed",
-			"inputs": [
-				{"name":"buyer","type":"address"},
-				{"name":"refundToBuyer","type":"uint128"}
-			],
-			"outputs": [
-			]
-		},
-		{
 			"name": "ShellWithdrawn",
 			"inputs": [
 				{"name":"recipient","type":"address"},
@@ -463,8 +482,6 @@
 		{"init":false,"name":"_iobDepth","type":"uint16"},
 		{"init":false,"name":"_noteAuthorized","type":"bool"},
 		{"init":false,"name":"_offerPosted","type":"bool"},
-		{"init":false,"name":"_closing","type":"bool"},
-		{"init":false,"name":"_closePayout","type":"address"},
 		{"init":false,"name":"_modelName","type":"string"},
 		{"init":false,"name":"_modelHash","type":"uint256"},
 		{"init":false,"name":"_pricePerTick","type":"uint128"},
@@ -481,8 +498,10 @@
 		{"init":false,"name":"_probeTick","type":"uint128"},
 		{"init":false,"name":"_probeTime","type":"uint64"},
 		{"init":false,"name":"_sellerBondFunded","type":"bool"},
+		{"init":false,"name":"_buyerBondFunded","type":"bool"},
 		{"init":false,"name":"_sellerBond","type":"uint128"},
 		{"init":false,"name":"_buyerBond","type":"uint128"},
+		{"init":false,"name":"_balance","type":"uint128"},
 		{"init":false,"name":"_deposit","type":"uint128"},
 		{"init":false,"name":"_finalizedOwed","type":"uint128"},
 		{"init":false,"name":"_feeAccrued","type":"uint128"},
@@ -499,9 +518,7 @@
 		{"init":false,"name":"_periodStart","type":"uint64"},
 		{"init":false,"name":"_weekBaseTokens","type":"uint128"},
 		{"init":false,"name":"_tokensFinal","type":"uint128"},
-		{"init":false,"name":"_tokensPend1","type":"uint128"},
-		{"init":false,"name":"_tokensPend2","type":"uint128"},
-		{"init":false,"name":"_lastClaimTime","type":"uint64"},
-		{"init":false,"name":"_prevClaimTime","type":"uint64"}
+		{"init":false,"name":"_tokensPend","type":"uint128"},
+		{"init":false,"name":"_lastClaimTime","type":"uint64"}
 	]
 }

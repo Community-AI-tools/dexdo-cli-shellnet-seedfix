@@ -1,11 +1,15 @@
-use super::backends::{is_canonical_zero_address, note_owner_mismatch_reason};
-use super::book_events::{read_book_event_fold, BookEventFold};
+use super::backends::{is_absent_address, note_owner_mismatch_reason};
+use super::book_events::{
+    read_book_event_fold, read_book_fill_candidates, BookEventFold, BookFillCandidate,
+};
 use super::contracts_provision::*;
 use crate::chain::{
-    check_seller_pubkey, check_subscription_buy_reserve, flags, DealBuyerBond, DealChainSnapshot,
-    DealChainState, DealSellerBond, DealSubscription, InferenceSubscriptionPlacement,
-    MatchWatchCursor, MatchedFill, SettlementAction, SettlementActionBondState,
-    SettlementActionEvent, SettlementActionPostState, SettlementActionReceipt,
+    check_seller_pubkey, check_subscription_buy_reserve, flags, BuyerOrderFact,
+    BuyerStopTerminalFact, BuyerStopTerminalReceipt, DealBuyerBond, DealChainSnapshot,
+    DealChainState, DealOfferLatch, DealRole, DealSellerBond, DealSubscription,
+    InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill, SettlementAction,
+    SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
+    SettlementActionReceipt,
 };
 use crate::manifest::{model_hash_for, MarketManifest};
 use crate::onchain_diagnostics::{validate_onchain_submit_response, OnchainSubmitError};
@@ -28,8 +32,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tvm_block::Deserializable;
 
-const FIXED_SUPERROOT_ACCOUNT_ID: &str =
-    "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
+#[cfg(test)]
+#[path = "client_issue_1120_tests.rs"]
+mod client_issue_1120_tests;
+
+#[cfg(test)]
+#[path = "client_issue_1348_tests.rs"]
+mod client_issue_1348_tests;
+
 const MIN_PMP_INITIAL_STAKE: u128 = 10_000_000;
 /// Pinned `tvm_client` default signed-message lifetime(`message_expiration_timeout`).
 const SDK_MESSAGE_EXPIRY_SECS: u64 = 40;
@@ -40,6 +50,114 @@ const MAX_CLOCK_BEHIND_SECS: u64 =
 const MAX_CLOCK_AHEAD_SECS: u64 = CONTRACT_MESSAGE_WINDOW_SECS
     - SDK_MESSAGE_EXPIRY_SECS
     - crate::params::SHELLNET_CLOCK_SKEW_SAFETY_MARGIN_SECS;
+
+fn display_dexdo_address(address: impl ToString) -> String {
+    crate::address::display(&address.to_string())
+}
+
+fn display_token_contract(address: impl ToString) -> String {
+    crate::address::display_self_dapp(&address.to_string())
+}
+
+/// `PrivateNote.fundDeal` -- the seller-side funding door of contracts 4.0.33. It replaced
+/// `postSellerBond(nonce, amount)`, which the deployed `PrivateNote` no longer declares at all.
+pub(super) const NOTE_FUND_DEAL_METHOD: &str = "fundDeal";
+
+/// `SuperRoot.deployRootModel` -- the door a seller's `RootModel` comes into existence through in
+/// contracts 4.0.34. It replaced `registerRoot(uint256)`, which verified a *self-deployed* root's
+/// address; SuperRoot performs the deploy now, so there is no claim left to verify and the entry is
+/// gone from the ABI.
+pub(super) const SUPERROOT_DEPLOY_ROOT_MODEL_METHOD: &str = "deployRootModel";
+
+/// `SuperRoot.registerRoot` -- the superseded entry. Named so the offline shape pin can assert it is
+/// absent(4.0.34) or, in the window before the artifacts are vendored, that the client is not
+/// encoding it.
+#[cfg(test)]
+pub(super) const SUPERROOT_REGISTER_ROOT_METHOD: &str = "registerRoot";
+
+/// The exact argument object [`RealChainBackend::request_root_model_deploy`] sends. Pure so the
+/// encoded shape is pinned offline against the vendored `SuperRoot.abi.json` itself.
+pub(super) fn super_root_deploy_root_model_params(owner_pubkey: &Value) -> Value {
+    json!({ "ownerPubkey": owner_pubkey })
+}
+
+/// `TokenContract.fundDeal` -- the receiving half. 4.0.33 renamed `fundSellerBond()` to
+/// `fundDeal(uint128 amount)` and turned the bond from attached currency into a figure argument.
+/// Only the legacy operator-wallet giver addresses the deal directly; the production seller path
+/// reaches it through `PrivateNote.fundDeal`.
+#[cfg(any(test, feature = "test-giver"))]
+pub(super) const DEAL_FUND_DEAL_METHOD: &str = "fundDeal";
+
+/// The exact argument object [`RealChainBackend::note_fund_deal`] sends. Kept pure so the encoded
+/// shape can be pinned offline against the vendored `PrivateNote.abi.json` itself rather than
+/// against a hand-written copy of it.
+/// **FOUR ARGUMENTS, NOT THREE.** Contracts 4.0.35 added `endpointCipher optional(bytes)` to both
+/// halves of the funding door, so a seller may publish the endpoint together with the bond in one
+/// message from the note. An `optional` argument is a different `functionId`, not an extra field on
+/// the old one: the three-argument shape does not encode at all against 4.0.35, so the omission is a
+/// refusal before send rather than a silently truncated call.
+/// This client sends `null` -- no endpoint on this leg. It publishes the endpoint where it already
+/// does, in [`RealChainBackend::open_stream`] (`TokenContract.open(endpointCipher)`), which 4.0.35
+/// left untouched. Taking the new leg would move handover from the moment the stream opens to the
+/// moment the bond is posted, and nothing in the 4.0.35 migration forces that.
+pub(super) fn note_fund_deal_params(nonce: u64, gas_shell: u128, amount: u128) -> Value {
+    json!({
+        "nonce": nonce.to_string(),
+        "gasShell": gas_shell.to_string(),
+        "amount": amount.to_string(),
+        "endpointCipher": Value::Null,
+    })
+}
+
+/// The exact argument object a caller sends to `TokenContract.fundDeal`. Pure for the same reason,
+/// and carrying the same 4.0.35 `endpointCipher optional(bytes)` leg, sent as `null` for the same
+/// reason.
+#[cfg(any(test, feature = "test-giver"))]
+pub(super) fn deal_fund_deal_params(amount: u128) -> Value {
+    json!({
+        "amount": amount.to_string(),
+        "endpointCipher": Value::Null,
+    })
+}
+
+/// The exact argument object [`RealChainBackend::note_fund_deploy_shell`] sends.
+/// **TWO ARGUMENTS, NOT THREE.** Contracts 4.0.34 removed the `rootModelShell` leg --
+/// `fundDeployShell(uint64 nonce, uint128 tcShell)`(`contracts/dex/PrivateNote.sol:1143`). The leg
+/// existed only because a `RootModel` used to be deployed by its owner as an external message, so
+/// somebody had to place native gas at that uninit address first and the note was the somebody.
+/// `SuperRoot.deployRootModel` performs an internal `new` now(`contracts/airegistry/SuperRoot.sol:193`)
+/// and an internal deploy carries its own value (`ROOT_MODEL_DEPLOY_VALUE = 5 vmshell`,
+/// `contracts/airegistry/SuperRoot.sol:58`), so there is nothing left to pre-fund. The note's private
+/// `_rootModelAddr` helper was deleted with the leg.
+/// Kept pure for the same reason as [`note_fund_deal_params`]: the encoded shape is what the offline
+/// regression pins, so a third argument cannot come back unnoticed.
+pub(super) fn note_fund_deploy_shell_params(nonce: u64, tc_shell: u128) -> Value {
+    json!({
+        "nonce": nonce.to_string(),
+        "tcShell": tc_shell.to_string(),
+    })
+}
+
+/// 0.34 -- the note has no `RootModel` funding leg any more, so a caller asking for one is
+/// refused rather than silently served a message that funds only the deal.
+/// A non-zero request here used to mean "put `rootModelShell` at the RootModel's uninit deploy
+/// address". `PrivateNote.fundDeployShell` no longer has that argument, so honouring the call would
+/// mean dropping the amount on the floor and reporting success -- the RootModel would stay unfunded
+/// and the caller would never learn it. It cannot be silently mapped onto the deal's leg either:
+/// that is a different contract at a different address.
+pub(super) fn root_model_deploy_shell_unsupported(root_model_shell: u128) -> Option<String> {
+    if root_model_shell == 0 {
+        return None;
+    }
+    Some(format!(
+        "fundDeployShell was asked for {root_model_shell} raw ECC[2] of RootModel gas, but contracts \
+         4.0.34 removed that leg: PrivateNote.fundDeployShell takes (nonce, tcShell) only \
+         (contracts/dex/PrivateNote.sol:1143). A RootModel is deployed by SuperRoot with its own \
+         ROOT_MODEL_DEPLOY_VALUE = 5 vmshell (contracts/airegistry/SuperRoot.sol:58) and mints its own \
+         gas from SuperRoot's configured dapp (RootModel.ensureBalance), so it needs no note funding. \
+         Pass root_model_shell = 0."
+    ))
+}
 
 fn money_submit_identity(signed_boc: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -99,7 +217,6 @@ impl MoneySubmitError {
     }
 }
 
-#[allow(dead_code)]
 fn consume_new_fill_batch(
     cursor: &mut MatchWatchCursor,
     mut fills: Vec<(i64, MatchedFill)>,
@@ -201,6 +318,9 @@ pub(super) async fn wait_correlated_inference_fill(
     }
 }
 
+#[path = "operator_wallet.rs"]
+mod operator_wallet;
+
 #[cfg(feature = "test-giver")]
 #[path = "test_giver.rs"]
 mod test_giver;
@@ -280,11 +400,11 @@ fn subscription_order_is_active_for_owner(
         && order
             .get("note")
             .and_then(Value::as_str)
-            .is_some_and(is_canonical_zero_address)
+            .is_some_and(is_absent_address)
         && order
             .get("tokenContract")
             .and_then(Value::as_str)
-            .is_some_and(is_canonical_zero_address)
+            .is_some_and(is_absent_address)
         && ["price", "escrow", "deadline", "flags", "ts"]
             .iter()
             .all(|field| getter_u128(order, field) == Some(0))
@@ -301,7 +421,12 @@ fn subscription_order_is_active_for_owner(
         return Err(anyhow!("getOrder({order_id}) has no owner note: {order}"));
     };
     let note = Address::parse(note)
-        .map_err(|error| anyhow!("getOrder({order_id}) owner note {note}: {error}"))?
+        .map_err(|error| {
+            anyhow!(
+                "getOrder({order_id}) owner note {}: {error}",
+                display_dexdo_address(note)
+            )
+        })?
         .with_workchain();
     let owner_note = Address::parse(owner_note)
         .map_err(|error| anyhow!("expected owner note {owner_note}: {error}"))?
@@ -310,8 +435,9 @@ fn subscription_order_is_active_for_owner(
         .ok_or_else(|| anyhow!("getOrder({order_id}) has no isBuy: {order}"))?;
     if !note.eq_ignore_ascii_case(&owner_note) {
         return Err(anyhow!(
-            "getOrder({order_id}) owner {note} contradicts expected subscription owner \
-             {owner_note}: {order}"
+            "getOrder({order_id}) owner {} contradicts expected subscription owner {}: {order}",
+            display_dexdo_address(&note),
+            display_dexdo_address(&owner_note)
         ));
     }
     if !is_buy {
@@ -323,10 +449,11 @@ fn subscription_order_is_active_for_owner(
         .get("tokenContract")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("getOrder({order_id}) has no tokenContract: {order}"))?;
-    if !is_canonical_zero_address(token_contract) {
+    if !is_absent_address(token_contract) {
         return Err(anyhow!(
             "getOrder({order_id}) subscription BUY has non-zero tokenContract \
-             {token_contract}: {order}"
+             {}: {order}",
+            display_token_contract(token_contract)
         ));
     }
     let price = getter_u128(order, "price")
@@ -452,15 +579,17 @@ fn details_has_withdrawn(details: &Value) -> Option<bool> {
 fn note_withdrawn_sell_offer_message(note: &Address) -> String {
     format!(
         "seller post_offer aborted: this note has withdrawn and can no longer post sell offers -- deploy/use a \
-         fresh note, re-provision the market, and retry. note={note}; postSellOffer would revert \
-         ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true."
+         fresh note, re-provision the market, and retry. note={}; postSellOffer would revert \
+         ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true.",
+        display_dexdo_address(note)
     )
 }
 
 fn note_withdrawn_buy_message(note: &Address) -> String {
     format!(
         "buyer place aborted: this note has withdrawn and can no longer place buys (deploy/use a fresh note); \
-         the chain rejects it with ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true. note={note}"
+         the chain rejects it with ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true. note={}",
+        display_dexdo_address(note)
     )
 }
 
@@ -470,8 +599,9 @@ fn buyer_note_withdrawn_guard(note: &Address, details: Option<&Value>) -> Result
         Some(false) => Ok(()),
         None => {
             eprintln!(
-                "buyer place preflight note: PrivateNote.getDetails for note {note} did not expose \
-                 hasWithdrawn; continuing without the withdrawn-state guard"
+                "buyer place preflight note: PrivateNote.getDetails for note {} did not expose \
+                 hasWithdrawn; continuing without the withdrawn-state guard",
+                display_dexdo_address(note)
             );
             Ok(())
         }
@@ -500,7 +630,7 @@ fn seller_note_withdrawn_check(note: &Address, actual: Option<bool>) -> Shellnet
     ShellnetDoctorCheck {
         name: "seller PrivateNote withdrawn state".to_string(),
         status,
-        address: Some(note.with_workchain()),
+        address: Some(display_dexdo_address(note)),
         expected: Some("hasWithdrawn=false".to_string()),
         actual,
         message,
@@ -534,17 +664,85 @@ pub(super) fn code_hash_check(
     ShellnetDoctorCheck {
         name: name.to_string(),
         status,
-        address: address.map(|a| a.with_workchain()),
+        address: address.map(display_dexdo_address),
         expected: Some(expected),
         actual,
         message,
     }
 }
 
-fn account_id_eq(addr: &Address, account_id: &str) -> bool {
-    let addr = addr.with_workchain();
-    let addr = addr.strip_prefix("0:").unwrap_or(&addr);
-    addr.eq_ignore_ascii_case(account_id)
+// The generation checks `doctor` runs against the fixed shellnet roots and the per-model book, split
+// out so each can be driven with a chain-supplied value in a test. `live_code_hash` is the
+// `code_hash` read from the live account.
+// Every one of them is unconditional, and one `Fail` aborts `shellnet_doctor_preflight`, so the
+// constants they name gate provision/seller/buyer/`note deploy`/`note withdraw` ahead of every note
+// guard. None of them may take its expected value from a vendored `.tvc`.
+
+/// The SuperRoot generation check.
+pub(super) fn superroot_generation_check(
+    superroot: &Address,
+    live_code_hash: Option<&str>,
+) -> ShellnetDoctorCheck {
+    code_hash_check(
+        "SuperRoot code hash",
+        Some(superroot),
+        SHELLNET_SUPERROOT_CODE_HASH,
+        live_code_hash,
+    )
+}
+
+/// The RootPN generation check.
+pub(super) fn rootpn_generation_check(
+    rootpn: &Address,
+    live_code_hash: Option<&str>,
+) -> ShellnetDoctorCheck {
+    code_hash_check(
+        "RootPN code hash",
+        Some(rootpn),
+        SHELLNET_ROOTPN_V1_CODE_HASH,
+        live_code_hash,
+    )
+}
+
+/// The RootOracle generation check.
+pub(super) fn rootoracle_generation_check(
+    rootoracle: &Address,
+    live_code_hash: Option<&str>,
+) -> ShellnetDoctorCheck {
+    code_hash_check(
+        "RootOracle code hash",
+        Some(rootoracle),
+        SHELLNET_ROOTORACLE_CODE_HASH,
+        live_code_hash,
+    )
+}
+
+/// The per-model `InferenceOrderBook` generation check.
+pub(super) fn inference_orderbook_generation_check(
+    book: &Address,
+    live_code_hash: Option<&str>,
+) -> ShellnetDoctorCheck {
+    code_hash_check(
+        "InferenceOrderBook code hash",
+        Some(book),
+        SHELLNET_INFERENCE_ORDERBOOK_CODE_HASH,
+        live_code_hash,
+    )
+}
+
+/// The PrivateNote generation check `doctor` runs, split out for the same reason. `rootpn_details` is
+/// the `RootPN.getDetails()` getter result; the PrivateNote code RootPN currently mints is its
+/// `privateNoteCodeHash` field.
+/// The comparison is deliberately against `PRIVATENOTE_PINNED_CODE_HASH` -- the constant the money-path
+/// guards enforce -- and NOT against the embedded `PRIVATENOTE_TVC`, which this CLI never deploys and
+/// which is therefore no evidence about the chain.
+pub(super) fn private_note_pin_check(rootpn_details: &Value) -> ShellnetDoctorCheck {
+    code_hash_check(
+        "PrivateNote code hash (RootPN pin)",
+        None,
+        PRIVATENOTE_PINNED_CODE_HASH,
+        rootpn_details["privateNoteCodeHash"].as_str(),
+    )
 }
 
 pub(super) fn active_check(name: &str, address: &Address, active: bool) -> ShellnetDoctorCheck {
@@ -639,13 +837,14 @@ async fn fetch_chain_time_secs(http: &reqwest::Client, endpoint: &str) -> Result
     let body = json!({
         "query": "{ blockchain { blocks(last:1){ edges { node { gen_utime } } } } }"
     });
-    let response: Value = http
+    let response = http
         .post(&graphql_url)
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("POST {graphql_url} for chain time"))?
-        .error_for_status()?
+        .with_context(|| format!("POST {graphql_url} for chain time"))?;
+    let response: Value = shellnet_response_for_status(response)
+        .await?
         .json()
         .await
         .context("parse GraphQL chain-time response")?;
@@ -661,7 +860,7 @@ async fn fetch_chain_time_secs(http: &reqwest::Client, endpoint: &str) -> Result
 /// Fail closed before a signed SDK write when the operator clock is unsafe for the contracts'
 /// five-minute `expireAt` window.
 pub async fn shellnet_clock_skew_preflight(endpoint: &str) -> Result<()> {
-    let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
+    let http = shellnet_http_client()?;
     let check = clock_skew_check(
         local_unix_secs()?,
         fetch_chain_time_secs(&http, endpoint).await?,
@@ -682,6 +881,48 @@ fn dense_string_map(labels: &[String]) -> Value {
 
 fn u128_array(values: &[u128]) -> Vec<String> {
     values.iter().map(u128::to_string).collect()
+}
+
+fn private_note_pmp_exit_payload(
+    event_id: &str,
+    oracle_list_hash: &str,
+    token_type: u32,
+) -> Result<Value> {
+    Ok(json!({
+        "eventId": normalize_uint256_hex(event_id)?,
+        "oracleListHash": normalize_uint256_hex(oracle_list_hash)?,
+        "tokenType": token_type,
+    }))
+}
+
+fn oracle_withdraw_fees_payload(to: &str, amount: u128) -> Value {
+    json!({
+        "to": to,
+        "amount": amount.to_string(),
+    })
+}
+
+/// `_stakes` and `_openOrdersByEvent` use `tvm.hash(abi.encode(eventId,
+/// oracleListHash, tokenType))`. Reproduce that exact ABI 2.4 cell here instead of matching a
+/// stake by only the oracle/token suffix and risking a different event with the same pair.
+fn pmp_stake_key(event_id: &str, oracle_list_hash: &str, token_type: u32) -> Result<String> {
+    let params = [
+        tvm_abi::Param::new("eventId", tvm_abi::ParamType::Uint(256)),
+        tvm_abi::Param::new("oracleListHash", tvm_abi::ParamType::Uint(256)),
+        tvm_abi::Param::new("tokenType", tvm_abi::ParamType::Uint(32)),
+    ];
+    let values = private_note_pmp_exit_payload(event_id, oracle_list_hash, token_type)?;
+    let tokens = tvm_abi::token::Tokenizer::tokenize_all_params(&params, &values)
+        .context("encode PrivateNote PMP stake tuple")?;
+    let cell = tvm_abi::TokenValue::pack_values_into_chain(
+        &tokens,
+        Vec::new(),
+        &tvm_abi::contract::ABI_VERSION_2_4,
+    )
+    .context("pack PrivateNote PMP stake tuple")?
+    .into_cell()
+    .context("build PrivateNote PMP stake tuple cell")?;
+    Ok(format!("0x{}", cell.repr_hash().to_hex_string()))
 }
 
 fn pubkey_uint256(keys: &KeyPair) -> String {
@@ -745,6 +986,53 @@ fn value_to_uint256_hex(v: &Value) -> Option<String> {
         })
 }
 
+fn uint256_map_entry<'a>(map: &'a Value, wanted: &str) -> Option<&'a Value> {
+    if let Some(entries) = map.as_object() {
+        return entries.iter().find_map(|(key, value)| {
+            (normalize_uint256_hex(key).ok().as_deref() == Some(wanted)).then_some(value)
+        });
+    }
+    map.as_array()?.iter().find_map(|entry| {
+        if let Some(object) = entry.as_object() {
+            let key = object.get("key").or_else(|| object.get("0"))?;
+            let value = object.get("value").or_else(|| object.get("1"))?;
+            return (value_to_uint256_hex(key).as_deref() == Some(wanted)).then_some(value);
+        }
+        let pair = entry.as_array()?;
+        (pair.len() == 2 && value_to_uint256_hex(&pair[0]).as_deref() == Some(wanted))
+            .then(|| &pair[1])
+    })
+}
+
+fn uint32_map_entry(map: &Value, wanted: u32) -> Option<&Value> {
+    if let Some(entries) = map.as_object() {
+        return entries.iter().find_map(|(key, value)| {
+            (parse_u128_literal(key) == Some(u128::from(wanted))).then_some(value)
+        });
+    }
+    map.as_array()?.iter().find_map(|entry| {
+        if let Some(object) = entry.as_object() {
+            let key = object.get("key").or_else(|| object.get("0"))?;
+            let value = object.get("value").or_else(|| object.get("1"))?;
+            return (value_u128(key) == Some(u128::from(wanted))).then_some(value);
+        }
+        let pair = entry.as_array()?;
+        (pair.len() == 2 && value_u128(&pair[0]) == Some(u128::from(wanted))).then(|| &pair[1])
+    })
+}
+
+fn optional_address(value: &Value) -> Option<String> {
+    if let Some(address) = value.as_str().filter(|address| !address.trim().is_empty()) {
+        return Some(address.trim().to_string());
+    }
+    value
+        .as_object()
+        .and_then(|object| object.get("value").or_else(|| object.get("0")))
+        .and_then(Value::as_str)
+        .filter(|address| !address.trim().is_empty())
+        .map(|address| address.trim().to_string())
+}
+
 fn requested_bounds_to_uint256_hex(bounds: &[String]) -> Result<Vec<String>> {
     bounds.iter().map(|b| normalize_uint256_hex(b)).collect()
 }
@@ -784,6 +1072,37 @@ fn value_u128(v: &Value) -> Option<u128> {
     v.as_u64()
         .map(u128::from)
         .or_else(|| v.as_str().and_then(parse_u128_literal))
+}
+
+fn private_note_balance_currency(details: &Value, currency_id: u32) -> Result<u128> {
+    let balance = details
+        .get("balance")
+        .ok_or_else(|| anyhow!("PrivateNote.getDetails().balance is missing"))?;
+    let raw = balance
+        .as_object()
+        .and_then(|entries| entries.get(&currency_id.to_string()))
+        .or_else(|| {
+            balance.as_array()?.iter().find_map(|entry| {
+                let id = entry
+                    .get("currency")
+                    .or_else(|| entry.get("id"))
+                    .and_then(value_u128)?;
+                (id == u128::from(currency_id)).then(|| {
+                    entry
+                        .get("value")
+                        .or_else(|| entry.get("amount"))
+                        .unwrap_or(&Value::Null)
+                })
+            })
+        })
+        .ok_or_else(|| {
+        anyhow!(
+            "PrivateNote.getDetails().balance has no currency {currency_id}; refusing to infer a spendable balance"
+        )
+    })?;
+    value_u128(raw).ok_or_else(|| {
+        anyhow!("PrivateNote.getDetails().balance[{currency_id}] is not a uint128: {raw}")
+    })
 }
 
 fn field<'a>(value: &'a Value, camel: &str, snake: &str) -> &'a Value {
@@ -914,7 +1233,7 @@ fn event_from_getter_output<'a>(output: &'a Value, event_id: &str) -> Option<&'a
     })
 }
 
-fn oracle_event_list_storage_fields(account_boc: &str) -> Result<Value> {
+fn account_storage_fields(account_boc: &str, abi_json: &str, contract_name: &str) -> Result<Value> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(account_boc)
         .map_err(|error| anyhow!("decode account BOC base64: {error}"))?;
@@ -925,8 +1244,8 @@ fn oracle_event_list_storage_fields(account_boc: &str) -> Result<Value> {
     let data = account
         .get_data()
         .ok_or_else(|| anyhow!("active account exposes no data cell"))?;
-    let contract = tvm_abi::Contract::load(ORACLEEVENTLIST_ABI.as_bytes())
-        .map_err(|error| anyhow!("load OracleEventList ABI: {error}"))?;
+    let contract = tvm_abi::Contract::load(abi_json.as_bytes())
+        .map_err(|error| anyhow!("load {contract_name} ABI: {error}"))?;
     let tokens = contract
         .decode_storage_fields(
             tvm_types::SliceData::load_cell(data)
@@ -936,6 +1255,10 @@ fn oracle_event_list_storage_fields(account_boc: &str) -> Result<Value> {
         .map_err(|error| anyhow!("decode account storage: {error}"))?;
     tvm_abi::token::Detokenizer::detokenize_to_json_value(&tokens)
         .map_err(|error| anyhow!("detokenize account storage: {error}"))
+}
+
+fn oracle_event_list_storage_fields(account_boc: &str) -> Result<Value> {
+    account_storage_fields(account_boc, ORACLEEVENTLIST_ABI, "OracleEventList")
 }
 
 fn oracle_pmp_confirmation_is_active(
@@ -954,7 +1277,8 @@ fn oracle_pmp_confirmation_is_active(
         != Some(normalize_uint256_hex(event_id)?.as_str())
     {
         return Err(anyhow!(
-            "OracleEventList _pmpConfirmed entry for PMP {pmp} belongs to another event"
+            "OracleEventList _pmpConfirmed entry for PMP {} belongs to another event",
+            display_dexdo_address(pmp)
         ));
     }
     Ok(true)
@@ -1019,26 +1343,255 @@ fn validate_salted_pmp_identity(
     pmp_code: Option<&Value>,
 ) -> Result<()> {
     let deployer_account = deployer_account.ok_or_else(|| {
-        anyhow!("PrivateNote account {deployer} is not Active/not found (account snapshot absent)")
+        anyhow!(
+            "PrivateNote account {} is not Active/not found (account snapshot absent)",
+            display_dexdo_address(deployer)
+        )
     })?;
     if deployer_account.address != *deployer {
         return Err(anyhow!(
-            "PMP deployer account snapshot belongs to {} instead of {deployer}",
-            deployer_account.address
+            "PMP deployer account snapshot belongs to {} instead of {}",
+            display_dexdo_address(&deployer_account.address),
+            display_dexdo_address(deployer)
         ));
     }
     note_balance_private_note_account(deployer, Some(deployer_account))?;
-    let pmp_code =
-        pmp_code.ok_or_else(|| anyhow!("PrivateNote {deployer} getPMPCode unavailable"))?;
+    let pmp_code = pmp_code.ok_or_else(|| {
+        anyhow!(
+            "PrivateNote {} getPMPCode unavailable",
+            display_dexdo_address(deployer)
+        )
+    })?;
     let expected = value_to_uint256_hex(&pmp_code["pmpCodeHash"])
         .and_then(|hash| normalize_code_hash(&hash))
-        .ok_or_else(|| anyhow!("PrivateNote {deployer} getPMPCode exposes no pmpCodeHash"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "PrivateNote {} getPMPCode exposes no pmpCodeHash",
+                display_dexdo_address(deployer)
+            )
+        })?;
     let actual = actual_pmp_code_hash
         .and_then(normalize_code_hash)
-        .ok_or_else(|| anyhow!("PMP {pmp} exposes no code hash"))?;
+        .ok_or_else(|| anyhow!("PMP {} exposes no code hash", display_dexdo_address(pmp)))?;
     if actual != expected {
         return Err(anyhow!(
-            "PMP {pmp} code hash does not match PrivateNote {deployer} getPMPCode"
+            "PMP {} code hash does not match PrivateNote {} getPMPCode",
+            display_dexdo_address(pmp),
+            display_dexdo_address(deployer)
+        ));
+    }
+    Ok(())
+}
+
+fn required_deployed_contract_hash(deployed: &Deployed, contract: &str) -> Result<String> {
+    deployed
+        .contract_hashes
+        .get(contract)
+        .and_then(|hash| normalize_code_hash(hash))
+        .ok_or_else(|| anyhow!("deployed manifest exposes no valid {contract} code hash"))
+}
+
+fn active_account_code_hash(
+    contract: &str,
+    address: &Address,
+    account: &Account,
+) -> Result<String> {
+    let display_address = display_dexdo_address(address);
+    if account.address != *address {
+        return Err(anyhow!(
+            "{contract} account snapshot belongs to {} instead of {display_address}",
+            display_dexdo_address(&account.address)
+        ));
+    }
+    if !account.is_active() {
+        return Err(anyhow!("{contract} {display_address} is not Active"));
+    }
+    account
+        .code_hash
+        .as_deref()
+        .and_then(normalize_code_hash)
+        .ok_or_else(|| anyhow!("{contract} {display_address} exposes no valid code hash"))
+}
+
+fn active_account_code(
+    contract: &str,
+    address: &Address,
+    account: &Account,
+) -> Result<(String, tvm_types::Cell)> {
+    let display_address = display_dexdo_address(address);
+    let advertised_hash = active_account_code_hash(contract, address, account)?;
+    let boc = account
+        .boc
+        .as_deref()
+        .ok_or_else(|| anyhow!("{contract} {display_address} account BOC is unavailable"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(boc)
+        .with_context(|| format!("decode {contract} {display_address} account BOC base64"))?;
+    let root = tvm_types::read_single_root_boc(&bytes)
+        .with_context(|| format!("read {contract} {display_address} account BOC"))?;
+    let decoded = tvm_block::Account::construct_from_cell(root)
+        .with_context(|| format!("decode {contract} {display_address} account"))?;
+    let code = decoded
+        .get_code()
+        .ok_or_else(|| anyhow!("{contract} {display_address} active account BOC exposes no code"))?;
+    let boc_hash = code.repr_hash().to_hex_string();
+    if advertised_hash != boc_hash {
+        return Err(anyhow!(
+            "{contract} {display_address} account BOC code hash does not match its advertised code hash"
+        ));
+    }
+    Ok((advertised_hash, code))
+}
+
+fn code_salt(contract: &str, address: &Address, code: &tvm_types::Cell) -> Result<tvm_types::Cell> {
+    let display_address = display_dexdo_address(address);
+    let code_boc = tvm_types::write_boc(code)
+        .with_context(|| format!("serialize {contract} {display_address} code"))?;
+    let context = std::sync::Arc::new(
+        tvm_client::client::ClientContext::new(Default::default()).with_context(|| {
+            format!("initialize TVM code-salt decoder for {contract} {display_address}")
+        })?,
+    );
+    let result = tvm_client::boc::get_code_salt(
+        context,
+        tvm_client::boc::ParamsOfGetCodeSalt {
+            code: base64::engine::general_purpose::STANDARD.encode(code_boc),
+            boc_cache: None,
+        },
+    )
+    .with_context(|| format!("extract {contract} {display_address} code salt"))?;
+    let salt_boc = result
+        .salt
+        .ok_or_else(|| anyhow!("{contract} {display_address} code has no salt"))?;
+    let salt_bytes = base64::engine::general_purpose::STANDARD
+        .decode(salt_boc)
+        .with_context(|| format!("decode {contract} {display_address} code salt BOC base64"))?;
+    tvm_types::read_single_root_boc(&salt_bytes)
+        .with_context(|| format!("read {contract} {display_address} code salt BOC"))
+}
+
+fn validate_salted_code_from_current_base(
+    deployed: &Deployed,
+    contract: &str,
+    address: &Address,
+    actual_hash: &str,
+    actual_code: &tvm_types::Cell,
+    base_tvc: &[u8],
+) -> Result<tvm_types::Cell> {
+    let display_address = display_dexdo_address(address);
+    let expected_base_hash = required_deployed_contract_hash(deployed, contract)?;
+    let base_code =
+        code_cell(base_tvc).with_context(|| format!("load compiled {contract} code"))?;
+    let compiled_base_hash = base_code.repr_hash().to_hex_string();
+    if compiled_base_hash != expected_base_hash {
+        return Err(anyhow!(
+            "compiled {contract} base code hash does not match the deployed manifest"
+        ));
+    }
+    let salt = code_salt(contract, address, actual_code)?;
+    let reconstructed = tvm_client::boc::set_code_salt_cell(base_code, salt.clone())
+        .with_context(|| format!("apply live salt to compiled {contract} base code"))?;
+    if reconstructed.repr_hash().to_hex_string() != actual_hash
+        || reconstructed.repr_depth() != actual_code.repr_depth()
+    {
+        return Err(anyhow!(
+            "{contract} {display_address} code was not produced from the current compiled base and its live salt"
+        ));
+    }
+    Ok(salt)
+}
+
+fn decode_pmp_private_note_code(salt: tvm_types::Cell) -> Result<tvm_types::Cell> {
+    let tokens = tvm_abi::TokenValue::decode_params(
+        &[tvm_abi::Param::new(
+            "privateNoteCode",
+            tvm_abi::ParamType::Cell,
+        )],
+        tvm_types::SliceData::load_cell(salt).context("load PMP code salt")?,
+        &tvm_abi::contract::ABI_VERSION_2_4,
+        false,
+    )
+    .context("decode PMP code salt")?;
+    tokens
+        .into_iter()
+        .find_map(|token| match token.value {
+            tvm_abi::TokenValue::Cell(code) if token.name == "privateNoteCode" => Some(code),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("PMP code salt exposes no PrivateNote code"))
+}
+
+fn decode_order_book_salt(salt: tvm_types::Cell) -> Result<(tvm_types::Cell, String, u16)> {
+    let tokens = tvm_abi::TokenValue::decode_params(
+        &[
+            tvm_abi::Param::new("privateNoteCode", tvm_abi::ParamType::Cell),
+            tvm_abi::Param::new("pmpSaltedCodeHash", tvm_abi::ParamType::Uint(256)),
+            tvm_abi::Param::new("pmpSaltedCodeDepth", tvm_abi::ParamType::Uint(16)),
+        ],
+        tvm_types::SliceData::load_cell(salt).context("load OrderBook code salt")?,
+        &tvm_abi::contract::ABI_VERSION_2_4,
+        false,
+    )
+    .context("decode OrderBook code salt")?;
+    let private_note_code = tokens.iter().find_map(|token| match &token.value {
+        tvm_abi::TokenValue::Cell(code) if token.name == "privateNoteCode" => Some(code.clone()),
+        _ => None,
+    });
+    let pmp_hash = tokens.iter().find_map(|token| match &token.value {
+        tvm_abi::TokenValue::Uint(value) if token.name == "pmpSaltedCodeHash" => {
+            normalize_code_hash(&value.number.to_str_radix(16))
+        }
+        _ => None,
+    });
+    let pmp_depth = tokens.iter().find_map(|token| match &token.value {
+        tvm_abi::TokenValue::Uint(value) if token.name == "pmpSaltedCodeDepth" => {
+            value.number.to_string().parse::<u16>().ok()
+        }
+        _ => None,
+    });
+    Ok((
+        private_note_code
+            .ok_or_else(|| anyhow!("OrderBook code salt exposes no PrivateNote code"))?,
+        pmp_hash.ok_or_else(|| anyhow!("OrderBook code salt exposes no PMP code hash"))?,
+        pmp_depth.ok_or_else(|| anyhow!("OrderBook code salt exposes no PMP code depth"))?,
+    ))
+}
+
+fn validate_private_note_generation(
+    deployed: &Deployed,
+    container: &str,
+    private_note_code: &tvm_types::Cell,
+) -> Result<String> {
+    let expected = required_deployed_contract_hash(deployed, "PrivateNote")?;
+    let actual = private_note_code.repr_hash().to_hex_string();
+    if actual != expected {
+        return Err(anyhow!(
+            "{container} code salt embeds a different PrivateNote generation"
+        ));
+    }
+    Ok(actual)
+}
+
+fn getter_code_hash(details: &Value, field: &str) -> Option<String> {
+    value_to_uint256_hex(&details[field]).and_then(|hash| normalize_code_hash(&hash))
+}
+
+fn validate_order_book_market_identity(pmp: &Value, order_book: &Value) -> Result<()> {
+    let pmp_event = value_to_uint256_hex(&pmp["eventId"])
+        .ok_or_else(|| anyhow!("PMP getDetails exposes no eventId"))?;
+    let book_event = value_to_uint256_hex(&order_book["eventId"])
+        .ok_or_else(|| anyhow!("OrderBook getDetails exposes no eventId"))?;
+    let pmp_oracles = value_to_uint256_hex(&pmp["oracleListHash"])
+        .ok_or_else(|| anyhow!("PMP getDetails exposes no oracleListHash"))?;
+    let book_oracles = value_to_uint256_hex(&order_book["oracleListHash"])
+        .ok_or_else(|| anyhow!("OrderBook getDetails exposes no oracleListHash"))?;
+    if pmp_event != book_event
+        || pmp_oracles != book_oracles
+        || getter_u128(pmp, "tokenType") != getter_u128(order_book, "tokenType")
+        || getter_u128(pmp, "tokenType").is_none()
+    {
+        return Err(anyhow!(
+            "OrderBook getDetails market identity does not match its PMP"
         ));
     }
     Ok(())
@@ -1348,6 +1901,9 @@ mod oracle_getter_tests {
 /// `TokenContract`(per-deal) are derived/discovered on the fly, so they are not pinned here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Deployed {
+    /// Contract generation declared by the deployment manifest.
+    #[serde(default)]
+    pub version: Option<String>,
     /// Network label(for shellnet, `"shellnet"`).
     pub network: String,
     /// `SuperRoot` airegistry -- the derivation point for `RootModel`/`InferenceOrderBook`.
@@ -1369,6 +1925,124 @@ impl Deployed {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Checks that the supplied manifest describes the generation read from shellnet and carries
+    /// the canonical pin set embedded in this binary.
+    pub fn validate(&self, live_versions: &[(String, String)]) -> Vec<ShellnetDoctorCheck> {
+        let live_generations = live_versions
+            .iter()
+            .filter_map(|(_, version)| version.split_whitespace().next())
+            .filter(|generation| !generation.is_empty())
+            .collect::<BTreeSet<_>>();
+        let chain_generation = live_generations
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        let manifest_generation = self
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|generation| !generation.is_empty());
+        let generation_matches = live_generations.len() == 1
+            && manifest_generation.is_some_and(|generation| generation == chain_generation);
+        let generation_message = match (manifest_generation, live_generations.len()) {
+            (Some(manifest), 1) if generation_matches => {
+                format!("deployed manifest and live chain both report generation {manifest}")
+            }
+            (Some(manifest), 1) => format!(
+                "deployed manifest generation {manifest} does not match live chain generation {chain_generation}"
+            ),
+            (None, 1) => format!(
+                "deployed manifest has no generation, while the live chain reports {chain_generation}"
+            ),
+            (Some(manifest), 0) => format!(
+                "live chain exposed no contract generation to compare with deployed manifest generation {manifest}"
+            ),
+            (None, 0) => {
+                "deployed manifest has no generation and the live chain exposed none".to_string()
+            }
+            (Some(manifest), _) => format!(
+                "live contracts report multiple generations ({chain_generation}); deployed manifest reports {manifest}"
+            ),
+            (None, _) => format!(
+                "live contracts report multiple generations ({chain_generation}); deployed manifest has no generation"
+            ),
+        };
+        let mut checks = vec![ShellnetDoctorCheck {
+            name: "deployed manifest generation".to_string(),
+            status: if generation_matches {
+                ShellnetDoctorStatus::Pass
+            } else {
+                ShellnetDoctorStatus::Fail
+            },
+            address: None,
+            expected: Some(format!(
+                "chain={}",
+                if chain_generation.is_empty() {
+                    "<missing>"
+                } else {
+                    &chain_generation
+                }
+            )),
+            actual: Some(format!(
+                "manifest={}",
+                manifest_generation.unwrap_or("<missing>")
+            )),
+            message: generation_message,
+        }];
+
+        let canonical: Deployed =
+            serde_json::from_str(include_str!("../../../../contracts/deployed.shellnet.json"))
+                .expect("embedded deployed.shellnet.json must deserialize");
+        checks.extend(
+            canonical
+                .contract_hashes
+                .iter()
+                .filter(|(name, _)| !name.starts_with('_'))
+                .map(|(name, expected)| {
+                    deployed_manifest_pin_check(
+                        name,
+                        expected,
+                        self.contract_hashes.get(name).map(String::as_str),
+                    )
+                }),
+        );
+        checks
+    }
+}
+
+fn deployed_manifest_pin_check(
+    name: &str,
+    expected: &str,
+    actual: Option<&str>,
+) -> ShellnetDoctorCheck {
+    let expected = normalize_code_hash(expected).unwrap_or_else(|| expected.trim().to_string());
+    let normalized_actual = actual.and_then(normalize_code_hash);
+    let matches = normalized_actual.as_deref() == Some(expected.as_str());
+    let actual_display = normalized_actual
+        .as_deref()
+        .or(actual)
+        .unwrap_or("<missing>");
+    let message = if matches {
+        format!("deployed manifest {name} pin matches this binary's canonical manifest")
+    } else {
+        format!(
+            "deployed manifest {name} pin is stale, missing, or malformed: manifest={actual_display}, binary={expected}"
+        )
+    };
+    ShellnetDoctorCheck {
+        name: format!("deployed manifest {name} pin"),
+        status: if matches {
+            ShellnetDoctorStatus::Pass
+        } else {
+            ShellnetDoctorStatus::Fail
+        },
+        address: None,
+        expected: Some(format!("binary={expected}")),
+        actual: Some(format!("manifest={actual_display}")),
+        message,
     }
 }
 
@@ -1402,13 +2076,329 @@ pub fn resolve_endpoint(explicit: Option<&str>, manifest: &Deployed) -> anyhow::
     )
 }
 
+fn ai_registry_config_from_manifest(manifest: &Deployed) -> anyhow::Result<AiRegistryConfig> {
+    match manifest.network.as_str() {
+        "shellnet" => Ok(AiRegistryConfig::shellnet()),
+        "mainnet" => Ok(AiRegistryConfig::mainnet()),
+        "" => anyhow::bail!(
+            "deployed manifest field `network` is empty; no SDK network profile can be selected"
+        ),
+        network => anyhow::bail!(
+            "deployed manifest field `network` names unsupported profile `{network}`; no SDK configuration is available"
+        ),
+    }
+}
+
+fn connect_client_from_manifest_with<T>(
+    manifest_path: impl AsRef<Path>,
+    endpoint_override: Option<&str>,
+    connect: impl FnOnce(&str, AiRegistryConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<(Deployed, T)> {
+    let deployed = Deployed::load(manifest_path)?;
+    let config = ai_registry_config_from_manifest(&deployed)?;
+    let endpoint = resolve_endpoint(endpoint_override, &deployed)?;
+    let client = connect(&endpoint, config)?;
+    Ok((deployed, client))
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReadFailureFacts {
+    status: Option<reqwest::StatusCode>,
+    edge_client_signature_ban: bool,
+    connect: bool,
+    timeout: bool,
+    body: bool,
+    decode: bool,
+}
+
+impl ReadFailureFacts {
+    fn status(status: reqwest::StatusCode) -> Self {
+        Self {
+            status: Some(status),
+            edge_client_signature_ban: false,
+            connect: false,
+            timeout: false,
+            body: false,
+            decode: false,
+        }
+    }
+
+    fn reqwest(error: &reqwest::Error) -> Self {
+        Self {
+            status: error.status(),
+            edge_client_signature_ban: false,
+            connect: error.is_connect(),
+            timeout: error.is_timeout(),
+            body: error.is_body(),
+            decode: error.is_decode(),
+        }
+    }
+}
+
+/// A non-success response whose 403 discriminator survived body consumption.
+#[derive(Debug)]
+pub(super) struct ShellnetHttpResponseError {
+    url: String,
+    cf_ray: bool,
+    error_code_1010: bool,
+    retry_after_seconds: Option<u64>,
+    body_read_error: Option<reqwest::Error>,
+}
+
+fn content_type_is_plain_text(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/plain"))
+}
+
+impl ShellnetHttpResponseError {
+    pub(super) fn forbidden(
+        url: impl Into<String>,
+        headers: &reqwest::header::HeaderMap,
+        body: &str,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            cf_ray: headers.contains_key("cf-ray"),
+            error_code_1010: content_type_is_plain_text(headers)
+                && body.to_ascii_lowercase().contains("error code: 1010"),
+            retry_after_seconds: headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+            body_read_error: None,
+        }
+    }
+
+    fn facts(&self) -> ReadFailureFacts {
+        let mut facts = ReadFailureFacts::status(reqwest::StatusCode::FORBIDDEN);
+        facts.edge_client_signature_ban = self.error_code_1010;
+        facts
+    }
+}
+
+impl std::fmt::Display for ShellnetHttpResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.error_code_1010 {
+            let evidence = if self.cf_ray {
+                "Cloudflare error code 1010; cf-ray header present"
+            } else {
+                "Cloudflare error code 1010"
+            };
+            write!(
+                f,
+                "shellnet HTTP 403 from {}: this client's HTTP signature is banned at the \
+                 Cloudflare edge ({evidence}); use a different HTTP client, not a longer retry",
+                self.url
+            )
+        } else {
+            write!(f, "shellnet HTTP 403 Forbidden for {}", self.url)
+        }
+    }
+}
+
+impl std::error::Error for ShellnetHttpResponseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.body_read_error
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
+async fn shellnet_response_for_status(
+    response: reqwest::Response,
+) -> Result<reqwest::Response> {
+    if response.status() != reqwest::StatusCode::FORBIDDEN {
+        return Ok(response.error_for_status()?);
+    }
+
+    let url = response.url().to_string();
+    let headers = response.headers().clone();
+    let (body, body_read_error) = if content_type_is_plain_text(&headers) {
+        match response.text().await {
+            Ok(body) => (body, None),
+            Err(error) => (String::new(), Some(error)),
+        }
+    } else {
+        (String::new(), None)
+    };
+    let mut error = ShellnetHttpResponseError::forbidden(url, &headers, &body);
+    error.body_read_error = body_read_error;
+    Err(anyhow::Error::new(error))
+}
+
+/// The one retry decision for shellnet transport failures.
+fn read_failure_is_transient(facts: ReadFailureFacts) -> bool {
+    !facts.edge_client_signature_ban
+        && (facts.connect
+            || facts.timeout
+            || facts.body
+            || facts.decode
+            || facts.status.is_some_and(|status| {
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::FORBIDDEN
+                    || status.is_server_error()
+            }))
+}
+
+/// Compatibility wrapper for status-only callers and tests. The decision remains above.
+#[cfg(test)]
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    read_failure_is_transient(ReadFailureFacts::status(status))
+}
+
+pub(super) fn reqwest_error_is_transient(error: &reqwest::Error) -> bool {
+    read_failure_is_transient(ReadFailureFacts::reqwest(error))
+}
+
+pub(super) fn is_transient_transport_failure(error: &anyhow::Error) -> bool {
+    if let Some(response) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ShellnetHttpResponseError>())
+    {
+        return read_failure_is_transient(response.facts());
+    }
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest_error_is_transient)
+    })
+}
+
+/// What the server asked us to wait, when it asked. Honouring it is the difference between backing
+/// off and making the limit worse; ignoring a stated `Retry-After` and retrying on our own schedule
+/// is what turns one rate-limited read into five.
+fn retry_after_delay(error: &anyhow::Error) -> Option<std::time::Duration> {
+    let seconds: u64 = error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<RetryAfter>()
+                .map(|retry_after| retry_after.seconds)
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<ShellnetHttpResponseError>()
+                        .and_then(|response| response.retry_after_seconds)
+                })
+        })?;
+    let asked = std::time::Duration::from_secs(seconds);
+    (asked <= crate::params::TRANSIENT_READ_MAX_RETRY_AFTER).then_some(asked)
+}
+
+/// A `Retry-After` seen on a rate-limited response, carried in the error chain so the retry loop
+/// can read it without re-issuing the request.
+#[derive(Debug)]
+pub struct RetryAfter {
+    pub seconds: u64,
+}
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server asked to retry after {}s", self.seconds)
+    }
+}
+
+impl std::error::Error for RetryAfter {}
+
+/// Chain reads, retried when they got no answer.
+/// One policy for every read, whichever way it leaves the process -- the SDK's getter, our own
+/// `reqwest` client for event pages and chain time, or the liveness probe. Keeping them separate is
+/// how the first version of this missed `dexdo doctor`: it went out through a path the wrapper did
+/// not cover, and a run stopped on exactly the failure the fix was written for.
+/// Bounded twice, because the SDK's HTTP client carries no timeout of its own: each attempt has a
+/// ceiling, and the whole call has a budget. Without both, a server that accepts and never answers
+/// keeps attempt one alive forever and attempt two never happens.
+/// Retrying a read is safe because it is a read: nothing was submitted, so nothing can be submitted
+/// twice. That is why this wraps reads and not the calls that move money.
+pub async fn retry_transient_read<T, F, Fut>(mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let started = tokio::time::Instant::now();
+    let budget = crate::params::TRANSIENT_READ_TOTAL_BUDGET;
+    let mut delay = crate::params::TRANSIENT_READ_INITIAL_BACKOFF;
+
+    for attempt in 1..=crate::params::TRANSIENT_READ_ATTEMPTS {
+        let attempt_result = tokio::time::timeout(
+            crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT,
+            call(),
+        )
+        .await;
+        let error = match attempt_result {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                if !is_transient_transport_failure(&error) {
+                    return Err(error);
+                }
+                error
+            }
+            Err(_) => anyhow::anyhow!(
+                "chain read exceeded {:?} on attempt {attempt}",
+                crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT
+            ),
+        };
+
+        let wait = retry_after_delay(&error).unwrap_or(delay);
+        let spent = started.elapsed();
+        if attempt == crate::params::TRANSIENT_READ_ATTEMPTS || spent + wait >= budget {
+            return Err(error.context(format!(
+                "{}{attempt} attempt(s) in {spent:?}",
+                crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX
+            )));
+        }
+        tokio::time::sleep(wait).await;
+        delay = (delay * 2).min(crate::params::TRANSIENT_READ_MAX_BACKOFF);
+    }
+    unreachable!("the loop returns on the last attempt")
+}
+
+/// Chain reads that repeat when they got no answer. See [`retry_transient_read`] for the policy
+/// and for why a read may be repeated at all.
+#[allow(async_fn_in_trait)]
+pub trait RetryingReads {
+    async fn run_getter_retrying(
+        &self,
+        address: &Address,
+        abi: &str,
+        method: &str,
+        args: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>>;
+
+    async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>>;
+
+    async fn chain_liveness_retrying(&self) -> Result<ChainLiveness>;
+}
+
+impl RetryingReads for ChainClient {
+    async fn run_getter_retrying(
+        &self,
+        address: &Address,
+        abi: &str,
+        method: &str,
+        args: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        retry_transient_read(|| self.run_getter(address, abi, method, args.clone())).await
+    }
+
+    async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
+        retry_transient_read(|| self.get_account(address)).await
+    }
+
+    async fn chain_liveness_retrying(&self) -> Result<ChainLiveness> {
+        retry_transient_read(|| self.chain_liveness()).await
+    }
+}
+
 /// Real on-chain backend on top of `gosh.ackinacki` `ChainClient`.
 /// Carries a live connection to shellnet and the root addresses from the manifest.
 pub struct RealChainBackend {
     client: ChainClient,
-    /// Browser-UA http client for reads, with reqwest's default redirect behavior.
+    /// `DEXDO_USER_AGENT` http client for reads, with reqwest's default redirect behavior.
     pub(super) http: reqwest::Client,
-    /// Browser-UA client used only for one-shot money POSTs to `/v2/messages`.
+    /// `DEXDO_USER_AGENT` client used only for one-shot money POSTs to `/v2/messages`.
     money_post_http: reqwest::Client,
     superroot: Address,
     deployed: Deployed,
@@ -1446,7 +2436,7 @@ struct LiveDealSnapshotSource<'a> {
 #[async_trait::async_trait]
 impl DealSnapshotSource for LiveDealSnapshotSource<'_> {
     async fn account_identity(&mut self) -> Result<Option<DealAccountIdentity>> {
-        let Some(account) = self.chain.client.get_account(self.token_contract).await? else {
+        let Some(account) = self.chain.client.get_account_retrying(self.token_contract).await? else {
             return Ok(None);
         };
         if !account.is_active() {
@@ -1598,12 +2588,10 @@ mod coherent_deal_snapshot_tests {
                 deposit: 100 + u128::from(generation),
                 finalized_owed: 3,
                 tokens_final: 10,
-                tokens_superseded: 20,
                 tokens_pending: 30,
                 probe_tick: 2,
                 funded_time: Some(70),
                 probe_time: 40,
-                prev_claim_time: 50,
                 last_claim_time: 60,
                 dispute_time: 0,
             }
@@ -1827,7 +2815,7 @@ mod coherent_deal_snapshot_tests {
         cases.push((
             "subscription required bonds differ",
             snapshot,
-            "bondRequired mismatch",
+            "is not the shape getBuyerBond() can report",
         ));
 
         let mut snapshot = valid.clone();
@@ -1837,9 +2825,9 @@ mod coherent_deal_snapshot_tests {
             bond_required: 1,
         };
         cases.push((
-            "ordinary deal exposes buyer bond",
+            "ordinary deal reports a non-zero buyer requirement",
             snapshot,
-            "ordinary-deal shape",
+            "is not the shape getBuyerBond() can report",
         ));
 
         let mut snapshot = valid;
@@ -2104,9 +3092,21 @@ fn fund_deploy_shell_receipt_error(
     }
 }
 
+/// The single place `DEXDO_USER_AGENT` is attached to an outgoing client. Every http client that
+/// talks to the shellnet edge is built from this - a header set in N places is a header the N+1th
+/// site will not set, and the edge 403s a request that arrives without one.
+pub(super) fn shellnet_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(DEXDO_USER_AGENT)
+}
+
+/// An http client for the shellnet edge, carrying our identifier. Callers outside this crate must
+/// use this instead of `reqwest::Client::new()`, which sends no `User-Agent` at all.
+pub fn shellnet_http_client() -> reqwest::Result<reqwest::Client> {
+    shellnet_http_builder().build()
+}
+
 fn build_money_post_http_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(BROWSER_UA)
+    shellnet_http_builder()
         .redirect(reqwest::redirect::Policy::none())
         // A signed BOC expires after this existing SDK window. Do not let a lost HTTP response
         // hold the caller forever; the settlement path reconciles the possibly-landed BOC from
@@ -2163,7 +3163,7 @@ pub(super) async fn send_message_routed_checked(
             response.status()
         ));
     }
-    let response = response.error_for_status()?;
+    let response = shellnet_response_for_status(response).await?;
     let status = response.status();
     let resp = response
         .json::<Value>()
@@ -2226,6 +3226,43 @@ fn is_queue_overflow_submit(error: &anyhow::Error) -> bool {
         || message.contains("message queue is full")
 }
 
+fn is_transient_submit_failure(error: &anyhow::Error) -> bool {
+    is_queue_overflow_submit(error) || is_transient_transport_failure(error)
+}
+
+fn is_decoded_transient_money_rejection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MoneySubmitError>())
+        .is_some_and(|outcome| matches!(outcome, MoneySubmitError::Rejected { .. }))
+        && is_transient_submit_failure(error)
+}
+
+async fn retry_buyer_money_submit(
+    http: &reqwest::Client,
+    endpoint: &str,
+    boc_base64: &str,
+    account_id: &str,
+    dapp_id: &str,
+) -> Result<Value> {
+    let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
+    for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
+        match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_decoded_transient_money_rejection(&error) => {
+                eprintln!(
+                    "shellnet transient submit error (attempt {attempt}): {error}; waiting {delay:?} then retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * crate::params::TRANSIENT_SUBMIT_BACKOFF_MULTIPLIER)
+                    .min(crate::params::TRANSIENT_SUBMIT_MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await
+}
+
 /// Submit an explicit buyer STOP exactly once. A decoded queue-overflow response is still
 /// outcome-ambiguous for this non-idempotent signed message and must never trigger a fresh POST.
 async fn send_explicit_stop_money_once(
@@ -2271,7 +3308,7 @@ async fn query_exact_destination_receipt(
     expected_message_hash: &str,
 ) -> Result<Value> {
     let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-    let response: Value = http
+    let response = http
         .post(&gql)
         .json(&json!({
             "query": EXACT_MESSAGE_RECEIPT_QUERY,
@@ -2282,8 +3319,9 @@ async fn query_exact_destination_receipt(
             },
         }))
         .send()
+        .await?;
+    let response: Value = shellnet_response_for_status(response)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     Ok(response)
@@ -2564,6 +3602,248 @@ pub(super) struct ExtOutPage {
     pub previous_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenContractParties {
+    buyer: String,
+    seller_note: String,
+}
+
+/// One `PrivateNote.getOutstanding().deals` address that the named `TokenContract` independently
+/// confirms as currently funded and belonging to this note.
+/// This remains a lead, not a complete recovery result: the note's best-effort fill callback can
+/// fail before recording a real deal, and its best-effort close callback can leave a destroyed
+/// address recorded until `touchDeal` clears it. Callers must preserve those caveats when exposing
+/// this value to an operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutstandingDealLead {
+    pub token_contract: String,
+    pub role: DealRole,
+    pub state: DealChainState,
+}
+
+/// One address named by `getOutstanding` that its `TokenContract` did not independently confirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutstandingDealLeadRefusal {
+    pub token_contract: String,
+    pub reason: String,
+}
+
+/// Read-only diagnostic result for one note's `getOutstanding` mirror.
+/// `deal_leads` contains only independently confirmed current facts. `opaque_order_count` is a
+/// count on purpose: the getter returns hashes that cannot recover `(modelHash, orderId)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivateNoteOutstandingReport {
+    pub deal_leads: Vec<OutstandingDealLead>,
+    pub refused_deal_leads: Vec<OutstandingDealLeadRefusal>,
+    pub opaque_order_count: usize,
+}
+
+fn outstanding_deal_refusal(
+    token_contract: &str,
+    reason: impl Into<String>,
+) -> OutstandingDealLeadRefusal {
+    OutstandingDealLeadRefusal {
+        token_contract: token_contract.to_string(),
+        reason: reason.into(),
+    }
+}
+
+fn classify_outstanding_deal_lead(
+    note: &str,
+    token_contract: &str,
+    parties: Option<&TokenContractParties>,
+    state: Option<&DealChainState>,
+) -> std::result::Result<OutstandingDealLead, OutstandingDealLeadRefusal> {
+    let Some(parties) = parties else {
+        return Err(outstanding_deal_refusal(
+            token_contract,
+            "TokenContract.getParties returned no data; the address is absent or destroyed",
+        ));
+    };
+    let Some(state) = state else {
+        return Err(outstanding_deal_refusal(
+            token_contract,
+            "TokenContract.getState returned no data; the address is absent or destroyed",
+        ));
+    };
+    if !state.funded {
+        return Err(outstanding_deal_refusal(
+            token_contract,
+            "TokenContract.getState reports funded=false",
+        ));
+    }
+    if state.is_stopped() {
+        return Err(outstanding_deal_refusal(
+            token_contract,
+            "TokenContract.getState reports a terminal stopped deal",
+        ));
+    }
+    let role = if parties.buyer.eq_ignore_ascii_case(note) {
+        DealRole::Buyer
+    } else if parties.seller_note.eq_ignore_ascii_case(note) {
+        DealRole::Seller
+    } else {
+        return Err(outstanding_deal_refusal(
+            token_contract,
+            format!(
+                "TokenContract.getParties names buyer {} and seller note {}, not queried note {note}",
+                parties.buyer, parties.seller_note
+            ),
+        ));
+    };
+    Ok(OutstandingDealLead {
+        token_contract: token_contract.to_string(),
+        role,
+        state: *state,
+    })
+}
+
+fn decode_private_note_outstanding(value: &Value) -> Result<(Vec<Address>, usize)> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("PrivateNote.getOutstanding() returned a non-object: {value}"))?;
+    if object.len() != 2 || !object.contains_key("deals") || !object.contains_key("orders") {
+        return Err(anyhow!(
+            "PrivateNote.getOutstanding() must return exactly deals and orders: {value}"
+        ));
+    }
+    let raw_deals = object["deals"]
+        .as_array()
+        .ok_or_else(|| anyhow!("PrivateNote.getOutstanding().deals is not address[]"))?;
+    let raw_orders = object["orders"]
+        .as_array()
+        .ok_or_else(|| anyhow!("PrivateNote.getOutstanding().orders is not uint256[]"))?;
+    for (index, order) in raw_orders.iter().enumerate() {
+        if value_to_uint256_hex(order).is_none() {
+            return Err(anyhow!(
+                "PrivateNote.getOutstanding().orders[{index}] is not uint256: {order}"
+            ));
+        }
+    }
+    let mut deals = raw_deals
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let raw = value.as_str().ok_or_else(|| {
+                anyhow!(
+                    "PrivateNote.getOutstanding().deals[{index}] is not an address string: {value}"
+                )
+            })?;
+            Address::parse(raw).with_context(|| {
+                format!("PrivateNote.getOutstanding().deals[{index}] address {raw}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    deals.sort_by_key(Address::with_workchain);
+    deals.dedup_by(|left, right| {
+        left.with_workchain()
+            .eq_ignore_ascii_case(&right.with_workchain())
+    });
+    Ok((deals, raw_orders.len()))
+}
+
+/// One `InferenceFilled` the book really emitted whose named `sellerTC` did not confirm it.
+/// A refusal is evidence, not noise. The book emits `InferenceFilled` in the match transaction
+/// itself, so its existence is a fact about this note regardless of what happened afterwards. An
+/// operator shown only an empty candidate list cannot tell "the book never named my note" from "the
+/// book named it and that deal is already settled or was unwound" -- the two call for opposite
+/// actions, and only one of them means there is nothing to look for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookFillCandidateRefusal {
+    /// The whole decoded fill, not just the address that failed.
+    /// is about identities the client threw away, so a refusal keeps all of them: an operator
+    /// whose deal is already settled still needs `sellerNote` and the order ids to reconcile it, and
+    /// discarding them here would reintroduce the same loss one layer up.
+    pub candidate: BookFillCandidate,
+    /// What the TokenContract said, in its own terms, that stopped this fill being offered.
+    pub reason: String,
+}
+
+/// Every `InferenceFilled` the book emitted for one buyer note, split by what its `sellerTC` says now.
+/// `candidates` are the fills whose TokenContract still names both parties and reports
+/// `funded=true`; `refusals` are the fills it does not, each with the reason it was withheld.
+/// Neither list is a recovery: a candidate can settle after this read, and an empty report is not
+/// proof no deal exists, because it can only report the ext-out history the node still serves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BookFillCandidateReport {
+    pub candidates: Vec<BookFillCandidate>,
+    pub refusals: Vec<BookFillCandidateRefusal>,
+}
+
+impl BookFillCandidateReport {
+    /// How many `InferenceFilled` events named this note at all, confirmed or refused.
+    /// This is the figure that separates "the book never named you" from "the book named you and
+    /// nothing survives verification", which a length check on `candidates` alone cannot do.
+    pub fn fills_named(&self) -> usize {
+        self.candidates.len() + self.refusals.len()
+    }
+}
+
+/// Why the named `TokenContract` does not confirm this fill, or `None` when it does.
+/// This is the single place the verification decision is made; the yes/no predicate below is this
+/// function with the reason discarded, so the two can never drift apart.
+fn book_fill_candidate_refusal_reason(
+    candidate: &BookFillCandidate,
+    requested_buyer_note: &str,
+    parties: Option<&TokenContractParties>,
+    state: Option<&DealChainState>,
+) -> Option<String> {
+    let Some(parties) = parties else {
+        return Some(
+            "TokenContract.getParties returned no data; the address is absent or destroyed"
+                .to_string(),
+        );
+    };
+    let Some(state) = state else {
+        return Some(
+            "TokenContract.getState returned no data; the address is absent or destroyed"
+                .to_string(),
+        );
+    };
+    if !state.funded {
+        return Some("TokenContract.getState reports funded=false".to_string());
+    }
+    if !candidate
+        .buyer_note
+        .eq_ignore_ascii_case(requested_buyer_note)
+    {
+        return Some(format!(
+            "InferenceFilled names buyer note {}, not queried note {requested_buyer_note}",
+            candidate.buyer_note
+        ));
+    }
+    if !parties.buyer.eq_ignore_ascii_case(requested_buyer_note) {
+        return Some(format!(
+            "TokenContract.getParties names buyer {}, not queried note {requested_buyer_note}",
+            parties.buyer
+        ));
+    }
+    if !parties
+        .seller_note
+        .eq_ignore_ascii_case(&candidate.seller_note)
+    {
+        return Some(format!(
+            "TokenContract.getParties names seller note {}, but InferenceFilled named {}",
+            parties.seller_note, candidate.seller_note
+        ));
+    }
+    None
+}
+
+/// The classifier above as a yes/no, for the tests that assert the decision rather than its wording.
+/// Production reads the reason, so this has no caller outside tests; it stays because it is what
+/// the existing verification test exercises, and routing it through the same classifier keeps that
+/// test asserting the shipped decision instead of a second copy of it.
+#[cfg(test)]
+fn book_fill_candidate_is_verified(
+    candidate: &BookFillCandidate,
+    requested_buyer_note: &str,
+    parties: Option<&TokenContractParties>,
+    state: Option<&DealChainState>,
+) -> bool {
+    book_fill_candidate_refusal_reason(candidate, requested_buyer_note, parties, state).is_none()
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct SellerOfferEvents {
     pub placed_order_id: Option<u128>,
@@ -2583,6 +3863,122 @@ pub struct PlaceInferenceBuyReceipt {
     pub escrow: u128,
 }
 
+/// The call a `TokenContract` executed in the transaction that emitted one of its settlement
+/// receipts, decoded from that transaction's internal inbound message. This is what distinguishes
+/// the buyer's `stop()` from the seller's `sellerStop()`, which share one `StreamStopped` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenContractInboundCall {
+    /// Message id of the internal message that carried the call.
+    pub message_id: String,
+    /// Sender of that internal message: `msg.sender` as the contract's own guard saw it.
+    pub source: String,
+    /// `TokenContract` ABI function the message body decodes to.
+    pub function: String,
+}
+
+impl TokenContractInboundCall {
+    pub(super) fn is_buyer_stop_from(&self, buyer_note: &Address) -> bool {
+        self.function == "stop"
+            && normalize_addr(&self.source).is_ok_and(|source| {
+                source.eq_ignore_ascii_case(&buyer_note.with_workchain())
+            })
+    }
+}
+
+/// One buyer STOP receipt together with the exact external message the client submitted for this
+/// invocation. The external identity is retained until it can be bound through the PrivateNote
+/// transaction to the internal `TokenContract.stop` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedBuyerStopReceipt {
+    pub receipt: SettlementActionReceipt,
+    pub client_message_id: String,
+}
+
+const SUBMITTED_BUYER_STOP_QUERY: &str = r#"
+    query($hash: String!) {
+      blockchain {
+        message(hash: $hash) {
+          id dst
+          dst_transaction {
+            status aborted
+            out_msgs
+          }
+        }
+      }
+    }
+"#;
+
+pub(super) fn parse_submitted_buyer_stop_out_message_ids(
+    response: &Value,
+    expected_client_message_id: &str,
+    buyer_note: &str,
+) -> Result<Option<Vec<String>>> {
+    let message = response
+        .pointer("/data/blockchain/message")
+        .ok_or_else(|| anyhow!("submitted buyer STOP GraphQL response shape changed"))?;
+    if message.is_null() {
+        return Ok(None);
+    }
+    let observed_client_message_id = message["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("submitted buyer STOP external message has no id"))?;
+    if bare_hex(observed_client_message_id) != bare_hex(expected_client_message_id) {
+        return Err(anyhow!(
+            "submitted buyer STOP exact-hash lookup returned mismatched message id"
+        ));
+    }
+    let destination = message["dst"]
+        .as_str()
+        .ok_or_else(|| anyhow!("submitted buyer STOP external message has no destination"))?;
+    if bare_hex(destination) != bare_hex(buyer_note) {
+        return Err(anyhow!(
+            "submitted buyer STOP external message targeted {destination}, expected buyer note {buyer_note}"
+        ));
+    }
+
+    let transaction = &message["dst_transaction"];
+    if transaction.is_null() {
+        return Ok(None);
+    }
+    let finalized = transaction["status"].as_i64() == Some(3)
+        || transaction["status"].as_str() == Some("Finalized");
+    if !finalized {
+        return Ok(None);
+    }
+    if transaction["aborted"].as_bool() != Some(false) {
+        return Err(anyhow!(
+            "submitted buyer STOP external message did not produce a successful PrivateNote transaction"
+        ));
+    }
+    let out_messages = transaction["out_msgs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("submitted buyer STOP PrivateNote transaction has no out_msgs"))?;
+    let message_ids = out_messages
+        .iter()
+        .map(|message_id| {
+            let message_id = message_id.as_str().ok_or_else(|| {
+                anyhow!("submitted buyer STOP PrivateNote transaction has a malformed out_msg id")
+            })?;
+            if message_id.is_empty() {
+                return Err(anyhow!(
+                    "submitted buyer STOP PrivateNote transaction has an empty out_msg id"
+                ));
+            }
+            Ok(message_id.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(message_ids))
+}
+
+/// Destination identity recovered from one ABI-decoded RootPN `TokensWithdrawn` event body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokensWithdrawnEvent {
+    /// Destination account in the contract ABI's workchain form(`0:<account_id>`).
+    pub to: String,
+    /// Destination DApp as one lowercase, zero-padded 256-bit hex component.
+    pub dapp_id: String,
+}
+
 /// One ordered lifecycle/settlement event emitted by a `TokenContract`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenContractSettlementReceipt {
@@ -2595,6 +3991,10 @@ pub struct TokenContractSettlementReceipt {
 /// Exact ABI payload of a known `TokenContract` lifecycle/settlement event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenContractSettlementEvent {
+    ContractDeployed { token_contract: String },
+    StreamFunded { buyer: String, deposit: u128 },
+    SellerBondFunded { amount: u128 },
+    StreamOpened { buyer: String, price_per_tick: u128 },
     ProbeAccepted {
         buyer: String,
         to_seller: u128,
@@ -2628,12 +4028,34 @@ pub enum TokenContractSettlementEvent {
         refund_to_buyer: u128,
         released: bool,
     },
+    StreamReclaimed { buyer: String, refund_to_buyer: u128 },
+    ShellWithdrawn { recipient: String, amount: u128 },
+    ContractDestroyed { token_contract: String },
 }
 
 /// Ordered lifecycle and settlement receipts emitted by one `TokenContract`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenContractSettlementReceipts {
     pub events: Vec<TokenContractSettlementReceipt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenContractCurrentFacts {
+    pub state: Value,
+    pub fees: Value,
+    pub deal: Value,
+    pub parties: Value,
+    pub seller: Value,
+    pub version: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenContractReceiptChainData {
+    pub account_id: String,
+    pub account_active: bool,
+    pub code_hash: Option<String>,
+    pub current: Option<TokenContractCurrentFacts>,
+    pub receipts: TokenContractSettlementReceipts,
 }
 
 pub(super) async fn fetch_ext_out_page(
@@ -2657,7 +4079,7 @@ pub(super) async fn fetch_ext_out_page(
           }
         }
     "#;
-    let response: Value = http
+    let response = http
         .post(&gql)
         .json(&json!({
             "query": query,
@@ -2669,8 +4091,9 @@ pub(super) async fn fetch_ext_out_page(
             },
         }))
         .send()
+        .await?;
+    let response: Value = shellnet_response_for_status(response)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     if let Some(errors) = response.get("errors") {
@@ -2721,21 +4144,29 @@ pub(super) async fn fetch_ext_out_page(
     })
 }
 
-async fn fetch_all_ext_out_messages(
+pub(super) async fn fetch_all_ext_out_messages<T, F>(
     http: &reqwest::Client,
     endpoint: &str,
     account_id: &str,
-) -> Result<Vec<ExtOutMessage>> {
+    filter_map: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(ExtOutMessage) -> Result<Option<T>>,
+{
     let dapp_id = fetch_dapp_id(http, endpoint, account_id).await?;
-    fetch_all_ext_out_messages_routed(http, endpoint, account_id, &dapp_id).await
+    fetch_all_ext_out_messages_routed(http, endpoint, account_id, &dapp_id, filter_map).await
 }
 
-async fn fetch_all_ext_out_messages_routed(
+async fn fetch_all_ext_out_messages_routed<T, F>(
     http: &reqwest::Client,
     endpoint: &str,
     account_id: &str,
     dapp_id: &str,
-) -> Result<Vec<ExtOutMessage>> {
+    filter_map: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(ExtOutMessage) -> Result<Option<T>>,
+{
     // Existing PR689 reader bound. R20-10 reuses the reader rather than defining a second pager.
     let mut before: Option<String> = None;
     let mut pages = Vec::new();
@@ -2757,14 +4188,21 @@ async fn fetch_all_ext_out_messages_routed(
     }
     // Pages are fetched newest first; edges inside each page already carry chain order. Reverse
     // pages only. Message ids/cursors stay byte-for-byte opaque and are never parsed or sorted.
-    dedupe_ext_out_messages_in_order(pages.into_iter().rev().flat_map(|page| page.into_iter()))
+    filter_map_ext_out_messages_in_order(
+        pages.into_iter().rev().flat_map(|page| page.into_iter()),
+        filter_map,
+    )
 }
 
-fn dedupe_ext_out_messages_in_order(
+fn filter_map_ext_out_messages_in_order<T, F>(
     messages: impl IntoIterator<Item = ExtOutMessage>,
-) -> Result<Vec<ExtOutMessage>> {
+    mut filter_map: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(ExtOutMessage) -> Result<Option<T>>,
+{
     let mut by_id = BTreeMap::<String, ExtOutMessage>::new();
-    let mut ordered = Vec::new();
+    let mut retained = Vec::new();
     for message in messages {
         if let Some(previous) = by_id.get(&message.id) {
             if previous != &message {
@@ -2776,9 +4214,17 @@ fn dedupe_ext_out_messages_in_order(
             continue;
         }
         by_id.insert(message.id.clone(), message.clone());
-        ordered.push(message);
+        if let Some(candidate) = filter_map(message)? {
+            retained.push(candidate);
+        }
     }
-    Ok(ordered)
+    Ok(retained)
+}
+
+fn dedupe_ext_out_messages_in_order(
+    messages: impl IntoIterator<Item = ExtOutMessage>,
+) -> Result<Vec<ExtOutMessage>> {
+    filter_map_ext_out_messages_in_order(messages, |message| Ok(Some(message)))
 }
 
 fn decode_token_contract_settlement_receipts(
@@ -2847,6 +4293,20 @@ fn decode_token_contract_settlement_event(
             .ok_or_else(|| anyhow!("{name} body missing or invalid {field}"))
     };
     Ok(Some(match name.as_str() {
+        "ContractDeployed" => TokenContractSettlementEvent::ContractDeployed {
+            token_contract: required_address("self")?,
+        },
+        "StreamFunded" => TokenContractSettlementEvent::StreamFunded {
+            buyer: required_address("buyer")?,
+            deposit: required_u128("deposit")?,
+        },
+        "SellerBondFunded" => TokenContractSettlementEvent::SellerBondFunded {
+            amount: required_u128("amount")?,
+        },
+        "StreamOpened" => TokenContractSettlementEvent::StreamOpened {
+            buyer: required_address("buyer")?,
+            price_per_tick: required_u128("pricePerTick")?,
+        },
         "ProbeAccepted" => TokenContractSettlementEvent::ProbeAccepted {
             buyer: required_address("buyer")?,
             to_seller: required_u128("toSeller")?,
@@ -2880,8 +4340,237 @@ fn decode_token_contract_settlement_event(
             refund_to_buyer: required_u128("refundToBuyer")?,
             released: required_bool("released")?,
         },
+        "StreamReclaimed" => TokenContractSettlementEvent::StreamReclaimed {
+            buyer: required_address("buyer")?,
+            refund_to_buyer: required_u128("refundToBuyer")?,
+        },
+        "ShellWithdrawn" => TokenContractSettlementEvent::ShellWithdrawn {
+            recipient: required_address("recipient")?,
+            amount: required_u128("amount")?,
+        },
+        "ContractDestroyed" => TokenContractSettlementEvent::ContractDestroyed {
+            token_contract: required_address("self")?,
+        },
         _ => return Ok(None),
     }))
+}
+
+/// Decode one ext-out body as the current compiled RootPN `TokensWithdrawn` event.
+/// A body for another event is skipped. Once the selector identifies `TokensWithdrawn`, ABI drift
+/// or a malformed body fails loud rather than returning a partial destination identity.
+pub fn decode_tokens_withdrawn_event(body_b64: &str) -> Result<Option<TokensWithdrawnEvent>> {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(body_b64.trim()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let cell = match tvm_types::read_single_root_boc(&bytes) {
+        Ok(cell) => cell,
+        Err(_) => return Ok(None),
+    };
+    let slice = match tvm_types::SliceData::load_cell(cell) {
+        Ok(slice) => slice,
+        Err(_) => return Ok(None),
+    };
+    let id = match tvm_abi::Event::decode_id(slice.clone()) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    let contract = tvm_abi::Contract::load(ROOTPN_ABI.as_bytes())
+        .map_err(|error| anyhow!("load RootPN ABI: {error}"))?;
+    let event = match contract.event_by_id(id) {
+        Ok(event) => event,
+        Err(_) => return Ok(None),
+    };
+    if event.name != "TokensWithdrawn" {
+        return Ok(None);
+    }
+    let tokens = event
+        .decode_input(slice, true)
+        .map_err(|error| anyhow!("decode TokensWithdrawn body: {error}"))?;
+    let to = decoded_address(&tokens, "to")
+        .ok_or_else(|| anyhow!("TokensWithdrawn body missing or invalid to"))?;
+    let dapp_id = tokens
+        .iter()
+        .find_map(|token| {
+            if token.name != "dapp_id" {
+                return None;
+            }
+            match &token.value {
+                tvm_abi::token::TokenValue::Uint(value) => {
+                    Some(format!("{:0>64}", value.number.to_str_radix(16)))
+                }
+                _ => None,
+            }
+        })
+        .ok_or_else(|| anyhow!("TokensWithdrawn body missing or invalid dapp_id"))?;
+    Ok(Some(TokensWithdrawnEvent { to, dapp_id }))
+}
+
+/// One finalized queue event from a canonical multisig.
+/// Two of the wallet's events answer the only question that separates a funding request which moved
+/// money from one which never did:
+/// - `TransactionSubmitted` is emitted when a request is QUEUED. It carries the queue id and, on
+/// the message that delivered it, the chain time it happened at - which is what makes an expiry
+/// verdict a chain fact rather than a local timer, and what recovers the queue id for a client
+/// whose own submit receipt was never observed.
+/// - `TransactionSent` is emitted when a queued request is confirmed and actually sent. Its presence
+/// in finalized history is a POSITIVE proof of execution.
+/// Without both, a request that has left `getTransactions` is indistinguishable from one that
+/// expired, and those two are opposite in money terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultisigQueueEvent {
+    /// The request entered the queue.
+    Submitted {
+        transaction_id: u64,
+        dest: String,
+        value: u128,
+        dapp_id: String,
+    },
+    /// The request left the queue by executing.
+    Sent {
+        transaction_id: u64,
+        dest: String,
+        value: u128,
+        send_flags: u64,
+        bounce: bool,
+        dapp_id: String,
+    },
+}
+
+impl MultisigQueueEvent {
+    /// The queue id the event is about.
+    pub fn transaction_id(&self) -> u64 {
+        match self {
+            Self::Submitted { transaction_id, .. } | Self::Sent { transaction_id, .. } => {
+                *transaction_id
+            }
+        }
+    }
+}
+
+/// One queue event as finalized history delivered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultisigQueueRecord {
+    pub event: MultisigQueueEvent,
+    /// The finalized ext-out message that carried it.
+    pub message_id: String,
+    /// The chain time that message was created at.
+    pub created_at: u64,
+}
+
+fn decoded_uint256_hex(tokens: &[tvm_abi::Token], name: &str) -> Option<String> {
+    tokens.iter().find_map(|token| {
+        if token.name != name {
+            return None;
+        }
+        match &token.value {
+            tvm_abi::token::TokenValue::Uint(value) => {
+                Some(format!("{:0>64}", value.number.to_str_radix(16)))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Decode one ext-out body as a canonical multisig queue event.
+/// A body for any other event is skipped. Once the selector identifies one of the two, ABI drift or
+/// a malformed body fails loud rather than returning a partial claim - a half-read execution proof
+/// is worse than none, because it is the fact that forbids a second transfer.
+pub fn decode_multisig_queue_event(body_b64: &str) -> Result<Option<MultisigQueueEvent>> {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(body_b64.trim()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let cell = match tvm_types::read_single_root_boc(&bytes) {
+        Ok(cell) => cell,
+        Err(_) => return Ok(None),
+    };
+    let slice = match tvm_types::SliceData::load_cell(cell) {
+        Ok(slice) => slice,
+        Err(_) => return Ok(None),
+    };
+    let id = match tvm_abi::Event::decode_id(slice.clone()) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    let contract = tvm_abi::Contract::load(crate::canonical_multisig::MULTISIG_ABI_JSON.as_bytes())
+        .map_err(|error| anyhow!("load canonical multisig ABI: {error}"))?;
+    let event = match contract.event_by_id(id) {
+        Ok(event) => event,
+        Err(_) => return Ok(None),
+    };
+    let name = event.name.clone();
+    if name != "TransactionSubmitted" && name != "TransactionSent" {
+        return Ok(None);
+    }
+    let tokens = event
+        .decode_input(slice, true)
+        .map_err(|error| anyhow!("decode {name} body: {error}"))?;
+    let transaction_id = decoded_u64(&tokens, "transactionId")
+        .ok_or_else(|| anyhow!("{name} body missing or invalid transactionId"))?;
+    let dest = decoded_address(&tokens, "dest")
+        .ok_or_else(|| anyhow!("{name} body missing or invalid dest"))?;
+    let value = decoded_u128(&tokens, "value")
+        .ok_or_else(|| anyhow!("{name} body missing or invalid value"))?;
+    let dapp_id = decoded_uint256_hex(&tokens, "dapp_id")
+        .ok_or_else(|| anyhow!("{name} body missing or invalid dapp_id"))?;
+    if name == "TransactionSubmitted" {
+        return Ok(Some(MultisigQueueEvent::Submitted {
+            transaction_id,
+            dest,
+            value,
+            dapp_id,
+        }));
+    }
+    let send_flags = decoded_u64(&tokens, "sendFlags")
+        .ok_or_else(|| anyhow!("TransactionSent body missing or invalid sendFlags"))?;
+    let bounce = decoded_bool(&tokens, "bounce")
+        .ok_or_else(|| anyhow!("TransactionSent body missing or invalid bounce"))?;
+    Ok(Some(MultisigQueueEvent::Sent {
+        transaction_id,
+        dest,
+        value,
+        send_flags,
+        bounce,
+        dapp_id,
+    }))
+}
+
+/// Every queue event in a multisig's own finalized ext-out history, in chain order.
+/// Read over the account's COMPLETE ext-out stream rather than a recent window, so "not found"
+/// cannot quietly mean "not looked far enough back" - which, for an execution proof, would be the
+/// difference between refusing a second transfer and making one.
+pub async fn read_multisig_queue_history(
+    http: &reqwest::Client,
+    endpoint: &str,
+    multisig_account_id: &str,
+    multisig_dapp_id: &str,
+) -> Result<Vec<MultisigQueueRecord>> {
+    fetch_all_ext_out_messages_routed(
+        http,
+        endpoint,
+        multisig_account_id,
+        multisig_dapp_id,
+        |message| {
+            let Some(event) = decode_multisig_queue_event(&message.body)? else {
+                return Ok(None);
+            };
+            Ok(Some(MultisigQueueRecord {
+                event,
+                message_id: message.id,
+                created_at: message.created_at,
+            }))
+        },
+    )
+    .await
+}
+
+/// The chain's own clock, in unix seconds.
+/// Exposed because an expiry verdict has to be taken against chain time. A local clock is not chain
+/// evidence: a machine whose clock runs fast would conclude that a request it can still confirm has
+/// expired, and act on that by creating a second one.
+pub async fn chain_time_secs(http: &reqwest::Client, endpoint: &str) -> Result<u64> {
+    fetch_chain_time_secs(http, endpoint).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2915,9 +4604,106 @@ fn settlement_action_event_kind(event: &TokenContractSettlementEvent) -> Option<
             released: false, ..
         } => Some("DisputeResolved(released=false)"),
         TokenContractSettlementEvent::ProbeAccepted { .. }
+        | TokenContractSettlementEvent::ContractDeployed { .. }
+        | TokenContractSettlementEvent::StreamFunded { .. }
+        | TokenContractSettlementEvent::SellerBondFunded { .. }
+        | TokenContractSettlementEvent::StreamOpened { .. }
+        | TokenContractSettlementEvent::StreamReclaimed { .. }
+        | TokenContractSettlementEvent::ShellWithdrawn { .. }
+        | TokenContractSettlementEvent::ContractDestroyed { .. }
         | TokenContractSettlementEvent::TickFinalized { .. }
         | TokenContractSettlementEvent::TicksClaimed { .. } => None,
     }
+}
+
+fn select_prior_buyer_terminal_receipt(
+    token_contract: &str,
+    expected_buyer: &str,
+    receipts: &TokenContractSettlementReceipts,
+) -> Result<Option<BuyerStopTerminalReceipt>> {
+    let actions = receipts
+        .events
+        .iter()
+        .filter(|receipt| settlement_action_event_kind(&receipt.event).is_some())
+        .collect::<Vec<_>>();
+    let stops = actions
+        .iter()
+        .copied()
+        .filter(|receipt| {
+            matches!(
+                receipt.event,
+                TokenContractSettlementEvent::ProbeBurned { .. }
+                    | TokenContractSettlementEvent::StreamStopped { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if stops.is_empty() {
+        return Ok(None);
+    }
+    if actions.len() != 1 || stops.len() != 1 {
+        return Err(anyhow!(
+            "TokenContract {token_contract} prior settlement history contains a terminal close event mixed \
+             with another action; refusing local terminal reconciliation"
+        ));
+    }
+
+    let receipt = stops[0];
+    let (buyer, event) = match &receipt.event {
+        TokenContractSettlementEvent::ProbeBurned {
+            buyer,
+            burned_probe,
+            burned_bond,
+            refund_to_buyer,
+        } => (
+            buyer,
+            SettlementActionEvent::ProbeBurned {
+                buyer: buyer.clone(),
+                burned_probe: (*burned_probe).into(),
+                burned_bond: (*burned_bond).into(),
+                refund_to_buyer: (*refund_to_buyer).into(),
+            },
+        ),
+        TokenContractSettlementEvent::StreamStopped {
+            buyer,
+            to_seller,
+            refund_to_buyer,
+        } => (
+            buyer,
+            SettlementActionEvent::StreamStopped {
+                buyer: buyer.clone(),
+                to_seller: (*to_seller).into(),
+                refund_to_buyer: (*refund_to_buyer).into(),
+            },
+        ),
+        _ => unreachable!("stops contains only terminal buyer-bearing events"),
+    };
+    let observed = normalize_addr(buyer).with_context(|| {
+        format!(
+            "TokenContract {token_contract} prior terminal receipt has malformed buyer beneficiary {buyer}"
+        )
+    })?;
+    let expected = normalize_addr(expected_buyer).with_context(|| {
+        format!(
+            "TokenContract {token_contract} has malformed expected buyer actor {expected_buyer}"
+        )
+    })?;
+    if observed != expected {
+        return Err(anyhow!(
+            "TokenContract {token_contract} prior terminal receipt beneficiary {observed} does not \
+             match expected buyer note {expected}; refusing local reconciliation"
+        ));
+    }
+
+    Ok(Some(BuyerStopTerminalReceipt {
+        token_contract: token_contract.to_string(),
+        fact: BuyerStopTerminalFact::AlreadyClosed,
+        stop_submitted: false,
+        message_id: receipt.message_id.clone(),
+        created_at: receipt.created_at,
+        event,
+        pre_bonds: None,
+        post_state: None,
+    }))
 }
 
 fn reject_prior_settlement_action(
@@ -2926,6 +4712,7 @@ fn reject_prior_settlement_action(
     expected_buyer: Option<&str>,
     receipts: &TokenContractSettlementReceipts,
 ) -> Result<()> {
+    let token_contract = display_token_contract(token_contract);
     let actions = receipts
         .events
         .iter()
@@ -3044,6 +4831,13 @@ fn reject_prior_settlement_action(
                 | TokenContractSettlementEvent::StreamStopped { buyer, .. }
                 | TokenContractSettlementEvent::StreamDisputed { buyer, .. } => Some(buyer),
                 TokenContractSettlementEvent::DisputeResolved { .. }
+                | TokenContractSettlementEvent::ContractDeployed { .. }
+                | TokenContractSettlementEvent::StreamFunded { .. }
+                | TokenContractSettlementEvent::SellerBondFunded { .. }
+                | TokenContractSettlementEvent::StreamOpened { .. }
+                | TokenContractSettlementEvent::StreamReclaimed { .. }
+                | TokenContractSettlementEvent::ShellWithdrawn { .. }
+                | TokenContractSettlementEvent::ContractDestroyed { .. }
                 | TokenContractSettlementEvent::ProbeAccepted { .. }
                 | TokenContractSettlementEvent::TickFinalized { .. }
                 | TokenContractSettlementEvent::TicksClaimed { .. } => None,
@@ -3052,6 +4846,8 @@ fn reject_prior_settlement_action(
                 let expected = normalize_addr(expected_buyer)?;
                 let observed = normalize_addr(observed_buyer)?;
                 if expected != observed {
+                    let expected = display_dexdo_address(expected);
+                    let observed = display_dexdo_address(observed);
                     return Err(anyhow!(
                         "TokenContract {token_contract} has prior action {action} receipt with buyer \
                          actor {observed}, expected {expected}; refusing before any money POST"
@@ -3097,9 +4893,10 @@ fn validate_buyer_stop_pre_state(
     pre: Option<&DealChainSnapshot>,
     receipts: &TokenContractSettlementReceipts,
 ) -> Result<()> {
+    let token_contract = display_token_contract(token_contract);
     // Immutable action history wins over a potentially stale-open getter. Checking the getter first
     // would let a restarted process POST a second STOP after the terminal event had already landed.
-    reject_prior_settlement_action(token_contract, SettlementAction::BuyerStop, None, receipts)?;
+    reject_prior_settlement_action(&token_contract, SettlementAction::BuyerStop, None, receipts)?;
 
     if pre.is_some_and(|snapshot| snapshot.state.opened && !snapshot.state.disputed) {
         return Ok(());
@@ -3141,6 +4938,7 @@ fn settlement_confirmation_delay(
 }
 
 fn validate_settlement_facts(token_contract: &str, facts: &DealChainSnapshot) -> Result<()> {
+    let token_contract = display_token_contract(token_contract);
     if facts.seller_bond.bond_held > facts.seller_bond.bond_required {
         return Err(anyhow!(
             "TokenContract {token_contract} getSellerBond contradiction: held {} exceeds required {}",
@@ -3148,19 +4946,32 @@ fn validate_settlement_facts(token_contract: &str, facts: &DealChainSnapshot) ->
             facts.seller_bond.bond_required
         ));
     }
-    if facts.buyer_bond.bond_held > facts.buyer_bond.bond_required {
+    // `getBuyerBond()` returns `(_buyerBond, _isSubscription() ? _bondAmount(): 0)`
+    // (`contracts/airegistry/TokenContract.sol:2119-2121`). The two halves answer DIFFERENT
+    // questions: `bondHeld` is what is actually held, `bondRequired` is what this deal SHAPE
+    // mandates. Comparing them is only meaningful where the second is a real requirement.
+    // On a subscription it is: `_bondAmount()` is `2 * _pricePerTick`(`:554-556`), the 2P mirror,
+    // so holding more than that is a genuine contradiction and stays checked here.
+    // On an ordinary deal `bondRequired` is a hard `0` in that ternary -- not a balance, not a
+    // residual, nothing that can ever be otherwise -- so `held > required` degenerates to
+    // `held > 0` and asserts that ordinary buyers never post a bond. 4.0.35 contradicts that by
+    // construction: an ordinary buyer's bond is real and non-zero, and this gate aborted the
+    // settlement POST before `streamStop` was ever submitted.
+    if facts.subscription.is_subscription()
+        && facts.buyer_bond.bond_held > facts.buyer_bond.bond_required
+    {
         return Err(anyhow!(
-            "TokenContract {token_contract} getBuyerBond contradiction: held {} exceeds required {}",
+            "subscription TokenContract {token_contract} getBuyerBond contradiction: held {} exceeds required {}",
             facts.buyer_bond.bond_held,
             facts.buyer_bond.bond_required
         ));
     }
-    if !facts.subscription.is_subscription()
-        && (facts.buyer_bond.bond_held != 0 || facts.buyer_bond.bond_required != 0)
-    {
+    // The ONLY incoherence `getBuyerBond()` can report on an ordinary deal: the contract cannot
+    // return a non-zero requirement there, so a non-zero one is not this contract answering.
+    // `bond_held` is deliberately NOT asserted -- it is unconstrained on this shape.
+    if !facts.subscription.is_subscription() && facts.buyer_bond.bond_required != 0 {
         return Err(anyhow!(
-            "ordinary TokenContract {token_contract} exposes non-zero buyer bond: held={} required={}",
-            facts.buyer_bond.bond_held,
+            "ordinary TokenContract {token_contract} reports a non-zero buyer bond requirement: {}",
             facts.buyer_bond.bond_required
         ));
     }
@@ -3187,7 +4998,8 @@ fn settlement_action_post_state(
     post: &DealChainSnapshot,
     event: &TokenContractSettlementEvent,
 ) -> Result<SettlementActionPostState> {
-    validate_settlement_facts(token_contract, post)?;
+    let token_contract = display_token_contract(token_contract);
+    validate_settlement_facts(&token_contract, post)?;
     if pre.subscription.is_subscription() != post.subscription.is_subscription()
         || pre.seller_bond.bond_required != post.seller_bond.bond_required
         || pre.buyer_bond.bond_required != post.buyer_bond.bond_required
@@ -3255,7 +5067,6 @@ fn settlement_action_post_state(
 
     Ok(SettlementActionPostState {
         tokens_final: post.state.tokens_final.into(),
-        tokens_superseded: post.state.tokens_superseded.into(),
         tokens_pending: post.state.tokens_pending.into(),
         seller_bond_held: post.seller_bond.bond_held.into(),
         seller_bond_required: post.seller_bond.bond_required.into(),
@@ -3273,10 +5084,11 @@ fn attach_settlement_post_snapshot(
     event: &TokenContractSettlementEvent,
     post: Option<&DealChainSnapshot>,
 ) -> Result<()> {
+    let token_contract = display_token_contract(token_contract);
     match post {
         Some(post) => {
             receipt.post_state = Some(settlement_action_post_state(
-                token_contract,
+                &token_contract,
                 pre,
                 post,
                 event,
@@ -3302,6 +5114,7 @@ fn select_new_settlement_action_receipt(
     observed: &TokenContractSettlementReceipts,
     pre_bonds: SettlementActionBondState,
 ) -> Result<Option<SettlementActionReceipt>> {
+    let display_tc = display_token_contract(token_contract);
     let action_events = observed
         .events
         .iter()
@@ -3320,7 +5133,7 @@ fn select_new_settlement_action_receipt(
     }
     if action_events.len() != 1 {
         return Err(anyhow!(
-            "TokenContract {token_contract} action {action} produced {} distinct new action events: {}",
+            "TokenContract {display_tc} action {action} produced {} distinct new action events: {}",
             action_events.len(),
             action_events
                 .iter()
@@ -3333,22 +5146,24 @@ fn select_new_settlement_action_receipt(
     let preserve_buyer = |observed_buyer: &str| -> Result<String> {
         let expected_buyer = expected_buyer.ok_or_else(|| {
             anyhow!(
-                "TokenContract {token_contract} action {action} has no independently known buyer actor"
+                "TokenContract {display_tc} action {action} has no independently known buyer actor"
             )
         })?;
         let observed = normalize_addr(observed_buyer).with_context(|| {
             format!(
-                "TokenContract {token_contract} action {action} emitted malformed buyer actor {observed_buyer}"
+                "TokenContract {display_tc} action {action} emitted malformed buyer actor {observed_buyer}"
             )
         })?;
         let expected = normalize_addr(expected_buyer).with_context(|| {
             format!(
-                "TokenContract {token_contract} action {action} has malformed expected buyer actor {expected_buyer}"
+                "TokenContract {display_tc} action {action} has malformed expected buyer actor {expected_buyer}"
             )
         })?;
         if observed != expected {
+            let observed = display_dexdo_address(observed);
+            let expected = display_dexdo_address(expected);
             return Err(anyhow!(
-                "TokenContract {token_contract} action {action} emitted wrong buyer actor {observed}; expected {expected}"
+                "TokenContract {display_tc} action {action} emitted wrong buyer actor {observed}; expected {expected}"
             ));
         }
         Ok(observed_buyer.to_string())
@@ -3401,12 +5216,12 @@ fn select_new_settlement_action_receipt(
         },
         (ExpectedSettlementEvent::BuyerStop, _) => {
             return Err(anyhow!(
-                "TokenContract {token_contract} action {action} retained unresolved buyer-stop event expectation"
+                "TokenContract {display_tc} action {action} retained unresolved buyer-stop event expectation"
             ));
         }
         _ => {
             return Err(anyhow!(
-                "TokenContract {token_contract} action {action} observed incompatible new event {:?}; \
+                "TokenContract {display_tc} action {action} observed incompatible new event {:?}; \
                  expected {expected:?}",
                 receipt.event
             ));
@@ -3459,6 +5274,7 @@ fn ambiguous_settlement_action(
     action: SettlementAction,
     source: anyhow::Error,
 ) -> anyhow::Error {
+    let token_contract = display_token_contract(token_contract);
     anyhow::Error::new(MoneySubmitError::Ambiguous {
         source: source.context(format!(
             "TokenContract {token_contract} action {action} may have landed; the BOC was not resubmitted"
@@ -3644,6 +5460,21 @@ fn decode_external_abi_message(
     }
 }
 
+/// Decode the ABI call an INTERNAL message body carries: no signature and no header, so the same
+/// decoder has to be told the message is internal.
+fn decode_internal_abi_call(
+    body_b64: &str,
+    abi: &str,
+) -> Option<tvm_abi::contract::DecodedMessage> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body_b64.trim())
+        .ok()?;
+    let cell = tvm_types::read_single_root_boc(&bytes).ok()?;
+    let slice = tvm_types::SliceData::load_cell(cell).ok()?;
+    let contract = tvm_abi::Contract::load(abi.as_bytes()).ok()?;
+    contract.decode_input(slice, true, true).ok()
+}
+
 #[cfg(feature = "test-giver")]
 fn decode_external_abi_message_boc(
     message_b64: &str,
@@ -3713,6 +5544,15 @@ fn decoded_bool(tokens: &[tvm_abi::Token], name: &str) -> Option<bool> {
 }
 
 impl RealChainBackend {
+    /// Decode storage from a caller-owned immutable account snapshot with its compiled ABI.
+    pub fn decode_account_storage_fields(
+        account_boc: &str,
+        abi_json: &str,
+        contract_name: &str,
+    ) -> Result<Value> {
+        account_storage_fields(account_boc, abi_json, contract_name)
+    }
+
     /// Connect using an optional manifest endpoint, falling back to the canonical shellnet endpoint.
     pub fn connect(manifest_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::connect_with_endpoint(manifest_path, None)
@@ -3723,12 +5563,15 @@ impl RealChainBackend {
         manifest_path: impl AsRef<Path>,
         endpoint: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let deployed = Deployed::load(manifest_path)?;
-        let endpoint = resolve_endpoint(endpoint, &deployed)?;
-        let client = ChainClient::connect_with_config(&endpoint, AiRegistryConfig::shellnet())?;
-        let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
+        let (deployed, client) =
+            connect_client_from_manifest_with(manifest_path, endpoint, |endpoint, config| {
+                ChainClient::connect_with_config(endpoint, config)
+            })?;
+        let http = shellnet_http_client()?;
         let money_post_http = build_money_post_http_client()?;
-        let superroot = Address::parse(&deployed.superroot)?;
+        // The SuperRoot is a shared-DApp account and this field is the chain address the client
+        // reads and writes with, so only the chain half is stored.
+        let superroot = crate::address::parse_chain_address(&deployed.superroot)?.into_chain();
         Ok(Self {
             client,
             http,
@@ -3738,13 +5581,93 @@ impl RealChainBackend {
         })
     }
 
+    /// Network profile selected from the deployment manifest used by this client.
+    pub fn network(&self) -> &str {
+        &self.deployed.network
+    }
+
+    /// A read-only client that addresses the Shell Accumulator's DApp explicitly.
+    /// The accumulator root does NOT live in the dexdo DApp: it reports `dapp_id` 1 on both
+    /// networks, and a read addressed to DApp 4 returns null rather than an error. The default
+    /// getter rule(`dapp_id == account_id`) happens to reach it today because two DApp ids can
+    /// route to the same shard - but "it answered" is not "it lives there", and a client that
+    /// depends on that coincidence reads nothing the day routing changes, which on a money path
+    /// looks like an empty queue rather than a failure. So the DApp is stated rather than inferred.
+    pub fn connect_accumulator_reader(
+        manifest_path: impl AsRef<Path>,
+        endpoint: Option<&str>,
+    ) -> anyhow::Result<ChainClient> {
+        let (_deployed, client) =
+            connect_client_from_manifest_with(manifest_path, endpoint, |endpoint, mut config| {
+                config.dapp_id_override = Some(crate::params::ACCUMULATOR_DAPP_ID.to_string());
+                ChainClient::connect_with_config(endpoint, config)
+            })?;
+        Ok(client)
+    }
+
     /// Fold authoritative live orders from one `InferenceOrderBook` ext-out stream.
     pub async fn fold_order_book_events(
         &self,
         order_book: &str,
         previous: BookEventFold,
     ) -> Result<BookEventFold> {
-        read_book_event_fold(&self.http, self.client.endpoint(), order_book, previous).await
+        retry_transient_read(|| {
+            read_book_event_fold(&self.http, self.client.endpoint(), order_book, previous.clone())
+        })
+        .await
+    }
+
+    /// Report every `InferenceFilled` that names `buyer_note`, split into confirmed candidates and
+    /// refusals.
+    /// This is a verified candidate list, not a recovery operation: the book history is filtered
+    /// by normalized buyer note while it is walked, then every retained event's TokenContract must
+    /// still report the same buyer and seller note through `getParties` and `funded=true` through
+    /// `getState`. Inactive, settled, unfunded, or identity-mismatched historical fills are
+    /// reported as refusals rather than dropped, because a fill the book emitted is a fact about
+    /// this note whether or not its deal survived, and an operator who is shown nothing cannot
+    /// otherwise tell that case from a note the book never named. Transport or ABI failures remain
+    /// errors because they prevent verification.
+    pub async fn verified_book_fill_candidates(
+        &self,
+        order_book: &Address,
+        buyer_note: &Address,
+    ) -> Result<BookFillCandidateReport> {
+        let account_id = order_book.bare().to_string();
+        let buyer_note = normalize_addr(&buyer_note.with_workchain())?;
+        let candidates = retry_transient_read(|| {
+            read_book_fill_candidates(
+                &self.http,
+                self.client.endpoint(),
+                &account_id,
+                &buyer_note,
+            )
+        })
+        .await?;
+        let mut report = BookFillCandidateReport::default();
+        for candidate in candidates {
+            let token_contract = Address::parse(&candidate.seller_token_contract).with_context(
+                || {
+                    format!(
+                        "InferenceFilled sellerTC {}",
+                        candidate.seller_token_contract
+                    )
+                },
+            )?;
+            let parties = self.token_contract_parties(&token_contract).await?;
+            let state = self.token_contract_deal_state(&token_contract).await?;
+            match book_fill_candidate_refusal_reason(
+                &candidate,
+                &buyer_note,
+                parties.as_ref(),
+                state.as_ref(),
+            ) {
+                None => report.candidates.push(candidate),
+                Some(reason) => report
+                    .refusals
+                    .push(BookFillCandidateRefusal { candidate, reason }),
+            }
+        }
+        Ok(report)
     }
 
     /// Low-level chain client(for the trait adapter in the next step).
@@ -3759,13 +5682,14 @@ impl RealChainBackend {
 
     /// Chain liveness check -- confirms a working connection to shellnet.
     pub async fn liveness(&self) -> Result<ChainLiveness> {
-        self.client.chain_liveness().await
+        self.client.chain_liveness_retrying().await
     }
 
     async fn clock_skew_preflight(&self) -> Result<()> {
         let check = clock_skew_check(
             local_unix_secs()?,
-            fetch_chain_time_secs(&self.http, self.client.endpoint()).await?,
+            retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
+                .await?,
         );
         if check.status == ShellnetDoctorStatus::Fail {
             return Err(anyhow!(check.message));
@@ -3774,17 +5698,28 @@ impl RealChainBackend {
     }
 
     pub async fn observed_chain_timestamp(&self) -> Result<u64> {
-        fetch_chain_time_secs(&self.http, self.client.endpoint()).await
+        retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint())).await
     }
 
     pub async fn account_active_code_hash(&self, addr: &Address) -> Result<(bool, Option<String>)> {
-        let Some(acc) = self.client.get_account(addr).await? else {
+        let Some(acc) = self.client.get_account_retrying(addr).await? else {
             return Ok((false, None));
         };
         Ok((
             acc.is_active(),
             acc.code_hash.as_deref().and_then(normalize_code_hash),
         ))
+    }
+
+    /// Read an account's live `code_hash` and hand it to one of the generation-check builders. An
+    /// account that is not Active reports `None`, which those builders fail closed on.
+    async fn generation_check(
+        &self,
+        addr: &Address,
+        build: fn(&Address, Option<&str>) -> ShellnetDoctorCheck,
+    ) -> Result<ShellnetDoctorCheck> {
+        let (active, hash) = self.account_active_code_hash(addr).await?;
+        Ok(build(addr, active.then_some(hash).flatten().as_deref()))
     }
 
     async fn code_hash_account_check(
@@ -3800,6 +5735,17 @@ impl RealChainBackend {
         Ok(code_hash_check(name, Some(addr), expected, hash.as_deref()))
     }
 
+    async fn self_dapp_code_hash_account_check(
+        &self,
+        name: &str,
+        addr: &Address,
+        expected: &str,
+    ) -> Result<ShellnetDoctorCheck> {
+        let mut check = self.code_hash_account_check(name, addr, expected).await?;
+        check.address = Some(display_token_contract(addr));
+        Ok(check)
+    }
+
     async fn seller_note_withdrawn_check(&self, note: &Address) -> Result<ShellnetDoctorCheck> {
         match self.private_note_details(note).await {
             Ok(Some(details)) => Ok(seller_note_withdrawn_check(
@@ -3809,7 +5755,7 @@ impl RealChainBackend {
             Ok(None) => Ok(ShellnetDoctorCheck {
                 name: "seller PrivateNote withdrawn state".to_string(),
                 status: ShellnetDoctorStatus::Fail,
-                address: Some(note.with_workchain()),
+                address: Some(display_dexdo_address(note)),
                 expected: Some("hasWithdrawn=false".to_string()),
                 actual: Some("getDetails=<none>".to_string()),
                 message: "seller note returned no PrivateNote.getDetails; it is not active/current enough to prove postSellOffer safety"
@@ -3818,7 +5764,7 @@ impl RealChainBackend {
             Err(e) => Ok(ShellnetDoctorCheck {
                 name: "seller PrivateNote withdrawn state".to_string(),
                 status: ShellnetDoctorStatus::Fail,
-                address: Some(note.with_workchain()),
+                address: Some(display_dexdo_address(note)),
                 expected: Some("hasWithdrawn=false".to_string()),
                 actual: Some("getDetails=<error>".to_string()),
                 message: format!(
@@ -3831,7 +5777,7 @@ impl RealChainBackend {
     async fn version_of(&self, addr: &Address, abi: &str) -> Result<Option<String>> {
         let Some(v) = self
             .client
-            .run_getter(addr, abi, "getVersion", json!({}))
+            .run_getter_retrying(addr, abi, "getVersion", json!({}))
             .await?
         else {
             return Ok(None);
@@ -3854,25 +5800,12 @@ impl RealChainBackend {
         checks.push(pass_check("shellnet endpoint", "reachable"));
         checks.push(clock_skew_check(
             local_unix_secs()?,
-            fetch_chain_time_secs(&self.http, self.client.endpoint()).await?,
+            retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
+                .await?,
         ));
 
-        if account_id_eq(&self.superroot, FIXED_SUPERROOT_ACCOUNT_ID) {
-            checks.push(skipped_check(
-                "SuperRoot code hash",
-                "fixed-superroot shellnet redeploy uses the 0:0c0c... zerostate anchor; old code-derived accounts are intentionally gone",
-            ));
-        } else {
-            let superroot_hash = code_hash(SUPERROOT_TVC)?;
-            checks.push(
-                self.code_hash_account_check(
-                    "SuperRoot code hash",
-                    &self.superroot,
-                    &superroot_hash,
-                )
-                .await?,
-            );
-        }
+        let superroot = self.superroot.clone();
+        checks.push(self.generation_check(&superroot, superroot_generation_check).await?);
 
         if self.deployed.dapp_config.trim().is_empty() {
             checks.push(skipped_check(
@@ -3890,31 +5823,19 @@ impl RealChainBackend {
         }
 
         let rootpn = Address::parse(ROOTPN_ADDR)?;
-        checks.push(
-            self.code_hash_account_check("RootPN code hash", &rootpn, SHELLNET_ROOTPN_V1_CODE_HASH)
-                .await?,
-        );
+        checks.push(self.generation_check(&rootpn, rootpn_generation_check).await?);
         let rootoracle = Address::parse(ROOTORACLE_ADDR)?;
         checks.push(
-            self.code_hash_account_check(
-                "RootOracle code hash",
-                &rootoracle,
-                &code_hash(ROOTORACLE_TVC)?,
-            )
-            .await?,
+            self.generation_check(&rootoracle, rootoracle_generation_check)
+                .await?,
         );
 
         let rootpn_details = self
             .client
-            .run_getter(&rootpn, ROOTPN_ABI, "getDetails", json!({}))
+            .run_getter_retrying(&rootpn, ROOTPN_ABI, "getDetails", json!({}))
             .await?
             .ok_or_else(|| anyhow!("RootPN is not active"))?;
-        checks.push(code_hash_check(
-            "PrivateNote code hash (RootPN pin)",
-            None,
-            &code_hash(PRIVATENOTE_TVC)?,
-            rootpn_details["privateNoteCodeHash"].as_str(),
-        ));
+        checks.push(private_note_pin_check(&rootpn_details));
 
         if let Some(market) = market {
             let rm = Address::parse(&market.root_model)?;
@@ -3928,27 +5849,25 @@ impl RealChainBackend {
             );
             let ob = Address::parse(&market.inference_order_book)?;
             checks.push(
-                self.code_hash_account_check(
-                    "InferenceOrderBook code hash",
-                    &ob,
-                    &code_hash(INFERENCE_ORDERBOOK_TVC)?,
-                )
-                .await?,
+                self.generation_check(&ob, inference_orderbook_generation_check)
+                    .await?,
             );
             let tc = Address::parse(&market.token_contract)?;
             checks.push(
-                self.code_hash_account_check(
+                self.self_dapp_code_hash_account_check(
                     "TokenContract code hash",
                     &tc,
                     ROOTMODEL_PINNED_TC_CODE_HASH,
                 )
                 .await?,
             );
-            checks.push(active_check(
+            let mut token_contract_state = active_check(
                 "market TokenContract state",
                 &tc,
                 self.token_contract_state(&tc).await?.is_some(),
-            ));
+            );
+            token_contract_state.address = Some(display_token_contract(&tc));
+            checks.push(token_contract_state);
             let seller_note = Address::parse(&market.seller_note)?;
             checks.push(self.seller_note_withdrawn_check(&seller_note).await?);
         } else {
@@ -3984,6 +5903,7 @@ impl RealChainBackend {
         if let Some(v) = self.version_of(&rootoracle, ROOTORACLE_ABI).await? {
             versions.push(("RootOracle".to_string(), v));
         }
+        checks.extend(self.deployed.validate(&versions));
         Ok(ShellnetDoctorReport {
             network: self.deployed.network.clone(),
             versions,
@@ -3995,7 +5915,7 @@ impl RealChainBackend {
     pub async fn superroot_owner_pubkey(&self) -> Result<Value> {
         let v = self
             .client
-            .run_getter(&self.superroot, SUPERROOT_ABI, "getOwnerPubkey", json!({}))
+            .run_getter_retrying(&self.superroot, SUPERROOT_ABI, "getOwnerPubkey", json!({}))
             .await?
             .ok_or_else(|| anyhow!("SuperRoot is not active"))?;
         Ok(v["value0"].clone())
@@ -4007,7 +5927,7 @@ impl RealChainBackend {
     pub async fn root_model_address_for(&self, owner_pubkey: &Value) -> Result<Address> {
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 &self.superroot,
                 SUPERROOT_ABI,
                 "getRootModelAddress",
@@ -4024,25 +5944,37 @@ impl RealChainBackend {
         self.root_model_address_for(&owner).await
     }
 
-    async fn root_model_deploy_msg(&self, owner: &KeyPair) -> Result<(Address, String)> {
-        let ctx = local_context()?;
-        let tc_code = code_boc_b64(TOKENCONTRACT_TVC)?;
-        let init_data = json!({
-            "_ownerPubkey": format!("0x{}", owner.public_hex()),
-            "_superRootAddress": self.superroot.with_workchain(),
-        });
-        let ctor = json!({ "tokenContractCode": tc_code });
-        let msg = build_deploy(
-            &ctx,
-            ROOTMODEL_ABI,
-            ROOTMODEL_TVC,
-            init_data,
-            ctor,
-            owner.public_hex(),
-            owner.secret_hex(),
+    /// Ask `SuperRoot` to deploy the `RootModel` for `owner_pubkey`: an external call to the fixed
+    /// SuperRoot address, `deployRootModel(uint256 ownerPubkey)`
+    /// (`contracts/airegistry/SuperRoot.sol:189`).
+    /// **THE CLIENT NO LONGER DEPLOYS THE ROOT MODEL, IT ASKS FOR IT.** Under 4.0.34 an externally
+    /// deployed `RootModel` is not merely malformed, it is refused on authority: the constructor's
+    /// first statement is `require(msg.sender == _superRootAddress, ERR_INVALID_SENDER)`
+    /// (`contracts/airegistry/RootModel.sol:67`, `ERR_INVALID_SENDER = 302`), and `msg.sender` on an
+    /// external message is `addr_none`. The deploy therefore has to come from SuperRoot's own internal
+    /// `new`, which is also the point of the change -- an internal `new` lands the root in SuperRoot's
+    /// configured dapp, where `RootModel.ensureBalance() -> gosh.mintshellq` works, whereas an external
+    /// deploy landed it in a dapp of its own with no configuration and that line did nothing.
+    /// **NOTHING IS ATTACHED AND NOTHING IS PRE-FUNDED.** SuperRoot carries `ROOT_MODEL_DEPLOY_VALUE =
+    /// 5 vmshell` on the deploy message itself(`contracts/airegistry/SuperRoot.sol:58`), so the seller
+    /// note has no uninit address to fund first. The entry takes `tvm.accept()` on its first line and
+    /// checks no key, so the signature this call carries is ignored by the contract; it is the seller's
+    /// own key only because that is the key the caller already holds.
+    /// Calling it twice is a no-op -- a `new` at an occupied address does not overwrite and, with
+    /// `bounce: false`, does not revert. So this is safe to re-issue on an idempotent provision.
+    async fn request_root_model_deploy(
+        &self,
+        owner: &KeyPair,
+        owner_pubkey: &Value,
+    ) -> Result<Value> {
+        self.submit(
+            &self.superroot,
+            SUPERROOT_ABI,
+            SUPERROOT_DEPLOY_ROOT_MODEL_METHOD,
+            super_root_deploy_root_model_params(owner_pubkey),
+            owner,
         )
-        .await?;
-        Ok((Address::parse(&msg.address)?, msg.message_boc_b64))
+        .await
     }
 
     /// Derive the per-deal `TokenContract` address from `RootModel`(`getTokenContractAddress`)
@@ -4055,7 +5987,7 @@ impl RealChainBackend {
     ) -> Result<Address> {
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 root_model,
                 ROOTMODEL_ABI,
                 "getTokenContractAddress",
@@ -4107,7 +6039,7 @@ impl RealChainBackend {
     pub async fn read_handover(&self, token_contract: &Address) -> Result<Option<Vec<u8>>> {
         let Some(v) = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 token_contract,
                 TOKENCONTRACT_ABI,
                 "getEndpointCipher",
@@ -4131,7 +6063,7 @@ impl RealChainBackend {
     pub async fn token_contract_model_hash(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getModelHash", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getModelHash", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4150,7 +6082,7 @@ impl RealChainBackend {
     pub async fn token_contract_model_name(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getModelName", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getModelName", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4168,7 +6100,7 @@ impl RealChainBackend {
     pub async fn token_contract_price_per_tick(&self, tc: &Address) -> Result<Option<u128>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getDeal", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getDeal", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4185,7 +6117,7 @@ impl RealChainBackend {
     ) -> Result<Option<(u128, u128, u128)>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getDeal", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getDeal", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4210,7 +6142,7 @@ impl RealChainBackend {
     pub async fn token_contract_buyer_pubkey(&self, tc: &Address) -> Result<Option<[u8; 32]>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getBuyerPubkey", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getBuyerPubkey", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4236,12 +6168,43 @@ impl RealChainBackend {
         Ok(Some(ed))
     }
 
+    async fn token_contract_parties(&self, tc: &Address) -> Result<Option<TokenContractParties>> {
+        let display_tc = display_token_contract(tc);
+        let Some(value) = self
+            .client
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getParties", json!({}))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let buyer = value["buyer"]
+            .as_str()
+            .ok_or_else(|| anyhow!("TokenContract {display_tc} getParties() has no buyer address"))?;
+        let seller_note = value["sellerNote"]
+            .as_str()
+            .ok_or_else(|| anyhow!("TokenContract {display_tc} getParties() has no sellerNote address"))?;
+        Ok(Some(TokenContractParties {
+            buyer: normalize_addr(buyer).with_context(|| {
+                format!(
+                    "TokenContract {display_tc} getParties() buyer {}",
+                    display_dexdo_address(buyer)
+                )
+            })?,
+            seller_note: normalize_addr(seller_note).with_context(|| {
+                format!(
+                    "TokenContract {display_tc} getParties() sellerNote {}",
+                    display_dexdo_address(seller_note)
+                )
+            })?,
+        }))
+    }
+
     /// Read the buyer note address from `TokenContract.getParties()`. `None` means the TC is inactive
     /// or has not recorded a buyer yet.
     pub async fn token_contract_buyer_note(&self, tc: &Address) -> Result<Option<Address>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getParties", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getParties", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4266,7 +6229,7 @@ impl RealChainBackend {
     pub async fn token_contract_seller_pubkey(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getSeller", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getSeller", json!({}))
             .await?
         else {
             return Ok(None);
@@ -4310,7 +6273,7 @@ impl RealChainBackend {
         let code = Self::inference_orderbook_code_b64()?;
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 note,
                 PRIVATENOTE_ABI,
                 "getInferenceOrderBookAddress",
@@ -4330,11 +6293,11 @@ impl RealChainBackend {
     /// the book is not yet active.
     pub async fn inference_orderbook_params(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(ob, INFERENCE_ORDERBOOK_ABI, "getParams", json!({}))
+            .run_getter_retrying(ob, INFERENCE_ORDERBOOK_ABI, "getParams", json!({}))
             .await
     }
 
-    /// A signed external contract call(write) through the backend's **browser-UA** http
+    /// A signed external contract call(write) through the backend's **`DEXDO_USER_AGENT`** http
     /// client: `encode_external_call`(the same codec as `ChainClient::call`) -> submit to
     /// `/v2/messages`. The ChainClient is not used for writes -- its default UA is blocked by
     /// Cloudflare(getters through it work fine). Returns the submit response.
@@ -4393,6 +6356,27 @@ impl RealChainBackend {
         Ok((endpoint, boc, account_id, dapp_id))
     }
 
+    async fn submit_money_call_once(
+        &self,
+        addr: &Address,
+        abi_json: &str,
+        method: &str,
+        args: Value,
+        keys: &KeyPair,
+    ) -> Result<Value> {
+        let (endpoint, boc, account_id, dapp_id) = self
+            .prepare_money_post(addr, abi_json, method, args, keys)
+            .await?;
+        send_message_routed_money_once(
+            &self.money_post_http,
+            &endpoint,
+            &boc,
+            &account_id,
+            &dapp_id,
+        )
+        .await
+    }
+
     /// Submit `boc` to `/v2/messages`. `deploy` selects the routing:
     /// - `false` -- a regular write to an **existing** contract(call/fund): `send_message`, which
     /// reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error -> propagates.
@@ -4425,30 +6409,16 @@ impl RealChainBackend {
         .await
     }
 
-    /// Submit a message to shellnet with retry on **transient** infrastructure failures:
-    /// (1) overflow of the block manager's write queue(`QUEUE_OVERFLOW` -- "message queue is full");
-    /// (2) **transient gateway 5xx** (`502 Bad Gateway` / `503` / `504` from the reverse proxy, when
-    /// the backend is briefly unavailable -- observed to flicker on shellnet under load). The node is alive and moving
-    /// blocks; we wait(exponential backoff, cap 8s) and retry -- this is resilience to a real network,
-    /// not a test crutch. Other(logical) errors propagate immediately. `deploy` is threaded to
-    /// [`submit_once`] so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
+    /// Submit a message to shellnet with retry on the shared transient transport classification or
+    /// the block manager's explicit `QUEUE_OVERFLOW` answer. `deploy` is threaded to [`submit_once`]
+    /// so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
     async fn retry_submit(&self, boc: &str, deploy: bool) -> Result<Value> {
         self.clock_skew_preflight().await?;
-        // Transient marker: the queue is full OR a temporary gateway failure(5xx) that clears on its own.
-        fn is_transient(msg: &str) -> bool {
-            msg.contains("QUEUE_OVERFLOW")
-                || msg.contains("502")
-                || msg.contains("503")
-                || msg.contains("504")
-                || msg.contains("Bad Gateway")
-                || msg.contains("Service Unavailable")
-                || msg.contains("Gateway Time")
-        }
         let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
         for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
             match self.submit_once(boc, deploy).await {
                 Ok(v) => return Ok(v),
-                Err(e) if is_transient(&e.to_string()) => {
+                Err(e) if is_transient_submit_failure(&e) => {
                     eprintln!(
                         "shellnet transient submit error (attempt {attempt}): {e}; waiting {delay:?} then retrying"
                     );
@@ -4509,7 +6479,7 @@ impl RealChainBackend {
     /// in the order book as an ask. `None` if the book is not active.
     pub async fn inference_orderbook_best_bid_ask(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(ob, INFERENCE_ORDERBOOK_ABI, "getBestBidAsk", json!({}))
+            .run_getter_retrying(ob, INFERENCE_ORDERBOOK_ABI, "getBestBidAsk", json!({}))
             .await
     }
 
@@ -4542,7 +6512,7 @@ impl RealChainBackend {
               }
             }
         "#;
-        let resp: Value = self
+        let response = self
             .http
             .post(&gql)
             .json(&json!({
@@ -4550,8 +6520,9 @@ impl RealChainBackend {
                 "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
             }))
             .send()
+            .await?;
+        let resp: Value = shellnet_response_for_status(response)
             .await?
-            .error_for_status()?
             .json()
             .await?;
         let edges = resp["data"]["blockchain"]["account"]["messages"]["edges"]
@@ -4586,7 +6557,7 @@ impl RealChainBackend {
                         .map_err(|e| {
                             anyhow!(
                                 "InferenceFilledConfirmed tokenContract {}: {e}",
-                                fill.token_contract
+                                display_token_contract(&fill.token_contract)
                             )
                         })?
                         .with_workchain();
@@ -4636,7 +6607,7 @@ impl RealChainBackend {
               }
             }
         "#;
-        let response: Value = self
+        let response = self
             .http
             .post(&gql)
             .json(&json!({
@@ -4644,8 +6615,9 @@ impl RealChainBackend {
                 "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
             }))
             .send()
+            .await?;
+        let response: Value = shellnet_response_for_status(response)
             .await?
-            .error_for_status()?
             .json()
             .await?;
         let edges = response["data"]["blockchain"]["account"]["messages"]["edges"]
@@ -4704,7 +6676,15 @@ impl RealChainBackend {
             .map(|a| a.with_workchain())
             .unwrap_or_else(|_| order_book.with_workchain());
         let messages =
-            fetch_all_ext_out_messages(&self.http, self.client.endpoint(), &account_id).await?;
+            retry_transient_read(|| {
+                fetch_all_ext_out_messages(
+                    &self.http,
+                    self.client.endpoint(),
+                    &account_id,
+                    |message| Ok(Some(message)),
+                )
+            })
+            .await?;
         let mut matches = Vec::<(i64, u128, MatchedFill)>::new();
         for message in messages {
             match super::note_events::decode_attributed_inference_filled(&message.body) {
@@ -4725,7 +6705,7 @@ impl RealChainBackend {
                         .map_err(|e| {
                             anyhow!(
                                 "InferenceFilledConfirmed tokenContract {}: {e}",
-                                fill.token_contract
+                                display_token_contract(&fill.token_contract)
                             )
                         })?
                         .with_workchain();
@@ -4818,7 +6798,7 @@ impl RealChainBackend {
     /// The book's `getStats` getter(`nextOrderId`, `orderCount`, `executedNotional`, `executedTicks`).
     pub async fn inference_orderbook_stats(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(ob, INFERENCE_ORDERBOOK_ABI, "getStats", json!({}))
+            .run_getter_retrying(ob, INFERENCE_ORDERBOOK_ABI, "getStats", json!({}))
             .await
     }
 
@@ -4836,7 +6816,15 @@ impl RealChainBackend {
     ) -> Result<Vec<InferenceSubscriptionPlacement>> {
         let account_id = ob.bare().to_string();
         let messages =
-            fetch_all_ext_out_messages(&self.http, self.client.endpoint(), &account_id).await?;
+            retry_transient_read(|| {
+                fetch_all_ext_out_messages(
+                    &self.http,
+                    self.client.endpoint(),
+                    &account_id,
+                    |message| Ok(Some(message)),
+                )
+            })
+            .await?;
         let buyer_note = buyer_note.with_workchain();
         let mut placements = Vec::new();
         for message in messages {
@@ -4849,7 +6837,7 @@ impl RealChainBackend {
                 .map_err(|error| {
                     anyhow!(
                         "InferenceSubscriptionPlaced buyerNote {}: {error}",
-                        placement.buyer_note
+                        display_dexdo_address(&placement.buyer_note)
                     )
                 })?
                 .with_workchain();
@@ -4873,6 +6861,54 @@ impl RealChainBackend {
         )
     }
 
+    /// Owner-facing BUY outcome facts one note has in this book, oldest first.
+    /// The book emits a distinct event per outcome and names the owning note on each, so the durable buyer
+    /// submit record is resolved by the outcome that happened rather than by the order's absence.
+    pub async fn inference_buyer_order_facts(
+        &self,
+        ob: &Address,
+        buyer_note: &Address,
+    ) -> Result<Vec<BuyerOrderFact>> {
+        let account_id = ob.bare().to_string();
+        let messages =
+            retry_transient_read(|| {
+                fetch_all_ext_out_messages(
+                    &self.http,
+                    self.client.endpoint(),
+                    &account_id,
+                    |message| Ok(Some(message)),
+                )
+            })
+            .await?;
+        let buyer_note = buyer_note.with_workchain();
+        let mut facts = Vec::new();
+        for message in messages {
+            let created_at = i64::try_from(message.created_at).map_err(|_| {
+                anyhow!(
+                    "InferenceOrderBook ext-out {} created_at exceeds i64",
+                    message.id
+                )
+            })?;
+            let Some(fact) = super::book_events::decode_buyer_order_fact(&message.body, created_at)?
+            else {
+                continue;
+            };
+            let owner = Address::parse(&fact.note)
+                .map_err(|error| {
+                    anyhow!(
+                        "InferenceOrderBook event note {}: {error}",
+                        display_dexdo_address(&fact.note)
+                    )
+                })?
+                .with_workchain();
+            if !owner.eq_ignore_ascii_case(&buyer_note) {
+                continue;
+            }
+            facts.push(BuyerOrderFact { note: owner, ..fact });
+        }
+        Ok(facts)
+    }
+
     /// The book's `getWeeklyMedianPrice` getter. `None` means the book is inactive; a live active
     /// book with no matched volume returns the contract's `ERR_NO_LIQUIDITY` through the TVM getter error.
     pub async fn inference_orderbook_weekly_median_price(
@@ -4881,7 +6917,7 @@ impl RealChainBackend {
     ) -> Result<Option<u128>> {
         let Some(v) = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 ob,
                 INFERENCE_ORDERBOOK_ABI,
                 "getWeeklyMedianPrice",
@@ -4903,7 +6939,7 @@ impl RealChainBackend {
     /// The book's `getOrder(id)` getter -- resolves a specific order/offer(note, `tokenContract`, price...).
     pub async fn inference_orderbook_order(&self, ob: &Address, id: u128) -> Result<Option<Value>> {
         self.client
-            .run_getter(
+            .run_getter_retrying(
                 ob,
                 INFERENCE_ORDERBOOK_ABI,
                 "getOrder",
@@ -4937,14 +6973,33 @@ impl RealChainBackend {
     ) -> Result<Option<DealSubscription>> {
         let Some(v) = self
             .client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getSubscription", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getSubscription", json!({}))
             .await?
         else {
             return Ok(None);
         };
         DealSubscription::decode_getter(&v)
             .map(Some)
-            .map_err(|reason| anyhow!("TokenContract {tc}: {reason}"))
+            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
+    }
+
+    /// The deal's `getOffer()` getter on the `TokenContract`.
+    /// `offerPosted` is the `_offerPosted` latch: a TC with it set drops `postFromNote` on the floor
+    /// (`contracts/airegistry/TokenContract.sol:713`), so it is the fact a seller must read before
+    /// believing a successor ask can rest. The book clears it through `onSellClosed` when the ask
+    /// leaves WITHOUT a fill -- cancel or expiry -- which is what keeps the same live TC re-listable
+    /// (`contracts/airegistry/TokenContract.sol:729-736`).
+    pub async fn token_contract_offer(&self, tc: &Address) -> Result<Option<DealOfferLatch>> {
+        let Some(v) = self
+            .client
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getOffer", json!({}))
+            .await?
+        else {
+            return Ok(None);
+        };
+        DealOfferLatch::decode_getter(&v)
+            .map(Some)
+            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
     }
 
     /// Permissionlessly clear an order whose deadline has passed, refunding its escrow.
@@ -4997,7 +7052,7 @@ impl RealChainBackend {
 
     /// The buyer(note) places a limit buy for inference -- `placeInferenceBuy(modelHash,
     /// maxPricePerTick, ticks, escrow, flags, deadline)`(signed with the note's owner key). The
-    /// escrow is ECC SHELL(currency 2): the note moves `escrow` from its ECC balance into the book.
+    /// escrow is SHELL currency 2: the note moves `escrow` from `getDetails().balance[2]` into the book.
     /// If `maxPricePerTick` >= the resting ask -- a match happens immediately (the book calls
     /// `fundFromOrderBook` on the TC).
     /// `deadline` is an absolute unix timestamp. The contract permits zero as GTC, but the dexdo CLI applies
@@ -5073,23 +7128,17 @@ impl RealChainBackend {
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         *cursor = final_cursor;
-        let account = self
-            .client
-            .get_account(note)
+        let note_shell_balance = self
+            .private_note_shell_balance(note)
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        note_balance_private_note_account(note, account.as_ref())
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        let note_shell_balance = account
-            .expect("validated PrivateNote account must be present")
-            .ecc_balance(2);
         before_post(
             money_submit_identity(&boc),
             cursor.clone(),
             note_shell_balance,
         )
         .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        send_message_routed_money_once(
+        retry_buyer_money_submit(
             &self.money_post_http,
             &endpoint,
             &boc,
@@ -5154,7 +7203,7 @@ impl RealChainBackend {
                 anyhow::Error::new(MoneySubmitError::Preparation {
                     source: anyhow!(
                         "InferenceOrderBook {} is not active before subscription POST",
-                        order_book.with_workchain()
+                        display_dexdo_address(order_book)
                     ),
                 })
             })?;
@@ -5177,7 +7226,7 @@ impl RealChainBackend {
             pre_post_fills,
         )
         .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        send_message_routed_money_once(
+        retry_buyer_money_submit(
             &self.money_post_http,
             &endpoint,
             &boc,
@@ -5230,7 +7279,7 @@ impl RealChainBackend {
     /// an ordinary zero-valued deal.
     pub async fn token_contract_state(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getState", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getState", json!({}))
             .await
     }
 
@@ -5241,14 +7290,14 @@ impl RealChainBackend {
         };
         DealChainState::decode_getter(&value)
             .map(Some)
-            .map_err(|reason| anyhow!("TokenContract {tc}: {reason}"))
+            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
     }
 
     /// The raw `getSellerBond` getter of the deal. Production lifecycle consumers must use
     /// [`Self::token_contract_deal_seller_bond`].
     pub async fn token_contract_seller_bond(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getSellerBond", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getSellerBond", json!({}))
             .await
     }
 
@@ -5262,14 +7311,14 @@ impl RealChainBackend {
         };
         DealSellerBond::decode_getter(&value)
             .map(Some)
-            .map_err(|reason| anyhow!("TokenContract {tc}: {reason}"))
+            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
     }
 
     /// The raw `getBuyerBond` getter of the deal. Production accounting consumers must use
     /// [`Self::token_contract_deal_buyer_bond`].
     pub async fn token_contract_buyer_bond(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getBuyerBond", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getBuyerBond", json!({}))
             .await
     }
 
@@ -5283,7 +7332,7 @@ impl RealChainBackend {
         };
         DealBuyerBond::decode_getter(&value)
             .map(Some)
-            .map_err(|reason| anyhow!("TokenContract {tc}: {reason}"))
+            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
     }
 
     /// Read one coherent strict accounting/lifecycle snapshot.
@@ -5301,7 +7350,7 @@ impl RealChainBackend {
         };
         read_coherent_deal_snapshot(&mut source)
             .await
-            .map_err(|error| anyhow!("TokenContract {tc}: {error}"))
+            .map_err(|error| anyhow!("TokenContract {}: {error}", display_token_contract(tc)))
     }
     /// The `getConfig` getter of the deal(`TokenContract`, 4.0.31 `view`):
     /// `platformFeeBps`, `minClaimInterval`, `minSecondsPerTick`, and `disputeWindow`.
@@ -5309,15 +7358,92 @@ impl RealChainBackend {
     /// promotion windows are not returned here. `None` if the TC is not active.
     pub async fn token_contract_config(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(tc, TOKENCONTRACT_ABI, "getConfig", json!({}))
+            .run_getter_retrying(tc, TOKENCONTRACT_ABI, "getConfig", json!({}))
             .await
     }
 
     /// Read-only `PrivateNote.getDetails()`: public balance/lock maps and metadata, no key and no signed call.
     pub async fn private_note_details(&self, note: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
+            .run_getter_retrying(note, PRIVATENOTE_ABI, "getDetails", json!({}))
             .await
+    }
+
+    /// Read the note's best-effort outstanding mirror and independently check every deal address.
+    /// The mirror has two opposite blind spots. Its `bounce:false` fill callback can fail before a
+    /// live deal is recorded, so absence here proves nothing. Its `bounce:false` close callback can
+    /// also fail, so a destroyed deal can remain recorded. For that reason only a candidate whose
+    /// own `getParties` names this note and whose own `getState` reports `funded=true` is returned as
+    /// a lead; inactive, destroyed, unfunded, terminal, and identity-mismatched addresses are
+    /// retained as explicit refusals.
+    pub async fn private_note_outstanding(
+        &self,
+        note: &Address,
+    ) -> Result<PrivateNoteOutstandingReport> {
+        let note = normalize_addr(&note.with_workchain())?;
+        let note_address = Address::parse(&note)?;
+        let value = self
+            .client
+            .run_getter_retrying(
+                &note_address,
+                PRIVATENOTE_ABI,
+                "getOutstanding",
+                json!({}),
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "PrivateNote {note} getOutstanding returned no data; no deal address is proven"
+                )
+            })?;
+        let (deals, opaque_order_count) = decode_private_note_outstanding(&value)?;
+        let mut report = PrivateNoteOutstandingReport {
+            opaque_order_count,
+            ..Default::default()
+        };
+        for token_contract in deals {
+            let token_contract = token_contract.with_workchain();
+            let address = Address::parse(&token_contract)?;
+            let parties = self
+                .token_contract_parties(&address)
+                .await
+                .with_context(|| {
+                    format!(
+                        "validate PrivateNote {note} getOutstanding lead {token_contract} through TokenContract.getParties"
+                    )
+                })?;
+            let state = self
+                .token_contract_deal_state(&address)
+                .await
+                .with_context(|| {
+                    format!(
+                        "validate PrivateNote {note} getOutstanding lead {token_contract} through TokenContract.getState"
+                    )
+                })?;
+            match classify_outstanding_deal_lead(
+                &note,
+                &token_contract,
+                parties.as_ref(),
+                state.as_ref(),
+            ) {
+                Ok(lead) => report.deal_leads.push(lead),
+                Err(refusal) => report.refused_deal_leads.push(refusal),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Spendable SHELL recorded by the note contract. Physical account ECC[2] is deployment gas,
+    /// not order or seller-bond money on 4.0.33.
+    pub async fn private_note_shell_balance(&self, note: &Address) -> Result<u128> {
+        let display_note = display_dexdo_address(note);
+        let details = self.private_note_details(note).await?.ok_or_else(|| {
+            anyhow!(
+                "PrivateNote {display_note} getDetails returned no data; spendable balance is unknown"
+            )
+        })?;
+        private_note_balance_currency(&details, crate::params::SHELL_CURRENCY_ID)
+            .with_context(|| format!("PrivateNote {display_note} spendable SHELL balance"))
     }
 
     /// Read every successful owner-signed `placeInferenceBuy` receipt for one note. This is intended
@@ -5360,7 +7486,7 @@ impl RealChainBackend {
         let mut seen = BTreeSet::new();
         let mut receipts = Vec::new();
         loop {
-            let response: Value = self
+            let response = self
                 .http
                 .post(&gql)
                 .json(&json!({
@@ -5373,8 +7499,9 @@ impl RealChainBackend {
                     },
                 }))
                 .send()
+                .await?;
+            let response: Value = shellnet_response_for_status(response)
                 .await?
-                .error_for_status()?
                 .json()
                 .await?;
             if let Some(errors) = response.get("errors") {
@@ -5452,6 +7579,206 @@ impl RealChainBackend {
         Ok(receipts)
     }
 
+    /// Resolve every outbound message produced by this invocation's exact external
+    /// `PrivateNote.streamStop` message. These ids can be matched directly against the terminal
+    /// TokenContract transaction's inbound message id.
+    pub async fn submitted_buyer_stop_out_message_ids(
+        &self,
+        client_message_id: &str,
+        buyer_note: &Address,
+    ) -> Result<Option<Vec<String>>> {
+        let gql = format!("{}/graphql", self.client.endpoint().trim_end_matches('/'));
+        let response: Value = self
+            .http
+            .post(&gql)
+            .json(&json!({
+                "query": SUBMITTED_BUYER_STOP_QUERY,
+                "variables": { "hash": bare_hex(client_message_id) },
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(errors) = response.get("errors") {
+            return Err(anyhow!(
+                "submitted buyer STOP message GraphQL errors: {errors}"
+            ));
+        }
+        parse_submitted_buyer_stop_out_message_ids(
+            &response,
+            client_message_id,
+            &buyer_note.with_workchain(),
+        )
+    }
+
+    /// Resolve which call produced one settlement receipt, from the inbound message of the
+    /// transaction that emitted it rather than from the event body.
+    /// `StreamStopped` has a single emit site, in `_closeClean()`, which both the buyer's `stop()`
+    /// and the seller's `sellerStop()` reach, and its payload names the buyer beneficiary and
+    /// never the actor. The discriminator is one level up, in the transaction's inbound message:
+    /// `stop()` is `require(msg.sender == _buyer)`, so only an internal message from the recorded
+    /// buyer note reaches it, while `sellerStop()` is `onlyOwnerPubkey(_sellerPubkey) accept` and
+    /// arrives as an external message. Only internal inbound messages are read here, so a receipt
+    /// an external close produced has no call to bind to and fails instead of being reported as a
+    /// buyer stop.
+    /// Introduced for's live verifier and reused by's production STOP attribution: both
+    /// need the same transaction-bound fact, so the client keeps one reader rather than a second
+    /// event heuristic.
+    pub async fn token_contract_settlement_inbound_call(
+        &self,
+        token_contract: &Address,
+        settlement_message_id: &str,
+    ) -> Result<TokenContractInboundCall> {
+        let account_id = token_contract.bare().to_string();
+        let endpoint = self.client.endpoint().trim_end_matches('/');
+        let gql = format!("{endpoint}/graphql");
+        // The same account and the same post-terminal `/v2/account` 404 as
+        // `token_contract_settlement_receipts`, which reads this deal's ext-out side.
+        let dapp_id = match fetch_dapp_id(&self.http, endpoint, &account_id).await {
+            Ok(dapp_id) => dapp_id,
+            Err(error) if is_uninit_account_404(&error.to_string()) => account_id.clone(),
+            Err(error) => return Err(error),
+        };
+        // One projection for both sides, so the receipt id and the inbound message id are compared
+        // as the same field of the same type: the ext-out receipt names its emitting transaction
+        // through `src_transaction`, and the message that transaction consumed names it back
+        // through `dst_transaction`. A transaction executes exactly one inbound message, so that
+        // pair is an exact binding rather than a search for a compatible-looking record.
+        let query = r#"
+            query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
+              blockchain {
+                account(account_id: $accountId, dapp_id: $dappId) {
+                  messages(msg_type: [IntIn, ExtOut], last: $last, before: $before) {
+                    pageInfo { startCursor hasPreviousPage }
+                    edges {
+                      node {
+                        id src body
+                        src_transaction { id }
+                        dst_transaction { id }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        let mut before: Option<String> = None;
+        let mut nodes = Vec::new();
+        loop {
+            let response = self
+                .http
+                .post(&gql)
+                .json(&json!({
+                    "query": query,
+                    "variables": {
+                        "accountId": bare_hex(&account_id),
+                        "dappId": bare_hex(&dapp_id),
+                        // The existing account-message pager bound; not a second copy of it.
+                        "last": crate::params::EXT_OUT_PAGE_SIZE,
+                        "before": before.as_deref(),
+                    },
+                }))
+                .send()
+                .await?;
+            let response: Value = shellnet_response_for_status(response)
+                .await?
+                .json()
+                .await?;
+            if let Some(errors) = response.get("errors") {
+                return Err(anyhow!(
+                    "TokenContract {token_contract} inbound-call GraphQL errors: {errors}"
+                ));
+            }
+            let messages = response
+                .pointer("/data/blockchain/account/messages")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "TokenContract {token_contract} inbound-call GraphQL shape changed: \
+                         {response}"
+                    )
+                })?;
+            let edges = messages["edges"].as_array().ok_or_else(|| {
+                anyhow!("TokenContract {token_contract} inbound-call GraphQL edges missing")
+            })?;
+            nodes.extend(edges.iter().map(|edge| edge["node"].clone()));
+            let Some(next) = previous_page_cursor(
+                &format!("TokenContract {token_contract} inbound-call"),
+                messages,
+                before.as_deref(),
+            )?
+            else {
+                break;
+            };
+            before = Some(next);
+        }
+        let emitting = nodes
+            .iter()
+            .filter(|node| node["id"].as_str() == Some(settlement_message_id))
+            .filter_map(|node| node["src_transaction"]["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        if emitting.len() != 1 {
+            return Err(anyhow!(
+                "TokenContract {token_contract} settlement receipt {settlement_message_id} names \
+                 {} emitting transactions of this deal, expected exactly one",
+                emitting.len()
+            ));
+        }
+        let inbound = nodes
+            .iter()
+            .filter(|node| node["dst_transaction"]["id"].as_str() == Some(emitting[0].as_str()))
+            .collect::<Vec<_>>();
+        if inbound.len() != 1 {
+            return Err(anyhow!(
+                "TokenContract {token_contract} settlement receipt {settlement_message_id} was \
+                 emitted by a transaction carrying {} internal inbound messages, expected exactly \
+                 one; a close with none was submitted externally, which `stop()` cannot be because \
+                 it requires `msg.sender == _buyer`",
+                inbound.len()
+            ));
+        }
+        let executed = inbound[0];
+        let message_id = executed["id"].as_str().ok_or_else(|| {
+            anyhow!("TokenContract {token_contract} inbound call has no message id")
+        })?;
+        let source = executed["src"].as_str().ok_or_else(|| {
+            anyhow!("TokenContract {token_contract} inbound call {message_id} has no sender")
+        })?;
+        let function = executed["body"]
+            .as_str()
+            .and_then(|body| decode_internal_abi_call(body, TOKENCONTRACT_ABI))
+            .map(|decoded| decoded.function_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "TokenContract {token_contract} inbound call {message_id} does not decode \
+                     against the TokenContract ABI"
+                )
+            })?;
+        Ok(TokenContractInboundCall {
+            message_id: message_id.to_string(),
+            source: source.to_string(),
+            function,
+        })
+    }
+
+    /// Confirm that the transaction which emitted `settlement_message_id` consumed the buyer
+    /// note's internal `TokenContract.stop()` call. Event payload alone cannot prove this because
+    /// buyer STOP, seller STOP, and permissionless finalization share terminal event shapes.
+    pub async fn settlement_receipt_confirms_buyer_stop(
+        &self,
+        token_contract: &Address,
+        settlement_message_id: &str,
+        buyer_note: &Address,
+    ) -> Result<bool> {
+        let call = self
+            .token_contract_settlement_inbound_call(token_contract, settlement_message_id)
+            .await?;
+        if call.function != "stop" {
+            return Ok(false);
+        }
+        Ok(normalize_addr(&call.source)? == normalize_addr(&buyer_note.with_workchain())?)
+    }
+
     /// Read ordered lifecycle receipts for one deal. `StreamStopped` proves the clean
     /// post-probe-accept split; `ProbeBurned` proves the mutually exclusive probe-burn path.
     pub async fn token_contract_settlement_receipts(
@@ -5471,9 +7798,81 @@ impl RealChainBackend {
             self.client.endpoint(),
             &account_id,
             &dapp_id,
+            |message| Ok(Some(message)),
         )
         .await?;
         decode_token_contract_settlement_receipts(messages)
+    }
+
+    /// Read current getters when active and immutable ext-out history for one TokenContract.
+    pub async fn token_contract_receipt_chain_data(
+        &self,
+        token_contract: &Address,
+    ) -> Result<TokenContractReceiptChainData> {
+        let account = self.client.get_account(token_contract).await?;
+        let account_active = account.as_ref().is_some_and(Account::is_active);
+        let code_hash = account
+            .as_ref()
+            .and_then(|account| account.code_hash.as_deref())
+            .and_then(normalize_code_hash);
+        let current = if account_active {
+            let getter = |name: &'static str| async move {
+                self.client
+                    .run_getter(token_contract, TOKENCONTRACT_ABI, name, json!({}))
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "active TokenContract {} returned no {name}",
+                            token_contract.with_workchain()
+                        )
+                    })
+            };
+            Some(TokenContractCurrentFacts {
+                state: getter("getState").await?,
+                fees: getter("getFees").await?,
+                deal: getter("getDeal").await?,
+                parties: getter("getParties").await?,
+                seller: getter("getSeller").await?,
+                version: getter("getVersion").await?,
+            })
+        } else {
+            None
+        };
+        let receipts = self.token_contract_settlement_receipts(token_contract).await?;
+        Ok(TokenContractReceiptChainData {
+            account_id: token_contract.with_workchain(),
+            account_active,
+            code_hash,
+            current,
+            receipts,
+        })
+    }
+
+    /// Read immutable terminal history before a buyer STOP path prepares or submits money. A
+    /// matching terminal event is a successful already-closed observation, not a STOP error and
+    /// not proof that this client closed the deal.
+    pub async fn buyer_terminal_before_stop(
+        &self,
+        buyer_note: &Address,
+        token_contract: &Address,
+    ) -> Result<Option<BuyerStopTerminalReceipt>> {
+        let timeout = SellerLivenessParams::canonical().cancel_confirmation_timeout;
+        let receipts = tokio::time::timeout(
+            timeout,
+            self.token_contract_settlement_receipts(token_contract),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "TokenContract {token_contract} terminal event read exceeded the existing canonical \
+                 confirmation/read timeout"
+            )
+        })??;
+        select_prior_buyer_terminal_receipt(
+            &token_contract.with_workchain(),
+            &buyer_note.with_workchain(),
+            &receipts,
+        )
     }
 
     async fn reject_prior_settlement_action_before_prepare(
@@ -5482,6 +7881,7 @@ impl RealChainBackend {
         action: SettlementAction,
         buyer_actor: Option<&Address>,
     ) -> Result<()> {
+        let display_tc = display_token_contract(token_contract);
         let confirmation_timeout = SellerLivenessParams::canonical().cancel_confirmation_timeout;
         let receipts = tokio::time::timeout(
             confirmation_timeout,
@@ -5490,7 +7890,7 @@ impl RealChainBackend {
         .await
         .map_err(|_| {
             anyhow!(
-                "TokenContract {token_contract} pre-prepare event snapshot exceeded the existing \
+                "TokenContract {display_tc} pre-prepare event snapshot exceeded the existing \
                  canonical confirmation/read timeout"
             )
         })??;
@@ -5533,6 +7933,7 @@ impl RealChainBackend {
         prepared: (String, String, String, String),
         before_post: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<Option<SettlementActionReceipt>> {
+        let display_tc = display_token_contract(token_contract);
         let timing = SellerLivenessParams::canonical();
         let confirmation_timeout = timing.cancel_confirmation_timeout;
         let confirmation_poll = timing.cancel_confirmation_poll;
@@ -5543,7 +7944,7 @@ impl RealChainBackend {
         .await
         .map_err(|_| {
             anyhow!(
-                "TokenContract {token_contract} pre-submit event snapshot exceeded the existing \
+                "TokenContract {display_tc} pre-submit event snapshot exceeded the existing \
                  canonical confirmation/read timeout"
             )
         })??;
@@ -5561,7 +7962,7 @@ impl RealChainBackend {
         .await
         .map_err(|_| {
             anyhow!(
-                "TokenContract {token_contract} pre-submit coherent snapshot exceeded the existing \
+                "TokenContract {display_tc} pre-submit coherent snapshot exceeded the existing \
                  canonical confirmation/read timeout"
             )
         })??;
@@ -5569,7 +7970,7 @@ impl RealChainBackend {
             validate_buyer_stop_pre_state(&token_contract.with_workchain(), pre.as_ref(), &before)?;
         }
         let pre = pre.ok_or_else(|| {
-            anyhow!("TokenContract {token_contract} was inactive before the settlement action POST")
+            anyhow!("TokenContract {display_tc} was inactive before the settlement action POST")
         })?;
         validate_settlement_facts(&token_contract.with_workchain(), &pre)?;
         let expected = expected.resolve(pre.state);
@@ -5584,13 +7985,13 @@ impl RealChainBackend {
             .await
             .map_err(|_| {
                 anyhow!(
-                    "TokenContract {token_contract} buyer-actor preflight exceeded the existing \
+                    "TokenContract {display_tc} buyer-actor preflight exceeded the existing \
                      canonical confirmation/read timeout"
                 )
             })??
             .ok_or_else(|| {
                 anyhow!(
-                    "TokenContract {token_contract} has no authoritative buyer actor in getParties; \
+                    "TokenContract {display_tc} has no authoritative buyer actor in getParties; \
                      refusing settlement action before any money POST"
                 )
             })?;
@@ -5599,8 +8000,10 @@ impl RealChainBackend {
                 let actor = normalize_addr(&actor.with_workchain())?;
                 if recorded != actor {
                     return Err(anyhow!(
-                        "TokenContract {token_contract} recorded buyer actor {recorded} does not match \
-                         requested buyer note {actor}; refusing settlement action before any money POST"
+                        "TokenContract {display_tc} recorded buyer actor {} does not match requested \
+                         buyer note {}; refusing settlement action before any money POST",
+                        display_dexdo_address(&recorded),
+                        display_dexdo_address(&actor)
                     ));
                 }
             }
@@ -5678,8 +8081,9 @@ impl RealChainBackend {
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!(
-                            "buyer place preflight could not read PrivateNote.getDetails for note {note} \
+                            "buyer place preflight could not read PrivateNote.getDetails for note {} \
                              after {} attempts",
+                            display_dexdo_address(note),
                             crate::params::BUYER_NOTE_PREFLIGHT_MAX_ATTEMPTS
                         )
                     });
@@ -5697,14 +8101,16 @@ impl RealChainBackend {
     pub async fn assert_note_can_post_sell_offer(&self, note: &Address) -> Result<()> {
         let details = self.private_note_details(note).await?.ok_or_else(|| {
             anyhow!(
-                "seller post_offer aborted: note {note} returned no PrivateNote.getDetails; cannot read \
-                 hasWithdrawn before postSellOffer. Re-mint/deploy a fresh note against the current contracts."
+                "seller post_offer aborted: note {} returned no PrivateNote.getDetails; cannot read \
+                 hasWithdrawn before postSellOffer. Re-mint/deploy a fresh note against the current contracts.",
+                display_dexdo_address(note)
             )
         })?;
         let withdrawn = details_has_withdrawn(&details).ok_or_else(|| {
             anyhow!(
-                "seller post_offer aborted: PrivateNote.getDetails for note {note} has no hasWithdrawn field; \
-                 refusing to submit postSellOffer without proving the note is not withdrawn"
+                "seller post_offer aborted: PrivateNote.getDetails for note {} has no hasWithdrawn field; \
+                 refusing to submit postSellOffer without proving the note is not withdrawn",
+                display_dexdo_address(note)
             )
         })?;
         if withdrawn {
@@ -5713,12 +8119,17 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive -- the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
-    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)`(4.0.7). The note
-    /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address -- this
-    /// replaces the operator multisig's [`fund_deploy_from_wallet_ecc`](Self::fund_deploy_from_wallet_ecc) on the
-    /// operate path. The RootModel/TC *deploys* stay external seller-signed; this call only pre-funds. The call is
+    /// Directive -- the note pre-funds its per-deal TC **uninit deploy address** from its ECC[2],
+    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, tcShell)`. The note derives the target
+    /// internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address -- this replaces the
+    /// operator multisig's [`fund_deploy_from_wallet_ecc`](Self::fund_deploy_from_wallet_ecc) on the
+    /// operate path. The TC *deploy* stays external seller-signed; this call only pre-funds. The call is
     /// an external owner-signed message to the note, exactly like [`deploy_inference_orderbook`](Self::deploy_inference_orderbook).
+    /// **ONE LEG SINCE 4.0.34.** `rootModelShell` is gone from the contract signature
+    /// (`contracts/dex/PrivateNote.sol:1143`) because `SuperRoot` deploys the `RootModel` itself and
+    /// carries its own value. The Rust parameter is kept so a caller that still passes one is REFUSED
+    /// rather than served a message that quietly funds only the deal -- see
+    /// [`root_model_deploy_shell_unsupported`].
     pub async fn note_fund_deploy_shell(
         &self,
         note: &Address,
@@ -5727,15 +8138,14 @@ impl RealChainBackend {
         root_model_shell: u128,
         tc_shell: u128,
     ) -> Result<Value> {
+        if let Some(reason) = root_model_deploy_shell_unsupported(root_model_shell) {
+            return Err(anyhow!(reason));
+        }
         let boc = Self::encode_signed_call_boc(
             note,
             PRIVATENOTE_ABI,
             "fundDeployShell",
-            json!({
-                "nonce": nonce.to_string(),
-                "rootModelShell": root_model_shell.to_string(),
-                "tcShell": tc_shell.to_string(),
-            }),
+            note_fund_deploy_shell_params(nonce, tc_shell),
             owner_keys,
         )
         .await?;
@@ -5783,7 +8193,7 @@ impl RealChainBackend {
     pub(super) async fn active_native_balance(&self, addr: &Address) -> Result<u128> {
         let account = self
             .client
-            .get_account(addr)
+            .get_account_retrying(addr)
             .await?
             .ok_or_else(|| anyhow!("contract {addr} is missing; cannot gas-health check"))?;
         if !account.is_active() {
@@ -5809,7 +8219,7 @@ impl RealChainBackend {
     }
 
     async fn account_snapshot(&self, addr: &Address) -> String {
-        match self.client.get_account(addr).await {
+        match self.client.get_account_retrying(addr).await {
             Ok(Some(a)) => format!(
                 "status={} native={} ecc2={} code_hash={}",
                 a.status,
@@ -5830,95 +8240,138 @@ impl RealChainBackend {
         tc: &Address,
     ) {
         eprintln!(
-            "deploy-prefund {stage}: note {note} [{}]; RootModel {rm} [{}]; TokenContract {tc} [{}]",
+            "deploy-prefund {stage}: note {} [{}]; RootModel {} [{}]; TokenContract {} [{}]",
+            display_dexdo_address(note),
             self.account_snapshot(note).await,
+            display_dexdo_address(rm),
             self.account_snapshot(rm).await,
+            display_token_contract(tc),
             self.account_snapshot(tc).await,
         );
     }
 
-    /// before an active RootModel / per-deal TC write, ensure the contract still has native
-    /// vmshell gas. `fundDeployShell` is seller-note-owned and derives both targets from
-    /// `(seller pubkey, nonce)`, so only call this from paths that hold the seller note/key/nonce.
+    /// before an active per-deal TC write, ensure the deal still has native vmshell gas.
+    /// `fundDeployShell` is seller-note-owned and derives the target from `(seller pubkey, nonce)`, so
+    /// only call this from paths that hold the seller note/key/nonce.
+    /// **THE DEAL ONLY.** This used to top the `RootModel` up as well, on the same message. Both halves
+    /// of that are gone in 4.0.34 and for the same reason: `fundDeployShell` no longer has a RootModel
+    /// leg(`contracts/dex/PrivateNote.sol:1143`), and the RootModel no longer needs one -- deployed by
+    /// SuperRoot it lives in SuperRoot's configured dapp, where its own `ensureBalance() ->
+    /// gosh.mintshellq` mints what it needs. A deal cannot do that: it is deployed by an external
+    /// message into a dapp of its own with no configuration, which is why this step survives for it.
+    /// ** -- SIZED TO THE DEAL, NOT TO A CONSTANT.** The floor and target used to be the flat
+    /// `ACTIVE_CONTRACT_GAS_HEALTH_*` pair, 5 and 10 vmshell. That made the deposit decision
+    /// meaningless: whatever the seller funded, a deal below 5 was refilled to 10 out of the same
+    /// note, so a cheap deal spent ten SHELL either way and the surplus burnt at `destroy`. The
+    /// figures here are the deal's own, read from the deal -- which states its `maxTicks`.
     pub async fn ensure_deal_contract_gas(
         &self,
         note: &Address,
         owner_keys: &KeyPair,
         nonce: u64,
-        root_model: Option<&Address>,
         token_contract: Option<&Address>,
     ) -> Result<()> {
-        let mut rm_top_up = 0;
-        let mut tc_top_up = 0;
-
-        if let Some(rm) = root_model {
-            let balance = self.active_native_balance(rm).await?;
-            rm_top_up = gas_health_top_up_amount(
-                balance,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
-            )
-            .unwrap_or(0);
-        }
-        if let Some(tc) = token_contract {
-            let balance = self.active_native_balance(tc).await?;
-            tc_top_up = gas_health_top_up_amount(
-                balance,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
-            )
-            .unwrap_or(0);
-        }
-
-        if rm_top_up == 0 && tc_top_up == 0 {
-            return Ok(());
-        }
-
-        eprintln!(
-            "gas-health: topping up RootModel {rm_top_up} + TokenContract {tc_top_up} native nanotokens via note fundDeployShell"
-        );
-        self.note_fund_deploy_shell(note, owner_keys, nonce, rm_top_up, tc_top_up)
-            .await?;
-
-        if rm_top_up > 0 {
-            if let Some(rm) = root_model {
-                self.wait_native_balance_at_least(
-                    rm,
-                    crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                )
-                .await?;
-            }
-        }
-        if tc_top_up > 0 {
-            if let Some(tc) = token_contract {
-                self.wait_native_balance_at_least(
-                    tc,
-                    crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                )
-                .await?;
-            }
-        }
-        Ok(())
+        let deal_gas_overhead_raw =
+            crate::params::resolve_deal_gas_overhead_raw(self.network(), None)
+                .map_err(anyhow::Error::msg)?;
+        self.ensure_deal_contract_gas_with_overhead(
+            note,
+            owner_keys,
+            nonce,
+            token_contract,
+            deal_gas_overhead_raw,
+        )
+        .await
     }
 
-    /// Directive -- the note posts the exact `2P` seller bond to the nonce-derived `TokenContract` from its own
-    /// ECC[2], via the `PrivateNote` owner-method `postSellerBond(nonce, amount)`(4.0.7) -- replaces the
-    /// operator multisig's [`fund_seller_bond`](Self::fund_seller_bond). External owner-signed message.
-    pub async fn note_post_seller_bond(
+    /// Gas-health check using the measured remainder selected for this runtime network.
+    pub async fn ensure_deal_contract_gas_with_overhead(
         &self,
         note: &Address,
         owner_keys: &KeyPair,
         nonce: u64,
+        token_contract: Option<&Address>,
+        deal_gas_overhead_raw: u128,
+    ) -> Result<()> {
+        let mut tc_top_up = 0;
+        let mut tc_floor = crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL;
+
+        if let Some(tc) = token_contract {
+            let balance = self.active_native_balance(tc).await?;
+            // The deal is the authority on its own terms. `getDeal` is constructor-bound, so this is
+            // the same `maxTicks` the provision funded against and cannot drift from it. A deal that
+            // does not answer is not one this step can size for -- fall back to the generic pair
+            // rather than guess a cheaper floor for a contract we could not read.
+            let max_ticks = self
+                .token_contract_deal_terms(tc)
+                .await?
+                .map(|(_, _, max_ticks)| max_ticks);
+            let (floor, target) = match max_ticks {
+                Some(max_ticks) => (
+                    crate::params::deal_gas_health_floor_raw_with_overhead(
+                        max_ticks,
+                        deal_gas_overhead_raw,
+                    ),
+                    crate::params::deal_gas_health_target_raw_with_overhead(
+                        max_ticks,
+                        deal_gas_overhead_raw,
+                    ),
+                ),
+                None => (
+                    crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
+                    crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
+                ),
+            };
+            tc_floor = floor;
+            tc_top_up = gas_health_top_up_amount(balance, floor, target).unwrap_or(0);
+        }
+
+        if tc_top_up == 0 {
+            return Ok(());
+        }
+
+        eprintln!(
+            "gas-health: topping up TokenContract {tc_top_up} native nanotokens via note fundDeployShell"
+        );
+        self.note_fund_deploy_shell(note, owner_keys, nonce, 0, tc_top_up)
+            .await?;
+
+        if let Some(tc) = token_contract {
+            self.wait_native_balance_at_least(tc, tc_floor).await?;
+        }
+        Ok(())
+    }
+
+    /// Directive -- the note funds its own nonce-derived per-deal `TokenContract` with the exact
+    /// `2P` seller bond, with no operator multisig in the path (replaces the operator
+    /// multisig's [`fund_seller_bond`](Self::fund_seller_bond)). External owner-signed message.
+    /// Contracts 4.0.33 replaced `postSellerBond(nonce, amount)` with the single funding door
+    /// `fundDeal(nonce, gasShell, amount)`(`contracts/dex/PrivateNote.sol`), and 4.0.35 added a
+    /// fourth argument, `endpointCipher optional(bytes)`, which this client sends as `null` -- see
+    /// [`note_fund_deal_params`]. The door carries the two things a deal needs from two different
+    /// pockets in one message:
+    /// * `gasShell` rides in `currencies` as physical ECC[2] and flag 17 turns it into the deal's
+    /// native gas -- a deal cannot mint its own, because it is deployed by an external message
+    /// into its own dapp, which has no dapp config;
+    /// * `amount` is a **figure**, subtracted from this note's private `_balance[CURRENCIES_ID_SHELL]`
+    /// and passed as a call argument, which `TokenContract.fundDeal(amount)` adds to the deal's own
+    /// record after re-deriving the caller as the canonical seller note. The bond is that figure.
+    /// The gas leg is left where it already is: [`ensure_deal_contract_gas`](Self::ensure_deal_contract_gas)
+    /// tops the `TokenContract` up through `fundDeployShell` before this call, so the production
+    /// seller path passes `gas_shell = 0` and this message moves money only.
+    pub async fn note_fund_deal(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        nonce: u64,
+        gas_shell: u128,
         amount: u128,
     ) -> Result<Value> {
         self.submit(
             note,
             PRIVATENOTE_ABI,
-            "postSellerBond",
-            json!({
-                "nonce": nonce.to_string(),
-                "amount": amount.to_string(),
-            }),
+            NOTE_FUND_DEAL_METHOD,
+            note_fund_deal_params(nonce, gas_shell, amount),
             owner_keys,
         )
         .await
@@ -6034,20 +8487,27 @@ impl RealChainBackend {
         .await
     }
 
-    /// the seller CLOSES a STOPped deal's `TokenContract`. `destroy(payoutAddress)` is
-    /// `onlyOwnerPubkey(_sellerPubkey)`, gated `!_opened && !_disputed` (the buyer's `stop()` clears
-    /// `_opened` on close), and calls `selfdestruct(payoutAddress)`(`contracts/airegistry/TokenContract.sol:651`).
+    /// the seller CLOSES a STOPped deal's `TokenContract`. `destroy()` is
+    /// `onlyOwnerPubkey(_sellerPubkey)`, gated `!_opened && !_disputed && !_offerPosted` (the buyer's
+    /// `stop()` clears `_opened` on close), and calls `selfdestruct` to the deal's own stored
+    /// `_sellerNote`(`contracts/airegistry/TokenContract.sol:1844`).
     /// External call, signed by the seller owner key(matches `_sellerPubkey`).
-    /// **DESTRUCTIVE / BURNS(by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover to `payout`
-    /// when `payout` is the cross-dapp note -- the note balance does not increase(reproduced x2). The deploy
-    /// *funding* crossed dapps via `fundDeployShell` flag:16(credited); the raw `selfdestruct` *return* crossing
-    /// the boundary is not credited -> the reserve is **burned at destroy**. So this closes the TC; reclaiming the
-    /// reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix(contract-side).
-    /// NOT the dex/PMP oracle lifecycle.
+    /// **DESTRUCTIVE / BURNS(by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover when the
+    /// stored `_sellerNote` is the cross-dapp note -- the note balance does not increase(reproduced x2). The
+    /// deploy *funding* crossed dapps via `fundDeployShell` flag:16(credited); the raw `selfdestruct` *return*
+    /// crossing the boundary is not credited -> the reserve is **burned at destroy**. So this closes the TC;
+    /// reclaiming the reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix
+    /// (contract-side). NOT the dex/PMP oracle lifecycle.
+    /// **4.0.33 signature.** Task O removed the caller-named payee: the contract pays its own
+    /// stored `_sellerNote`(`TokenContract.sol` `_die`/`_payOwedAndDie`), and `destroy()` takes no
+    /// inputs. A function id is derived from the whole signature, so sending the old
+    /// `destroy(payoutAddress)` addresses a method this generation does not have -- the message
+    /// never reaches a guard at all. `_payout` is kept only so the CLI surface is unchanged; it is
+    /// deliberately not encoded, and it does not decide the payee.
     pub async fn destroy_token_contract(
         &self,
         tc: &Address,
-        payout: &Address,
+        _payout: &Address,
         seller_keys: &KeyPair,
     ) -> Result<Value> {
         let seller_pubkey = self.token_contract_seller_pubkey(tc).await?;
@@ -6061,10 +8521,36 @@ impl RealChainBackend {
             tc,
             TOKENCONTRACT_ABI,
             "destroy",
-            json!({ "payoutAddress": payout.with_workchain() }),
+            json!({}),
             seller_keys,
         )
         .await
+    }
+
+    /// the seller winds down an **UNSOLD** deal -- one that never matched, so it was never
+    /// funded and never opened. `destroy()` cannot reach that shape: it is gated on a STOPped deal,
+    /// and a deal nobody bought was never stopped because it never started. `close()` is its door
+    /// (`contracts/airegistry/TokenContract.sol:803`), `onlyOwnerPubkey(_sellerPubkey)` exactly like
+    /// `destroy()`, and it takes no inputs after Task O.
+    /// **TWO BRANCHES, AND ONLY ONE OF THEM ENDS THE DEAL.** With no ask resting, the contract hands
+    /// the bond back to its own stored `_sellerNote` and self-destructs in this same transaction
+    /// (`TokenContract.sol:816-820`). With an ask still resting it records INTENT only --
+    /// `_closing = true`, then returns(`TokenContract.sol:805-810`) -- leaving the deal alive and
+    /// still matchable, and the destruct deferred to whenever the book announces the ask left. So
+    /// the caller must establish `getOffer().offerPosted == false` before sending this, or it will
+    /// report a close that did not happen; `dexdo close` refuses instead.
+    /// **It could not be sent at all before 4.0.34.** `_buyer` was declared and never assigned, and
+    /// `addr_none.value` compiles to `PARSEMSGADDR` + `INDEX 3`, an out-of-range read(`exit_code 5`)
+    /// on the one-element representation -- thrown inside `_die` at `TokenContract.sol:434`, on every
+    /// path through it. The constructor now writes `_buyer = address(0)`
+    /// (`contracts/airegistry/TokenContract.sol:318`), whose `.value` is a readable zero; that one
+    /// assignment is what lets this call reach `selfdestruct`.
+    pub async fn close_unsold_deal(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
+        let seller_pubkey = self.token_contract_seller_pubkey(tc).await?;
+        check_seller_pubkey("close", seller_pubkey.as_deref(), seller_keys.public_hex())
+            .map_err(anyhow::Error::msg)?;
+        self.submit(tc, TOKENCONTRACT_ABI, "close", json!({}), seller_keys)
+            .await
     }
 
     /// The seller **concedes the dispute** through `releaseDispute()`
@@ -6132,62 +8618,114 @@ impl RealChainBackend {
 
     /// Withdraw finalized seller SHELL from a closed or still-open deal balance. This moves only the
     /// already-finalized `_finalizedOwed`; it is separate from `destroy`, which closes/selfdestructs the TC.
+    /// **4.0.33 signature.** Like `destroy`, this lost its caller-named payee to Task O:
+    /// `withdrawShell(uint128 amount)` pays the contract's stored `_sellerNote`.
     pub async fn withdraw_shell(
         &self,
         tc: &Address,
         amount: u128,
-        recipient: &Address,
         seller_keys: &KeyPair,
     ) -> Result<Value> {
         self.submit(
             tc,
             TOKENCONTRACT_ABI,
             "withdrawShell",
-            json!({
-                "amount": amount.to_string(),
-                "recipient": recipient.with_workchain(),
-            }),
+            json!({ "amount": amount.to_string() }),
             seller_keys,
         )
         .await
     }
 
     /// Submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's available token
-    /// balances. `dapp_id` is event metadata only(surfaced in `TokensWithdrawn`, drives no logic) -- taken from
-    /// the deployed manifest. Returns the submit result. Do not treat this helper as proof that every
-    /// native/ECC balance is fully retired
+    /// balances. `destination_dapp_id` is event metadata only(surfaced in `TokensWithdrawn`, drives no logic)
+    /// and names the destination wallet's DApp, not the dexdo deployment. Returns the submit result. Do not
+    /// treat this helper as proof that every native/ECC balance is fully retired
     /// without by-fact evidence on the current deployed contract.
     pub async fn withdraw_note_tokens(
         &self,
         note: &Address,
         keys: &KeyPair,
         dest_wallet: &Address,
+        destination_dapp_id: &str,
     ) -> Result<Value> {
         // One-shot guard: `withdrawTokens` sets `_hasWithdrawn=true` and reverts `ERR_INVALID_STATE` on a
         // re-call. Read `getDetails().hasWithdrawn` and fail
         // LOUD with a clear reason instead of the opaque `TVM_ERROR(compute phase)` the revert would produce.
         if let Some(d) = self
             .client
-            .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
+            .run_getter_retrying(note, PRIVATENOTE_ABI, "getDetails", json!({}))
             .await?
         {
             let already = details_has_withdrawn(&d).unwrap_or(false);
             if already {
                 return Err(anyhow!(
-                    "note {note} was already withdrawn -- `withdrawTokens` is one-shot per note. Re-check the \
-                     note/wallet on-chain before assuming any remaining balance is withdrawable."
+                    "note {} was already withdrawn -- `withdrawTokens` is one-shot per note. Re-check the \
+                     note/wallet on-chain before assuming any remaining balance is withdrawable.",
+                    display_dexdo_address(note)
                 ));
             }
         }
-        let dapp_id = format!("0x{}", self.deployed.dapp_id.trim_start_matches("0x"));
         self.submit(
             note,
             PRIVATENOTE_ABI,
             "withdrawTokens",
-            withdraw_note_tokens_payload(dest_wallet, &dapp_id),
+            self.withdraw_note_tokens_payload_for_destination(
+                dest_wallet,
+                destination_dapp_id,
+            ),
             keys,
         )
         .await
+    }
+
+    fn withdraw_note_tokens_payload_for_destination(
+        &self,
+        dest_wallet: &Address,
+        destination_dapp_id: &str,
+    ) -> Value {
+        let dapp_id = format!("0x{}", destination_dapp_id.trim_start_matches("0x"));
+        withdraw_note_tokens_payload(dest_wallet, &dapp_id)
+    }
+
+    /// Submit owner-signed `PrivateNote.initTransfer(destDepositHash, tokenType, amount, eccAmount)`:
+    /// move part of THIS note's spendable trading record(`_balance`) into another note's.
+    /// This is the only credit into `_balance` a user can originate. The record is written once by
+    /// the constructor and otherwise credited only by a deal, by the book, or -- here -- by another
+    /// note, so a note whose trading balance has run down has no other refill: `note topup` reaches
+    /// the ECC[2] pocket and cannot touch this plane at all.
+    /// The destination is named by its `depositIdentifierHash`, NOT by its address, because that is
+    /// what the contract takes: it derives `dest` itself with
+    /// `DexLib.computePrivateNoteAddress(_privateNoteCode, destDepositHash)`. Callers should read
+    /// that hash off the destination note's own `getDetails()` rather than carry it separately --
+    /// `_depositIdentifierHash` is a `static` StateInit field, so for any genuine note of the
+    /// pinned generation the hash and the address determine each other, and reading it from the
+    /// account whose balance was checked is what makes "the note I inspected" and "the note the
+    /// contract will credit" the same note by construction.
+    /// `ecc_amount` rides the physical ECC pocket along with the record and is a separate figure;
+    /// pass 0 to move the record only.
+    /// The refusals this can come back with are not generic failures and are re-stated by name --
+    /// see [`note_transfer_submit_hint`].
+    pub async fn init_note_transfer(
+        &self,
+        note: &Address,
+        keys: &KeyPair,
+        dest_deposit_hash: &str,
+        token_type: u32,
+        amount: u128,
+        ecc_amount: u128,
+    ) -> Result<Value> {
+        self.submit(
+            note,
+            PRIVATENOTE_ABI,
+            "initTransfer",
+            init_note_transfer_payload(dest_deposit_hash, token_type, amount, ecc_amount),
+            keys,
+        )
+        .await
+        .map_err(|e| match note_transfer_submit_hint(&e.to_string()) {
+            Some(hint) => anyhow!("{e}\n{hint}"),
+            None => e,
+        })
     }
 
     /// The buyer stops the stream via their note: `streamStop(tokenContract)` -> `TC.stop()`
@@ -6198,7 +8736,7 @@ impl RealChainBackend {
         buyer_note: &Address,
         buyer_keys: &KeyPair,
         tc: &Address,
-    ) -> Result<SettlementActionReceipt> {
+    ) -> Result<SubmittedBuyerStopReceipt> {
         self.reject_prior_settlement_action_before_prepare(
             tc,
             SettlementAction::BuyerStop,
@@ -6214,14 +8752,20 @@ impl RealChainBackend {
                 buyer_keys,
             )
             .await?;
-        self.submit_settlement_action_once(
+        let client_message_id = external_message_hash(&prepared.1)
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let receipt = self.submit_settlement_action_once(
             tc,
             SettlementAction::BuyerStop,
             ExpectedSettlementEvent::BuyerStop,
             Some(buyer_note),
             prepared,
         )
-        .await
+        .await?;
+        Ok(SubmittedBuyerStopReceipt {
+            receipt,
+            client_message_id,
+        })
     }
 
     /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` -> `TC.dispute()`
@@ -6270,7 +8814,7 @@ impl RealChainBackend {
         buyer_keys: &KeyPair,
         tc: &Address,
         before_post: &mut (dyn FnMut() -> bool + Send),
-    ) -> Result<Option<SettlementActionReceipt>> {
+    ) -> Result<Option<SubmittedBuyerStopReceipt>> {
         self.reject_prior_settlement_action_before_prepare(
             tc,
             SettlementAction::BuyerStop,
@@ -6286,15 +8830,22 @@ impl RealChainBackend {
                 buyer_keys,
             )
             .await?;
-        self.submit_settlement_action_once_if(
-            tc,
-            SettlementAction::BuyerStop,
-            ExpectedSettlementEvent::BuyerStop,
-            Some(buyer_note),
-            prepared,
-            before_post,
-        )
-        .await
+        let client_message_id = external_message_hash(&prepared.1)
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let receipt = self
+            .submit_settlement_action_once_if(
+                tc,
+                SettlementAction::BuyerStop,
+                ExpectedSettlementEvent::BuyerStop,
+                Some(buyer_note),
+                prepared,
+                before_post,
+            )
+            .await?;
+        Ok(receipt.map(|receipt| SubmittedBuyerStopReceipt {
+            receipt,
+            client_message_id,
+        }))
     }
 
     /// The buyer cleans up a funded-but-never-opened deal via their note:
@@ -6316,22 +8867,31 @@ impl RealChainBackend {
         .await
     }
 
-    /// Directive -- `RootModel` deploy on the **note-funded** path: builds the same deploy message as
-    /// [`deploy_root_model_from_wallet`](Self::deploy_root_model_from_wallet) but assumes the note has already
-    /// pre-funded the uninit address with ECC[2] (via [`note_fund_deploy_shell`](Self::note_fund_deploy_shell));
-    /// it only sends the external seller-signed deploy and waits for `Active`. No operator wallet.
+    /// Bring the seller's `RootModel` into existence and wait for it to be `Active`.
+    /// **NO LONGER A DEPLOY THIS PROCESS SENDS.** It is one call to
+    /// [`request_root_model_deploy`](Self::request_root_model_deploy) -- `SuperRoot.deployRootModel` --
+    /// followed by the same activation wait as before. The note pre-funding step that used to precede
+    /// this is gone with the leg that performed it: SuperRoot attaches the deploy value itself.
+    /// The name is kept because the callers' contract is unchanged: hand it the owner key, get back
+    /// the address of an `Active` RootModel.
     pub async fn deploy_root_model_note_funded(&self, owner: &KeyPair) -> Result<Address> {
-        let (addr, message_boc_b64) = self.root_model_deploy_msg(owner).await?;
-        // The note already pre-funded the uninit address(`fundDeployShell`); just send the deploy + wait.
-        // Deploy-message send -> `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404.
-        let submit_err = self.send_deploy_with_retry(&message_boc_b64).await.err();
+        let owner_pubkey = json!(format!("0x{}", owner.public_hex()));
+        let addr = self.root_model_address_for(&owner_pubkey).await?;
+        // `deployRootModel` is idempotent at the contract (a `new` at an occupied address does not
+        // overwrite and does not revert), so a re-issued request on an already-Active root is a no-op.
+        let submit_err = self
+            .request_root_model_deploy(owner, &owner_pubkey)
+            .await
+            .err();
         if self
             .wait_active(&addr, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
             .await
         {
             if let Some(e) = submit_err {
                 eprintln!(
-                    "deploy {addr} became Active after submit returned an error (treating as landed): {e}"
+                    "RootModel {} became Active after SuperRoot.deployRootModel returned an error \
+                     (treating as landed): {e}",
+                    display_dexdo_address(&addr)
                 );
             }
             Ok(addr)
@@ -6339,7 +8899,9 @@ impl RealChainBackend {
             Err(e)
         } else {
             Err(anyhow!(
-                "deploy {addr} did not activate within the allotted time (note-funded)"
+                "RootModel {} did not activate within the allotted time after \
+                 SuperRoot.deployRootModel",
+                display_dexdo_address(&addr)
             ))
         }
     }
@@ -6459,6 +9021,35 @@ impl RealChainBackend {
         max_ticks: u128,
         gas: u128,
     ) -> Result<crate::MarketManifest> {
+        let deal_gas_overhead_raw =
+            crate::params::resolve_deal_gas_overhead_raw(self.network(), None)
+                .map_err(anyhow::Error::msg)?;
+        self.provision_market_with_deal_gas_overhead(
+            seed_keys,
+            note,
+            frame_model,
+            nonce,
+            price_per_tick,
+            max_ticks,
+            gas,
+            deal_gas_overhead_raw,
+        )
+        .await
+    }
+
+    /// Provision using the measured remainder selected for the runtime network.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn provision_market_with_deal_gas_overhead(
+        &self,
+        seed_keys: &KeyPair,
+        note: &Address,
+        frame_model: &str,
+        nonce: u64,
+        price_per_tick: u128,
+        max_ticks: u128,
+        gas: u128,
+        deal_gas_overhead_raw: u128,
+    ) -> Result<crate::MarketManifest> {
         // fail-closed up front if the seller note is orphaned by a contract redeploy -- a clear
         // "re-mint" error instead of a downstream bare TVM_ERROR(stale note) or "note is not active".
         self.assert_seller_note_current(note).await?;
@@ -6477,19 +9068,31 @@ impl RealChainBackend {
                 .wait_active(&ob, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
                 .await
             {
-                return Err(anyhow!("InferenceOrderBook {ob} did not activate"));
+                return Err(anyhow!(
+                    "InferenceOrderBook {} did not activate",
+                    display_dexdo_address(&ob)
+                ));
             }
         }
-        // 2) RootModel + per-deal TokenContract -- NOTE-FUNDED: no operator multisig. The note pre-funds
-        // each uninit deploy address from its own ECC[2] (`fundDeployShell`, the note derives the targets from
-        // `(ephemeralPubkey, nonce)`), then the external seller-signed deploy activates it. ORDER MATTERS: the
-        // RootModel is deployed first so the per-deal TC registers into it in its ctor; the TC address itself is
-        // derived **locally from the deploy INIT-DATA**, NOT by querying
-        // the RootModel `getTokenContractAddress` getter -- so neither a fixed-superroot shellnet restart nor
-        // a not-yet-`Active` RootModel can 404 the idempotency check. The getter is used only as a post-`Active`
-        // cross-check below.
+        // 2) RootModel + per-deal TokenContract. ORDER MATTERS: the RootModel exists first so the per-deal
+        // TC registers into it in its ctor.
+        // THE TWO ARE NO LONGER PROVISIONED THE SAME WAY(4.0.34). The RootModel is asked for --
+        // `SuperRoot.deployRootModel`, an internal `new` that carries its own 5 vmshell -- so there is
+        // nothing for the note to pre-fund and no external deploy to send; an external one would be
+        // refused, `ERR_INVALID_SENDER = 302`(`contracts/airegistry/RootModel.sol:67`). The per-deal TC
+        // is still NOTE-FUNDED: the note pre-funds its uninit deploy address from its own ECC[2]
+        // (`fundDeployShell`, the note derives the target from `(ephemeralPubkey, nonce)`), then the
+        // external seller-signed deploy activates it. That is why only one `gas` allocation is spent here
+        // where two used to be.
+        // The RootModel address comes from `SuperRoot.getRootModelAddress` rather than from a locally
+        // built deploy message: SuperRoot derives the child from its OWN pinned `_rootModelCode`, which
+        // is the code that actually lands, and SuperRoot sits at a fixed zerostate address that is always
+        // `Active`, so this getter cannot 404 the way a not-yet-`Active` RootModel's would. The TC address
+        // stays derived **locally from the deploy INIT-DATA**, NOT
+        // from the RootModel `getTokenContractAddress` getter, so a not-yet-`Active` RootModel cannot
+        // abort the idempotency check; that getter is used only as a post-`Active` cross-check below.
         let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
-        let (rm, _) = self.root_model_deploy_msg(seed_keys).await?;
+        let rm = self.root_model_address_for(&seller_pubkey).await?;
         let tc = self
             .token_contract_deploy_address(
                 seed_keys,
@@ -6506,22 +9109,8 @@ impl RealChainBackend {
             .wait_active(&rm, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
             .await;
         if rm_absent {
-            // Pre-fund the RootModel's(and the TC's -- same nonce) uninit deploy addresses, then deploy the RM.
-            self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
-                .await;
-            self.note_fund_deploy_shell(note, seed_keys, nonce, gas, gas)
-                .await
-                .context("note-funded provision: fundDeployShell ECC[2]/SHELL funding failed")?;
-            self.log_deploy_prefund_snapshot("after fundDeployShell", note, &rm, &tc)
-                .await;
-            // Do not hard-gate on a visible balance at the uninit deploy address. On shellnet an uninit
-            // pre-funded account can still read as absent/zero through account queries; the reliable proof is
-            // fund -> deploy -> wait Active. If funding did not land, the deploy wait below fails with the
-            // snapshots above in stderr.
             self.deploy_root_model_note_funded(seed_keys).await?;
         }
-        self.ensure_deal_contract_gas(note, seed_keys, nonce, Some(&rm), None)
-            .await?;
         // The per-deal TC address is derived from the deploy INIT-DATA(stateInit), NOT the RootModel
         // `getTokenContractAddress` network getter: on a fresh provision the RootModel deploy was just
         // sent(step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
@@ -6537,23 +9126,25 @@ impl RealChainBackend {
                 .await?;
             if getter_tc.with_workchain() != tc.with_workchain() {
                 return Err(anyhow!(
-                    "RootModel getTokenContractAddress {getter_tc} != INIT-DATA-derived {tc} (TC derivation diverged)"
+                    "RootModel getTokenContractAddress {} != INIT-DATA-derived {} (TC derivation diverged)",
+                    display_token_contract(&getter_tc),
+                    display_token_contract(&tc)
                 ));
             }
         } else {
-            // Deploy-if-absent. If the RootModel was already active(idempotent re-run), the TC was not
-            // pre-funded above.
-            if !rm_absent {
-                self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
-                    .await;
-                self.note_fund_deploy_shell(note, seed_keys, nonce, 0, gas)
-                    .await
-                    .context(
-                        "note-funded provision: fundDeployShell ECC[2]/SHELL funding failed",
-                    )?;
-                self.log_deploy_prefund_snapshot("after fundDeployShell", note, &rm, &tc)
-                    .await;
-            }
+            // Deploy-if-absent, and the TC is pre-funded HERE UNCONDITIONALLY. This used to be
+            // `if !rm_absent`, because the RootModel branch above funded both addresses on one
+            // `fundDeployShell(nonce, gas, gas)` message -- a fresh provision paid for the TC there. That
+            // message is gone with the RootModel leg(4.0.34), so the deal's own pre-fund is the only one
+            // left and skipping it on a fresh provision would send the TC deploy at an unfunded uninit
+            // address.
+            self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
+                .await;
+            self.note_fund_deploy_shell(note, seed_keys, nonce, 0, gas)
+                .await
+                .context("note-funded provision: fundDeployShell ECC[2]/SHELL funding failed")?;
+            self.log_deploy_prefund_snapshot("after fundDeployShell", note, &rm, &tc)
+                .await;
             let deployed = self
                 .deploy_token_contract_note_funded(
                     seed_keys,
@@ -6569,14 +9160,24 @@ impl RealChainBackend {
             // Post-deploy convergence guard: the deployed address must equal the INIT-DATA-derived one.
             if deployed.with_workchain() != tc.with_workchain() {
                 return Err(anyhow!(
-                    "deployed TC {deployed} != INIT-DATA-derived {tc} (derivation diverged)"
+                    "deployed TC {} != INIT-DATA-derived {} (derivation diverged)",
+                    display_token_contract(&deployed),
+                    display_token_contract(&tc)
                 ));
             }
         }
-        self.ensure_deal_contract_gas(note, seed_keys, nonce, Some(&rm), Some(&tc))
-            .await?;
+        // The deal only. The RootModel used to be topped up here too; it mints its own gas now that
+        // SuperRoot's deploy puts it in SuperRoot's configured dapp.
+        self.ensure_deal_contract_gas_with_overhead(
+            note,
+            seed_keys,
+            nonce,
+            Some(&tc),
+            deal_gas_overhead_raw,
+        )
+        .await?;
         Ok(crate::MarketManifest {
-            network: "shellnet".to_string(),
+            network: self.network().to_string(),
             frame_model: frame_model.to_string(),
             model_hash,
             inference_order_book: ob.with_workchain(),
@@ -6597,11 +9198,105 @@ impl RealChainBackend {
         Address::parse(ROOTPN_ADDR)
     }
 
+    async fn assert_deployed_contract_read_identity(
+        &self,
+        contract: &str,
+        address: &Address,
+    ) -> Result<()> {
+        let display_address = display_dexdo_address(address);
+        let account = self
+            .client
+            .get_account_retrying(address)
+            .await?
+            .ok_or_else(|| anyhow!("{contract} {display_address} account is not found"))?;
+        let actual = active_account_code_hash(contract, address, &account)?;
+        let expected = required_deployed_contract_hash(&self.deployed, contract)?;
+        if actual != expected {
+            return Err(anyhow!(
+                "{contract} {display_address} code hash does not match the deployed manifest"
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn assert_root_oracle_read_identity(&self) -> Result<()> {
+        let root = self.root_oracle_address().await?;
+        self.assert_deployed_contract_read_identity("RootOracle", &root)
+            .await
+    }
+
+    pub async fn assert_root_pn_read_identity(&self) -> Result<()> {
+        let root = self.root_pn_address().await?;
+        self.assert_deployed_contract_read_identity("RootPN", &root)
+            .await
+    }
+
+    pub async fn assert_oracle_read_identity(&self, oracle: &Address) -> Result<()> {
+        self.assert_deployed_contract_read_identity("Oracle", oracle)
+            .await
+    }
+
+    /// Read the Oracle's factual ECC[2] fee balance and bind `signer` to the owner key stored in
+    /// the same active/current account snapshot. `Oracle` exposes no fee-balance getter.
+    pub async fn oracle_fee_balance_for_owner(
+        &self,
+        oracle: &Address,
+        signer: &KeyPair,
+    ) -> Result<u128> {
+        let account = self
+            .client
+            .get_account_retrying(oracle)
+            .await?
+            .ok_or_else(|| anyhow!("Oracle {oracle} account is not found"))?;
+        let actual = active_account_code_hash("Oracle", oracle, &account)?;
+        let expected = required_deployed_contract_hash(&self.deployed, "Oracle")?;
+        if actual != expected {
+            return Err(anyhow!(
+                "Oracle {oracle} code hash does not match the deployed manifest"
+            ));
+        }
+        let fields = account_storage_fields(
+            account
+                .boc
+                .as_deref()
+                .ok_or_else(|| anyhow!("Oracle {oracle} account BOC is unavailable"))?,
+            ORACLE_ABI,
+            "Oracle",
+        )?;
+        let owner = value_to_uint256_hex(&fields["_oraclePubkey"])
+            .ok_or_else(|| anyhow!("Oracle {oracle} storage exposes no _oraclePubkey"))?;
+        let signer = normalize_uint256_hex(&pubkey_uint256(signer))?;
+        if owner != signer {
+            return Err(anyhow!(
+                "oracle signer {} does not own Oracle {oracle}",
+                signer
+            ));
+        }
+        Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
+    }
+
+    pub async fn withdraw_oracle_fees(
+        &self,
+        oracle: &Address,
+        signer: &KeyPair,
+        to: &Address,
+        amount: u128,
+    ) -> Result<Value> {
+        self.submit_money_call_once(
+            oracle,
+            ORACLE_ABI,
+            "withdrawFees",
+            oracle_withdraw_fees_payload(&to.with_workchain(), amount),
+            signer,
+        )
+        .await
+    }
+
     pub async fn oracle_address(&self, oracle_name: &str) -> Result<Address> {
         let root = self.root_oracle_address().await?;
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 &root,
                 ROOTORACLE_ABI,
                 "getOracleAddress",
@@ -6638,7 +9333,7 @@ impl RealChainBackend {
     ) -> Result<Address> {
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 oracle,
                 ORACLE_ABI,
                 "getEventListAddress",
@@ -6669,9 +9364,14 @@ impl RealChainBackend {
         .await
     }
 
+    pub async fn assert_oracle_event_list_read_identity(&self, event_list: &Address) -> Result<()> {
+        self.assert_deployed_contract_read_identity("OracleEventList", event_list)
+            .await
+    }
+
     pub async fn oracle_event_list_events(&self, oel: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(oel, ORACLEEVENTLIST_ABI, "_events", json!({}))
+            .run_getter_retrying(oel, ORACLEEVENTLIST_ABI, "_events", json!({}))
             .await
     }
 
@@ -6679,13 +9379,18 @@ impl RealChainBackend {
         let events = self
             .oracle_event_list_events(oel)
             .await?
-            .ok_or_else(|| anyhow!("OracleEventList {oel} _events getter unavailable"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "OracleEventList {} _events getter unavailable",
+                    display_dexdo_address(oel)
+                )
+            })?;
         Ok(event_from_getter_output(&events, event_id).cloned())
     }
 
     pub async fn oracle_range_data(&self, oel: &Address, event_id: &str) -> Result<Option<Value>> {
         self.client
-            .run_getter(
+            .run_getter_retrying(
                 oel,
                 ORACLEEVENTLIST_ABI,
                 "getRangeData",
@@ -6734,7 +9439,7 @@ impl RealChainBackend {
         let root = self.root_pn_address().await?;
         let v = self
             .client
-            .run_getter(
+            .run_getter_retrying(
                 &root,
                 ROOTPN_ABI,
                 "getPMPAddress",
@@ -6782,9 +9487,209 @@ impl RealChainBackend {
         .await
     }
 
+    /// Validate the manifest tuple against the current compiled PMP and its live `getDetails`.
+    /// Participant exits do not have an Oracle signer, so they cannot reuse the Oracle-owned
+    /// cancellation preflight.
+    pub async fn assert_pmp_market_identity(
+        &self,
+        manifest: &OracleMarketManifest,
+    ) -> Result<(Address, Value)> {
+        manifest.validate().map_err(anyhow::Error::msg)?;
+        let pmp = Address::parse(&manifest.pmp).context("oracle manifest pmp")?;
+        let (_, details) = self.validated_pmp_read_identity(&pmp).await?;
+        validate_pmp_manifest(&details, manifest)?;
+        Ok((pmp, details))
+    }
+
+    /// One coherent PrivateNote storage snapshot for a PMP participant exit. The exact stake key
+    /// is the contract's `tvm.hash(abi.encode(eventId, oracleListHash, tokenType))`; private
+    /// `_openOrdersByEvent` is decoded from the same account BOC because `getDetails` does not expose
+    /// it. The returned JSON has a stable client-owned shape consumed by the CLI pre/post checks.
+    pub async fn private_note_pmp_exit_state(
+        &self,
+        note: &Address,
+        event_id: &str,
+        oracle_list_hash: &str,
+        token_type: u32,
+    ) -> Result<Value> {
+        let account = self
+            .client
+            .get_account_retrying(note)
+            .await?
+            .ok_or_else(|| anyhow!("PrivateNote {note} account is not found"))?;
+        note_balance_private_note_account(note, Some(&account))?;
+        let fields = account_storage_fields(
+            account
+                .boc
+                .as_deref()
+                .ok_or_else(|| anyhow!("PrivateNote {note} account BOC is unavailable"))?,
+            PRIVATENOTE_ABI,
+            "PrivateNote",
+        )?;
+        let stake_key = pmp_stake_key(event_id, oracle_list_hash, token_type)?;
+        let stake = uint256_map_entry(&fields["_stakes"], &stake_key).cloned();
+        if let Some(stake) = stake.as_ref() {
+            let live_oracles = value_to_uint256_hex(&stake["oracleListHash"])
+                .ok_or_else(|| anyhow!("PrivateNote {note} stake exposes no oracleListHash"))?;
+            if live_oracles != normalize_uint256_hex(oracle_list_hash)? {
+                return Err(anyhow!(
+                    "PrivateNote {note} stake oracleListHash does not match the manifest"
+                ));
+            }
+            if value_u128(&stake["tokenType"]) != Some(u128::from(token_type)) {
+                return Err(anyhow!(
+                    "PrivateNote {note} stake tokenType does not match the manifest"
+                ));
+            }
+        }
+        let candidate_amount = match stake.as_ref() {
+            Some(stake) => value_u128(&stake["candidateAmount"])
+                .ok_or_else(|| anyhow!("PrivateNote {note} stake exposes no candidateAmount"))?,
+            None => 0,
+        };
+        let amount_slots = match stake.as_ref() {
+            Some(stake) => stake["amount"]
+                .as_array()
+                .ok_or_else(|| anyhow!("PrivateNote {note} stake exposes no amount array"))?
+                .len(),
+            None => 0,
+        };
+        let open_orders_by_event = fields
+            .get("_openOrdersByEvent")
+            .filter(|map| map.is_object() || map.is_array())
+            .ok_or_else(|| {
+                anyhow!("PrivateNote {note} storage exposes no _openOrdersByEvent map")
+            })?;
+        let open_orders = uint256_map_entry(open_orders_by_event, &stake_key)
+            .and_then(value_u128)
+            .unwrap_or(0);
+        let open_orders = u32::try_from(open_orders).map_err(|_| {
+            anyhow!("PrivateNote {note} _openOrdersByEvent[{stake_key}] exceeds uint32")
+        })?;
+        let has_withdrawn = getter_bool(&fields, "_hasWithdrawn")
+            .ok_or_else(|| anyhow!("PrivateNote {note} storage exposes no _hasWithdrawn"))?;
+        let balance = fields
+            .get("_balance")
+            .filter(|map| map.is_object() || map.is_array())
+            .ok_or_else(|| anyhow!("PrivateNote {note} storage exposes no _balance map"))?;
+        let note_balance = uint32_map_entry(balance, token_type)
+            .and_then(value_u128)
+            .unwrap_or(0);
+        let coupons_value = value_u128(&fields["_couponsValue"])
+            .ok_or_else(|| anyhow!("PrivateNote {note} storage exposes no _couponsValue"))?;
+        let busy = fields
+            .get("_busy")
+            .ok_or_else(|| anyhow!("PrivateNote {note} storage exposes no _busy"))?;
+        Ok(json!({
+            "stake_key": stake_key,
+            "stake_present": stake.is_some(),
+            "candidate_amount": candidate_amount.to_string(),
+            "amount_slots": amount_slots,
+            "open_orders": open_orders,
+            "busy_address": optional_address(busy),
+            "has_withdrawn": has_withdrawn,
+            "note_balance": note_balance.to_string(),
+            "coupons_value": coupons_value.to_string(),
+        }))
+    }
+
+    pub async fn cancel_pmp_stake(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        event_id: &str,
+        oracle_list_hash: &str,
+        token_type: u32,
+    ) -> Result<Value> {
+        self.submit_money_call_once(
+            note,
+            PRIVATENOTE_ABI,
+            "cancelStake",
+            private_note_pmp_exit_payload(event_id, oracle_list_hash, token_type)?,
+            owner_keys,
+        )
+        .await
+    }
+
+    pub async fn claim_pmp_stake(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        event_id: &str,
+        oracle_list_hash: &str,
+        token_type: u32,
+    ) -> Result<Value> {
+        self.submit_money_call_once(
+            note,
+            PRIVATENOTE_ABI,
+            "claim",
+            private_note_pmp_exit_payload(event_id, oracle_list_hash, token_type)?,
+            owner_keys,
+        )
+        .await
+    }
+
     pub async fn pmp_details(&self, pmp: &Address) -> Result<Option<Value>> {
         self.client
-            .run_getter(pmp, PMP_ABI, "getDetails", json!({}))
+            .run_getter_retrying(pmp, PMP_ABI, "getDetails", json!({}))
+            .await
+    }
+
+    async fn validated_pmp_read_identity(&self, pmp: &Address) -> Result<(tvm_types::Cell, Value)> {
+        let display_pmp = display_dexdo_address(pmp);
+        let account = self
+            .client
+            .get_account_retrying(pmp)
+            .await?
+            .ok_or_else(|| anyhow!("PMP {display_pmp} account is not found"))?;
+        let (actual_hash, actual_code) = active_account_code("PMP", pmp, &account)?;
+        let salt = validate_salted_code_from_current_base(
+            &self.deployed,
+            "PMP",
+            pmp,
+            &actual_hash,
+            &actual_code,
+            PMP_TVC,
+        )?;
+        let private_note_code = decode_pmp_private_note_code(salt)?;
+        let private_note_hash = validate_private_note_generation(
+            &self.deployed,
+            &format!("PMP {display_pmp}"),
+            &private_note_code,
+        )?;
+        let details = self
+            .pmp_details(pmp)
+            .await?
+            .ok_or_else(|| anyhow!("PMP {display_pmp} getDetails unavailable"))?;
+        if getter_code_hash(&details, "privateNoteCodeHash").as_deref()
+            != Some(private_note_hash.as_str())
+        {
+            return Err(anyhow!(
+                "PMP {display_pmp} getDetails PrivateNote generation does not match its code salt"
+            ));
+        }
+        Ok((actual_code, details))
+    }
+
+    pub async fn assert_pmp_read_identity(&self, pmp: &Address) -> Result<()> {
+        self.validated_pmp_read_identity(pmp).await.map(|_| ())
+    }
+
+    pub async fn pmp_shutdown_state(&self, pmp: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(pmp, PMP_ABI, "getShutdownState", json!({}))
+            .await
+    }
+
+    pub async fn pmp_unclaimed_balance(&self, pmp: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(pmp, PMP_ABI, "getUnclaimedBalance", json!({}))
+            .await
+    }
+
+    pub async fn pmp_version(&self, pmp: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(pmp, PMP_ABI, "getVersion", json!({}))
             .await
     }
 
@@ -6799,13 +9704,14 @@ impl RealChainBackend {
         let oel = Address::parse(&manifest.oracle_event_list)
             .context("oracle manifest oracle_event_list")?;
         let oracle = Address::parse(&manifest.oracle).context("oracle manifest oracle")?;
+        let display_oel = display_dexdo_address(&oel);
 
         let oel_account = self
             .client
-            .get_account(&oel)
+            .get_account_retrying(&oel)
             .await?
             .filter(Account::is_active)
-            .ok_or_else(|| anyhow!("OracleEventList {oel} is not Active"))?;
+            .ok_or_else(|| anyhow!("OracleEventList {display_oel} is not Active"))?;
         let expected_oel_hash = self
             .deployed
             .contract_hashes
@@ -6816,30 +9722,30 @@ impl RealChainBackend {
             .code_hash
             .as_deref()
             .and_then(normalize_code_hash)
-            .ok_or_else(|| anyhow!("OracleEventList {oel} exposes no code hash"))?;
+            .ok_or_else(|| anyhow!("OracleEventList {display_oel} exposes no code hash"))?;
         if actual_oel_hash != expected_oel_hash {
             return Err(anyhow!(
-                "OracleEventList {oel} code hash does not match the deployed manifest"
+                "OracleEventList {display_oel} code hash does not match the deployed manifest"
             ));
         }
         let oel_fields = oracle_event_list_storage_fields(
             oel_account
                 .boc
                 .as_deref()
-                .ok_or_else(|| anyhow!("OracleEventList {oel} account BOC is unavailable"))?,
+                .ok_or_else(|| anyhow!("OracleEventList {display_oel} account BOC is unavailable"))?,
         )?;
         let index = validate_oracle_event_list_identity(&oel_fields, manifest, signer)?;
         let canonical_oel = self.oracle_event_list_address(&oracle, index).await?;
         if canonical_oel.with_workchain() != oel.with_workchain() {
             return Err(anyhow!(
-                "OracleEventList {oel} is not canonical oracle {} index {index}",
-                manifest.oracle
+                "OracleEventList {display_oel} is not canonical oracle {} index {index}",
+                display_dexdo_address(&manifest.oracle)
             ));
         }
         let event = self
             .oracle_event_info(&oel, &manifest.event_id)
             .await?
-            .ok_or_else(|| anyhow!("event {} is absent from {oel}", manifest.event_id))?;
+            .ok_or_else(|| anyhow!("event {} is absent from {display_oel}", manifest.event_id))?;
         let range = self
             .oracle_range_data(&oel, &manifest.event_id)
             .await?
@@ -6856,23 +9762,24 @@ impl RealChainBackend {
     ) -> Result<(Address, Address, Value, Value)> {
         let (oel, event) = self.assert_oracle_event_identity(manifest, signer).await?;
         let pmp = Address::parse(&manifest.pmp).context("oracle manifest pmp")?;
+        let display_pmp = display_dexdo_address(&pmp);
         let pmp_account = self
             .client
-            .get_account(&pmp)
+            .get_account_retrying(&pmp)
             .await?
             .filter(Account::is_active)
-            .ok_or_else(|| anyhow!("PMP {pmp} is not Active"))?;
+            .ok_or_else(|| anyhow!("PMP {display_pmp} is not Active"))?;
         let details = self
             .pmp_details(&pmp)
             .await?
-            .ok_or_else(|| anyhow!("PMP {pmp} getDetails unavailable"))?;
+            .ok_or_else(|| anyhow!("PMP {display_pmp} getDetails unavailable"))?;
         validate_pmp_manifest(&details, manifest)?;
         let deployer = pmp_deployer(&details)?;
-        let deployer_account = self.client.get_account(&deployer).await?;
+        let deployer_account = self.client.get_account_retrying(&deployer).await?;
         note_balance_private_note_account(&deployer, deployer_account.as_ref())?;
         let pmp_code = self
             .client
-            .run_getter(&deployer, PRIVATENOTE_ABI, "getPMPCode", json!({}))
+            .run_getter_retrying(&deployer, PRIVATENOTE_ABI, "getPMPCode", json!({}))
             .await?;
         validate_salted_pmp_identity(
             &pmp,
@@ -6886,7 +9793,7 @@ impl RealChainBackend {
             .await?
         {
             return Err(anyhow!(
-                "PMP {pmp} has no active confirmation for event {}",
+                "PMP {display_pmp} has no active confirmation for event {}",
                 manifest.event_id
             ));
         }
@@ -6899,17 +9806,18 @@ impl RealChainBackend {
         pmp: &Address,
         event_id: &str,
     ) -> Result<bool> {
+        let display_oel = display_dexdo_address(oel);
         let account = self
             .client
-            .get_account(oel)
+            .get_account_retrying(oel)
             .await?
             .filter(Account::is_active)
-            .ok_or_else(|| anyhow!("OracleEventList {oel} is not Active"))?;
+            .ok_or_else(|| anyhow!("OracleEventList {display_oel} is not Active"))?;
         let fields = oracle_event_list_storage_fields(
             account
                 .boc
                 .as_deref()
-                .ok_or_else(|| anyhow!("OracleEventList {oel} account BOC is unavailable"))?,
+                .ok_or_else(|| anyhow!("OracleEventList {display_oel} account BOC is unavailable"))?,
         )?;
         oracle_pmp_confirmation_is_active(&fields, pmp, event_id)
     }
@@ -6942,7 +9850,7 @@ impl RealChainBackend {
     pub async fn pmp_order_book_address(&self, pmp: &Address) -> Result<Option<Address>> {
         let Some(v) = self
             .client
-            .run_getter(pmp, PMP_ABI, "getOrderBookAddress", json!({}))
+            .run_getter_retrying(pmp, PMP_ABI, "getOrderBookAddress", json!({}))
             .await?
         else {
             return Ok(None);
@@ -6951,6 +9859,112 @@ impl RealChainBackend {
             .as_str()
             .or_else(|| v["value0"].as_str());
         raw.map(Address::parse).transpose()
+    }
+
+    pub async fn order_book_details(&self, order_book: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(order_book, ORDERBOOK_ABI, "getDetails", json!({}))
+            .await
+    }
+
+    pub async fn order_book_queue_size(&self, order_book: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(order_book, ORDERBOOK_ABI, "getQueueSize", json!({}))
+            .await
+    }
+
+    pub async fn order_book_shutdown_state(&self, order_book: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(order_book, ORDERBOOK_ABI, "getShutdownState", json!({}))
+            .await
+    }
+
+    pub async fn order_book_order(
+        &self,
+        order_book: &Address,
+        order_id: u128,
+    ) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(
+                order_book,
+                ORDERBOOK_ABI,
+                "getOrder",
+                json!({ "orderId": order_id.to_string() }),
+            )
+            .await
+    }
+
+    pub async fn order_book_orders_by_owner(
+        &self,
+        order_book: &Address,
+        deposit_hash: &str,
+    ) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(
+                order_book,
+                ORDERBOOK_ABI,
+                "getOrdersByOwner",
+                json!({ "depositHash": normalize_uint256_hex(deposit_hash)? }),
+            )
+            .await
+    }
+
+    pub async fn order_book_version(&self, order_book: &Address) -> Result<Option<Value>> {
+        self.client
+            .run_getter_retrying(order_book, ORDERBOOK_ABI, "getVersion", json!({}))
+            .await
+    }
+
+    pub async fn assert_order_book_read_identity(
+        &self,
+        pmp: &Address,
+        order_book: &Address,
+    ) -> Result<()> {
+        let display_pmp = display_dexdo_address(pmp);
+        let display_order_book = display_dexdo_address(order_book);
+        let (pmp_code, pmp_details) = self.validated_pmp_read_identity(pmp).await?;
+        let bound_order_book = self
+            .pmp_order_book_address(pmp)
+            .await?
+            .ok_or_else(|| anyhow!("PMP {display_pmp} getOrderBookAddress unavailable"))?;
+        if bound_order_book != *order_book {
+            return Err(anyhow!(
+                "OrderBook {display_order_book} is not the book bound to PMP {display_pmp}"
+            ));
+        }
+
+        let account = self
+            .client
+            .get_account_retrying(order_book)
+            .await?
+            .ok_or_else(|| anyhow!("OrderBook {display_order_book} account is not found"))?;
+        let (actual_hash, actual_code) = active_account_code("OrderBook", order_book, &account)?;
+        let salt = validate_salted_code_from_current_base(
+            &self.deployed,
+            "OrderBook",
+            order_book,
+            &actual_hash,
+            &actual_code,
+            ORDERBOOK_TVC,
+        )?;
+        let (private_note_code, salted_pmp_hash, salted_pmp_depth) = decode_order_book_salt(salt)?;
+        validate_private_note_generation(
+            &self.deployed,
+            &format!("OrderBook {display_order_book}"),
+            &private_note_code,
+        )?;
+        if salted_pmp_hash != pmp_code.repr_hash().to_hex_string()
+            || salted_pmp_depth != pmp_code.repr_depth()
+        {
+            return Err(anyhow!(
+                "OrderBook {display_order_book} code salt does not bind the live PMP {display_pmp} code"
+            ));
+        }
+        let order_book_details = self
+            .order_book_details(order_book)
+            .await?
+            .ok_or_else(|| anyhow!("OrderBook {display_order_book} getDetails unavailable"))?;
+        validate_order_book_market_identity(&pmp_details, &order_book_details)
     }
 
     pub async fn resolve_oracle_range(
@@ -7029,7 +10043,10 @@ impl RealChainBackend {
                 .wait_active(&oracle, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
                 .await
             {
-                return Err(anyhow!("Oracle {oracle} did not activate"));
+                return Err(anyhow!(
+                    "Oracle {} did not activate",
+                    display_dexdo_address(&oracle)
+                ));
             }
         }
 
@@ -7051,7 +10068,10 @@ impl RealChainBackend {
                 .wait_active(&oel, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
                 .await
             {
-                return Err(anyhow!("OracleEventList {oel} did not activate"));
+                return Err(anyhow!(
+                    "OracleEventList {} did not activate",
+                    display_dexdo_address(&oel)
+                ));
             }
         }
 
@@ -7103,7 +10123,10 @@ impl RealChainBackend {
                 .wait_active(&pmp, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
                 .await
             {
-                return Err(anyhow!("PMP {pmp} did not activate"));
+                return Err(anyhow!(
+                    "PMP {} did not activate",
+                    display_dexdo_address(&pmp)
+                ));
             }
         }
 
@@ -7113,21 +10136,31 @@ impl RealChainBackend {
         let range = self
             .oracle_range_data(&oel, &event_id)
             .await?
-            .ok_or_else(|| anyhow!("OracleEventList {oel} returned no range data"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "OracleEventList {} returned no range data",
+                    display_dexdo_address(&oel)
+                )
+            })?;
         if !range["exists"].as_bool().unwrap_or(false) {
             return Err(anyhow!(
-                "OracleEventList {oel} has no range data for event {event_id}"
+                "OracleEventList {} has no range data for event {event_id}",
+                display_dexdo_address(&oel)
             ));
         }
         let range_ob = range["ob"].as_str().unwrap_or("");
         if normalize_addr(range_ob)? != normalize_addr(&market.inference_order_book)? {
             return Err(anyhow!(
-                "range event OB {range_ob} != market inference_order_book {}",
-                market.inference_order_book
+                "range event OB {} != market inference_order_book {}",
+                display_dexdo_address(range_ob),
+                display_dexdo_address(&market.inference_order_book)
             ));
         }
         let on_chain_bounds = range_bounds_to_uint256_hex(&range["bounds"]).ok_or_else(|| {
-            anyhow!("OracleEventList {oel} returned invalid bounds for event {event_id}: {range:?}")
+            anyhow!(
+                "OracleEventList {} returned invalid bounds for event {event_id}: {range:?}",
+                display_dexdo_address(&oel)
+            )
         })?;
         let requested_bounds = requested_bounds_to_uint256_hex(bounds)?;
         if on_chain_bounds != requested_bounds {
@@ -7200,11 +10233,13 @@ impl RealChainBackend {
             }
         }
         Err(anyhow!(
-            "range event `{event_name}` did not appear in OracleEventList {oel}"
+            "range event `{event_name}` did not appear in OracleEventList {}",
+            display_dexdo_address(oel)
         ))
     }
 
     async fn wait_pmp_approved(&self, pmp: &Address) -> Result<Value> {
+        let display_pmp = display_dexdo_address(pmp);
         for i in 0..crate::params::PMP_APPROVAL_MAX_READS {
             if let Some(details) = self.pmp_details(pmp).await? {
                 if details["approved"].as_bool().unwrap_or(false) {
@@ -7217,7 +10252,7 @@ impl RealChainBackend {
         }
         let details = self.pmp_details(pmp).await?;
         Err(anyhow!(
-            "PMP {pmp} did not become approved by oracle; last getDetails={details:?}"
+            "PMP {display_pmp} did not become approved by oracle; last getDetails={details:?}"
         ))
     }
 
@@ -7228,7 +10263,7 @@ impl RealChainBackend {
     /// `TVM_ERROR` in the compute phase. Catch both here with an actionable "re-mint your pool" message
     /// instead of letting provision fail opaquely downstream.
     pub async fn assert_seller_note_current(&self, note: &Address) -> Result<()> {
-        let account = self.client.get_account(note).await?;
+        let account = self.client.get_account_retrying(note).await?;
         seller_note_account_current(note, account.as_ref())
     }
 
@@ -7251,12 +10286,18 @@ impl RealChainBackend {
     pub async fn assert_note_withdraw_generation(&self, note: &Address) -> Result<()> {
         let acc = self
             .client
-            .get_account(note)
+            .get_account_retrying(note)
             .await?
-            .ok_or_else(|| anyhow!("note {note} is not on-chain; cannot withdraw"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "note {} is not on-chain; cannot withdraw",
+                    display_dexdo_address(note)
+                )
+            })?;
         if !acc.is_active() {
             return Err(anyhow!(
-                "note {note} is {}, not Active; cannot withdraw",
+                "note {} is {}, not Active; cannot withdraw",
+                display_dexdo_address(note),
                 acc.status
             ));
         }
@@ -7276,13 +10317,14 @@ impl RealChainBackend {
     ) -> Result<()> {
         let details = self
             .client
-            .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
+            .run_getter_retrying(note, PRIVATENOTE_ABI, "getDetails", json!({}))
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "{role} aborted: note {note} returned no getDetails (not on-chain/active) -- the pn_pool is \
+                    "{role} aborted: note {} returned no getDetails (not on-chain/active) -- the pn_pool is \
                      likely orphaned by a contract redeploy. Re-mint against the current contracts \
-                     (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool."
+                     (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool.",
+                    display_dexdo_address(note)
                 )
             })?;
         match note_owner_mismatch_reason(
@@ -7301,7 +10343,7 @@ impl RealChainBackend {
     /// as "not active" -- the caller then deploys or fails with a clear message.
     async fn wait_active(&self, addr: &Address, tries: u32) -> bool {
         for i in 0..tries {
-            if let Ok(Some(a)) = self.client.get_account(addr).await {
+            if let Ok(Some(a)) = self.client.get_account_retrying(addr).await {
                 if a.is_active() {
                     return true;
                 }
@@ -7319,6 +10361,234 @@ fn withdraw_note_tokens_payload(dest_wallet: &Address, dapp_id: &str) -> Value {
         "destWalletAddr": dest_wallet.with_workchain(),
         "dapp_id": dapp_id,
     })
+}
+
+fn init_note_transfer_payload(
+    dest_deposit_hash: &str,
+    token_type: u32,
+    amount: u128,
+    ecc_amount: u128,
+) -> Value {
+    json!({
+        "destDepositHash": dest_deposit_hash,
+        "tokenType": token_type,
+        "amount": amount.to_string(),
+        "eccAmount": ecc_amount.to_string(),
+    })
+}
+
+/// A refusal the note-to-note transfer would meet, recognised from public `getDetails()` reads
+/// before anything is signed.
+/// Every variant mirrors a `require` in `contracts/dex/PrivateNote.sol` and carries that
+/// requirement's error constant, because the point of naming them here is that the operator is told
+/// the same thing the contract would have told them -- only for free. `initTransfer` runs
+/// `tvm.accept()` before all of these(`onlyOwnerPubkey... accept`, PrivateNote.sol), so meeting
+/// one on chain is not a cheap bounce: it spends the sending note's gas to be refused.
+/// This list is what `getDetails()` can see, and it is deliberately not claimed to be all of them.
+/// `_openOrderCount`, `_restingInf`, `_pendingInf` and `_liveDeals` are not in the getter, so a
+/// sender carrying leftover inference state passes every check here and is still refused on chain
+/// with `ERR_OPEN_ORDERS_EXIST` -- which is why that code is given its own explanation in
+/// [`note_transfer_submit_hint`] rather than left to arrive as a bare number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteTransferRefusal {
+    /// `initTransfer` requires `!_hasWithdrawn`(`ERR_INVALID_STATE`).
+    SenderWithdrawn,
+    /// `offerTransfer` requires `!_hasWithdrawn` on the RECEIVING note(`ERR_INVALID_STATE`). This
+    /// is the destination's only state gate, and it is the one that would silently cost money: the
+    /// sender debits its record, the destination refuses, and the value comes home only through the
+    /// bounce path.
+    DestWithdrawn,
+    /// `initTransfer` requires `!_busy.hasValue()`(`ERR_NOTE_BUSY`).
+    SenderBusy { with: String },
+    /// `initTransfer` requires `_couponsValue == 0`(`ERR_COUPON_ACTIVE`).
+    SenderCouponActive { value: u128 },
+    /// `initTransfer` requires every `_lockedInOrders` entry to be zero(`ERR_NON_ZERO_BALANCE`).
+    SenderLockedInOrders { token_type: u32, locked: u128 },
+    /// `initTransfer` requires `_balance[tokenType] >= amount`(`ERR_LOW_VALUE`).
+    SenderRecordShort { have: u128, want: u128 },
+    /// `initTransfer` requires `amount >= minStakeValue(tokenType)`(`ERR_LOW_VALUE`).
+    AmountBelowMinimum { amount: u128, minimum: u128 },
+    /// `initTransfer` requires `destDepositHash != _depositIdentifierHash`(`ERR_INVALID_PARAMS`).
+    SelfTransfer { note: String },
+}
+
+impl std::fmt::Display for NoteTransferRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SenderWithdrawn => f.write_str(
+                "the sending note has already been withdrawn (`withdrawTokens` is one-shot), so \
+                 `initTransfer` would revert dex::ERR_INVALID_STATE (151)",
+            ),
+            Self::DestWithdrawn => f.write_str(
+                "the destination note has already been withdrawn, so it would refuse the incoming \
+                 transfer with dex::ERR_INVALID_STATE (151) -- the sending note debits its record \
+                 first and only gets it back through the bounce path",
+            ),
+            Self::SenderBusy { with } => write!(
+                f,
+                "the sending note is busy with {with}, so `initTransfer` would revert \
+                 dex::ERR_NOTE_BUSY (121). `_busy` is a latch cleared only by the acknowledgement \
+                 of whatever set it (or by that message bouncing); it is not a wait-and-retry state \
+                 and may not clear on its own"
+            ),
+            Self::SenderCouponActive { value } => write!(
+                f,
+                "the sending note holds {value} raw in active coupons, so `initTransfer` would \
+                 revert dex::ERR_COUPON_ACTIVE (149)"
+            ),
+            Self::SenderLockedInOrders { token_type, locked } => write!(
+                f,
+                "the sending note still has {locked} raw of token type {token_type} locked in \
+                 orders, so `initTransfer` would revert dex::ERR_NON_ZERO_BALANCE (144)"
+            ),
+            Self::SenderRecordShort { have, want } => write!(
+                f,
+                "the sending note's spendable trading record is {have} raw and the transfer needs \
+                 {want} raw, so `initTransfer` would revert dex::ERR_LOW_VALUE (102). This is the \
+                 note's `_balance`, not its ECC[2] pocket -- `dexdo note topup` cannot raise it"
+            ),
+            Self::AmountBelowMinimum { amount, minimum } => write!(
+                f,
+                "{amount} raw is below the contract's minimum transfer of {minimum} raw \
+                 (`minStakeValue`), so `initTransfer` would revert dex::ERR_LOW_VALUE (102)"
+            ),
+            Self::SelfTransfer { note } => write!(
+                f,
+                "source and destination are both {}; `initTransfer` refuses a transfer to the \
+                 sending note's own deposit hash with dex::ERR_INVALID_PARAMS (129)",
+                display_dexdo_address(note)
+            ),
+        }
+    }
+}
+
+/// The destination's `depositIdentifierHash` as `initTransfer` wants it, read off the destination
+/// note's own `getDetails()`.
+pub fn note_transfer_deposit_identifier_hash(details: &Value) -> Result<String> {
+    let raw = field(details, "depositIdentifierHash", "deposit_identifier_hash");
+    match raw {
+        Value::String(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        _ => Err(anyhow!(
+            "PrivateNote.getDetails() carries no usable depositIdentifierHash; refusing to guess \
+             the destination the contract would derive from it"
+        )),
+    }
+}
+
+/// The `initTransfer` refusals visible in the SENDING note's `getDetails()`.
+pub fn note_transfer_sender_refusal(details: &Value) -> Option<NoteTransferRefusal> {
+    if details_has_withdrawn(details).unwrap_or(false) {
+        return Some(NoteTransferRefusal::SenderWithdrawn);
+    }
+    if let Some(with) = busy_with(details) {
+        return Some(NoteTransferRefusal::SenderBusy { with });
+    }
+    let coupons = value_u128(field(details, "couponsValue", "coupons_value")).unwrap_or_default();
+    if coupons > 0 {
+        return Some(NoteTransferRefusal::SenderCouponActive { value: coupons });
+    }
+    currency_map_entries(field(details, "lockedInOrders", "locked_in_orders"))
+        .into_iter()
+        .find(|(_, locked)| *locked > 0)
+        .map(
+            |(token_type, locked)| NoteTransferRefusal::SenderLockedInOrders {
+                token_type,
+                locked,
+            },
+        )
+}
+
+/// The `offerTransfer` refusal visible in the RECEIVING note's `getDetails()`. The receiving side
+/// has exactly one state gate, so this is the whole of it.
+pub fn note_transfer_dest_refusal(details: &Value) -> Option<NoteTransferRefusal> {
+    details_has_withdrawn(details)
+        .unwrap_or(false)
+        .then_some(NoteTransferRefusal::DestWithdrawn)
+}
+
+/// The two amount refusals, which depend on the figure rather than on either note's state.
+pub fn note_transfer_amount_refusal(
+    sender_record: u128,
+    amount: u128,
+    minimum: u128,
+) -> Option<NoteTransferRefusal> {
+    if amount < minimum {
+        return Some(NoteTransferRefusal::AmountBelowMinimum { amount, minimum });
+    }
+    (sender_record < amount).then_some(NoteTransferRefusal::SenderRecordShort {
+        have: sender_record,
+        want: amount,
+    })
+}
+
+/// What the two transfer-specific on-chain refusals actually mean, keyed on the exit code an
+/// `initTransfer` submit came back with.
+/// Both already arrive with their constant's name attached, because every exit code goes through
+/// `contract_error_label`. A name is not yet an answer, though: `ERR_OPEN_ORDERS_EXIST` on a note
+/// the operator believes is idle reads as a contradiction unless someone says which state it means,
+/// and `ERR_NOTE_BUSY` reads as "try again shortly" when it is a latch that may never clear on its
+/// own. Neither is preflightable -- `getDetails()` does not expose `_openOrderCount`,
+/// `_restingInf`, `_pendingInf` or `_liveDeals` -- so the explanation has to be attached here, on
+/// the way out, rather than raised before the send.
+pub fn note_transfer_submit_hint(error_text: &str) -> Option<&'static str> {
+    // The exact fragment `exit_code_fragment` writes, so this keys on the code rather than on the
+    // wording of the sentence around it.
+    if error_text.contains("exit_code=167 (") {
+        return Some(
+            "dex::ERR_OPEN_ORDERS_EXIST (167): the SENDING note still carries inference state -- an \
+             open order, a resting or pending inference, or a live deal. None of those are in \
+             `getDetails()`, so this could not be refused before the send. A note in this state can \
+             still RECEIVE a transfer; it cannot send one. Settle or cancel what the note is \
+             holding (`dexdo status`, then cancel/stop the deals it names) and re-run the same \
+             `--to-raw`, which submits nothing if the destination has meanwhile reached the level.",
+        );
+    }
+    if error_text.contains("exit_code=121 (") {
+        return Some(
+            "dex::ERR_NOTE_BUSY (121): the SENDING note's `_busy` latch is set. It is cleared only \
+             by the acknowledgement of the operation that set it, or by that operation's message \
+             bouncing -- so this is not a wait-and-retry state and it may not clear on its own. \
+             Check what the note is busy with (`dexdo note balance` on the SENDING note reports \
+             `busyAddress`) before re-running; a latch left by a lost acknowledgement needs that \
+             counterparty resolved, not another transfer.",
+        );
+    }
+    None
+}
+
+/// `_busy` as `getDetails()` renders it: `optional(address)`, so absent, null, or the address.
+fn busy_with(details: &Value) -> Option<String> {
+    match field(details, "busyAddress", "busy_address") {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Both shapes a `map(uint32,uint128)` getter output arrives in, as `(currency, value)` pairs.
+/// Shared with nothing on purpose: `private_note_balance_currency` answers about ONE currency and
+/// this needs every entry, since `initTransfer` requires them all to be zero.
+fn currency_map_entries(value: &Value) -> Vec<(u32, u128)> {
+    if let Some(entries) = value.as_object() {
+        return entries
+            .iter()
+            .filter_map(|(id, raw)| Some((id.parse::<u32>().ok()?, value_u128(raw)?)))
+            .collect();
+    }
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry
+                .get("currency")
+                .or_else(|| entry.get("id"))
+                .and_then(value_u128)?;
+            let amount = value_u128(entry.get("value").or_else(|| entry.get("amount"))?)?;
+            Some((u32::try_from(id).ok()?, amount))
+        })
+        .collect()
 }
 
 /// One shape for every `PrivateNote.placeInferenceBuy` payload -- ordinary buys and subscriptions alike,
@@ -7344,6 +10614,434 @@ fn place_inference_buy_payload(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn committed_mainnet_manifest_loads_network_endpoint_dapp_and_roots() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/deployed.mainnet.json");
+        let manifest = Deployed::load(&path).expect("load committed mainnet manifest");
+
+        assert_eq!(manifest.network, "mainnet");
+        assert_eq!(
+            resolve_endpoint(None, &manifest).expect("resolve committed mainnet endpoint"),
+            "https://dd-mainnet.ackinacki.org"
+        );
+        assert_eq!(
+            manifest.dapp_id,
+            "0000000000000000000000000000000000000000000000000000000000000004"
+        );
+        assert_eq!(
+            manifest.superroot,
+            "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+        );
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read committed mainnet manifest"))
+                .expect("parse committed mainnet manifest as JSON");
+        assert_eq!(
+            raw["model_registry"],
+            "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+        );
+        assert_eq!(
+            raw["rootpn"],
+            "0:1010101010101010101010101010101010101010101010101010101010101010"
+        );
+        assert_eq!(
+            raw["rootoracle"],
+            "0:1515151515151515151515151515151515151515151515151515151515151515"
+        );
+    }
+
+    #[test]
+    fn committed_mainnet_hash_table_equals_shellnet_hash_table() {
+        let contracts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts");
+        let mainnet = Deployed::load(contracts.join("deployed.mainnet.json"))
+            .expect("load committed mainnet manifest");
+        let shellnet = Deployed::load(contracts.join("deployed.shellnet.json"))
+            .expect("load committed shellnet manifest");
+        let mainnet_hashes = mainnet
+            .contract_hashes
+            .iter()
+            .filter(|(name, _)| !name.starts_with('_'))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let shellnet_hashes = shellnet
+            .contract_hashes
+            .iter()
+            .filter(|(name, _)| !name.starts_with('_'))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(mainnet_hashes, shellnet_hashes);
+    }
+
+    #[test]
+    fn committed_shellnet_manifest_retains_existing_identity() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/deployed.shellnet.json");
+        let manifest = Deployed::load(&path).expect("load committed shellnet manifest");
+
+        assert_eq!(manifest.network, "shellnet");
+        assert_eq!(manifest.version.as_deref(), Some("4.0.35"));
+        assert_eq!(manifest.dapp_config, "");
+        assert_eq!(
+            resolve_endpoint(None, &manifest).expect("resolve committed shellnet endpoint"),
+            crate::params::DEFAULT_SHELLNET_ENDPOINT
+        );
+        assert_eq!(
+            manifest.dapp_id,
+            "0000000000000000000000000000000000000000000000000000000000000004"
+        );
+        assert_eq!(
+            manifest.superroot,
+            "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+        );
+
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(&path).expect("read committed shellnet manifest"),
+        )
+        .expect("parse committed shellnet manifest as JSON");
+        assert_eq!(
+            raw["model_registry"],
+            "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+        );
+        assert_eq!(
+            raw["rootpn"],
+            "0:1010101010101010101010101010101010101010101010101010101010101010"
+        );
+        assert_eq!(
+            raw["rootoracle"],
+            "0:1515151515151515151515151515151515151515151515151515151515151515"
+        );
+    }
+
+    #[test]
+    fn committed_manifest_missing_required_field_refuses_before_connection() {
+        use std::cell::Cell;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/deployed.mainnet.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read committed mainnet manifest"))
+                .expect("parse committed mainnet manifest as JSON");
+        manifest
+            .as_object_mut()
+            .expect("deployment manifest is an object")
+            .remove("superroot");
+        let root = tempfile::tempdir().expect("manifest fixture directory");
+        let incomplete = root.path().join("deployed.missing-superroot.json");
+        std::fs::write(
+            &incomplete,
+            serde_json::to_vec(&manifest).expect("serialize incomplete manifest"),
+        )
+        .expect("write incomplete manifest");
+        let connector_called = Cell::new(false);
+
+        let error = super::connect_client_from_manifest_with(&incomplete, None, |_, _| {
+            connector_called.set(true);
+            Ok(())
+        })
+        .expect_err("a manifest without superroot must be refused");
+
+        assert!(!connector_called.get(), "no connection attempt is allowed");
+        assert!(format!("{error:#}").contains("superroot"), "{error:#}");
+    }
+
+    #[test]
+    fn manifest_network_shellnet_builds_the_previous_exact_sdk_config() {
+        let actual = super::ai_registry_config_from_manifest(&deployed(""))
+            .expect("the committed shellnet profile is supported");
+        let actual = serde_json::to_vec(&actual).expect("serialize manifest-selected config");
+        let previous = serde_json::to_vec(&gosh_ackinacki::config::AiRegistryConfig::shellnet())
+            .expect("serialize previous hardcoded config");
+
+        assert!(
+            actual == previous,
+            "manifest-selected shellnet config must be byte-identical to the previous hardcoded config"
+        );
+    }
+
+    #[test]
+    fn manifest_network_profile_mainnet_uses_exact_sdk_config_without_giver() {
+        let mut manifest = deployed("");
+        manifest.network = "mainnet".to_string();
+
+        let actual = super::ai_registry_config_from_manifest(&manifest)
+            .expect("the committed mainnet profile is supported");
+        assert!(actual.giver_address.is_none());
+        assert!(actual.giver_pubkey.is_none());
+        assert!(actual.giver_secret.is_none());
+        assert_eq!(
+            serde_json::to_value(&actual).expect("serialize manifest-selected config"),
+            serde_json::to_value(gosh_ackinacki::config::AiRegistryConfig::mainnet())
+                .expect("serialize SDK mainnet config"),
+            "manifest-selected mainnet config must be the SDK profile without local hash substitution"
+        );
+    }
+
+    #[test]
+    fn manifest_network_profile_unknown_remains_unsupported() {
+        let mut manifest = deployed("");
+        manifest.network = "unknown-net".to_string();
+
+        let error = super::ai_registry_config_from_manifest(&manifest)
+            .expect_err("an unknown network profile must be refused");
+        assert!(
+            error.to_string().contains(
+                "field `network` names unsupported profile `unknown-net`; no SDK configuration is available"
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn missing_manifest_network_refuses_before_the_connector_is_called() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().expect("manifest fixture directory");
+        let manifest = root.path().join("deployed.missing-network.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "superroot": format!("0:{}", "0".repeat(64)),
+                "dapp_config": "",
+                "dapp_id": "0".repeat(64)
+            }))
+            .expect("serialize incomplete manifest"),
+        )
+        .expect("write incomplete manifest");
+        let connector_called = Cell::new(false);
+
+        let error = super::connect_client_from_manifest_with(&manifest, None, |_, _| {
+            connector_called.set(true);
+            Ok(())
+        })
+        .expect_err("a manifest without network must be refused");
+
+        assert!(!connector_called.get(), "no connection attempt is allowed");
+        assert!(format!("{error:#}").contains("network"), "{error:#}");
+    }
+
+    /// A read that got no answer is repeated, and the answer that follows is the result.
+    /// Drives the retry the way callers reach it -- through the wrapper, on a call that fails the
+    /// way the endpoint fails -- rather than asserting on the classifier alone: the defect this
+    /// exists for was a path that never entered the wrapper at all.
+    #[tokio::test]
+    async fn transient_read_retries_and_returns_the_answer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+
+        let value = super::retry_transient_read(|| async {
+            let seen = calls.fetch_add(1, Ordering::SeqCst);
+            if seen < 2 {
+                Err(anyhow::Error::new(connect_failure().await))
+            } else {
+                Ok(42u32)
+            }
+        })
+        .await
+        .expect("the third attempt answers");
+
+        assert_eq!(value, 42);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two failures then the answer: the read must be repeated, not abandoned"
+        );
+    }
+
+    /// The retry stops. A read that never answers costs a bounded number of attempts and returns
+    /// the failure -- it does not spin, and it does not hide what happened.
+    #[tokio::test]
+    async fn transient_read_gives_up_after_the_bounded_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+
+        let outcome: Result<u32> = super::retry_transient_read(|| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(connect_failure().await))
+        })
+        .await;
+
+        assert!(outcome.is_err(), "a read that never answers must fail");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::params::TRANSIENT_READ_ATTEMPTS,
+            "exactly the configured attempts, no more"
+        );
+    }
+
+    /// An answer is an answer. A refusal the node actually spoke is returned at once, so a wrong
+    /// key or a rejected argument does not cost five round trips before the operator sees it.
+    #[tokio::test]
+    async fn an_answered_refusal_is_not_repeated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+
+        let outcome: Result<u32> = super::retry_transient_read(|| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("contract refused: insufficient funds"))
+        })
+        .await;
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the node answered; repeating it only delays the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_1185_cloudflare_signature_ban_is_permanent_and_actionable() {
+        for response in [
+            http::Response::builder()
+                .status(reqwest::StatusCode::FORBIDDEN)
+                .header("cf-ray", "a290bd7b-ATH")
+                .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=UTF-8")
+                .body(b"error code: 1010".to_vec())
+                .expect("build Cloudflare edge 1010 response")
+                .into(),
+            http::Response::builder()
+                .status(reqwest::StatusCode::FORBIDDEN)
+                .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=UTF-8")
+                .body(b"error code: 1010".to_vec())
+                .expect("build Cloudflare 1010 response")
+                .into(),
+        ] {
+            let error = super::shellnet_response_for_status(response)
+                .await
+                .expect_err("HTTP 403 must fail");
+            assert!(
+                !super::is_transient_transport_failure(&error),
+                "a client-signature ban cannot clear on retry: {error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(message.contains("client's HTTP signature is banned"), "{message}");
+            assert!(message.contains("Cloudflare edge"), "{message}");
+            assert!(message.contains("different HTTP client"), "{message}");
+            assert!(!message.contains("rate limit"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_1185_other_forbidden_is_transient() {
+        let response: reqwest::Response = http::Response::builder()
+            .status(reqwest::StatusCode::FORBIDDEN)
+            .header("cf-ray", "a290bd7b-ATH")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(br#"{"error":"try later"}"#.to_vec())
+            .expect("build ordinary forbidden response")
+            .into();
+        let error = super::shellnet_response_for_status(response)
+            .await
+            .expect_err("HTTP 403 must fail");
+
+        assert!(
+            super::is_transient_transport_failure(&error),
+            "an unproven non-1010 HTTP 403 retains the existing retry policy: {error:#}"
+        );
+    }
+
+    #[test]
+    fn issue_1185_single_predicate_classifies_all_transient_shapes() {
+        for (label, facts) in [
+            (
+                "connect",
+                super::ReadFailureFacts {
+                    connect: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "timeout",
+                super::ReadFailureFacts {
+                    timeout: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "body",
+                super::ReadFailureFacts {
+                    body: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "decode",
+                super::ReadFailureFacts {
+                    decode: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "429",
+                super::ReadFailureFacts::status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            ),
+            (
+                "500",
+                super::ReadFailureFacts::status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            ),
+            (
+                "502",
+                super::ReadFailureFacts::status(reqwest::StatusCode::BAD_GATEWAY),
+            ),
+        ] {
+            assert!(
+                super::read_failure_is_transient(facts),
+                "{label} must be transient through the unified predicate"
+            );
+        }
+    }
+
+    /// Every shape of "no answer" is classified as one, including the two the first version missed:
+    /// a 5xx, and a body that died mid-transfer.
+    #[test]
+    fn no_answer_is_classified_by_shape_not_by_luck() {
+        assert!(super::is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(super::is_retryable_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(super::is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(super::is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(super::is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+
+        assert!(!super::is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!super::is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!super::is_retryable_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    /// A `Retry-After` the server stated is honoured; one that asks for longer than a command may
+    /// wait is not, and the read fails instead of sleeping past its purpose.
+    #[test]
+    fn retry_after_is_honoured_within_its_bound() {
+        let short = anyhow::Error::new(super::RetryAfter { seconds: 3 });
+        assert_eq!(
+            super::retry_after_delay(&short),
+            Some(std::time::Duration::from_secs(3))
+        );
+
+        let too_long = anyhow::Error::new(super::RetryAfter {
+            seconds: crate::params::TRANSIENT_READ_MAX_RETRY_AFTER.as_secs() + 1,
+        });
+        assert_eq!(super::retry_after_delay(&too_long), None);
+    }
+
+    /// A `reqwest` connect failure, built the only way the crate allows: by making a request that
+    /// cannot connect. Used by the retry tests above as a stand-in for a dropped connection.
+    async fn connect_failure() -> reqwest::Error {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("client")
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connecting to a closed port cannot succeed")
+    }
+
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{
@@ -7351,6 +11049,513 @@ mod tests {
         Arc, Mutex,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn model_registry_account_boc(names: &[String], abi: &str) -> String {
+        use tvm_block::Serializable as _;
+
+        let mut models = serde_json::Map::new();
+        for name in names {
+            assert!(
+                models
+                    .insert(crate::model_hash_for(name), Value::String(name.clone()))
+                    .is_none(),
+                "fixture model hashes must be unique"
+            );
+        }
+        let storage = json!({
+            "_pubkey": "0x0",
+            "_timestamp": "0",
+            "_constructorFlag": true,
+            "_models": models,
+            "_count": names.len().to_string(),
+            "_ownerPubkey": "0x0"
+        });
+        let contract = tvm_abi::Contract::load(abi.as_bytes()).expect("load ModelRegistry ABI");
+        let tokens = tvm_abi::token::Tokenizer::tokenize_all_params(contract.fields(), &storage)
+            .expect("tokenize ModelRegistry storage fixture");
+        let data = tvm_abi::token::TokenValue::pack_values_into_chain(
+            &tokens,
+            Vec::new(),
+            contract.version(),
+        )
+        .expect("encode ModelRegistry storage fixture")
+        .into_cell()
+        .expect("build ModelRegistry data cell");
+        let mut state_init = tvm_block::StateInit::default();
+        state_init.set_data(data);
+        let account_storage = tvm_block::AccountStorage::active_by_init_code_hash(
+            0,
+            tvm_block::CurrencyCollection::default(),
+            state_init,
+            false,
+        );
+        let address =
+            tvm_block::MsgAddressInt::with_standart(None, 0, tvm_types::AccountId::from([0u8; 32]))
+                .expect("fixture address");
+        let mut account = tvm_block::Account::with_storage(
+            &address,
+            &tvm_block::StorageInfo::default(),
+            &account_storage,
+        );
+        account.update_storage_stat().expect("fixture storage stat");
+        let boc = tvm_types::write_boc(&account.serialize().expect("serialize fixture account"))
+            .expect("write fixture account BOC");
+        base64::engine::general_purpose::STANDARD.encode(boc)
+    }
+
+    #[test]
+    fn model_registry_account_storage_decoder_reads_models_map_fixture() {
+        let abi = include_str!("../../../../contracts/compiled/airegistry/ModelRegistry.abi.json");
+        let account_boc =
+            model_registry_account_boc(&["alpha-model".to_string(), "beta-model".to_string()], abi);
+
+        let decoded = super::account_storage_fields(&account_boc, abi, "ModelRegistry")
+            .expect("decode ModelRegistry account fixture");
+
+        let mut names = decoded["_models"]
+            .as_object()
+            .expect("decoded _models map")
+            .values()
+            .map(|value| value.as_str().expect("decoded model name"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["alpha-model", "beta-model"]);
+        assert_eq!(decoded["_count"], "2");
+    }
+
+    /// The `(name, type)` input list a compiled ABI declares for `function`, or `None` when the
+    /// bundle does not declare it at all. Reads the ABI the crate actually embeds, never a copy.
+    fn compiled_abi_inputs(abi_json: &str, function: &str) -> Option<Vec<(String, String)>> {
+        let abi: Value = serde_json::from_str(abi_json).expect("parse compiled ABI");
+        abi["functions"]
+            .as_array()
+            .expect("compiled ABI functions[]")
+            .iter()
+            .find(|f| f["name"] == function)
+            .map(|f| {
+                f["inputs"]
+                    .as_array()
+                    .expect("compiled ABI inputs[]")
+                    .iter()
+                    .map(|i| {
+                        (
+                            i["name"].as_str().unwrap_or_default().to_string(),
+                            i["type"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect()
+    }
+
+    /// Shape pin for the seller-bond funding door, decoded against the ABI this crate itself embeds
+    /// (`PRIVATENOTE_ABI` / `TOKENCONTRACT_ABI`, `include_str!` of `contracts/compiled/`) -- never
+    /// against a hand-written or hand-copied signature, because a frozen copy of a proposed ABI
+    /// passes every offline gate while being dead against the deployed contract.
+    /// Contracts 4.0.33 removed `PrivateNote.postSellerBond(nonce, amount)` in favour of
+    /// `PrivateNote.fundDeal(nonce, gasShell, amount)`, and renamed `TokenContract.fundSellerBond()`
+    /// to `TokenContract.fundDeal(amount)`. Contracts 4.0.35 then added `endpointCipher
+    /// optional(bytes)` to BOTH halves, which is a new `functionId` rather than an added field, so
+    /// the previous shape does not encode at all. The client is adapted here; the compiled artifacts
+    /// are vendored by the contracts merge, so for one window the two may be a generation apart. The
+    /// invariant is therefore stated over both states, and it is fail-closed in both:
+    /// * artifacts at 4.0.33 or later -- `fundDeal` must be declared with exactly the argument names
+    /// and types this client sends, on both contracts, and the superseded entry points must be
+    /// gone;
+    /// * artifacts still pre-4.0.33 -- the superseded entry points must be the only ones declared,
+    /// and the client must NOT be encoding them. Putting the client back on
+    /// `postSellerBond`/`fundSellerBond` turns this red in either state, which is the regression.
+    #[test]
+    fn seller_bond_encodes_the_funding_door_the_compiled_abi_declares() {
+        let sent_note_keys: Vec<String> = note_fund_deal_params(7, 0, 2_000)
+            .as_object()
+            .expect("note fundDeal params object")
+            .keys()
+            .cloned()
+            .collect();
+        let sent_deal_keys: Vec<String> = deal_fund_deal_params(2_000)
+            .as_object()
+            .expect("deal fundDeal params object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let note_fund = compiled_abi_inputs(PRIVATENOTE_ABI, NOTE_FUND_DEAL_METHOD);
+        let note_legacy = compiled_abi_inputs(PRIVATENOTE_ABI, "postSellerBond");
+        let deal_fund = compiled_abi_inputs(TOKENCONTRACT_ABI, DEAL_FUND_DEAL_METHOD);
+        let deal_legacy = compiled_abi_inputs(TOKENCONTRACT_ABI, "fundSellerBond");
+
+        match (note_fund, note_legacy) {
+            (Some(fund), legacy) => {
+                assert!(
+                    legacy.is_none(),
+                    "4.0.33 removed PrivateNote.postSellerBond when it added fundDeal; a bundle \
+                     declaring both is not a generation this client can encode for"
+                );
+                assert_eq!(
+                    fund,
+                    owned(&[
+                        ("nonce", "uint64"),
+                        ("gasShell", "uint128"),
+                        ("amount", "uint128"),
+                        ("endpointCipher", "optional(bytes)"),
+                    ]),
+                    "PrivateNote.fundDeal takes (nonce, gasShell, amount, endpointCipher): gas as \
+                     attached ECC[2], money as a figure off the note's own _balance, and the 4.0.35 \
+                     optional endpoint leg this client sends as null"
+                );
+                let declared: Vec<String> = fund.iter().map(|(name, _)| name.clone()).collect();
+                assert_eq!(
+                    sent_note_keys, declared,
+                    "the client must send exactly the arguments the compiled PrivateNote ABI declares"
+                );
+
+                let deal_fund = deal_fund.expect(
+                    "TokenContract.fundDeal must be declared alongside PrivateNote.fundDeal -- the \
+                     note's call has no receiver otherwise",
+                );
+                assert!(
+                    deal_legacy.is_none(),
+                    "4.0.33 renamed TokenContract.fundSellerBond to fundDeal; both cannot be declared"
+                );
+                assert_eq!(
+                    deal_fund,
+                    owned(&[
+                        ("amount", "uint128"),
+                        ("endpointCipher", "optional(bytes)"),
+                    ]),
+                    "TokenContract.fundDeal takes the bond as a figure and the 4.0.35 optional \
+                     endpoint leg; the ECC that arrives with it is the deal's gas, not the bond"
+                );
+                let declared: Vec<String> =
+                    deal_fund.iter().map(|(name, _)| name.clone()).collect();
+                assert_eq!(
+                    sent_deal_keys, declared,
+                    "the client must send exactly the arguments the compiled TokenContract ABI declares"
+                );
+            }
+            (None, Some(legacy)) => {
+                assert_eq!(
+                    legacy,
+                    owned(&[("nonce", "uint64"), ("amount", "uint128")]),
+                    "a bundle without fundDeal must be the pre-4.0.33 PrivateNote, whose funding \
+                     door is postSellerBond(nonce, amount)"
+                );
+                assert!(
+                    deal_fund.is_none() && deal_legacy.is_some(),
+                    "the two compiled ABIs must be the same generation: PrivateNote is pre-4.0.33 \
+                     while TokenContract is not"
+                );
+                let declared: Vec<String> = legacy.iter().map(|(name, _)| name.clone()).collect();
+                assert_ne!(
+                    NOTE_FUND_DEAL_METHOD, "postSellerBond",
+                    "the client targets the deployed 4.0.33 contracts, which no longer declare \
+                     postSellerBond; the vendored artifacts are one generation behind the chain"
+                );
+                assert_ne!(
+                    sent_note_keys, declared,
+                    "the client must not fall back to the pre-4.0.33 (nonce, amount) shape"
+                );
+                assert_ne!(
+                    DEAL_FUND_DEAL_METHOD, "fundSellerBond",
+                    "the client targets TokenContract.fundDeal, not the renamed-away fundSellerBond"
+                );
+            }
+            (None, None) => panic!(
+                "the compiled PrivateNote ABI declares neither fundDeal nor postSellerBond -- it \
+                 carries no seller-side funding door at all"
+            ),
+        }
+    }
+
+    /// Shape pin for the 4.0.34 deploy-gas door, decoded against the `PrivateNote.abi.json` this
+    /// crate embeds -- the same discipline as
+    /// [`seller_bond_encodes_the_funding_door_the_compiled_abi_declares`], and for the same reason:
+    /// a client written against a proposed ABI passes every offline gate while being dead on chain.
+    /// 4.0.34 removed the `rootModelShell` leg -- `fundDeployShell(uint64 nonce, uint128 tcShell)`
+    /// (`contracts/dex/PrivateNote.sol:1143`) -- because `SuperRoot` deploys the `RootModel` and
+    /// attaches its own value, leaving the note nothing to pre-fund. The client is adapted here; the
+    /// compiled artifacts arrive with the contracts merge, so for one window the two are a generation
+    /// apart. The invariant is stated over both states and is fail-closed in both:
+    /// * artifacts at 4.0.34 -- the client must send exactly the two arguments the ABI declares;
+    /// * artifacts still at 4.0.33 -- the ABI declares three, and the client must NOT be sending the
+    /// third. Putting `rootModelShell` back turns this red in either state, which is the regression.
+    #[test]
+    fn deploy_gas_encodes_the_fund_deploy_shell_shape_the_compiled_abi_declares() {
+        let sent: Vec<String> = note_fund_deploy_shell_params(7, 10_000_000_000)
+            .as_object()
+            .expect("fundDeployShell params object")
+            .keys()
+            .cloned()
+            .collect();
+        let declared = compiled_abi_inputs(PRIVATENOTE_ABI, "fundDeployShell")
+            .expect("compiled PrivateNote ABI declares fundDeployShell");
+        let declared_names: Vec<String> =
+            declared.iter().map(|(name, _)| name.clone()).collect();
+
+        assert_eq!(
+            sent,
+            owned(&[("nonce", ""), ("tcShell", "")])
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            "the client sends the 4.0.34 shape: the deal's leg only"
+        );
+
+        if declared.len() == 2 {
+            assert_eq!(
+                declared,
+                owned(&[("nonce", "uint64"), ("tcShell", "uint128")]),
+                "4.0.34 PrivateNote.fundDeployShell funds the per-deal TokenContract only"
+            );
+            assert_eq!(
+                sent, declared_names,
+                "the client must send exactly the arguments the compiled PrivateNote ABI declares"
+            );
+        } else {
+            assert_eq!(
+                declared,
+                owned(&[
+                    ("nonce", "uint64"),
+                    ("rootModelShell", "uint128"),
+                    ("tcShell", "uint128"),
+                ]),
+                "a three-argument fundDeployShell must be the pre-4.0.34 shape; anything else is a \
+                 generation this client cannot encode for"
+            );
+            assert!(
+                !sent.contains(&"rootModelShell".to_string()),
+                "the vendored artifacts are one generation behind the chain this client targets; \
+                 the client must not fall back to funding a RootModel the super root now deploys"
+            );
+        }
+    }
+
+    /// Shape pin for how a `RootModel` comes into existence, over the same two states.
+    /// 4.0.34 replaced `SuperRoot.registerRoot(uint256)` -- which verified a self-deployed root's
+    /// address -- with `SuperRoot.deployRootModel(uint256)`, which performs the deploy
+    /// (`contracts/airegistry/SuperRoot.sol:189`). The client stops deploying and starts asking. A
+    /// method the deployed code does not declare is not refused, it is simply never executed, so the
+    /// name is pinned against the ABI rather than trusted.
+    #[test]
+    fn root_model_deploy_targets_the_superroot_entry_the_compiled_abi_declares() {
+        let sent: Vec<String> = super_root_deploy_root_model_params(&json!("0xabc"))
+            .as_object()
+            .expect("deployRootModel params object")
+            .keys()
+            .cloned()
+            .collect();
+        let deploy = compiled_abi_inputs(SUPERROOT_ABI, SUPERROOT_DEPLOY_ROOT_MODEL_METHOD);
+        let legacy = compiled_abi_inputs(SUPERROOT_ABI, SUPERROOT_REGISTER_ROOT_METHOD);
+
+        match (deploy, legacy) {
+            (Some(deploy), legacy) => {
+                assert!(
+                    legacy.is_none(),
+                    "4.0.34 removed SuperRoot.registerRoot when it added deployRootModel; a bundle \
+                     declaring both is not a generation this client can encode for"
+                );
+                assert_eq!(
+                    deploy,
+                    owned(&[("ownerPubkey", "uint256")]),
+                    "SuperRoot.deployRootModel takes the owner pubkey alone -- the address derives \
+                     from it and the code comes from SuperRoot's own pin, so a caller can neither \
+                     aim the deploy nor choose what lands there"
+                );
+                let declared: Vec<String> =
+                    deploy.iter().map(|(name, _)| name.clone()).collect();
+                assert_eq!(
+                    sent, declared,
+                    "the client must send exactly the arguments the compiled SuperRoot ABI declares"
+                );
+            }
+            (None, Some(legacy)) => {
+                assert_eq!(
+                    legacy,
+                    owned(&[("ownerPubkey", "uint256")]),
+                    "a bundle without deployRootModel must be the pre-4.0.34 SuperRoot, whose entry \
+                     is registerRoot(ownerPubkey)"
+                );
+                assert_ne!(
+                    SUPERROOT_DEPLOY_ROOT_MODEL_METHOD, SUPERROOT_REGISTER_ROOT_METHOD,
+                    "the client targets the 4.0.34 SuperRoot, which no longer declares \
+                     registerRoot; the vendored artifacts are one generation behind"
+                );
+                assert!(
+                    compiled_abi_inputs(ROOTMODEL_ABI, "constructor")
+                        .is_some_and(|ctor| !ctor.is_empty()),
+                    "a pre-4.0.34 bundle still declares RootModel's constructor argument; once it \
+                     is empty the SuperRoot ABI must have moved too"
+                );
+            }
+            (None, None) => panic!(
+                "the compiled SuperRoot ABI declares neither deployRootModel nor registerRoot -- it \
+                 carries no way to bring a RootModel into existence at all"
+            ),
+        }
+    }
+
+    /// 0.34 -- a caller asking the note to fund a `RootModel` is refused, not quietly served a
+    /// message that funds only the deal. The contract has no such leg any more, so honouring the
+    /// request would drop the amount and report success while the RootModel stayed unfunded.
+    #[test]
+    fn note_refuses_to_fund_a_root_model_it_can_no_longer_reach() {
+        assert!(
+            root_model_deploy_shell_unsupported(0).is_none(),
+            "zero is the only figure the removed leg can carry; it must not be an error"
+        );
+        let refusal = root_model_deploy_shell_unsupported(10_000_000_000)
+            .expect("a non-zero RootModel funding request must be refused");
+        assert!(
+            refusal.contains("10000000000"),
+            "the refusal must name the amount that was not sent: {refusal}"
+        );
+        assert!(
+            refusal.contains("contracts/dex/PrivateNote.sol:1143"),
+            "the refusal must cite the signature that removed the leg: {refusal}"
+        );
+    }
+
+    /// Task O(4.0.33) removed the caller-named payee from the TokenContract's terminal doors:
+    /// `close(payoutAddress) -> close()`, `destroy(payoutAddress) -> destroy()`,
+    /// `withdrawShell(amount, recipient) -> withdrawShell(amount)`. A function id is derived from
+    /// the whole signature, so an extra argument does not fail a guard -- it addresses a method the
+    /// deployed code does not have, and the call is simply never executed. Pin the encoded shape
+    /// against the compiled ABI so the next signature change is caught here, not on chain.
+    #[test]
+    fn token_contract_terminal_calls_match_the_compiled_4033_abi() {
+        for (method, expected) in [
+            ("destroy", owned(&[])),
+            ("withdrawShell", owned(&[("amount", "uint128")])),
+            ("close", owned(&[])),
+        ] {
+            let declared = compiled_abi_inputs(TOKENCONTRACT_ABI, method)
+                .unwrap_or_else(|| panic!("compiled TokenContract ABI declares {method}"));
+            assert_eq!(
+                declared, expected,
+                "TokenContract.{method} changed shape in the compiled bundle; the client's \
+                 encoded arguments must move with it"
+            );
+        }
+
+        // What the client actually puts on the wire for the two terminal doors it encodes.
+        let destroy_keys: Vec<String> = json!({})
+            .as_object()
+            .expect("destroy params object")
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            destroy_keys.is_empty(),
+            "destroy() takes no inputs on 4.0.33; the pre-Task-O payoutAddress must not be encoded"
+        );
+        let withdraw_keys: Vec<String> = json!({ "amount": 1u128.to_string() })
+            .as_object()
+            .expect("withdrawShell params object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            withdraw_keys,
+            vec!["amount".to_string()],
+            "withdrawShell(uint128 amount) takes no recipient on 4.0.33"
+        );
+    }
+
+    #[test]
+    fn buyer_note_and_voucher_calls_match_the_compiled_4033_abis() {
+        for (abi, method, expected) in [
+            (
+                PRIVATENOTE_ABI,
+                "placeInferenceBuy",
+                owned(&[
+                    ("modelHash", "uint256"),
+                    ("maxPricePerTick", "uint128"),
+                    ("ticks", "uint128"),
+                    ("escrow", "uint128"),
+                    ("flags", "uint8"),
+                    ("deadline", "uint64"),
+                ]),
+            ),
+            (
+                PRIVATENOTE_ABI,
+                "cancelOrder",
+                owned(&[
+                    ("eventId", "uint256"),
+                    ("oracleListHash", "uint256"),
+                    ("tokenType", "uint32"),
+                    ("orderId", "uint128"),
+                ]),
+            ),
+            (
+                PRIVATENOTE_ABI,
+                "withdrawTokens",
+                owned(&[("destWalletAddr", "address"), ("dapp_id", "uint256")]),
+            ),
+            (
+                ROOTPN_ABI,
+                "generateVoucher",
+                owned(&[("skUCommit", "uint256"), ("isFee", "bool")]),
+            ),
+            (
+                ROOTPN_ABI,
+                "deployPrivateNote",
+                owned(&[
+                    ("zkproof", "bytes"),
+                    ("depositIdentifierHash", "uint256"),
+                    ("finalLayerHistoricalHashRoot", "uint256"),
+                    ("voucherNominalFr", "uint256"),
+                    ("tokenTypeFr", "uint256"),
+                    ("ephemeralPubkey", "uint256"),
+                    ("value", "uint64"),
+                    ("tokenType", "uint32"),
+                    ("layerNumber", "uint8"),
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                compiled_abi_inputs(abi, method),
+                Some(expected),
+                "{method} input shape drifted from the 4.0.33 artifact"
+            );
+        }
+
+        let buy_payload = place_inference_buy_payload("0x1", 2, 3, 4, 5, 6);
+        let buy_keys: BTreeSet<_> = buy_payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            buy_keys,
+            BTreeSet::from([
+                "deadline",
+                "escrow",
+                "flags",
+                "maxPricePerTick",
+                "modelHash",
+                "ticks",
+            ])
+        );
+        let dest =
+            Address::parse("0:1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        let withdraw_payload = withdraw_note_tokens_payload(&dest, "0x4");
+        let withdraw_keys: BTreeSet<_> = withdraw_payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(withdraw_keys, BTreeSet::from(["dapp_id", "destWalletAddr"]));
+    }
 
     fn zero_address() -> String {
         format!("0:{}", "0".repeat(64))
@@ -7416,6 +11621,51 @@ mod tests {
                     "{field}={malformed:?}: {error:#}"
                 );
             }
+        }
+    }
+
+    /// The shape the live chain actually returns for a cancelled order.
+    /// `getOrder` is `Order o = _orders[id]` on a plain mapping
+    /// (`contracts/airegistry/InferenceOrderBook.sol:1775`), so after `delete _orders[orderId]`
+    /// (`:716`) every field comes back default-constructed -- and a default TVM `address` is
+    /// `addr_none`, which the ABI decoder renders as `""`, not as the `addr_std` `0:`+64-zeros
+    /// form a field explicitly written as `address(0)` produces. Reading only the second shape
+    /// made `dexdo subscription cancel` report its own successful cancellation as a corrupt row.
+    #[test]
+    fn subscription_history_treats_addr_none_cancelled_order_as_absent() {
+        let owner = format!("0:{}", "1".repeat(64));
+        let tombstone = json!({
+            "note": "",
+            "tokenContract": "",
+            "price": format!("0x{}", "0".repeat(64)),
+            "amount": "0",
+            "escrow": "0",
+            "deadline": "0",
+            "flags": "0",
+            "ts": "0",
+            "isBuy": false
+        });
+
+        assert!(
+            !subscription_order_is_active_for_owner(4, &tombstone, &owner)
+                .expect("an addr_none deletion tombstone is absent, not malformed")
+        );
+    }
+
+    /// A resting subscription BUY carries no `TokenContract` and the chain may say so in either
+    /// TVM shape; both mean "no deal yet" and neither may be read as a foreign deal.
+    #[test]
+    fn subscription_buy_accepts_either_absent_token_contract_shape() {
+        let owner = format!("0:{}", "1".repeat(64));
+        for absent in ["", &zero_address()] {
+            let mut resting = valid_subscription_order(&owner);
+            resting["tokenContract"] = json!(absent);
+
+            assert!(
+                subscription_order_is_active_for_owner(5, &resting, &owner)
+                    .unwrap_or_else(|e| panic!("tokenContract={absent:?}: {e:#}")),
+                "tokenContract={absent:?} must read as a resting subscription BUY"
+            );
         }
     }
 
@@ -7760,36 +12010,264 @@ mod tests {
         assert!(!format!("{error:#}").contains("operator clock"));
     }
 
+    struct SkewFixtureServer {
+        task: tokio::task::JoinHandle<()>,
+        unrecognized: Arc<Mutex<Option<String>>>,
+    }
+
+    impl SkewFixtureServer {
+        fn abort(&self) {
+            let unrecognized = self.unrecognized.lock().unwrap().clone();
+            self.task.abort();
+            if let Some(request) = unrecognized {
+                panic!("unrecognized skew fixture request: {request}");
+            }
+        }
+    }
+
+    fn skew_fixture_disputed_token_contract_account() -> (String, String) {
+        use tvm_block::{
+            Account as TvmAccount, CurrencyCollection, Deserializable, MsgAddressInt, Serializable,
+            StateInit,
+        };
+
+        let model_name = "fixture--model--v1";
+        let buyer = format!("0:{}", "2".repeat(64));
+        let funded_tokens = 2 * TICK_SIZE;
+        let mut fields = json!({
+            "_pubkey": "0x0",
+            "_timestamp": "0",
+            "_constructorFlag": true,
+            "_sellerPubkey": "0x0",
+            "_rootModelAddress": format!("0:{}", "0".repeat(64)),
+            "_nonce": "0",
+            "_iobHash": "0x1",
+            "_iobDepth": "1",
+            "_noteAuthorized": true,
+            "_offerPosted": false,
+            "_modelName": model_name,
+            "_modelHash": model_hash_for(model_name),
+            "_pricePerTick": "10",
+            "_maxTicks": "2",
+            "_buyer": buyer,
+            "_buyerPubkey": "0x0",
+            "_sellerNote": format!("0:{}", "3".repeat(64)),
+            "_endpointCipher": "",
+        });
+        let lifecycle = json!({
+            "_funded": true,
+            "_opened": true,
+            "_everOpened": true,
+            "_disputed": true,
+            "_probeAccepted": false,
+            "_probeTick": "10",
+            "_probeTime": "2",
+            "_sellerBondFunded": true,
+            "_buyerBondFunded": true,
+            "_sellerBond": "20",
+            "_buyerBond": "20",
+            "_balance": "60",
+            "_deposit": "10",
+            "_finalizedOwed": "0",
+            "_feeAccrued": "0",
+            "_ticksFinalized": "0",
+            "_everDisputed": true,
+        });
+        let subscription = json!({
+            "_fundedTime": "1",
+            "_disputeTime": "3",
+            "_dealFlags": "0",
+            "_subWeeks": "0",
+            "_weekIndex": "0",
+            "_tokensPerWeek": funded_tokens.to_string(),
+            "_fundedTokens": funded_tokens.to_string(),
+            "_tokensPaid": "0",
+            "_periodStart": "1",
+            "_weekBaseTokens": "0",
+            "_tokensFinal": "0",
+            "_tokensPend": "0",
+            "_lastClaimTime": "2",
+        });
+        for part in [lifecycle, subscription] {
+            fields
+                .as_object_mut()
+                .expect("TokenContract fixture storage object")
+                .extend(
+                    part.as_object()
+                        .expect("TokenContract fixture storage part")
+                        .clone(),
+                );
+        }
+        let root = tvm_types::read_single_root_boc(TOKENCONTRACT_TVC)
+            .expect("read TokenContract fixture TVC");
+        let mut state_init =
+            StateInit::construct_from_cell(root).expect("parse TokenContract fixture StateInit");
+        let contract = tvm_abi::Contract::load(TOKENCONTRACT_ABI.as_bytes())
+            .expect("load TokenContract fixture ABI");
+        let tokens = tvm_abi::token::Tokenizer::tokenize_all_params(contract.fields(), &fields)
+            .expect("tokenize TokenContract fixture storage");
+        state_init.data = Some(
+            tvm_abi::TokenValue::pack_values_into_chain(&tokens, Vec::new(), contract.version())
+                .expect("encode TokenContract fixture storage")
+                .into_cell()
+                .expect("build TokenContract fixture data cell"),
+        );
+        let address = MsgAddressInt::with_standart(None, 0, [0x11; 32].into())
+            .expect("TokenContract fixture address");
+        let account = TvmAccount::active_by_init_code_hash(
+            address,
+            CurrencyCollection::from(100_000_000_000u64),
+            0,
+            state_init,
+            false,
+        )
+        .expect("activate TokenContract fixture account");
+        let account_cell = account
+            .serialize()
+            .expect("serialize TokenContract fixture account");
+        let account_boc = base64::engine::general_purpose::STANDARD.encode(
+            tvm_types::write_boc(&account_cell).expect("write TokenContract fixture account BOC"),
+        );
+        let code_hash = code_hash(TOKENCONTRACT_TVC).expect("TokenContract fixture code hash");
+        (account_boc, code_hash)
+    }
+
+    fn skew_fixture_settlement_history(resolved: bool) -> Value {
+        let buyer = format!("0:{}", "2".repeat(64));
+        let mut edges = vec![json!({
+            "cursor": "stream-disputed-cursor",
+            "node": {
+                "id": "stream-disputed-message",
+                "body": encode_token_contract_event(
+                    "StreamDisputed",
+                    json!({"buyer": buyer, "at": "3"}),
+                ),
+                "created_at": 3,
+            },
+        })];
+        if resolved {
+            edges.push(json!({
+                "cursor": "dispute-resolved-cursor",
+                "node": {
+                    "id": "dispute-resolved-message",
+                    "body": encode_token_contract_event(
+                        "DisputeResolved",
+                        json!({
+                            "toSeller": "0",
+                            "refundToBuyer": "20",
+                            "released": false,
+                        }),
+                    ),
+                    "created_at": 4,
+                },
+            }));
+        }
+        json!({
+            "data": {"blockchain": {"account": {"messages": {
+                "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                "edges": edges,
+            }}}}
+        })
+    }
+
+    fn skew_fixture_unrecognized_response(
+        unrecognized: &Mutex<Option<String>>,
+        request: &str,
+    ) -> String {
+        unrecognized
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| request.to_string());
+        let message = format!("unrecognized skew fixture request: {request}");
+        json!({
+            "error": {"code": "FIXTURE_UNRECOGNIZED", "message": message},
+            "errors": [{"message": message}],
+        })
+        .to_string()
+    }
+
     async fn skew_fixture_backend(
         chain_offset: i64,
     ) -> (
         RealChainBackend,
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
+        SkewFixtureServer,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let fixture_account_id = "1".repeat(64);
+        let fixture_account_route = format!(
+            "GET /v2/account?account_id={fixture_account_id}&dapp_id={fixture_account_id} "
+        );
+        let (fixture_account_boc, fixture_code_hash) =
+            skew_fixture_disputed_token_contract_account();
         let posts = Arc::new(AtomicUsize::new(0));
         let server_posts = Arc::clone(&posts);
         let posted_bocs = Arc::new(Mutex::new(Vec::new()));
         let server_bocs = Arc::clone(&posted_bocs);
+        let unrecognized = Arc::new(Mutex::new(None));
+        let server_unrecognized = Arc::clone(&unrecognized);
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_fixture_http_request(&mut socket).await;
-                if request.starts_with("POST /v2/messages ") {
-                    server_posts.fetch_add(1, Ordering::SeqCst);
-                    let body = request.split_once("\r\n\r\n").unwrap().1;
-                    let payload: Value = serde_json::from_str(body).unwrap();
-                    server_bocs
-                        .lock()
-                        .unwrap()
-                        .push(payload[0]["body"].as_str().unwrap().to_string());
-                }
-                let local = local_unix_secs().unwrap() as i64;
-                let chain = (local + chain_offset) as u64;
-                let body = json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string();
+                let request_body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or_default();
+                let body = if request.starts_with(&fixture_account_route) {
+                    json!({"dapp_id": fixture_account_id}).to_string()
+                } else if request.starts_with("POST /graphql ") {
+                    let payload = serde_json::from_str::<Value>(request_body).ok();
+                    let query = payload
+                        .as_ref()
+                        .and_then(|payload| payload["query"].as_str());
+                    if query.is_some_and(|query| query.contains("blocks(last:1)")) {
+                        let local = local_unix_secs().unwrap() as i64;
+                        let chain = (local + chain_offset) as u64;
+                        json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string()
+                    } else if query
+                        .is_some_and(|query| query.contains("messages(msg_type: [ExtOut]"))
+                    {
+                        skew_fixture_settlement_history(server_posts.load(Ordering::SeqCst) > 0)
+                            .to_string()
+                    } else if query.is_some_and(|query| query.contains("info {")) {
+                        let info = if server_posts.load(Ordering::SeqCst) == 0 {
+                            json!({
+                                "address": fixture_account_id,
+                                "acc_type_name": "Active",
+                                "boc": fixture_account_boc,
+                                "code_hash": fixture_code_hash,
+                                "balance": "0x174876e800",
+                                "balance_other": [],
+                            })
+                        } else {
+                            Value::Null
+                        };
+                        json!({"data":{"blockchain":{"account":{"info":info}}}}).to_string()
+                    } else {
+                        skew_fixture_unrecognized_response(&server_unrecognized, &request)
+                    }
+                } else if request.starts_with("POST /v2/messages ") {
+                    let payload = serde_json::from_str::<Value>(request_body).ok();
+                    let routed_boc = payload
+                        .as_ref()
+                        .and_then(Value::as_array)
+                        .and_then(|entries| entries.first())
+                        .filter(|entry| entry["account_id"] == fixture_account_id)
+                        .filter(|entry| entry["dapp_id"] == fixture_account_id)
+                        .and_then(|entry| entry["body"].as_str());
+                    if let Some(boc) = routed_boc {
+                        server_bocs.lock().unwrap().push(boc.to_string());
+                        server_posts.fetch_add(1, Ordering::SeqCst);
+                        json!({"result":{"exit_code":0}}).to_string()
+                    } else {
+                        skew_fixture_unrecognized_response(&server_unrecognized, &request)
+                    }
+                } else {
+                    skew_fixture_unrecognized_response(&server_unrecognized, &request)
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(), body
@@ -7805,7 +12283,12 @@ mod tests {
             superroot: Address::parse(&deployed.superroot).unwrap(),
             deployed,
         };
-        (backend, posts, posted_bocs, task)
+        (
+            backend,
+            posts,
+            posted_bocs,
+            SkewFixtureServer { task, unrecognized },
+        )
     }
 
     #[tokio::test]
@@ -9113,6 +13596,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ext_out_walk_filter_map_retains_only_candidates_and_rejects_conflicts() {
+        let first = ExtOutMessage {
+            id: "first".to_string(),
+            created_at: 1,
+            cursor: "cursor-first".to_string(),
+            body: "unrelated".to_string(),
+        };
+        let candidate = ExtOutMessage {
+            id: "candidate".to_string(),
+            created_at: 2,
+            cursor: "cursor-candidate".to_string(),
+            body: "fill".to_string(),
+        };
+        let mut visited = Vec::new();
+        let retained = filter_map_ext_out_messages_in_order(
+            vec![first, candidate.clone(), candidate.clone()],
+            |message| {
+                visited.push(message.id.clone());
+                Ok((message.body == "fill").then_some(message.id))
+            },
+        )
+        .expect("filter the deduplicated history walk");
+        assert_eq!(visited, ["first", "candidate"]);
+        assert_eq!(retained, ["candidate"]);
+
+        let mut conflicting = candidate.clone();
+        conflicting.body = "changed-fill".to_string();
+        let error = filter_map_ext_out_messages_in_order(
+            vec![candidate, conflicting],
+            |message| Ok(Some(message.id)),
+        )
+        .expect_err("a reused message id with changed content must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("changed across overlapping pages"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn book_fill_candidate_verification_requires_both_parties_and_current_funding() {
+        let candidate = BookFillCandidate {
+            maker_id: 17,
+            taker_id: 18,
+            ticks: 4,
+            clearing_price: "700".to_string(),
+            seller_token_contract: format!("0:{}", "aa".repeat(32)),
+            buyer_note: format!("0:{}", "bb".repeat(32)),
+            seller_note: format!("0:{}", "cc".repeat(32)),
+        };
+        let requested_buyer = candidate.buyer_note.clone();
+        let parties = TokenContractParties {
+            buyer: candidate.buyer_note.clone(),
+            seller_note: candidate.seller_note.clone(),
+        };
+        let state = test_deal_state(false, false, 0);
+        assert!(book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            Some(&parties),
+            Some(&state),
+        ));
+        assert!(!book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            None,
+            Some(&state),
+        ));
+        assert!(!book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            Some(&parties),
+            None,
+        ));
+
+        let mut unfunded = state;
+        unfunded.funded = false;
+        assert!(!book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            Some(&parties),
+            Some(&unfunded),
+        ));
+
+        let wrong_buyer = TokenContractParties {
+            buyer: format!("0:{}", "dd".repeat(32)),
+            ..parties.clone()
+        };
+        assert!(!book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            Some(&wrong_buyer),
+            Some(&state),
+        ));
+
+        let wrong_seller = TokenContractParties {
+            seller_note: format!("0:{}", "ee".repeat(32)),
+            ..parties
+        };
+        assert!(!book_fill_candidate_is_verified(
+            &candidate,
+            &requested_buyer,
+            Some(&wrong_seller),
+            Some(&state),
+        ));
+    }
+
+    #[test]
+    fn outstanding_candidate_confirmed_by_its_token_contract_is_offered_as_a_lead() {
+        let note = format!("0:{}", "bb".repeat(32));
+        let token_contract = format!("0:{}", "aa".repeat(32));
+        let parties = TokenContractParties {
+            buyer: note.clone(),
+            seller_note: format!("0:{}", "cc".repeat(32)),
+        };
+        let state = test_deal_state(true, false, 0);
+
+        let lead = classify_outstanding_deal_lead(
+            &note,
+            &token_contract,
+            Some(&parties),
+            Some(&state),
+        )
+        .expect("matching getParties plus funded getState offers a lead");
+
+        assert_eq!(lead.token_contract, token_contract);
+        assert_eq!(lead.role, DealRole::Buyer);
+        assert_eq!(lead.state, state);
+    }
+
+    #[test]
+    fn outstanding_candidate_whose_token_contract_is_not_funded_is_refused() {
+        let note = format!("0:{}", "bb".repeat(32));
+        let token_contract = format!("0:{}", "aa".repeat(32));
+        let parties = TokenContractParties {
+            buyer: note.clone(),
+            seller_note: format!("0:{}", "cc".repeat(32)),
+        };
+        let mut state = test_deal_state(false, false, 0);
+        state.funded = false;
+
+        let refusal = classify_outstanding_deal_lead(
+            &note,
+            &token_contract,
+            Some(&parties),
+            Some(&state),
+        )
+        .expect_err("getOutstanding cannot promote an unfunded address to a deal lead");
+
+        assert_eq!(refusal.token_contract, token_contract);
+        assert!(refusal.reason.contains("funded=false"), "{refusal:?}");
+    }
+
+    #[test]
+    fn outstanding_candidate_whose_token_contract_is_absent_or_destroyed_is_refused() {
+        let note = format!("0:{}", "bb".repeat(32));
+        let token_contract = format!("0:{}", "aa".repeat(32));
+
+        let refusal = classify_outstanding_deal_lead(&note, &token_contract, None, None)
+            .expect_err("a stale pointer to a destroyed TokenContract is never a deal lead");
+
+        assert_eq!(refusal.token_contract, token_contract);
+        assert!(
+            refusal.reason.contains("absent or destroyed"),
+            "{refusal:?}"
+        );
+    }
+
     fn test_deal_state(opened: bool, disputed: bool, finalized_owed: u128) -> DealChainState {
         DealChainState {
             funded: true,
@@ -9122,12 +13775,10 @@ mod tests {
             deposit: if opened { 100 } else { 0 },
             finalized_owed,
             tokens_final: 1_000_001,
-            tokens_superseded: 1_000_002,
             tokens_pending: 1_000_003,
             probe_tick: 0,
             funded_time: Some(1),
             probe_time: 2,
-            prev_claim_time: 3,
             last_claim_time: 4,
             dispute_time: if disputed { 5 } else { 0 },
         }
@@ -9274,9 +13925,6 @@ mod tests {
         let mut changed = post.clone();
         changed.state.tokens_final += 1;
         mutations.push(("tokensFinal", changed));
-        let mut changed = post.clone();
-        changed.state.tokens_superseded += 1;
-        mutations.push(("tokensSuperseded", changed));
         let mut changed = post.clone();
         changed.state.tokens_pending += 1;
         mutations.push(("tokensPending", changed));
@@ -10071,6 +14719,88 @@ mod tests {
     }
 
     #[test]
+    fn prior_stream_stopped_is_recorded_as_already_closed_without_a_submit() {
+        let buyer = format!("0:{}", "44".repeat(32));
+        let receipt = select_prior_buyer_terminal_receipt(
+            "0:tc",
+            &buyer,
+            &TokenContractSettlementReceipts {
+                events: vec![TokenContractSettlementReceipt {
+                    message_id: "permissionless-finalize".to_string(),
+                    created_at: 81,
+                    cursor: "cursor-finalize".to_string(),
+                    event: TokenContractSettlementEvent::StreamStopped {
+                        buyer: buyer.clone(),
+                        to_seller: 10,
+                        refund_to_buyer: 90,
+                    },
+                }],
+            },
+        )
+        .expect("valid prior terminal history")
+        .expect("terminal observation");
+
+        assert_eq!(
+            receipt.fact,
+            crate::chain::BuyerStopTerminalFact::AlreadyClosed
+        );
+        assert!(!receipt.stop_submitted);
+        assert_eq!(receipt.message_id, "permissionless-finalize");
+    }
+
+    #[test]
+    fn submitted_stream_stop_message_is_bound_to_the_exact_client_transaction() {
+        let buyer = format!("0:{}", "44".repeat(32));
+        let response = json!({
+            "data": {
+                "blockchain": {
+                    "message": {
+                        "id": "client-stream-stop",
+                        "dst": buyer,
+                        "dst_transaction": {
+                            "status": 3,
+                            "aborted": false,
+                            "out_msgs": [
+                                "unrelated-ensure-balance",
+                                "our-internal-stop"
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_submitted_buyer_stop_out_message_ids(
+                &response,
+                "client-stream-stop",
+                &buyer,
+            )
+            .expect("exact submitted streamStop trace"),
+            Some(vec![
+                "unrelated-ensure-balance".to_string(),
+                "our-internal-stop".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn submitted_stop_graphql_query_matches_the_response_shape_parser_consumes() {
+        for field in [
+            "message(hash: $hash)",
+            "id dst",
+            "dst_transaction",
+            "status aborted",
+            "out_msgs",
+        ] {
+            assert!(
+                SUBMITTED_BUYER_STOP_QUERY.contains(field),
+                "submitted STOP query must request {field}"
+            );
+        }
+    }
+
+    #[test]
     fn destroyed_prior_terminal_receipt_wins_before_state_actor_or_post() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10785,6 +15515,123 @@ mod tests {
         assert!(!redirect_task.await.expect("money redirect task"));
     }
 
+    /// an explicit one on the wire -- and per `DEXDO_USER_AGENT` it must be OUR `name/version`
+    /// identifier, never a browser impersonation. Observed on the wire, not read back off the
+    /// builder, because only the sent header is what the edge sees.
+    #[tokio::test]
+    async fn shellnet_http_clients_send_our_own_user_agent() {
+        /// Serve exactly one request with `body`, and hand back its raw request head.
+        async fn capture_one_request(
+            body: &'static str,
+        ) -> (String, tokio::task::JoinHandle<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind user-agent capture server");
+            let addr = listener.local_addr().expect("capture server address");
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("capture request");
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut chunk).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write canned response");
+                String::from_utf8_lossy(&head).into_owned()
+            });
+            (format!("http://{addr}"), task)
+        }
+
+        /// The `User-Agent` value the client actually put on the wire, or `None` when it sent none.
+        fn sent_user_agent(request_head: &str) -> Option<String> {
+            request_head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("user-agent")
+                    .then(|| value.trim().to_string())
+            })
+        }
+
+        let expected = concat!("dexdo/", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            DEXDO_USER_AGENT, expected,
+            "the identifier must be our product name and the crate's own version"
+        );
+
+        // The read/getter client (`shellnet_clock_skew_preflight`, and the same builder backs
+        // `RealChainBackend::connect_with_endpoint`). The preflight's own verdict is irrelevant
+        // here -- the request is already on the wire by the time it fails on the canned body.
+        let (endpoint, captured) = capture_one_request("{}").await;
+        let _ = shellnet_clock_skew_preflight(&endpoint).await;
+        let read_ua = sent_user_agent(&captured.await.expect("capture task"))
+            .expect("the read client must send an explicit User-Agent; the edge 403s the default");
+
+        // The shared seam every shellnet-facing caller(including `crates/dexdo`) builds from.
+        let (endpoint, captured) = capture_one_request("{}").await;
+        let _ = shellnet_http_client()
+            .expect("shared shellnet client")
+            .post(&endpoint)
+            .send()
+            .await;
+        let shared_ua = sent_user_agent(&captured.await.expect("capture task"))
+            .expect("shellnet_http_client must send an explicit User-Agent");
+
+        // The money-POST client(`build_money_post_http_client`), used for `/v2/messages`.
+        let (endpoint, captured) = capture_one_request("[]").await;
+        let money_client = build_money_post_http_client().expect("money POST client");
+        let _ = send_message_routed_checked(
+            &money_client,
+            &endpoint,
+            "signed-boc",
+            "0:11",
+            "0:22",
+            None,
+        )
+        .await;
+        let money_ua = sent_user_agent(&captured.await.expect("capture task"))
+            .expect("the money POST client must send an explicit User-Agent");
+
+        for (label, sent) in [
+            ("read", &read_ua),
+            ("shared", &shared_ua),
+            ("money POST", &money_ua),
+        ] {
+            assert_eq!(
+                sent.as_str(),
+                DEXDO_USER_AGENT,
+                "the {label} client sent {sent:?} instead of our own identifier"
+            );
+            assert!(
+                !sent.to_ascii_lowercase().contains("mozilla"),
+                "the {label} client impersonated a browser: {sent:?}"
+            );
+            let (name, version) = sent
+                .split_once('/')
+                .expect("an honest identifier is name/version");
+            assert_eq!(name, "dexdo", "the {label} client must name this product");
+            assert!(
+                version.split('.').count() >= 2 && version.starts_with(char::is_numeric),
+                "the {label} client must carry the crate version, got {version:?}"
+            );
+        }
+    }
+
     #[test]
     fn details_has_withdrawn_accepts_bool_and_string_forms() {
         assert_eq!(
@@ -10804,6 +15651,36 @@ mod tests {
             Some(true)
         );
         assert_eq!(details_has_withdrawn(&json!({"hasWithdrawn": "wat"})), None);
+    }
+
+    #[test]
+    fn private_note_spendable_shell_is_get_details_balance_record() {
+        let details = json!({
+            "balance": {"2": "1000000000000"},
+            "lockedInOrders": {"2": "250000000000"}
+        });
+        assert_eq!(
+            private_note_balance_currency(&details, crate::params::SHELL_CURRENCY_ID).unwrap(),
+            1_000_000_000_000
+        );
+        assert_eq!(
+            private_note_balance_currency(
+                &json!({"balance": [{"currency": "2", "value": "7"}]}),
+                crate::params::SHELL_CURRENCY_ID,
+            )
+            .unwrap(),
+            7
+        );
+        let missing = private_note_balance_currency(
+            &json!({"balance": {}, "lockedInOrders": {"2": "1000000000000"}}),
+            crate::params::SHELL_CURRENCY_ID,
+        )
+        .expect_err("locked funds are not a substitute for spendable balance")
+        .to_string();
+        assert!(
+            missing.contains("refusing to infer a spendable balance"),
+            "{missing}"
+        );
     }
 
     #[test]
@@ -10914,10 +15791,269 @@ mod tests {
         );
     }
 
+    /// the DApp carried in `withdrawTokens` is the destination wallet's identity, not the
+    /// DApp from the dexdo deployment manifest. The backend fixture deliberately disagrees with
+    /// the destination so reaching for `self.deployed.dapp_id` makes this regression fail.
+    #[test]
+    fn withdraw_note_tokens_payload_uses_destination_dapp_not_deployment_dapp() {
+        let deployment_dapp = format!("{}4", "0".repeat(63));
+        let destination_dapp = "d".repeat(64);
+        let mut deployment = deployed("");
+        deployment.dapp_id = deployment_dapp.clone();
+        let backend = RealChainBackend {
+            client: ChainClient::connect("http://127.0.0.1:9").expect("offline fixture client"),
+            http: reqwest::Client::new(),
+            money_post_http: build_money_post_http_client().expect("money POST client"),
+            superroot: Address::parse(&deployment.superroot).expect("fixture SuperRoot"),
+            deployed: deployment,
+        };
+        let destination_account = "a".repeat(64);
+        let supplied_destination = crate::CanonicalAddress::parse(&format!(
+            "{destination_dapp}::{destination_account}"
+        ))
+        .expect("canonical --to destination");
+        let dest = Address::parse(&supplied_destination.legacy()).expect("destination account");
+
+        assert_ne!(backend.deployed.dapp_id, supplied_destination.dapp_id());
+        let payload = backend.withdraw_note_tokens_payload_for_destination(
+            &dest,
+            supplied_destination.dapp_id(),
+        );
+        assert_eq!(
+            payload,
+            json!({
+                "destWalletAddr": "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "dapp_id": format!("0x{destination_dapp}"),
+            })
+        );
+    }
+
     #[test]
     fn submit_path_has_no_raw_debug_console_output() {
         let source = include_str!("client.rs");
         assert!(!source.contains(concat!("DEXDO-SUBMIT", "-DBG")));
         assert!(!source.contains(concat!("deploy-prefund", " submit:")));
+    }
+
+    /// The note-to-note payload is encoded against the ABI the client actually ships, not against a
+    /// signature copied out of the contract source or an issue comment. Argument ORDER is the reason
+    /// this matters more here than usual: `initTransfer` takes two `uint128`s in a row, `amount` then
+    /// `eccAmount`, so a transposition compiles, encodes, submits, and moves the gas pocket instead
+    /// of the trading record.
+    #[test]
+    fn init_transfer_payload_matches_the_compiled_private_note_abi() {
+        let inputs = compiled_abi_inputs(PRIVATENOTE_ABI, "initTransfer")
+            .expect("compiled PrivateNote ABI declares initTransfer");
+        assert_eq!(
+            inputs,
+            owned(&[
+                ("destDepositHash", "uint256"),
+                ("tokenType", "uint32"),
+                ("amount", "uint128"),
+                ("eccAmount", "uint128"),
+            ])
+        );
+        let payload = init_note_transfer_payload("12345", 2, 81_000_000_000, 0);
+        assert_eq!(
+            payload,
+            json!({
+                "destDepositHash": "12345",
+                "tokenType": 2,
+                "amount": "81000000000",
+                "eccAmount": "0",
+            })
+        );
+        // Every declared input is supplied, by the name the ABI declares it under.
+        for (name, _) in &inputs {
+            assert!(
+                payload.get(name).is_some(),
+                "initTransfer payload is missing the declared input {name}"
+            );
+        }
+        assert_eq!(payload.as_object().expect("object").len(), inputs.len());
+    }
+
+    /// The refusals that can be seen for free are seen, and the ones that cannot are NOT claimed.
+    /// `initTransfer` accepts before it checks, so each of these met on chain costs the sending
+    /// note's gas to be refused. The last case is the important one: a note carrying open inference
+    /// state looks perfectly transferable through `getDetails()`, which is exactly why 167 has to be
+    /// explained on the way out instead.
+    #[test]
+    fn note_transfer_refusals_are_read_from_get_details() {
+        let clean = json!({
+            "depositIdentifierHash": "42",
+            "balance": { "2": "350000000000" },
+            "lockedInOrders": { "2": "0" },
+            "busyAddress": null,
+            "couponsValue": "0",
+            "hasWithdrawn": false,
+        });
+        assert_eq!(note_transfer_sender_refusal(&clean), None);
+        assert_eq!(note_transfer_dest_refusal(&clean), None);
+        assert_eq!(
+            note_transfer_deposit_identifier_hash(&clean).expect("hash"),
+            "42"
+        );
+
+        let mut withdrawn = clean.clone();
+        withdrawn["hasWithdrawn"] = json!(true);
+        assert_eq!(
+            note_transfer_sender_refusal(&withdrawn),
+            Some(NoteTransferRefusal::SenderWithdrawn)
+        );
+        // The destination's ONLY state gate, and the one that costs money if it is not checked: the
+        // sender debits `_balance` before the far side ever refuses.
+        assert_eq!(
+            note_transfer_dest_refusal(&withdrawn),
+            Some(NoteTransferRefusal::DestWithdrawn)
+        );
+
+        let mut busy = clean.clone();
+        busy["busyAddress"] = json!("0:2222222222222222222222222222222222222222222222222222222222222222");
+        assert_eq!(
+            note_transfer_sender_refusal(&busy),
+            Some(NoteTransferRefusal::SenderBusy {
+                with: "0:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string()
+            })
+        );
+
+        let mut coupon = clean.clone();
+        coupon["couponsValue"] = json!("7");
+        assert_eq!(
+            note_transfer_sender_refusal(&coupon),
+            Some(NoteTransferRefusal::SenderCouponActive { value: 7 })
+        );
+
+        let mut locked = clean.clone();
+        locked["lockedInOrders"] = json!({ "2": "5000" });
+        assert_eq!(
+            note_transfer_sender_refusal(&locked),
+            Some(NoteTransferRefusal::SenderLockedInOrders {
+                token_type: 2,
+                locked: 5000
+            })
+        );
+        // The array rendering of the same map is read too, so a getter that answers in the other
+        // shape does not silently report a locked note as clean.
+        let mut locked_array = clean.clone();
+        locked_array["lockedInOrders"] = json!([{ "currency": 2, "value": "5000" }]);
+        assert_eq!(
+            note_transfer_sender_refusal(&locked_array),
+            Some(NoteTransferRefusal::SenderLockedInOrders {
+                token_type: 2,
+                locked: 5000
+            })
+        );
+
+        // A note with open orders / resting inference / a live deal is INVISIBLE here: none of
+        // `_openOrderCount`, `_restingInf`, `_pendingInf`, `_liveDeals` is in `getDetails()`. This
+        // asserts the gap rather than pretending it is covered.
+        let details_keys: Vec<&str> = clean
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for absent in ["openOrderCount", "restingInf", "pendingInf", "liveDeals"] {
+            assert!(
+                !details_keys.contains(&absent),
+                "getDetails() now exposes {absent}; the ERR_OPEN_ORDERS_EXIST refusal became \
+                 preflightable and should be raised before spending instead of explained after"
+            );
+        }
+    }
+
+    /// Amount refusals, including the one that is easy to get backwards: below the contract minimum
+    /// is refused even when the sender is rich, because `minStakeValue` is checked before the
+    /// balance is.
+    #[test]
+    fn note_transfer_amount_refusals_match_the_contract_requires() {
+        let minimum = crate::params::MIN_NOTE_TRANSFER_SHELL_RAW;
+        assert_eq!(
+            note_transfer_amount_refusal(350_000_000_000, 81_000_000_000, minimum),
+            None
+        );
+        assert_eq!(
+            note_transfer_amount_refusal(350_000_000_000, minimum, minimum),
+            None
+        );
+        assert_eq!(
+            note_transfer_amount_refusal(350_000_000_000, minimum - 1, minimum),
+            Some(NoteTransferRefusal::AmountBelowMinimum {
+                amount: minimum - 1,
+                minimum
+            })
+        );
+        assert_eq!(
+            note_transfer_amount_refusal(40_000_000_000, 81_000_000_000, minimum),
+            Some(NoteTransferRefusal::SenderRecordShort {
+                have: 40_000_000_000,
+                want: 81_000_000_000
+            })
+        );
+        // Exactly the whole record is allowed: the contract's check is `>=`.
+        assert_eq!(
+            note_transfer_amount_refusal(81_000_000_000, 81_000_000_000, minimum),
+            None
+        );
+    }
+
+    /// The contract minimum is taken FROM the contract, not from folklore. If `MIN_VALUE_SHELL`
+    /// moves, this fails and the constant has to move with it rather than quietly under-refusing.
+    #[test]
+    fn min_note_transfer_matches_the_contract_min_stake_value() {
+        const MODIFIERS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/dex/modifiers/modifiers.sol"
+        ));
+        let at = MODIFIERS
+            .find("MIN_VALUE_SHELL")
+            .expect("modifiers.sol declares MIN_VALUE_SHELL");
+        let rest = &MODIFIERS[at..];
+        let eq = rest.find('=').expect("MIN_VALUE_SHELL is assigned");
+        let end = rest.find(';').expect("MIN_VALUE_SHELL terminator");
+        let declared: u128 = rest[eq + 1..end]
+            .replace('_', "")
+            .trim()
+            .parse()
+            .expect("numeric MIN_VALUE_SHELL");
+        assert_eq!(declared, crate::params::MIN_NOTE_TRANSFER_SHELL_RAW);
+    }
+
+    /// The two refusals no preflight can reach are re-stated by name and by what to do, keyed on the
+    /// exit code rather than on the wording around it. `exit_code=<n> (` is the exact fragment
+    /// `exit_code_fragment` writes, so the label already being there is what this hooks onto.
+    #[test]
+    fn note_transfer_names_the_refusals_a_preflight_cannot_reach() {
+        let open_orders = note_transfer_submit_hint(
+            "on-chain submit failed: exit_code=167 (dex::ERR_OPEN_ORDERS_EXIST) stage=compute",
+        )
+        .expect("167 is explained");
+        assert!(open_orders.contains("ERR_OPEN_ORDERS_EXIST"));
+        // The asymmetry is the actionable part: such a note can still RECEIVE.
+        assert!(open_orders.contains("still RECEIVE"));
+
+        let busy = note_transfer_submit_hint(
+            "on-chain submit failed: exit_code=121 (dex::ERR_NOTE_BUSY) stage=compute",
+        )
+        .expect("121 is explained");
+        assert!(busy.contains("ERR_NOTE_BUSY"));
+        // A latch, not a wait: telling an operator to retry would be the wrong instruction.
+        assert!(busy.contains("not a wait-and-retry state"));
+
+        // Numbers that merely CONTAIN these digits are not these codes.
+        assert_eq!(
+            note_transfer_submit_hint(
+                "on-chain submit failed: exit_code=1670 (unknown contract error code) stage=compute"
+            ),
+            None
+        );
+        assert_eq!(note_transfer_submit_hint("on-chain submit failed: exit_code=102 (dex::ERR_LOW_VALUE) stage=compute"), None);
+        // And the codes are the ones the vendored table already knows by these names, so the hint
+        // and the label can never disagree about which constant a number is.
+        assert!(crate::onchain_diagnostics::contract_error_names(167)
+            .contains(&"dex::ERR_OPEN_ORDERS_EXIST"));
+        assert!(crate::onchain_diagnostics::contract_error_names(121).contains(&"dex::ERR_NOTE_BUSY"));
     }
 }

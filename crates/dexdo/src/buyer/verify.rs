@@ -1,8 +1,8 @@
 //! Client-side model verification. Runs **inline on the canonical
 //! stream BEFORE re-rendering**(B5-B9), on the buyer's side -- the protocol does not guarantee
 //! authenticity off-chain; the client provides it.
-//! Layers in increasing order of cost: **B5 tokenizer-check**(here), then logprob shape
-//! (B6), reference spot-check(B7), behavioral probes(B8), per-seller score(B10). Currently B5 is
+//! Layers in increasing order of cost: **B5 tokenizer-check**(here), then reference
+//! spot-check(B7), behavioral probes(B8), per-seller score(B10). Currently B5 is
 //! up -- it is mandatory first and cheaply catches a crude model substitution.
 //! The verifier is **stateful per stream**: the `SignalManifest` arrives on the first chunk,
 //! the verifier captures it and runs the available layers on each chunk. No signals / not declared --
@@ -11,8 +11,7 @@
 use crate::registry::model_id_alias;
 use crate::seller::{ModelConfig, ModelsConfig};
 pub use dexdo_core::params::DEFAULT_SPOTCHECK_THRESHOLD;
-use dexdo_core::params::LOGPROB_VALIDATION_EPSILON;
-use dexdo_proto::{CanonChunk, SignalManifest, TokenLogprobs};
+use dexdo_proto::{CanonChunk, SignalManifest};
 use std::sync::Arc;
 
 /// Stream verification verdict: continue or bail (refuse/bail to the next
@@ -77,55 +76,6 @@ fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig
     }
 }
 
-/// Logprob shape -- at minimum: **distribution correctness**. A real LM returns
-/// valid log-probabilities(<= 0), a top-k sorted in descending order, and the chosen token no
-/// more probable than the maximum. Forged logprobs(zeros/unsorted/chosen > top) are an instant flag.
-/// Comparing entropy/shape against a **specific model's profile**(an equivalent-but-different model) is,
-/// horizon(needs a per-model profile); here -- a cheap universal consistency cross-check.
-fn logprob_shape_check(logprobs: &[TokenLogprobs]) -> Verdict {
-    for (i, tl) in logprobs.iter().enumerate() {
-        // A real model's log-probability is always FINITE and <= 0. NaN/+/-inf is a "broken" signal
-        // (corruption/fabrication); catch it explicitly, otherwise NaN comparisons(always false) silently bypass B6.
-        if !tl.logprob.is_finite() {
-            return Verdict::Bail(format!(
-                "logprob-shape: token {i} logprob is not finite ({}) -- invalid log-probability",
-                tl.logprob
-            ));
-        }
-        if tl.logprob > LOGPROB_VALIDATION_EPSILON {
-            return Verdict::Bail(format!(
-                "logprob-shape: token {i} logprob {:.4} > 0 -- invalid log-probability (fabrication)",
-                tl.logprob
-            ));
-        }
-        let mut prev = f64::INFINITY;
-        for (j, t) in tl.top.iter().enumerate() {
-            if !t.logprob.is_finite() {
-                return Verdict::Bail(format!(
-                    "logprob-shape: token {i} top[{j}] logprob is not finite -- invalid log-probability"
-                ));
-            }
-            if t.logprob > LOGPROB_VALIDATION_EPSILON {
-                return Verdict::Bail(format!("logprob-shape: token {i} top[{j}] logprob > 0"));
-            }
-            if t.logprob > prev + LOGPROB_VALIDATION_EPSILON {
-                return Verdict::Bail(format!(
-                    "logprob-shape: token {i} top is not descending -- distribution fabrication"
-                ));
-            }
-            prev = t.logprob;
-        }
-        if let Some(top0) = tl.top.first() {
-            if tl.logprob > top0.logprob + LOGPROB_VALIDATION_EPSILON {
-                return Verdict::Bail(format!(
-                    "logprob-shape: token {i} chosen logprob > top maximum -- inconsistent"
-                ));
-            }
-        }
-    }
-    Verdict::Pass
-}
-
 /// Stateful verifier of a single stream. Captures the `SignalManifest` from the first chunk and
 /// runs the available layers inline on each chunk BEFORE re-rendering. A `Bail` verdict is a signal to the buyer
 /// to bail(B10).
@@ -182,13 +132,6 @@ impl StreamVerifier {
                 &chunk.token_ids,
                 self.models.as_deref(),
             );
-            if v != Verdict::Pass {
-                return v;
-            }
-        }
-        // B6: logprob shape -- only if the gateway declared logprobs(otherwise degradation R3).
-        if manifest.has_logprobs && !chunk.logprobs.is_empty() {
-            let v = logprob_shape_check(&chunk.logprobs);
             if v != Verdict::Pass {
                 return v;
             }
@@ -403,18 +346,18 @@ fn normalize_words(s: &str) -> Vec<String> {
     words
 }
 
-/// Agreement fraction over the **leading word prefix**(B7 spot-check): greedy(temp=0) of the same
-/// model gives an identical prefix(-> 1.0); a different model diverges early(-> low). `0.0`, if
-/// there is nothing to compare(empty response on either side).
+/// Agreement fraction over the **leading word prefix**(B7 spot-check), normalized by the full
+/// reference length so a seller cannot raise its score by answering less. Greedy(temp=0) of the
+/// same model gives an identical prefix(-> 1.0); a different model diverges early(-> low). `0.0`,
+/// if there is nothing to compare(empty response on either side).
 pub fn prefix_agreement(seller: &str, reference: &str) -> f64 {
     let a = normalize_words(seller);
     let b = normalize_words(reference);
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let n = a.len().min(b.len());
     let matched = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-    matched as f64 / n as f64
+    matched as f64 / b.len() as f64
 }
 
 /// B7 spot-check verdict: agreement with the reference >= threshold -> `Pass`(model confirmed);
@@ -437,7 +380,6 @@ mod tests {
         SignalManifest {
             tokenizer_family: family.to_string(),
             has_token_ids,
-            has_logprobs: false,
             claimed_model: "m".to_string(),
         }
     }
@@ -448,7 +390,6 @@ mod tests {
             reasoning: String::new(),
             token_ids,
             seq,
-            logprobs: Vec::new(),
             manifest,
         }
     }
@@ -513,143 +454,12 @@ mod tests {
         assert_eq!(v2.verify(&chunk(0, vec![5], None)), Verdict::Pass);
     }
 
-    // ---- B6: logprob shape/correctness ----
-
-    fn lp(logprob: f64, top: Vec<(f64, u32)>) -> TokenLogprobs {
-        TokenLogprobs {
-            logprob,
-            top: top
-                .into_iter()
-                .map(|(l, id)| dexdo_proto::TopLogprob {
-                    token: id.to_string(),
-                    logprob: l,
-                })
-                .collect(),
-        }
-    }
-
-    fn chunk_lp(logprobs: Vec<TokenLogprobs>, manifest: Option<SignalManifest>) -> CanonChunk {
-        CanonChunk {
-            text: "x".to_string(),
-            reasoning: String::new(),
-            token_ids: Vec::new(),
-            seq: 0,
-            logprobs,
-            manifest,
-        }
-    }
-
-    fn manifest_lp(has_logprobs: bool) -> SignalManifest {
-        SignalManifest {
-            tokenizer_family: String::new(),
-            has_token_ids: false,
-            has_logprobs,
-            claimed_model: "m".to_string(),
-        }
-    }
-
-    #[test]
-    fn wellformed_logprobs_pass() {
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(
-            vec![lp(-0.5, vec![(-0.5, 10), (-1.2, 20), (-3.0, 30)])],
-            Some(manifest_lp(true)),
-        );
-        assert_eq!(v.verify(&c), Verdict::Pass);
-    }
-
-    #[test]
-    fn positive_logprob_bails() {
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(vec![lp(0.5, vec![])], Some(manifest_lp(true)));
-        assert!(
-            matches!(v.verify(&c), Verdict::Bail(_)),
-            "logprob > 0 -> Bail"
-        );
-    }
-
-    #[test]
-    fn logprob_epsilon_boundary_uses_canonical_parameter() {
-        let mut at_boundary = StreamVerifier::new();
-        let accepted = chunk_lp(
-            vec![lp(LOGPROB_VALIDATION_EPSILON, vec![])],
-            Some(manifest_lp(true)),
-        );
-        assert_eq!(at_boundary.verify(&accepted), Verdict::Pass);
-
-        let mut over_boundary = StreamVerifier::new();
-        let rejected = chunk_lp(
-            vec![lp(LOGPROB_VALIDATION_EPSILON * 2.0, vec![])],
-            Some(manifest_lp(true)),
-        );
-        assert!(matches!(over_boundary.verify(&rejected), Verdict::Bail(_)));
-    }
-
-    #[test]
-    fn unsorted_top_bails() {
-        // top increases(-1.2 then -0.5) -- not descending -> fabrication.
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(
-            vec![lp(-1.2, vec![(-1.2, 10), (-0.5, 20)])],
-            Some(manifest_lp(true)),
-        );
-        assert!(
-            matches!(v.verify(&c), Verdict::Bail(_)),
-            "unsorted top -> Bail"
-        );
-    }
-
-    #[test]
-    fn chosen_above_top_bails() {
-        // chosen logprob(-0.1) more probable than top maximum(-0.5) -> inconsistent.
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(vec![lp(-0.1, vec![(-0.5, 10)])], Some(manifest_lp(true)));
-        assert!(
-            matches!(v.verify(&c), Verdict::Bail(_)),
-            "chosen > top max -> Bail"
-        );
-    }
-
-    /// (negative, test review items 3/5): a "broken" CanonChunk with a NON-finite logprob(NaN/+/-inf) --
-    /// an invalid log-probability(a real model does not send such). Without an explicit check, NaN comparisons
-    /// (always false) silently bypass B6 -- we close this: -> Bail, and the verifier does not panic on garbage.
-    #[test]
-    fn garbage_canon_chunk_bails_on_nonfinite_logprob() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut v = StreamVerifier::new();
-            let c = chunk_lp(vec![lp(bad, vec![(-0.5, 10)])], Some(manifest_lp(true)));
-            assert!(
-                matches!(v.verify(&c), Verdict::Bail(_)),
-                "non-finite logprob {bad} -> Bail"
-            );
-        }
-        // A non-finite value inside top is also rejected.
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(
-            vec![lp(-0.5, vec![(f64::NAN, 10)])],
-            Some(manifest_lp(true)),
-        );
-        assert!(
-            matches!(v.verify(&c), Verdict::Bail(_)),
-            "non-finite top logprob -> Bail"
-        );
-    }
-
-    #[test]
-    fn logprob_check_skipped_when_has_logprobs_false() {
-        // has_logprobs=false -> B6 does not run even with broken logprobs(degradation R3).
-        let mut v = StreamVerifier::new();
-        let c = chunk_lp(vec![lp(0.5, vec![])], Some(manifest_lp(false)));
-        assert_eq!(v.verify(&c), Verdict::Pass);
-    }
-
     // ---- B7: comparing the declared model against the frame model ----
 
     fn manifest_full(family: &str, claimed: &str) -> SignalManifest {
         SignalManifest {
             tokenizer_family: family.to_string(),
             has_token_ids: false,
-            has_logprobs: false,
             claimed_model: claimed.to_string(),
         }
     }
@@ -657,7 +467,7 @@ mod tests {
     #[test]
     fn claimed_model_matches_frame_passes() {
         let mut v = StreamVerifier::with_expected_model("qwen/qwen3-32b".to_string());
-        let c = chunk_lp(vec![], Some(manifest_full("qwen", "qwen/qwen3-32b")));
+        let c = chunk(0, Vec::new(), Some(manifest_full("qwen", "qwen/qwen3-32b")));
         assert_eq!(v.verify(&c), Verdict::Pass);
     }
 
@@ -665,7 +475,11 @@ mod tests {
     fn claimed_model_mismatch_bails() {
         // The seller declares a different(cheap) model than the frame paid for -> substitution -> Bail.
         let mut v = StreamVerifier::with_expected_model("qwen/qwen3-32b".to_string());
-        let c = chunk_lp(vec![], Some(manifest_full("llama", "cheap/llama-1b")));
+        let c = chunk(
+            0,
+            Vec::new(),
+            Some(manifest_full("llama", "cheap/llama-1b")),
+        );
         assert!(
             matches!(v.verify(&c), Verdict::Bail(_)),
             "declared != frame -> Bail"
@@ -676,7 +490,7 @@ mod tests {
     fn mock_skips_model_check() {
         // Mock -- the model comparison does not apply(fake by design), even on a mismatch.
         let mut v = StreamVerifier::with_expected_model("dexdo-mock".to_string());
-        let c = chunk_lp(vec![], Some(manifest_full("mock", "mock")));
+        let c = chunk(0, Vec::new(), Some(manifest_full("mock", "mock")));
         assert_eq!(v.verify(&c), Verdict::Pass);
     }
 
@@ -684,7 +498,7 @@ mod tests {
     fn no_expected_model_skips_check() {
         // Without a frame model (new()) -- B7 does not run.
         let mut v = StreamVerifier::new();
-        let c = chunk_lp(vec![], Some(manifest_full("qwen", "anything")));
+        let c = chunk(0, Vec::new(), Some(manifest_full("qwen", "anything")));
         assert_eq!(v.verify(&c), Verdict::Pass);
     }
 
@@ -1009,8 +823,11 @@ mod tests {
             prefix_agreement("The answer is 42.", "the answer is 42"),
             1.0
         );
-        // The seller's response is a prefix of the reference(shorter) -> all of it matched -> 1.0.
-        assert_eq!(prefix_agreement("the answer", "the answer is 42"), 1.0);
+        // A seller answer that is a PREFIX of the reference is the attack is about: under the
+        // old `min(a,b)` denominator it scored a perfect 1.0, so answering one word was the cheapest
+        // way to pass any threshold. Normalised by the reference, two matching words out of four are
+        // worth exactly half. This line asserted the defect; it now asserts the guarantee.
+        assert_eq!(prefix_agreement("the answer", "the answer is 42"), 0.5);
         // Punctuation/case do not matter(normalization).
         assert_eq!(prefix_agreement("Hello,   World!", "hello world"), 1.0);
         // Streaming providers may emit no whitespace at token boundaries around numbers/operators.
@@ -1041,9 +858,33 @@ mod tests {
             Verdict::Pass
         );
         assert!(matches!(
-            spotcheck_verdict(0.3, DEFAULT_SPOTCHECK_THRESHOLD),
+            spotcheck_verdict(0.1, DEFAULT_SPOTCHECK_THRESHOLD),
             Verdict::Bail(_)
         ));
+    }
+
+    /// the threshold is calibrated against measured run-to-run agreement, NOT against an
+    /// assumed determinism. Both figures come from the real [`DEFAULT_SPOTCHECK_PROBE`] at
+    /// `CONTENT_PROBE_MAX_TOKENS`, greedy, against Groq: an honest seller (the same model on both
+    /// legs) floors at 0.41(`qwen/qwen3-32b` branches at word 21 of 51), a substituting seller
+    /// (6 different models) tops out at 0.02(branch at word 0/1). Both populations must stay on
+    /// their own side of the threshold, or the gate refuses honest sellers again.
+    #[test]
+    fn spotcheck_threshold_separates_measured_populations() {
+        // Honest floor measured live -- must PASS.
+        assert_eq!(
+            spotcheck_verdict(0.41, DEFAULT_SPOTCHECK_THRESHOLD),
+            Verdict::Pass
+        );
+        // Substitution ceiling measured live over 6 models -- must BAIL.
+        assert!(matches!(
+            spotcheck_verdict(0.02, DEFAULT_SPOTCHECK_THRESHOLD),
+            Verdict::Bail(_)
+        ));
+        assert!(
+            DEFAULT_SPOTCHECK_THRESHOLD > 0.02 && DEFAULT_SPOTCHECK_THRESHOLD <= 0.41,
+            "threshold {DEFAULT_SPOTCHECK_THRESHOLD} left the measured separation band"
+        );
     }
 
     #[test]
@@ -1064,6 +905,55 @@ mod tests {
         let agreement_ok = prefix_agreement(honest, reference);
         assert_eq!(
             spotcheck_verdict(agreement_ok, DEFAULT_SPOTCHECK_THRESHOLD),
+            Verdict::Pass
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_939_scoring_tests {
+    use super::*;
+
+    const REFERENCE: &str = "one two three four five six seven eight nine ten";
+
+    fn assert_score_and_bail(seller: &str, expected: f64) {
+        let agreement = prefix_agreement(seller, REFERENCE);
+        assert!(
+            (agreement - expected).abs() < 1e-12,
+            "expected agreement {expected}, got {agreement}"
+        );
+        assert!(matches!(
+            spotcheck_verdict(agreement, DEFAULT_SPOTCHECK_THRESHOLD),
+            Verdict::Bail(_)
+        ));
+    }
+
+    #[test]
+    fn issue_939_one_matching_word_uses_reference_denominator() {
+        assert_score_and_bail("one", 1.0 / 10.0);
+    }
+
+    #[test]
+    fn issue_939_four_words_with_one_match_use_reference_denominator() {
+        assert_score_and_bail("one wrong three four", 1.0 / 10.0);
+    }
+
+    #[test]
+    fn issue_939_eight_words_with_two_matches_use_reference_denominator() {
+        assert_score_and_bail("one two wrong four five six seven eight", 2.0 / 10.0);
+    }
+
+    #[test]
+    fn issue_939_full_length_substitution_still_bails() {
+        assert_score_and_bail("wrong two three four five six seven eight nine ten", 0.0);
+    }
+
+    #[test]
+    fn issue_939_full_length_match_still_passes() {
+        let agreement = prefix_agreement(REFERENCE, REFERENCE);
+        assert_eq!(agreement, 1.0);
+        assert_eq!(
+            spotcheck_verdict(agreement, DEFAULT_SPOTCHECK_THRESHOLD),
             Verdict::Pass
         );
     }

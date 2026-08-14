@@ -5,15 +5,27 @@ use crate::cli::args::OracleArgs;
 use anyhow::{bail, Result};
 #[cfg(feature = "shellnet")]
 use dexdo_core::params::{
-    ORACLE_RESOLUTION_MAX_READS, ORACLE_RESOLUTION_POLL_INTERVAL, SHELL_CURRENCY_ID,
+    ORACLE_FEE_WITHDRAW_CONFIRM_MAX_READS, ORACLE_FEE_WITHDRAW_CONFIRM_POLL_INTERVAL,
+    ORACLE_RESOLUTION_MAX_READS, ORACLE_RESOLUTION_POLL_INTERVAL, PMP_EXIT_CONFIRM_MAX_READS,
+    PMP_EXIT_CONFIRM_POLL_INTERVAL, SHELL_CURRENCY_ID,
 };
 
 #[cfg(feature = "shellnet")]
-use crate::cli::args::{OracleCommand, OracleProvisionArgs, OracleResolveArgs, OracleStateArgs};
+use crate::cli::args::{
+    OracleAddressArgs, OracleBookArgs, OracleBookCommand, OracleBookOrderArgs,
+    OracleBookOrdersArgs, OracleBookStatusArgs, OracleCommand, OracleEventListAddressArgs,
+    OracleEventListArgs, OracleEventListCommand, OracleEventListEventsArgs, OraclePmpAddressArgs,
+    OraclePmpArgs, OraclePmpCommand, OraclePmpExitArgs, OraclePmpStatusArgs, OracleProvisionArgs,
+    OracleResolveArgs, OracleStateArgs, OracleWithdrawFeesArgs,
+};
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{now_unix_secs, shellnet_doctor_preflight};
 #[cfg(feature = "shellnet")]
-use crate::cli::support::{load_market, read_secret_hex};
+use crate::cli::support::{load_market, read_secret_hex, require_note_addr, require_note_key};
+
+#[cfg(test)]
+#[path = "oracle_exit_1120_tests.rs"]
+mod oracle_exit_1120_tests;
 
 #[cfg(feature = "shellnet")]
 const ORACLE_MIN_RESULT_GAP_SECS: u64 = 120;
@@ -38,7 +50,7 @@ fn load_oracle_market_manifest(path: &std::path::Path) -> Result<dexdo_core::Ora
     Ok(manifest)
 }
 
-#[cfg(feature = "shellnet")]
+#[cfg(any(feature = "shellnet", test))]
 fn pmp_resolved_outcome(details: &serde_json::Value) -> Option<String> {
     let v = &details["resolvedOutcome"];
     if v.is_null() {
@@ -70,20 +82,462 @@ fn validate_oracle_deadline(deadline: u64, now: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "shellnet", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PmpExitAction {
+    CancelStake,
+    Claim,
+}
+
+#[cfg(any(feature = "shellnet", test))]
+impl PmpExitAction {
+    fn command(self) -> &'static str {
+        match self {
+            Self::CancelStake => "oracle cancel-stake",
+            Self::Claim => "oracle claim",
+        }
+    }
+}
+
+#[cfg(any(feature = "shellnet", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PmpExitObservation {
+    stake_present: bool,
+    candidate_amount: u128,
+    amount_slots: usize,
+    open_orders: u32,
+    busy_address: Option<String>,
+    has_withdrawn: bool,
+    note_balance: u128,
+    coupons_value: u128,
+}
+
+#[cfg(feature = "shellnet")]
+fn parse_pmp_exit_observation(value: &serde_json::Value) -> Result<PmpExitObservation> {
+    let required_bool = |field: &str| {
+        value[field]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("PrivateNote exit snapshot exposes no boolean {field}"))
+    };
+    let required_u128 = |field: &str| {
+        oracle_u128(value, field)
+            .ok_or_else(|| anyhow::anyhow!("PrivateNote exit snapshot exposes no uint {field}"))
+    };
+    Ok(PmpExitObservation {
+        stake_present: required_bool("stake_present")?,
+        candidate_amount: required_u128("candidate_amount")?,
+        amount_slots: usize::try_from(required_u128("amount_slots")?)
+            .map_err(|_| anyhow::anyhow!("PrivateNote exit snapshot amount_slots exceeds usize"))?,
+        open_orders: u32::try_from(required_u128("open_orders")?)
+            .map_err(|_| anyhow::anyhow!("PrivateNote exit snapshot open_orders exceeds uint32"))?,
+        busy_address: value["busy_address"]
+            .as_str()
+            .filter(|address| !address.trim().is_empty())
+            .map(|address| address.trim().to_string()),
+        has_withdrawn: required_bool("has_withdrawn")?,
+        note_balance: required_u128("note_balance")?,
+        coupons_value: required_u128("coupons_value")?,
+    })
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn oracle_bool(value: &serde_json::Value, field: &str) -> Option<bool> {
+    value[field]
+        .as_bool()
+        .or_else(|| match value[field].as_str()? {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        })
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn validate_pmp_exit_preflight(
+    action: PmpExitAction,
+    pmp: &serde_json::Value,
+    shutdown: &serde_json::Value,
+    note: &PmpExitObservation,
+) -> Result<()> {
+    let command = action.command();
+    if !note.stake_present {
+        bail!("{command}: this note has no stake for the manifest PMP tuple");
+    }
+    if note.has_withdrawn {
+        bail!("{command}: the PrivateNote is withdrawn");
+    }
+    if let Some(busy) = note.busy_address.as_deref() {
+        bail!("{command}: the PrivateNote is busy with {busy}");
+    }
+    if note.open_orders != 0 {
+        bail!(
+            "{command}: the PrivateNote still has {} open order(s) for this event",
+            note.open_orders
+        );
+    }
+    if note.candidate_amount != 0 {
+        bail!(
+            "{command}: the PrivateNote stake has pending candidate amount {}",
+            note.candidate_amount
+        );
+    }
+
+    let order_book_done = oracle_bool(shutdown, "orderBookDone").ok_or_else(|| {
+        anyhow::anyhow!("{command}: PMP getShutdownState exposes no orderBookDone")
+    })?;
+    match action {
+        PmpExitAction::CancelStake => {
+            if oracle_bool(pmp, "isCancelled") != Some(true) {
+                bail!("{command}: PMP is not cancelled");
+            }
+            let frozen = oracle_bool(pmp, "frozen")
+                .ok_or_else(|| anyhow::anyhow!("{command}: PMP getDetails exposes no frozen"))?;
+            if frozen && !order_book_done {
+                bail!("{command}: PMP OrderBook shutdown is not complete");
+            }
+        }
+        PmpExitAction::Claim => {
+            if oracle_bool(pmp, "approved") != Some(true) {
+                bail!("{command}: PMP is not approved");
+            }
+            if !order_book_done {
+                bail!("{command}: PMP OrderBook shutdown is not complete");
+            }
+            if pmp_resolved_outcome(pmp).is_none() {
+                bail!("{command}: PMP exposes no resolved outcome");
+            }
+            let outcomes = oracle_u128(pmp, "numOutcomes").ok_or_else(|| {
+                anyhow::anyhow!("{command}: PMP getDetails exposes no numOutcomes")
+            })?;
+            if u128::try_from(note.amount_slots).ok() != Some(outcomes) {
+                bail!(
+                    "{command}: note stake has {} outcome slots but PMP declares {outcomes}",
+                    note.amount_slots
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn pmp_exit_postread_confirmed(note: &PmpExitObservation) -> bool {
+    !note.stake_present && note.busy_address.is_none()
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn oracle_fee_expected_after(before: u128, amount: u128) -> Result<u128> {
+    if amount == 0 {
+        bail!("oracle withdraw-fees: --amount must be greater than zero");
+    }
+    before.checked_sub(amount).ok_or_else(|| {
+        anyhow::anyhow!(
+            "oracle withdraw-fees: --amount {amount} exceeds live Oracle fee balance {before} raw ECC[2] SHELL"
+        )
+    })
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn oracle_fee_postread_confirmed(expected: u128, observed: u128) -> bool {
+    observed == expected
+}
+
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_oracle(args: OracleArgs) -> Result<()> {
     match args.command {
+        OracleCommand::Address(a) => run_oracle_address(a).await,
+        OracleCommand::EventList(e) => run_oracle_event_list(e).await,
+        OracleCommand::Pmp(p) => run_oracle_pmp(p).await,
+        OracleCommand::Book(b) => run_oracle_book(b).await,
         OracleCommand::Provision(p) => run_oracle_provision(*p).await,
         OracleCommand::State(s) => run_oracle_state(s).await,
         OracleCommand::Resolve(r) => run_oracle_resolve(r).await,
         OracleCommand::Cancel(c) => run_oracle_cancel(c).await,
         OracleCommand::Delete(d) => run_oracle_delete(d).await,
+        OracleCommand::CancelStake(c) => run_oracle_pmp_exit(c, PmpExitAction::CancelStake).await,
+        OracleCommand::Claim(c) => run_oracle_pmp_exit(c, PmpExitAction::Claim).await,
+        OracleCommand::WithdrawFees(w) => run_oracle_withdraw_fees(w).await,
     }
 }
 
 #[cfg(not(feature = "shellnet"))]
 pub(crate) async fn run_oracle(_args: OracleArgs) -> Result<()> {
     bail!("oracle unavailable: build with `--features shellnet`")
+}
+
+#[cfg(feature = "shellnet")]
+fn parse_oracle_read_address(flag: &str, raw: &str) -> Result<dexdo_core::Address> {
+    dexdo_core::Address::parse(raw).map_err(|e| anyhow::anyhow!("{flag} {raw}: {e}"))
+}
+
+#[cfg(feature = "shellnet")]
+fn oracle_read_chain(contracts: &std::path::Path) -> Result<dexdo_core::RealChainBackend> {
+    dexdo_core::RealChainBackend::connect(
+        contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn required_oracle_getter(
+    value: Option<serde_json::Value>,
+    kind: &str,
+    address: &dexdo_core::Address,
+    getter: &str,
+) -> Result<serde_json::Value> {
+    value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{kind} {} {getter} unavailable (inactive or missing)",
+            dexdo_core::address::display(&address.with_workchain())
+        )
+    })
+}
+
+#[cfg(feature = "shellnet")]
+fn print_oracle_json(value: serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn bound_order_book(
+    chain: &dexdo_core::RealChainBackend,
+    pmp: &dexdo_core::Address,
+) -> Result<dexdo_core::Address> {
+    let order_book = chain.pmp_order_book_address(pmp).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "PMP {} exposes no bound OrderBook",
+            dexdo_core::address::display(&pmp.with_workchain())
+        )
+    })?;
+    if order_book.bare().bytes().all(|byte| byte == b'0') {
+        bail!(
+            "PMP {} exposes no bound OrderBook",
+            dexdo_core::address::display(&pmp.with_workchain())
+        );
+    }
+    chain
+        .assert_order_book_read_identity(pmp, &order_book)
+        .await?;
+    Ok(order_book)
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_address(args: OracleAddressArgs) -> Result<()> {
+    let chain = oracle_read_chain(&args.contracts)?;
+    chain.assert_root_oracle_read_identity().await?;
+    let oracle = chain.oracle_address(&args.oracle_name).await?;
+    print_oracle_json(serde_json::json!({
+        "kind": "oracle_address",
+        "oracle_name": args.oracle_name,
+        "oracle": dexdo_core::address::display(&oracle.with_workchain()),
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_event_list(args: OracleEventListArgs) -> Result<()> {
+    match args.command {
+        OracleEventListCommand::Address(a) => run_oracle_event_list_address(a).await,
+        OracleEventListCommand::Events(e) => run_oracle_event_list_events(e).await,
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_event_list_address(args: OracleEventListAddressArgs) -> Result<()> {
+    let oracle = parse_oracle_read_address("--oracle", &args.oracle)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    chain.assert_oracle_read_identity(&oracle).await?;
+    let event_list = chain.oracle_event_list_address(&oracle, args.index).await?;
+    print_oracle_json(serde_json::json!({
+        "kind": "oracle_event_list_address",
+        "oracle": dexdo_core::address::display(&oracle.with_workchain()),
+        "index": args.index.to_string(),
+        "event_list": dexdo_core::address::display(&event_list.with_workchain()),
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_event_list_events(args: OracleEventListEventsArgs) -> Result<()> {
+    let event_list = parse_oracle_read_address("--event-list", &args.event_list)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    chain
+        .assert_oracle_event_list_read_identity(&event_list)
+        .await?;
+    let raw = required_oracle_getter(
+        chain.oracle_event_list_events(&event_list).await?,
+        "OracleEventList",
+        &event_list,
+        "_events",
+    )?;
+    let events = raw.get("_events").cloned().unwrap_or(raw);
+    print_oracle_json(serde_json::json!({
+        "kind": "oracle_events",
+        "event_list": dexdo_core::address::display(&event_list.with_workchain()),
+        "events": events,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_pmp(args: OraclePmpArgs) -> Result<()> {
+    match args.command {
+        OraclePmpCommand::Address(a) => run_oracle_pmp_address(a).await,
+        OraclePmpCommand::Status(s) => run_oracle_pmp_status(s).await,
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_pmp_address(args: OraclePmpAddressArgs) -> Result<()> {
+    let chain = oracle_read_chain(&args.contracts)?;
+    chain.assert_root_pn_read_identity().await?;
+    let pmp = chain
+        .pmp_address(&args.event_id, &args.oracle_names, args.token_type)
+        .await?;
+    print_oracle_json(serde_json::json!({
+        "kind": "pmp_address",
+        "event_id": args.event_id,
+        "oracle_names": args.oracle_names,
+        "token_type": args.token_type,
+        "pmp": dexdo_core::address::display(&pmp.with_workchain()),
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_pmp_status(args: OraclePmpStatusArgs) -> Result<()> {
+    let pmp = parse_oracle_read_address("--pmp", &args.pmp)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    chain.assert_pmp_read_identity(&pmp).await?;
+    let details =
+        required_oracle_getter(chain.pmp_details(&pmp).await?, "PMP", &pmp, "getDetails")?;
+    let shutdown_state = required_oracle_getter(
+        chain.pmp_shutdown_state(&pmp).await?,
+        "PMP",
+        &pmp,
+        "getShutdownState",
+    )?;
+    let unclaimed = required_oracle_getter(
+        chain.pmp_unclaimed_balance(&pmp).await?,
+        "PMP",
+        &pmp,
+        "getUnclaimedBalance",
+    )?;
+    let unclaimed_balance = unclaimed
+        .get("value0")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+        })
+        .ok_or_else(|| anyhow::anyhow!("PMP getUnclaimedBalance exposes no uint128 value0"))?;
+    let version =
+        required_oracle_getter(chain.pmp_version(&pmp).await?, "PMP", &pmp, "getVersion")?;
+    let order_book = chain
+        .pmp_order_book_address(&pmp)
+        .await?
+        .and_then(|address| {
+            (!address.bare().bytes().all(|byte| byte == b'0'))
+                .then(|| dexdo_core::address::display(&address.with_workchain()))
+        });
+    print_oracle_json(serde_json::json!({
+        "kind": "pmp_status",
+        "pmp": dexdo_core::address::display(&pmp.with_workchain()),
+        "details": details,
+        "shutdown_state": shutdown_state,
+        "unclaimed_balance": unclaimed_balance,
+        "version": version,
+        "order_book": order_book,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_book(args: OracleBookArgs) -> Result<()> {
+    match args.command {
+        OracleBookCommand::Status(s) => run_oracle_book_status(s).await,
+        OracleBookCommand::Order(o) => run_oracle_book_order(o).await,
+        OracleBookCommand::Orders(o) => run_oracle_book_orders(o).await,
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_book_status(args: OracleBookStatusArgs) -> Result<()> {
+    let pmp = parse_oracle_read_address("--pmp", &args.pmp)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    let order_book = bound_order_book(&chain, &pmp).await?;
+    let details = required_oracle_getter(
+        chain.order_book_details(&order_book).await?,
+        "OrderBook",
+        &order_book,
+        "getDetails",
+    )?;
+    let queue_size = required_oracle_getter(
+        chain.order_book_queue_size(&order_book).await?,
+        "OrderBook",
+        &order_book,
+        "getQueueSize",
+    )?;
+    let shutdown_state = required_oracle_getter(
+        chain.order_book_shutdown_state(&order_book).await?,
+        "OrderBook",
+        &order_book,
+        "getShutdownState",
+    )?;
+    let version = required_oracle_getter(
+        chain.order_book_version(&order_book).await?,
+        "OrderBook",
+        &order_book,
+        "getVersion",
+    )?;
+    print_oracle_json(serde_json::json!({
+        "kind": "order_book_status",
+        "pmp": dexdo_core::address::display(&pmp.with_workchain()),
+        "order_book": dexdo_core::address::display(&order_book.with_workchain()),
+        "details": details,
+        "queue_size": queue_size,
+        "shutdown_state": shutdown_state,
+        "version": version,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_book_order(args: OracleBookOrderArgs) -> Result<()> {
+    let pmp = parse_oracle_read_address("--pmp", &args.pmp)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    let order_book = bound_order_book(&chain, &pmp).await?;
+    let order = required_oracle_getter(
+        chain.order_book_order(&order_book, args.order_id).await?,
+        "OrderBook",
+        &order_book,
+        "getOrder",
+    )?;
+    print_oracle_json(serde_json::json!({
+        "kind": "order_book_order",
+        "pmp": dexdo_core::address::display(&pmp.with_workchain()),
+        "order_book": dexdo_core::address::display(&order_book.with_workchain()),
+        "order_id": args.order_id.to_string(),
+        "order": order,
+    }))
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_book_orders(args: OracleBookOrdersArgs) -> Result<()> {
+    let pmp = parse_oracle_read_address("--pmp", &args.pmp)?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    let order_book = bound_order_book(&chain, &pmp).await?;
+    let orders = required_oracle_getter(
+        chain
+            .order_book_orders_by_owner(&order_book, &args.deposit_hash)
+            .await?,
+        "OrderBook",
+        &order_book,
+        "getOrdersByOwner",
+    )?;
+    print_oracle_json(serde_json::json!({
+        "kind": "order_book_orders_by_owner",
+        "pmp": dexdo_core::address::display(&pmp.with_workchain()),
+        "order_book": dexdo_core::address::display(&order_book.with_workchain()),
+        "deposit_hash": args.deposit_hash,
+        "orders": orders,
+    }))
 }
 
 #[cfg(feature = "shellnet")]
@@ -167,17 +621,19 @@ async fn run_oracle_state(args: OracleStateArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("oracle_event_list {}: {e}", manifest.oracle_event_list))?;
     let pmp =
         Address::parse(&manifest.pmp).map_err(|e| anyhow::anyhow!("pmp {}: {e}", manifest.pmp))?;
+    let pmp_display = dexdo_core::address::display(&manifest.pmp);
+    let inference_ob_display = dexdo_core::address::display(&manifest.inference_order_book);
     let range = chain.oracle_range_data(&oel, &manifest.event_id).await?;
     let details = chain.pmp_details(&pmp).await?;
     let pmp_ob = chain.pmp_order_book_address(&pmp).await?;
     println!(
         "oracle_state event={} pmp={} token_type={} deadline={} frame_model={} inference_ob={}",
         manifest.event_id,
-        manifest.pmp,
+        pmp_display,
         manifest.token_type,
         manifest.deadline,
         manifest.frame_model,
-        manifest.inference_order_book
+        inference_ob_display
     );
     match range {
         Some(r) => println!("range_data={}", serde_json::to_string(&r)?),
@@ -198,7 +654,10 @@ async fn run_oracle_state(args: OracleStateArgs) -> Result<()> {
         None => println!("pmp_details=<inactive-or-missing>"),
     }
     if let Some(ob) = pmp_ob {
-        println!("pmp_order_book={}", ob.with_workchain());
+        println!(
+            "pmp_order_book={}",
+            dexdo_core::address::display(&ob.with_workchain())
+        );
     }
     Ok(())
 }
@@ -224,9 +683,32 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("oracle_event_list {}: {e}", manifest.oracle_event_list))?;
     let pmp =
         Address::parse(&manifest.pmp).map_err(|e| anyhow::anyhow!("pmp {}: {e}", manifest.pmp))?;
+    let pmp_display = dexdo_core::address::display(&manifest.pmp);
     let oracle_seed = read_secret_hex(&args.oracle_key, "--oracle-key")?;
     let oracle_keys = KeyPair::from_secret_hex(oracle_seed.trim())
         .map_err(|e| anyhow::anyhow!("--oracle-key (SDK secret hex): {e:?}"))?;
+    // Liquidity preflight. `resolveRange` makes the PMP ask its bound InferenceOrderBook for the
+    // weekly median, and that book answers through `requestWeeklyMedian`
+    // (`contracts/airegistry/InferenceOrderBook.sol:1759`) with `bounce: false`. Its
+    // `_weeklyMedian()` reverts with `ERR_NO_LIQUIDITY = 334` (`:1738`, the constant declared at
+    // `:116`) while the week's matched volume is below `MIN_LIQUIDITY`(`:237`), and under
+    // `bounce: false` that revert never comes back: the resolve is paid for and the PMP stays
+    // unresolved. `getWeeklyMedianPrice()`(`:1749`) is the same `_weeklyMedian()` exposed as a
+    // public getter, so read it first and send nothing at all when it does not answer.
+    let order_book = chain.pmp_order_book_address(&pmp).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "oracle resolve: refusing to submit resolveRange -- PMP {} exposes no bound \
+             InferenceOrderBook, so whether it has liquidity for a weekly median cannot be read",
+            pmp_display
+        )
+    })?;
+    let order_book_s = dexdo_core::address::display(&order_book.with_workchain());
+    validate_oracle_resolve_liquidity(
+        &order_book_s,
+        chain
+            .inference_orderbook_weekly_median_price(&order_book)
+            .await,
+    )?;
     chain
         .resolve_oracle_range(
             &oel,
@@ -238,7 +720,7 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
         .await?;
     println!(
         "resolveRange submitted event={} oracle_list_hash={} pmp={}",
-        manifest.event_id, manifest.oracle_list_hash, manifest.pmp
+        manifest.event_id, manifest.oracle_list_hash, pmp_display
     );
     let mut last_details_error = None;
     for i in 0..ORACLE_RESOLUTION_MAX_READS {
@@ -247,7 +729,7 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
                 if let Some(outcome) = pmp_resolved_outcome(&details) {
                     println!(
                         "pmp resolved event={} outcome={} pmp={}",
-                        manifest.event_id, outcome, manifest.pmp
+                        manifest.event_id, outcome, pmp_display
                     );
                     return Ok(());
                 }
@@ -271,18 +753,49 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
         "resolveRange was submitted but PMP {} did not expose resolvedOutcome within {resolution_timeout_secs}s. \
          If the bound InferenceOrderBook has no MIN_LIQUIDITY, requestWeeklyMedian reverts under bounce:false \
          and onWeeklyMedian never arrives; this is the  no-liquidity stuck case, not a CLI success.{}",
-        manifest.pmp,
+        pmp_display,
         last_details_error
     )
 }
 
-#[cfg(feature = "shellnet")]
+#[cfg(any(feature = "shellnet", test))]
 fn oracle_u128(value: &serde_json::Value, field: &str) -> Option<u128> {
     value[field].as_u64().map(u128::from).or_else(|| {
         value[field]
             .as_str()
             .and_then(|raw| raw.parse::<u128>().ok())
     })
+}
+
+/// The book's own answer to `getWeeklyMedianPrice`, decided the way the contract decides it: an
+/// answer at all means `_weeklyMedian()` cleared `require(totalVol >= MIN_LIQUIDITY,
+/// ERR_NO_LIQUIDITY)`(`contracts/airegistry/InferenceOrderBook.sol:1738`), and no answer means it
+/// did not. Money path, so anything that is not an answer refuses the resolve rather than paying
+/// for one that cannot complete; the getter error is reported verbatim so the exit code the book
+/// actually returned is on the operator's screen next to the constant it belongs to.
+#[cfg(feature = "shellnet")]
+fn validate_oracle_resolve_liquidity(
+    order_book: &str,
+    weekly_median: Result<Option<u128>>,
+) -> Result<u128> {
+    let order_book = dexdo_core::address::display(order_book);
+    match weekly_median {
+        Ok(Some(price)) => Ok(price),
+        Ok(None) => bail!(
+            "oracle resolve: refusing to submit resolveRange -- InferenceOrderBook {order_book} is \
+             not Active, so no liquidity and no weekly median can be read from it \
+             (contracts/airegistry/InferenceOrderBook.sol:1749 getWeeklyMedianPrice)"
+        ),
+        Err(e) => bail!(
+            "oracle resolve: refusing to submit resolveRange -- InferenceOrderBook {order_book} \
+             reports no liquidity: getWeeklyMedianPrice \
+             (contracts/airegistry/InferenceOrderBook.sol:1749) did not answer, which is how \
+             `_weeklyMedian()` reports ERR_NO_LIQUIDITY = 334 (declared at :116, required at \
+             :1738 as totalVol >= MIN_LIQUIDITY). resolveRange would make the PMP call \
+             requestWeeklyMedian (:1759) under bounce:false, so that revert would never return \
+             and the PMP would stay unresolved. Getter error: {e:#}"
+        ),
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -437,7 +950,7 @@ async fn run_oracle_cancel(args: OracleResolveArgs) -> Result<()> {
     println!(
         "oracle cancel submitted event={} pmp={} post_read_is_cancelled={} confirmations={before_count}->{after_count} exact_confirmation_active={exact_confirmation_active} status={}",
         manifest.event_id,
-        manifest.pmp,
+        dexdo_core::address::display(&manifest.pmp),
         cancelled,
         if confirmed { "confirmed" } else { "pending" }
     );
@@ -467,9 +980,230 @@ async fn run_oracle_delete(args: OracleResolveArgs) -> Result<()> {
     println!(
         "oracle delete submitted event={} oracle_event_list={} post_read_exists={} status={}",
         manifest.event_id,
-        manifest.oracle_event_list,
+        dexdo_core::address::display(&manifest.oracle_event_list),
         after_event.is_some(),
         if confirmed { "confirmed" } else { "pending" }
+    );
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn is_ambiguous_money_submit(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<dexdo_core::MoneySubmitError>()
+            .is_some_and(dexdo_core::MoneySubmitError::is_ambiguous)
+    })
+}
+
+#[cfg(feature = "shellnet")]
+async fn read_pmp_unclaimed_balance(
+    chain: &dexdo_core::RealChainBackend,
+    pmp: &dexdo_core::Address,
+) -> Result<Option<u128>> {
+    chain
+        .pmp_unclaimed_balance(pmp)
+        .await?
+        .map(|value| {
+            oracle_u128(&value, "value0")
+                .ok_or_else(|| anyhow::anyhow!("PMP getUnclaimedBalance exposes no uint128 value0"))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "shellnet")]
+async fn wait_pmp_exit_postread(
+    chain: &dexdo_core::RealChainBackend,
+    note: &dexdo_core::Address,
+    manifest: &dexdo_core::OracleMarketManifest,
+    action: PmpExitAction,
+) -> Result<PmpExitObservation> {
+    let mut last_state = None;
+    let mut last_error = None;
+    for read in 0..PMP_EXIT_CONFIRM_MAX_READS {
+        match chain
+            .private_note_pmp_exit_state(
+                note,
+                &manifest.event_id,
+                &manifest.oracle_list_hash,
+                manifest.token_type,
+            )
+            .await
+            .and_then(|value| parse_pmp_exit_observation(&value))
+        {
+            Ok(state) if pmp_exit_postread_confirmed(&state) => return Ok(state),
+            Ok(state) => last_state = Some(state),
+            Err(error) => last_error = Some(format!("{error:#}")),
+        }
+        if read + 1 < PMP_EXIT_CONFIRM_MAX_READS {
+            tokio::time::sleep(PMP_EXIT_CONFIRM_POLL_INTERVAL).await;
+        }
+    }
+    bail!(
+        "{}: callback was not confirmed after {} reads; last_state={last_state:?}; last_read_error={last_error:?}",
+        action.command(),
+        PMP_EXIT_CONFIRM_MAX_READS
+    )
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_pmp_exit(args: OraclePmpExitArgs, action: PmpExitAction) -> Result<()> {
+    use dexdo_core::{KeyPair, RealChainBackend};
+
+    let manifest = load_oracle_market_manifest(&args.manifest)?;
+    let note_addr = require_note_addr(
+        &args.identity,
+        action.command(),
+        "PMP participant PrivateNote",
+    )?;
+    let note_key = require_note_key(
+        &args.identity,
+        action.command(),
+        "PMP participant note owner key",
+    )?;
+    let note = dexdo_core::address::parse_chain_address(&note_addr)
+        .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))?;
+    let note_secret = read_secret_hex(note_key, "--note-key")?;
+    let note_keys = KeyPair::from_secret_hex(note_secret.trim())
+        .map_err(|error| anyhow::anyhow!("--note-key (SDK secret hex): {error:?}"))?;
+    shellnet_doctor_preflight(&args.contracts, None).await?;
+    let chain = RealChainBackend::connect(
+        args.contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )?;
+    chain
+        .assert_note_owner_matches(action.command(), &note, &note_keys)
+        .await?;
+    let (pmp, pmp_details) = chain.assert_pmp_market_identity(&manifest).await?;
+    let shutdown = required_oracle_getter(
+        chain.pmp_shutdown_state(&pmp).await?,
+        "PMP",
+        &pmp,
+        "getShutdownState",
+    )?;
+    let before = parse_pmp_exit_observation(
+        &chain
+            .private_note_pmp_exit_state(
+                &note,
+                &manifest.event_id,
+                &manifest.oracle_list_hash,
+                manifest.token_type,
+            )
+            .await?,
+    )?;
+    validate_pmp_exit_preflight(action, &pmp_details, &shutdown, &before)?;
+    let before_unclaimed = read_pmp_unclaimed_balance(&chain, &pmp)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("PMP {pmp} getUnclaimedBalance unavailable before submit")
+        })?;
+
+    let submit = match action {
+        PmpExitAction::CancelStake => {
+            chain
+                .cancel_pmp_stake(
+                    &note,
+                    &note_keys,
+                    &manifest.event_id,
+                    &manifest.oracle_list_hash,
+                    manifest.token_type,
+                )
+                .await
+        }
+        PmpExitAction::Claim => {
+            chain
+                .claim_pmp_stake(
+                    &note,
+                    &note_keys,
+                    &manifest.event_id,
+                    &manifest.oracle_list_hash,
+                    manifest.token_type,
+                )
+                .await
+        }
+    };
+    let submit_status = match submit {
+        Ok(_) => "accepted",
+        Err(error) if is_ambiguous_money_submit(&error) => "ambiguous-reconciled",
+        Err(error) => return Err(error),
+    };
+    let after = wait_pmp_exit_postread(&chain, &note, &manifest, action).await?;
+    let after_unclaimed = read_pmp_unclaimed_balance(&chain, &pmp).await?;
+    let after_unclaimed = after_unclaimed
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "inactive-or-missing".to_string());
+    println!(
+        "{} submitted event={} oracle_list_hash={} token_type={} pmp={} note={} \
+         pmp_unclaimed={before_unclaimed}->{after_unclaimed} note_balance={}->{} \
+         coupons={}->{} submit_status={submit_status} status=confirmed",
+        action.command(),
+        manifest.event_id,
+        manifest.oracle_list_hash,
+        manifest.token_type,
+        pmp.with_workchain(),
+        note.with_workchain(),
+        before.note_balance,
+        after.note_balance,
+        before.coupons_value,
+        after.coupons_value,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+async fn wait_oracle_fee_balance(
+    chain: &dexdo_core::RealChainBackend,
+    oracle: &dexdo_core::Address,
+    signer: &dexdo_core::KeyPair,
+    expected: u128,
+) -> Result<u128> {
+    let mut last_balance = None;
+    let mut last_error = None;
+    for read in 0..ORACLE_FEE_WITHDRAW_CONFIRM_MAX_READS {
+        match chain.oracle_fee_balance_for_owner(oracle, signer).await {
+            Ok(balance) if oracle_fee_postread_confirmed(expected, balance) => return Ok(balance),
+            Ok(balance) => last_balance = Some(balance),
+            Err(error) => last_error = Some(format!("{error:#}")),
+        }
+        if read + 1 < ORACLE_FEE_WITHDRAW_CONFIRM_MAX_READS {
+            tokio::time::sleep(ORACLE_FEE_WITHDRAW_CONFIRM_POLL_INTERVAL).await;
+        }
+    }
+    bail!(
+        "oracle withdraw-fees: account ECC[2] balance did not reach expected {expected} after {} reads; \
+         last_balance={last_balance:?}; last_read_error={last_error:?}",
+        ORACLE_FEE_WITHDRAW_CONFIRM_MAX_READS
+    )
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_oracle_withdraw_fees(args: OracleWithdrawFeesArgs) -> Result<()> {
+    let oracle = parse_oracle_read_address("--oracle", &args.oracle)?;
+    let to = parse_oracle_read_address("--to", &args.to)?;
+    if oracle.with_workchain() == to.with_workchain() {
+        bail!("oracle withdraw-fees: --to must not be the Oracle itself");
+    }
+    let signer = load_oracle_signer(&args.oracle_key)?;
+    shellnet_doctor_preflight(&args.contracts, None).await?;
+    let chain = oracle_read_chain(&args.contracts)?;
+    let before = chain.oracle_fee_balance_for_owner(&oracle, &signer).await?;
+    let expected = oracle_fee_expected_after(before, args.amount)?;
+    let submit = chain
+        .withdraw_oracle_fees(&oracle, &signer, &to, args.amount)
+        .await;
+    let submit_status = match submit {
+        Ok(_) => "accepted",
+        Err(error) if is_ambiguous_money_submit(&error) => "ambiguous-reconciled",
+        Err(error) => return Err(error),
+    };
+    let after = wait_oracle_fee_balance(&chain, &oracle, &signer, expected).await?;
+    println!(
+        "oracle withdraw-fees submitted oracle={} to={} amount={} raw_ecc2_balance={before}->{after} \
+         submit_status={submit_status} status=confirmed",
+        oracle.with_workchain(),
+        to.with_workchain(),
+        args.amount,
     );
     Ok(())
 }
@@ -547,6 +1281,48 @@ mod tests {
         let now = 1_900_000_000;
         assert!(super::validate_oracle_deadline(now + 119, now).is_err());
         assert!(super::validate_oracle_deadline(now + 120, now).is_ok());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn oracle_resolve_refuses_without_weekly_median_liquidity() {
+        assert_eq!(
+            super::validate_oracle_resolve_liquidity("0:book", Ok(Some(7))).unwrap(),
+            7,
+            "an answered getWeeklyMedianPrice is the contract's own proof of liquidity"
+        );
+
+        for refusal in [
+            super::validate_oracle_resolve_liquidity("0:book", Ok(None)),
+            super::validate_oracle_resolve_liquidity(
+                "0:book",
+                Err(anyhow::anyhow!(
+                    "run_tvm getter getWeeklyMedianPrice: Contract execution was terminated with \
+                     error: exit code: 334"
+                )),
+            ),
+        ] {
+            let error = refusal.unwrap_err().to_string();
+            assert!(
+                error.to_ascii_lowercase().contains("no liquidity"),
+                "the refusal must name the condition in the words the operator reads: {error}"
+            );
+            assert!(
+                error.contains("refusing to submit resolveRange"),
+                "the refusal must say that nothing was submitted: {error}"
+            );
+        }
+
+        let exit_code = super::validate_oracle_resolve_liquidity(
+            "0:book",
+            Err(anyhow::anyhow!("run_tvm getter getWeeklyMedianPrice")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            exit_code.contains("ERR_NO_LIQUIDITY = 334"),
+            "the refusal must carry the exact contract exit code: {exit_code}"
+        );
     }
 
     #[cfg(feature = "shellnet")]

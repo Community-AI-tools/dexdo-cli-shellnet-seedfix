@@ -150,6 +150,27 @@ pub mod codes {
          service; never relax the certificate pin",
     );
 
+    /// the buyer could not dial the seller gateway named in its handover.
+    pub const E_GATEWAY_UNREACHABLE: ErrorCode = ErrorCode::new(
+        "E_GATEWAY_UNREACHABLE",
+        ErrorKind::Network,
+        "the pinned-TLS (h2) dial of the seller gateway failed at the transport level; the \
+         failing stage and the underlying cause are on the cause lines",
+        "check that the address on the headline is reachable from this host and that the seller \
+         gateway is still serving it; the seller advertises this address, so a wrong advertise or \
+         a closed port shows up here",
+    );
+
+    /// something answered the buyer's dial, but it is not the seller's gateway.
+    pub const E_GATEWAY_WRONG_ENDPOINT: ErrorCode = ErrorCode::new(
+        "E_GATEWAY_WRONG_ENDPOINT",
+        ErrorKind::Tls,
+        "the address in the handover answered, but the certificate it presented does not match \
+         the fingerprint the handover pinned, so it is provably not the seller's gateway",
+        "do not relax the pin: get a fresh handover from the seller, or have the seller advertise \
+         its own address instead of one served by another service",
+    );
+
     /// an owner fill was observed with no same-note deal handle to account it against.
     pub const E_POOL_UNKNOWN_OWNER_FILL: ErrorCode = ErrorCode::new(
         "E_POOL_UNKNOWN_OWNER_FILL",
@@ -173,13 +194,29 @@ pub mod codes {
          at the secondary notes",
     );
 
+    /// a command that spends from the funding(Hot) wallet ran with no active wallet binding.
+    pub const E_WALLET_NOT_CONFIGURED: ErrorCode = ErrorCode::new(
+        "E_WALLET_NOT_CONFIGURED",
+        ErrorKind::Config,
+        "the command needs a funding (Hot) wallet, and this instance has no active wallet binding; \
+         the CLI does not start onboarding on its own and never guesses a provider, because the \
+         provider is recorded when the wallet is bound and cannot be recovered from an address, a \
+         code hash or an on-chain parameter afterwards",
+        "bind a wallet once with `dexdo wallet onboard` followed by one of the providers \
+         `ackinacki-wallet`, `gosh-ai` or `manual`; on a headless host with no TTY, no browser and \
+         no camera use `dexdo wallet onboard manual`, whose whole input is a plain printed address",
+    );
+
     /// Every declared code. `error-codes.md` is checked against this table.
     pub const TABLE: &[ErrorCode] = &[
         E_ADVERTISE_NOT_PUBLIC,
         E_ADVERTISE_UNREACHABLE,
         E_ADVERTISE_WRONG_GATEWAY,
+        E_GATEWAY_UNREACHABLE,
+        E_GATEWAY_WRONG_ENDPOINT,
         E_POOL_UNKNOWN_OWNER_FILL,
         E_SELLER_POOL_FAILED,
+        E_WALLET_NOT_CONFIGURED,
     ];
 }
 

@@ -250,6 +250,7 @@ pub(crate) struct DashboardDeal {
     pub(crate) handle: String,
     pub(crate) role: String,
     pub(crate) network: String,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
     pub(crate) token_contract: String,
     pub(crate) frame_model: Option<String>,
     pub(crate) model_hash: Option<String>,
@@ -259,7 +260,9 @@ pub(crate) struct DashboardDeal {
     pub(crate) disputed: Option<bool>,
     pub(crate) terminal: Option<bool>,
     pub(crate) gateway_endpoint: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) actor_note: Option<String>,
+    #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub(crate) counterparty_note: Option<String>,
     pub(crate) accounting: DashboardAccounting,
 }
@@ -570,9 +573,15 @@ fn render_section(out: &mut String, title: &str, tbody_id: &str, deals: &[Dashbo
         out.push_str("<tr>");
         cell(out, &d.handle);
         cell(out, &d.state);
-        cell(out, &d.token_contract);
+        cell(
+            out,
+            &dexdo_core::address::display_self_dapp(&d.token_contract),
+        );
         cell(out, d.frame_model.as_deref().unwrap_or("unknown"));
-        cell(out, d.counterparty_note.as_deref().unwrap_or("unknown"));
+        cell(
+            out,
+            &dexdo_core::address::display_opt(d.counterparty_note.as_deref(), "unknown"),
+        );
         cell(out, d.gateway_endpoint.as_deref().unwrap_or("unknown"));
         out.push_str("<td>");
         render_accounting(out, &d.accounting);
@@ -978,12 +987,10 @@ mod tests {
             deposit: above_u64,
             finalized_owed: above_u64 + 1,
             tokens_final: dexdo_core::TICK_SIZE,
-            tokens_superseded: dexdo_core::TICK_SIZE,
             tokens_pending: dexdo_core::TICK_SIZE,
             probe_tick: 0,
             funded_time: None,
             probe_time: 1,
-            prev_claim_time: 1,
             last_claim_time: 1,
             dispute_time: 0,
         };
@@ -1045,12 +1052,10 @@ mod tests {
             deposit: 1000,
             finalized_owed: 2000,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             probe_tick: 50,
             funded_time: None,
             probe_time: 0,
-            prev_claim_time: 0,
             last_claim_time: 0,
             dispute_time: 0,
         };
@@ -1243,12 +1248,10 @@ mod tests {
                 deposit: 1_000,
                 finalized_owed: 0,
                 tokens_final: 0,
-                tokens_superseded: 0,
                 tokens_pending: 0,
                 funded_time: Some(1),
                 probe_tick: 0,
                 probe_time: 0,
-                prev_claim_time: 0,
                 last_claim_time: 2,
                 dispute_time: 0,
             }))

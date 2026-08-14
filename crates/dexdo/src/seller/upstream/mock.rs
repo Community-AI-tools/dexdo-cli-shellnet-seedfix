@@ -3,7 +3,7 @@
 //! `#[cfg(test)]` crutch. Retained even after the real upstream appears.
 
 use super::{chunk_with_structured_accounting, UpstreamEvent};
-use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest, TokenLogprobs};
+use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -29,11 +29,6 @@ pub async fn run(
             .map(last_user_message)
             .map(|p| p.contains("DEXDO_FIXTURE_SUBSTITUTE"))
             .unwrap_or(false);
-    // log-probability(>0) -> the buyer's verification(B6, logprobs shape) -> Bail.
-    let bad_logprobs = req
-        .map(last_user_message)
-        .map(|p| p.contains("DEXDO_FIXTURE_BADLOGPROBS"))
-        .unwrap_or(false);
     // token_ids OUTSIDE its vocabulary -> the buyer's verification(B5, tokenizer check) -> Bail.
     let foreign = req
         .map(last_user_message)
@@ -89,24 +84,14 @@ pub async fn run(
                 vec![seq as u32]
             },
             seq: seq as u64,
-            // The mock yields no logprobs; in the "bad logprobs" fixture -- invalid(>0) for B6.
-            logprobs: if bad_logprobs {
-                vec![TokenLogprobs {
-                    logprob: 1.0,
-                    top: Vec::new(),
-                }]
-            } else {
-                Vec::new()
-            },
             // R3: the gateway declares the available signals on the first chunk. The mock yields(fake)
-            // token_ids, no logprobs; the tokenizer family is the mock profile.
+            // token_ids; the tokenizer family is the mock profile.
             manifest: (seq == 0).then(|| {
                 if substitute {
                     // Fixture: real family + a foreign model(!= frame) -> buyer's B7 -> Bail.
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
-                        has_logprobs: false,
                         claimed_model: "substituted/cheap-model".to_string(),
                     }
                 } else if foreign {
@@ -115,22 +100,14 @@ pub async fn run(
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
-                        has_logprobs: false,
                         claimed_model: String::new(),
                     }
                 } else {
-                    // Mock(Permissive -- B5/B7 pass). In the bad-logprobs fixture we declare
-                    // has_logprobs so that B6 runs and rejects the invalid shape.
+                    // Mock(Permissive -- B5/B7 pass).
                     SignalManifest {
                         tokenizer_family: "mock".to_string(),
                         has_token_ids: true,
-                        has_logprobs: bad_logprobs,
-                        claimed_model: if bad_logprobs {
-                            "mock"
-                        } else {
-                            claimed_model.unwrap_or("mock")
-                        }
-                        .to_string(),
+                        claimed_model: claimed_model.unwrap_or("mock").to_string(),
                     }
                 }
             }),
@@ -140,9 +117,7 @@ pub async fn run(
                 Ok(tokens) => tokens,
                 Err(_) => {
                     let _ = tx
-                        .send(Err(Status::data_loss(
-                            "token-id count does not fit u64",
-                        )))
+                        .send(Err(Status::data_loss("token-id count does not fit u64")))
                         .await;
                     break;
                 }

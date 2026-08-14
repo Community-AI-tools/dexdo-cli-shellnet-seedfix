@@ -223,11 +223,9 @@ async fn stream_upstream(
                         reasoning,
                         token_ids: Vec::new(),
                         seq,
-                        logprobs: Vec::new(),
                         manifest: (seq == 0).then(|| SignalManifest {
                             tokenizer_family: cfg.tokenizer_family.clone(),
                             has_token_ids: false,
-                            has_logprobs: false,
                             claimed_model: cfg.frame_model.clone(),
                         }),
                     };
@@ -846,6 +844,7 @@ mod tests {
         assert!(matches!(events.as_slice(), [UpstreamEvent::Chunk { .. }]));
     }
 
+    /// E2E-ROW: E2E-UPS-18/L0
     #[tokio::test]
     async fn malformed_terminal_frame_fails_at_eof() {
         let malformed = b"event: message_stop\ndata: {\"type\":".to_vec();
@@ -923,6 +922,7 @@ mod tests {
         );
     }
 
+    /// E2E-ROW: E2E-UPS-21/L0
     #[tokio::test]
     async fn decreasing_cumulative_usage_fails_without_partial_accounting() {
         let sse = concat!(
@@ -949,6 +949,7 @@ mod tests {
         );
     }
 
+    /// E2E-ROW: E2E-UPS-22/L0
     #[tokio::test]
     async fn overflowing_usage_value_fails_without_accounting() {
         let sse = concat!(
@@ -968,5 +969,70 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// UPS-B5, the native-Anthropic half of the row: the first text delta is EMPTY and no
+    /// later one carries text at all, because the whole answer is streamed on the thinking channel.
+    /// The OpenAI-compatible side of this shape is what was: a thinking model delivered its
+    /// answer on a channel the accounting treated as absent, readiness read "billed without
+    /// delivery", and the family became unsellable. This adapter must give the opposite answer --
+    /// thinking IS delivered output -- and the empty delta must not be forwarded or consume `seq 0`,
+    /// because that is the slot the `SignalManifest` rides in.
+    #[tokio::test]
+    async fn an_empty_first_text_delta_delivers_nothing_and_thinking_is_billed() {
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"the whole\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" answer\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        result.expect("a thinking-only Anthropic stream is delivered output, not an empty response");
+
+        let mut chunks = Vec::new();
+        let mut accounted = Vec::new();
+        for event in events {
+            match event {
+                UpstreamEvent::Chunk { chunk, .. } => chunks.push(chunk),
+                UpstreamEvent::Accounted(tokens) => accounted.push(tokens),
+            }
+        }
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.seq).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the empty text delta forwards nothing and consumes no sequence number"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.reasoning.as_str())
+                .collect::<Vec<_>>(),
+            vec!["the whole", " answer"]
+        );
+        assert!(
+            chunks.iter().all(|chunk| chunk.text.is_empty()),
+            "nothing may be invented into the content channel"
+        );
+        assert_eq!(
+            chunks[0]
+                .manifest
+                .as_ref()
+                .expect("the first delivered chunk declares the manifest")
+                .claimed_model,
+            config().frame_model,
+            "the manifest rides the first DELIVERED chunk"
+        );
+        assert!(chunks[1].manifest.is_none());
+        assert_eq!(
+            accounted,
+            vec![4],
+            "the bill is the provider's own post-output cumulative output_tokens"
+        );
     }
 }

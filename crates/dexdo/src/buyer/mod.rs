@@ -80,11 +80,12 @@ impl Buyer {
         chain: &dyn ChainBackend,
         token_contract: &TokenContract,
     ) -> Result<Handover> {
+        let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let enc = chain
             .read_handover(token_contract)
             .await
             .map_err(|e| anyhow!(e))?
-            .ok_or_else(|| anyhow!("no handover for {token_contract}"))?;
+            .ok_or_else(|| anyhow!("no handover for {token_contract_display}"))?;
         let plain = self.note.decrypt(&enc).map_err(|e| {
             // DX guard: a real-shellnet handover is encrypted to the buyer's x25519 RECONSTRUCTED from
             // its on-chain ed25519(Montgomery form, `x25519_pub_from_ed25519_pub`). A mock/HKDF identity
@@ -102,7 +103,19 @@ impl Buyer {
                 anyhow!("handover decrypt failed: {e}")
             }
         })?;
-        Handover::from_bytes(&plain).map_err(|e| anyhow!("malformed handover: {e}"))
+        // E2E-OPEN-07 attribution: accept the payload only as THIS deal's handover. Decryption
+        // proves the matched buyer, never the deal -- the same buyer's other deals are encrypted to
+        // the same key -- so a replayed ciphertext would otherwise resolve into an endpoint and put
+        // the deal on the money path. Fail closed here, on the existing malformed-handover error.
+        let handover = Handover::from_deal_bytes(&plain, token_contract)
+            .map_err(|e| anyhow!("malformed handover: {e}"))?;
+        tracing::info!(
+            token_contract = %token_contract_display,
+            seller_gateway = %handover.endpoint,
+            tls_fingerprint = %handover.tls_fingerprint,
+            "buyer decrypted seller gateway handover"
+        );
+        Ok(handover)
     }
 
     /// Connect to the gateway over TLS, complete the
@@ -130,6 +143,7 @@ impl Buyer {
         request: Option<CanonRequest>,
         mut account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<StreamOutcome> {
+        let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let mut client = self.connect(handover).await?;
         let signed = self.authorize(&mut client, token_contract, request).await?;
 
@@ -150,7 +164,7 @@ impl Buyer {
                 .filter(|total| *total <= max_tokens)
                 .ok_or_else(|| {
                     anyhow!(
-                        "deal {token_contract}: probe chunk carries {accounted} tokens with \
+                        "deal {token_contract_display}: probe chunk carries {accounted} tokens with \
                          {tokens_accounted} of the {max_tokens}-token grant already accepted; \
                          refusing the noncompliant chunk before it crosses the grant"
                     )
@@ -214,6 +228,7 @@ impl Buyer {
         account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify;
+        let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let Some(probe_prompt) = verify::default_probe(model_id, models) else {
             // Nothing was asked of the seller, so nothing was consumed.
             return Ok(verify::Verdict::Pass);
@@ -223,7 +238,7 @@ impl Buyer {
         // the wire and asks the seller for an unbounded generation.
         if max_tokens == 0 {
             anyhow::bail!(
-                "deal {token_contract}: the admitted grant cannot pay for the identity verification \
+                "deal {token_contract_display}: the admitted grant cannot pay for the identity verification \
                  this deal still owes; refusing rather than probing on credit"
             );
         }
@@ -269,9 +284,16 @@ impl Buyer {
     /// ([`verify::prefix_agreement`]). Divergence above the threshold -> the model is not the one
     /// claimed -> `Bail`. No exact-model reference / no key in env / reference unavailable ->
     /// **degradation** (`Pass`, R3 -- we don't penalize the seller for the absence/failure of our
-    /// reference). The probe is a separate request(spends the tick budget), sent as an ordinary
-    /// completion(indistinguishable to the seller). The cheap B7(claimed-vs-frame) stays
-    /// separate; this is the strong sampled cross-check(1-5%).
+    /// reference). The probe is a separate request(spends the tick budget), sent over the ordinary
+    /// completion path -- no audit-only API, no second channel.
+    /// It is NOT, however, indistinguishable to the seller: this probe sets `greedy: true` while
+    /// every ordinary buyer request sets `greedy: false`, so a single boolean on the wire names the audit
+    /// with no false positives, and the probe prompt itself is a fixed public constant
+    /// ([`DEFAULT_SPOTCHECK_PROBE`]). A seller that answers this one request honestly and serves anything
+    /// cheaper afterwards is not caught by this check. Read the gate as what it is -- a sampled detector of
+    /// a substituting-by-default seller, not a defence against one that watches for the flag; making the
+    /// audit unidentifiable is tracked in and is a design decision, not a wording fix.
+    /// The cheap B7(claimed-vs-frame) stays separate; this is the strong sampled cross-check(1-5%).
     pub async fn reference_spotcheck(
         &self,
         handover: &Handover,
@@ -284,6 +306,7 @@ impl Buyer {
         use crate::buyer::verify::{
             self, prefix_agreement, reference_endpoint_for, spotcheck_verdict,
         };
+        let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let Some(endpoint) = reference_endpoint_for(model_id, models) else {
             return Ok(verify::Verdict::Pass); // no exact-model reference -> degradation(R3)
         };
@@ -297,7 +320,7 @@ impl Buyer {
         // the wire and asks the seller for an unbounded generation.
         if max_tokens == 0 {
             anyhow::bail!(
-                "deal {token_contract}: the admitted grant cannot pay for the identity verification \
+                "deal {token_contract_display}: the admitted grant cannot pay for the identity verification \
                  this deal still owes; refusing rather than probing on credit"
             );
         }
@@ -335,15 +358,17 @@ impl Buyer {
             };
 
         let agreement = prefix_agreement(&seller_response, &reference_response);
-        Ok(spotcheck_verdict(
-            agreement,
-            DEFAULT_SPOTCHECK_THRESHOLD,
-        ))
+        Ok(spotcheck_verdict(agreement, DEFAULT_SPOTCHECK_THRESHOLD))
     }
 
     /// Open a gRPC channel to the gateway over TLS, pinning the fingerprint from the handover.
     async fn connect(&self, handover: &Handover) -> Result<GatewayClient<Channel>> {
-        let channel = tls::connect_pinned(&handover.endpoint, &handover.tls_fingerprint).await?;
+        // the address being dialled and the real cause are attached HERE, where the endpoint
+        // is known. Reporting `?` straight through gave the operator `transport error` and nothing
+        // else, with the address absent from the log even at `RUST_LOG=trace`.
+        let channel = tls::connect_pinned(&handover.endpoint, &handover.tls_fingerprint)
+            .await
+            .map_err(|error| tls::gateway_dial_error(&handover.endpoint, error))?;
         Ok(GatewayClient::new(channel))
     }
 

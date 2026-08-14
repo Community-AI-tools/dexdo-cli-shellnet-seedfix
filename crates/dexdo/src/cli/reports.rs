@@ -32,7 +32,7 @@ pub(crate) async fn run_deals(args: DealsArgs) -> Result<()> {
             h.network,
             addr::display(&h.note_addr),
             h.frame_model,
-            addr::display(&h.token_contract),
+            addr::display_self_dapp(&h.token_contract),
             addr::display_opt(h.order_book.as_deref(), "-"),
             path.display()
         );
@@ -57,7 +57,7 @@ pub(crate) async fn run_history(args: HistoryArgs) -> Result<()> {
             addr::display(&h.note_addr),
             h.frame_model,
             h.model_hash.as_deref().unwrap_or("-"),
-            addr::display(&h.token_contract),
+            addr::display_self_dapp(&h.token_contract),
             addr::display_opt(h.order_book.as_deref(), "-"),
             h.created_at_unix,
             if h.created_order_ids.is_empty() {
@@ -173,10 +173,8 @@ fn status_response_from_summary(
             buyer_bond: machine::amount(s.buyer_bond),
             buyer_bond_required: machine::amount(s.buyer_bond_required),
             tokens_final: machine::amount(s.tokens_final),
-            tokens_superseded: machine::amount(s.tokens_superseded),
             tokens_pending: machine::amount(s.tokens_pending),
             probe_time_unix: Some(s.probe_time).filter(|v| *v != 0),
-            prev_claim_time_unix: Some(s.prev_claim_time).filter(|v| *v != 0),
             last_claim_time_unix: Some(s.last_claim_time).filter(|v| *v != 0),
             dispute_time_unix: Some(s.dispute_time).filter(|v| *v != 0),
             funded_time_unix: s.funded_time,
@@ -204,11 +202,9 @@ fn closed_status_response(
         buyer_bond_required: 0,
         finalized_owed: 0,
         tokens_final: 0,
-        tokens_superseded: 0,
         tokens_pending: 0,
         funded_time: None,
         probe_time: 0,
-        prev_claim_time: 0,
         last_claim_time: 0,
         dispute_time: 0,
     };
@@ -244,11 +240,9 @@ fn mock_summary_from_snapshot(snapshot: &dexdo_core::StreamSnapshot) -> deals::D
         buyer_bond_required: 0,
         finalized_owed: snapshot.seller_received,
         tokens_final: 0,
-        tokens_superseded: 0,
         tokens_pending: 0,
         funded_time: None,
         probe_time: 0,
-        prev_claim_time: 0,
         last_claim_time: 0,
         dispute_time: 0,
     }
@@ -286,7 +280,7 @@ async fn run_status_mock(args: StatusArgs) -> Result<()> {
             let s = mock_summary_from_snapshot(&snapshot);
             println!(
                 "status handle=(raw) role=unknown token_contract={} state={} active=true funded={} opened={} disputed=false probe_accepted={}",
-                addr::display(&target.token_contract),
+                addr::display_self_dapp(&target.token_contract),
                 s.kind.as_str(),
                 s.funded,
                 s.opened,
@@ -295,7 +289,7 @@ async fn run_status_mock(args: StatusArgs) -> Result<()> {
         }
         _ => println!(
             "status handle=(raw) role=unknown token_contract={} state=closed active=false",
-            addr::display(&target.token_contract)
+            addr::display_self_dapp(&target.token_contract)
         ),
     }
     Ok(())
@@ -309,7 +303,6 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
     let target = load_deal_target(&args.deal, args.deals_dir.as_deref(), None, None)?;
     let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
-    shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
     let contracts = args
         .contracts
         .as_deref()
@@ -319,10 +312,27 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     let chain = RealChainBackend::connect(contracts)?;
     let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
-    let Some(snapshot) = chain.token_contract_deal_snapshot(&tc).await? else {
+    // Read the deal BEFORE the market preflight, because a destroyed TokenContract is this
+    // command's expected terminal state and not a fault. A seller handle carries a `market`, that
+    // manifest pins the deal's TokenContract, and on 4.0.33 the STOP destroys that account in the
+    // same transaction -- so `shellnet_doctor_preflight_market` reports it "inactive/undeployed"
+    // and a seller could never read the status of his own completed deal, getting INTERNAL instead
+    // of the reading canon mandates: "If the TokenContract is absent, status returns
+    // `state="closed"` and `active=false`; that is not an error" (`runtime-machine-contract.md`
+    // ). The closed branch below already produces exactly that; it was simply unreachable.
+    // Nothing else is relaxed. The preflight still runs, unchanged, whenever the deal's account is
+    // LIVE -- so a wrong code hash on a live account, a malformed manifest or a bad pin still fail
+    // here exactly as before -- and an unreachable endpoint fails on this very read rather than
+    // being mistaken for a closed deal. Only `status` reorders: `run_export` and every command that
+    // is about to move money keep the preflight ahead of everything.
+    let deal_snapshot = chain.token_contract_deal_snapshot(&tc).await?;
+    if deal_snapshot.is_some() {
+        shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
+    }
+    let Some(snapshot) = deal_snapshot else {
         if args.json {
             return machine::print_json(&closed_status_response(
-                "shellnet",
+                chain.network(),
                 target.handle.as_ref().map(|h| h.handle.clone()),
                 target.role.map(|r| r.as_str().to_string()),
                 target.token_contract,
@@ -337,14 +347,14 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
                 .map(|h| h.handle.as_str())
                 .unwrap_or("(raw)"),
             target.role.map(|r| r.as_str()).unwrap_or("unknown"),
-            addr::display(&target.token_contract)
+            addr::display_self_dapp(&target.token_contract)
         );
         return Ok(());
     };
     let s = deals::summarize_deal_snapshot(&snapshot);
     if args.json {
         return machine::print_json(&status_response_from_summary(
-            "shellnet",
+            chain.network(),
             target.handle.as_ref().map(|h| h.handle.clone()),
             target.role.map(|r| r.as_str().to_string()),
             target.token_contract.clone(),
@@ -362,7 +372,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
             .map(|h| h.handle.as_str())
             .unwrap_or("(raw)"),
         target.role.map(|r| r.as_str()).unwrap_or("unknown"),
-        addr::display(&target.token_contract),
+        addr::display_self_dapp(&target.token_contract),
         s.kind.as_str(),
         s.funded,
         s.opened,
@@ -382,7 +392,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     println!(
         "accounting finalized_owed={} buyer_locked={} deposit={} probe_tick={} buyer_bond={} \
          buyer_bond_required={} tokens_final={} \
-         tokens_superseded={} tokens_pending={} probe_time={} prev_claim_time={} last_claim_time={} \
+         tokens_pending={} probe_time={} last_claim_time={} \
          dispute_time={} funded_time={}",
         s.finalized_owed,
         s.buyer_locked()?,
@@ -391,17 +401,23 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         s.buyer_bond,
         s.buyer_bond_required,
         s.tokens_final,
-        s.tokens_superseded,
         s.tokens_pending,
         s.probe_time,
-        s.prev_claim_time,
         s.last_claim_time,
         s.dispute_time,
         s.funded_time
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
-    println!("{}", close_hint(&target, &s));
+    println!(
+        "{}",
+        close_hint(
+            &target,
+            &s,
+            args.deals_dir.as_deref(),
+            Some(&contracts_path)
+        )
+    );
     Ok(())
 }
 
@@ -479,6 +495,79 @@ pub(crate) async fn run_export(_args: ExportArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A seller handle whose market TokenContract is GONE must report the terminal deal, not fail.
+    /// The seller's handle carries a `market`, that manifest pins the deal's TokenContract, and a
+    /// clean close destroys that account in the same transaction. While `status` ran
+    /// `shellnet_doctor_preflight_market` first, the preflight reported the pinned account
+    /// "inactive/undeployed" and the command exited `INTERNAL` -- so a seller could not read the
+    /// status of his own completed deal, and the `state="closed" active=false` branch canon
+    /// mandates was unreachable.
+    /// The oracle is the ORDER: the deal snapshot is read first, the preflight is gated on the
+    /// account still being live, and the closed branch is what an absent snapshot reaches. This is
+    /// a source-structure regression because the behaviour it guards is `feature = "shellnet"` and
+    /// needs a live chain to exercise; the behavioural proof is the live run of
+    /// `live_67_model_buyer_preserves_resting_order_identity_through_settle`.
+    #[test]
+    fn status_reports_a_destroyed_token_contract_as_closed_instead_of_failing_its_preflight() {
+        let source = include_str!("reports.rs");
+        let start = source
+            .find("pub(crate) async fn run_status(args: StatusArgs)")
+            .expect("shellnet run_status present");
+        let end = source[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("run_status end marker present");
+        let body = &source[start..end];
+
+        let snapshot_read = body
+            .find("let deal_snapshot = chain.token_contract_deal_snapshot(&tc).await?;")
+            .expect("status must read the deal snapshot itself");
+        let preflight = body
+            .find(
+                "shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?",
+            )
+            .expect("status must still run the market preflight");
+        assert!(
+            snapshot_read < preflight,
+            "status must read the deal BEFORE the market preflight, or a destroyed TokenContract \
+             fails the preflight and the terminal reading is never reached"
+        );
+        assert!(
+            body[snapshot_read..preflight].contains("if deal_snapshot.is_some() {"),
+            "the market preflight must be gated on the deal's account still being LIVE -- it stays \
+             mandatory for every live deal, and a wrong pin on a live account must still fail"
+        );
+        assert!(
+            body.contains("let Some(snapshot) = deal_snapshot else {")
+                && body.contains("state=closed active=false"),
+            "an absent snapshot must fall through to the EXISTING closed branch, not a second one"
+        );
+        assert!(
+            !body.contains(
+                "shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await;"
+            ),
+            "the preflight result must stay fatal where it runs; it is gated, never ignored"
+        );
+
+        // The relaxation is scoped to `status`. Every other command keeps the preflight ahead of
+        // everything it does, because there an inactive TokenContract IS a failure.
+        let export = source
+            .find("pub(crate) async fn run_export(args: ExportArgs)")
+            .expect("shellnet run_export present");
+        let export_end = source[export..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| export + offset)
+            .expect("run_export end marker present");
+        let export_body = &source[export..export_end];
+        let export_preflight = export_body
+            .find("shellnet_doctor_preflight_market(")
+            .expect("export keeps its market preflight");
+        assert!(
+            !export_body[..export_preflight].contains("token_contract_deal_snapshot"),
+            "run_export must keep the market preflight ahead of its chain reads"
+        );
+    }
+
     #[test]
     fn seller_open_probe_status_waits_for_delivery_then_window() {
         let summary = crate::cli::deals::DealStateSummary {
@@ -493,11 +582,9 @@ mod tests {
             buyer_bond_required: 0,
             finalized_owed: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             funded_time: Some(1),
             probe_time: 1,
-            prev_claim_time: 1,
             last_claim_time: 1,
             dispute_time: 0,
         };

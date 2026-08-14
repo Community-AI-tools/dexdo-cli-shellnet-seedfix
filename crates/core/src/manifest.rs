@@ -2,11 +2,12 @@
 //! One JSON file per per-deal market(`InferenceOrderBook` + `RootModel` + the deployed `TokenContract`).
 //! Pure data(no chain, no feature gate); this is the output/parsing contract, covered by a
 //! deterministic offline guard.
-//! **Note-funded:** `dexdo provision` brings up the OB + RootModel + per-deal `TokenContract`
-//! ALL from the seller note's own ECC[2] -- no operator multisig. The note pre-funds the RootModel/TC uninit
-//! deploy addresses via `PrivateNote.fundDeployShell` and the external seller-signed deploys activate them, so
-//! `token_contract` here is the **deployed, active** per-deal TC(not a derived placeholder). Giver is the
-//! one-time mint faucet only; zero giver in the operate path.
+//! **Note-funded:** `dexdo provision` brings up the OB + per-deal `TokenContract` from the
+//! seller note's own ECC[2] -- no operator multisig. The note pre-funds the TC's uninit deploy address via
+//! `PrivateNote.fundDeployShell` and the external seller-signed deploy activates it, so `token_contract` here
+//! is the **deployed, active** per-deal TC(not a derived placeholder). The `RootModel` is NOT note-funded:
+//! since 4.0.34 `SuperRoot.deployRootModel` deploys it with its own value, and an external deploy of it is
+//! refused outright. Giver is the one-time mint faucet only; zero giver in the operate path.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,22 +25,187 @@ pub fn model_hash_for(frame_model: &str) -> String {
     s
 }
 
-/// Validate that a model identifier is the **canonical `producer--model--version`** form -- exactly three
-/// non-empty `--`-separated parts(e.g. `openai--gpt--4.1`, `qwen--qwen3--32b`). This is the string
-/// hashed into the on-chain `modelHash`(and stored as the book's `getModelName`), and it is what the model
-/// indexer parses (`split("--")`, three parts) to show a human-readable market name; a non-canonical name
-/// (e.g. the OpenAI slug `qwen/qwen3-32b`) deploys a book the indexer can only key by its raw hash. Fail-loud
-/// so a mis-set `frame_model` is caught **before** a book/offer is created, not after.
-pub fn validate_canonical_model_id(name: &str) -> Result<(), String> {
-    let parts: Vec<&str> = name.split("--").collect();
-    if parts.len() == 3 && parts.iter().all(|p| !p.trim().is_empty()) {
-        return Ok(());
+/// Precision is a seller attestation carried by the model id; delivery does not enforce it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttestedModelPrecision {
+    pub value: String,
+    pub status: &'static str,
+    pub enforced: bool,
+}
+
+/// Optional canonical-id flag slots. `None`/`false` means the grammar's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CanonicalModelFlags {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub tools: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub think: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<AttestedModelPrecision>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+impl CanonicalModelFlags {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
     }
-    Err(format!(
-        "model id `{name}` is not canonical `producer--model--version` (exactly three non-empty `--`-separated \
-         parts, e.g. `qwen--qwen3--32b`). This string is the on-chain model name/hash the indexer \
-         parses -- an OpenAI slug like `qwen/qwen3-32b` belongs in `served_model`, not the market model id."
-    ))
+
+    /// Compact human rendering used beside every displayed book, offer, and quote.
+    pub fn render_human(&self) -> String {
+        let mut flags = Vec::new();
+        if let Some(unit) = &self.unit {
+            flags.push(format!("unit={unit}"));
+        }
+        if let Some(window) = &self.window {
+            flags.push(format!("window={window}"));
+        }
+        if let Some(resolution) = &self.resolution {
+            flags.push(format!("resolution={resolution}"));
+        }
+        if self.tools {
+            flags.push("tools".to_string());
+        }
+        if self.think {
+            flags.push("think".to_string());
+        }
+        if let Some(precision) = &self.precision {
+            flags.push(format!(
+                "precision={}(attested,not-enforced)",
+                precision.value
+            ));
+        }
+        flags.join(",")
+    }
+}
+
+/// Parsed canonical model id. The raw id remains the only input to [`model_hash_for`]; this value is
+/// descriptive and is never used to rebuild, reorder, or otherwise normalize the hash preimage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalModelId {
+    pub producer: String,
+    pub model: String,
+    pub version: String,
+    pub flags: CanonicalModelFlags,
+}
+
+fn parse_model_flag(token: &str) -> Result<(usize, &'static str), String> {
+    let slot = match token {
+        "sec" | "min" | "img" | "frame" => (0, "unit"),
+        "480p" | "720p" | "1080p" | "2160p" => (2, "resolution"),
+        "tools" => (3, "tools"),
+        "think" => (4, "think"),
+        "fp32" | "bf16" | "fp16" | "fp8" | "int8" | "int4" => (5, "precision"),
+        "gptq" | "awq" | "gguf" | "Q4_K_M" => {
+            return Err(format!(
+                "packing format `{token}` is not a canonical model-id flag; packing spellings are deliberately not admitted"
+            ));
+        }
+        _ if token.starts_with('w') => {
+            let digits = token
+                .strip_prefix('w')
+                .and_then(|value| value.strip_suffix('k'))
+                .unwrap_or_default();
+            let thousands = digits.parse::<u64>().ok();
+            if digits.is_empty()
+                || !digits.bytes().all(|byte| byte.is_ascii_digit())
+                || thousands == Some(0)
+                || thousands.is_none()
+                || thousands.is_some_and(|value| value.to_string() != digits)
+            {
+                return Err(format!(
+                    "malformed window flag `{token}`; expected `w<N>k` with a positive canonical integer N, e.g. `w8k`"
+                ));
+            }
+            (1, "window")
+        }
+        _ => return Err(format!("unknown flag token `{token}` in model id")),
+    };
+    Ok(slot)
+}
+
+/// Parse and validate the injective canonical-id grammar:
+/// `producer--model--version[--unit][--w<N>k][--<N>p][--tools][--think][--<precision>]`.
+/// Flag order is fixed, each slot may occur at most once, and the parser rejects rather than
+/// normalizing. In particular, callers must keep hashing the original raw bytes with
+/// [`model_hash_for`], never reconstruct an id from this parsed value.
+pub fn parse_canonical_model_id(name: &str) -> Result<CanonicalModelId, String> {
+    const CONTRACT_MODEL_NAME_MAX_BYTES: usize = 127;
+
+    let byte_len = name.len();
+    if byte_len > CONTRACT_MODEL_NAME_MAX_BYTES {
+        return Err(format!(
+            "model id is {byte_len} bytes; the contract model-name limit is {CONTRACT_MODEL_NAME_MAX_BYTES} bytes"
+        ));
+    }
+
+    let mut parts = name.split("--");
+    let (Some(producer), Some(model), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!(
+            "model id `{name}` is not canonical `producer--model--version` (three non-empty base parts are required)"
+        ));
+    };
+    if producer.trim().is_empty() || model.trim().is_empty() || version.trim().is_empty() {
+        return Err(format!(
+            "model id `{name}` is not canonical `producer--model--version` (three non-empty base parts are required)"
+        ));
+    }
+
+    let mut flags = CanonicalModelFlags::default();
+    let mut seen = [false; 6];
+    let mut last_slot = None;
+    let mut last_name = None;
+    for token in parts {
+        let (slot, slot_name) = parse_model_flag(token)?;
+        if seen[slot] {
+            return Err(format!("duplicate flag `{token}` in model id `{name}`"));
+        }
+        if last_slot.is_some_and(|last| slot < last) {
+            return Err(format!(
+                "flag `{token}` is in the wrong order in model id `{name}`; `{slot_name}` must precede `{}`",
+                last_name.unwrap_or("the previous flag")
+            ));
+        }
+        seen[slot] = true;
+        last_slot = Some(slot);
+        last_name = Some(slot_name);
+        match slot {
+            0 => flags.unit = Some(token.to_string()),
+            1 => flags.window = Some(token.to_string()),
+            2 => flags.resolution = Some(token.to_string()),
+            3 => flags.tools = true,
+            4 => flags.think = true,
+            5 => {
+                flags.precision = Some(AttestedModelPrecision {
+                    value: token.to_string(),
+                    status: "attested",
+                    enforced: false,
+                });
+            }
+            _ => unreachable!("model flag slot is closed"),
+        }
+    }
+
+    Ok(CanonicalModelId {
+        producer: producer.to_string(),
+        model: model.to_string(),
+        version: version.to_string(),
+        flags,
+    })
+}
+
+/// Validate a canonical model id while preserving the original validator's unit return type.
+pub fn validate_canonical_model_id(name: &str) -> Result<(), String> {
+    parse_canonical_model_id(name).map(|_| ())
 }
 
 /// Normalize a model hash for comparison: drop an optional `0x` prefix and lowercase. The on-chain
@@ -76,7 +242,8 @@ pub fn resolve_model_name(model_hash: Option<&str>, known_models: &[String]) -> 
 /// **Addresses:** written as canonical `<dapp_id>::<account_id>`, read in either that or the
 /// legacy `0:<account_id>` form, and held in memory in the workchain form the chain client takes. A
 /// manifest written by an older version keeps loading unchanged; one written now carries the DApp
-/// identity. Render them with [`crate::address::display`], never by printing the field directly.
+/// identity. Root/market/note accounts use the shared dexdo DApp; each TokenContract uses its own
+/// account id as its DApp id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketManifest {
     /// Network the market is deployed on(e.g. `shellnet`).
@@ -92,7 +259,7 @@ pub struct MarketManifest {
     #[serde(with = "crate::address::serde_canonical")]
     pub root_model: String,
     /// Per-deal `TokenContract` -- the **deployed, active** address.
-    #[serde(with = "crate::address::serde_canonical")]
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: String,
     /// The seller's provisioned `PrivateNote`(the market owner's note).
     #[serde(with = "crate::address::serde_canonical")]
@@ -263,7 +430,9 @@ mod tests {
         let m = sample();
         let json = m.to_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["token_contract"], crate::address::display(&addr('3')));
+        // a per-deal TokenContract is a self-DApp account, written `<account>::<account>`.
+        let tc = std::iter::repeat_n('3', 64).collect::<String>();
+        assert_eq!(v["token_contract"], format!("{tc}::{tc}"));
         assert_eq!(v["frame_model"], "qwen/qwen3-32b");
         assert_eq!(MarketManifest::from_json(&json).unwrap(), m);
     }
@@ -271,32 +440,51 @@ mod tests {
     /// Issue: a manifest is **written** with canonical `<dapp_id>::<account_id>` addresses, and is
     /// **read** from either that or a legacy `0:<account_id>` file written by an older version. Both load
     /// to the same manifest, so an existing market.json keeps driving the same deal.
+    /// The DApp half is role-specific. A per-deal `TokenContract` is a self-DApp account - its own
+    /// `info.dapp_id` IS its account id - so it is written `<account_id>::<account_id>`. The book, the
+    /// `RootModel` and the seller's `PrivateNote` are system contracts of the shared dexdo DApp.
     #[test]
     fn manifest_writes_canonical_addresses_and_reads_legacy_ones() {
         let m = sample();
         let json = m.to_json().unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        for (field, legacy) in [
-            ("inference_order_book", addr('1')),
-            ("root_model", addr('2')),
-            ("token_contract", addr('3')),
-            ("seller_note", addr('4')),
+        let self_dapp = addr('3').strip_prefix("0:").unwrap().to_string();
+        for (field, legacy, dapp) in [
+            (
+                "inference_order_book",
+                addr('1'),
+                crate::address::DEXDO_DAPP_ID.to_string(),
+            ),
+            (
+                "root_model",
+                addr('2'),
+                crate::address::DEXDO_DAPP_ID.to_string(),
+            ),
+            ("token_contract", addr('3'), self_dapp.clone()),
+            (
+                "seller_note",
+                addr('4'),
+                crate::address::DEXDO_DAPP_ID.to_string(),
+            ),
         ] {
             let written = v[field].as_str().unwrap();
             assert_eq!(
                 written,
-                format!(
-                    "{}::{}",
-                    crate::address::DEXDO_DAPP_ID,
-                    legacy.strip_prefix("0:").unwrap()
-                ),
+                format!("{dapp}::{}", legacy.strip_prefix("0:").unwrap()),
                 "{field} was not written canonically"
             );
             assert!(!written.starts_with("0:"), "{field} kept the legacy form");
         }
 
-        // A legacy file loads to the same manifest a canonical one does.
-        let legacy_json = json.replace(&format!("{}::", crate::address::DEXDO_DAPP_ID), "0:");
+        // A legacy file loads to the same manifest a canonical one does. Both DApp halves are
+        // stripped, so the fixture is the pre- file rather than a half-migrated one.
+        let legacy_json = json
+            .replace(&format!("{}::", crate::address::DEXDO_DAPP_ID), "0:")
+            .replace(&format!("{self_dapp}::"), "0:");
+        assert!(
+            !legacy_json.contains("::"),
+            "the legacy fixture still carries a DApp half: {legacy_json}"
+        );
         assert_eq!(MarketManifest::from_json(&legacy_json).unwrap(), m);
         assert_eq!(MarketManifest::from_json(&json).unwrap(), m);
     }

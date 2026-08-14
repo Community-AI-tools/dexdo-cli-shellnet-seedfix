@@ -231,7 +231,7 @@ pub(crate) fn render_depth_table(response: &InferenceDepthResponse, endpoint: &s
     out.push_str(&format!(
         "depth source=indexer endpoint={} address={} last_update_id={} bid_levels={} ask_levels={}\n",
         endpoint,
-        response.inference_order_book_address,
+        dexdo_core::address::display(&response.inference_order_book_address),
         if response.last_update_id.is_empty() {
             "-"
         } else {
@@ -247,6 +247,29 @@ pub(crate) fn render_depth_table(response: &InferenceDepthResponse, endpoint: &s
         out.push_str(&format!("ask price_per_tick={} ticks={}\n", ask[0], ask[1]));
     }
     out
+}
+
+pub(crate) fn render_depth_output(
+    response: &InferenceDepthResponse,
+    endpoint: &str,
+    as_of: u64,
+) -> String {
+    let last_update_id = if response.last_update_id.is_empty() {
+        "-"
+    } else {
+        response.last_update_id.as_str()
+    };
+    format!(
+        "depth {}\n{}",
+        crate::cli::provenance::render(
+            "indexer",
+            last_update_id,
+            as_of,
+            crate::cli::provenance::ROWS_INDEXER_DEPTH,
+            crate::cli::provenance::SCOPE_RAW_INDEXER_LEVELS_UNGATED,
+        ),
+        render_depth_table(response, endpoint)
+    )
 }
 
 pub(crate) fn validate_cursor(cursor: Option<&str>) -> Result<()> {
@@ -268,7 +291,7 @@ pub(crate) fn validate_cursor(cursor: Option<&str>) -> Result<()> {
 fn render_market_line(market: &InferenceMarket) -> String {
     format!(
         "market address={} model_ref={} producer={} name={} version={} status={} quote_asset={} maker_commission={} taker_commission={} price_precision={} quantity_precision={} tick_size={} step_size={} min_notional={} reference_price={} created_at={}",
-        market.inference_order_book_address,
+        dexdo_core::address::display(&market.inference_order_book_address),
         market.model.ref_,
         opt(&market.model.producer),
         opt(&market.model.name),
@@ -355,12 +378,8 @@ fn validate_optional_address(name: &str, value: Option<&str>) -> Result<()> {
 }
 
 fn validate_address(name: &str, value: &str) -> Result<()> {
-    let Some(hex) = value.strip_prefix("0:") else {
-        bail!("{name} `{value}` is not a valid shellnet address: expected 0:<64 hex>");
-    };
-    if hex.len() != 64 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        bail!("{name} `{value}` is not a valid shellnet address: expected 0:<64 hex>");
-    }
+    dexdo_core::address::CanonicalAddress::parse(value)
+        .map_err(|error| anyhow::anyhow!("{name} `{value}` is not a valid shellnet address: {error}"))?;
     Ok(())
 }
 
@@ -387,6 +406,10 @@ fn compact_body(body: &str) -> String {
         format!("{}...", &compact[..end])
     }
 }
+
+#[cfg(test)]
+#[path = "indexer_depth_provenance_1043.rs"]
+mod indexer_depth_provenance_1043;
 
 #[cfg(test)]
 mod tests {
@@ -435,6 +458,18 @@ mod tests {
         )
     }
 
+    /// The same account in the canonical `<dapp_id>::<account_id>` form the human tables render
+    /// . An `InferenceOrderBook` is a system contract of the shared dexdo DApp, so its DApp
+    /// half is `DEXDO_DAPP_ID`. The raw `--output json` DTO keeps the legacy machine form, which
+    /// `json_output_shape_is_stable` below still pins.
+    fn canonical_address() -> String {
+        format!(
+            "{}::{}",
+            dexdo_core::DEXDO_DAPP_ID,
+            ADDRESS.strip_prefix("0:").unwrap()
+        )
+    }
+
     #[test]
     fn parses_markets_fixture_and_renders_table() {
         let response = parse_markets_json(markets_fixture().as_bytes()).unwrap();
@@ -443,9 +478,12 @@ mod tests {
         let rendered = render_markets_table(&response, DEFAULT_INDEXER_URL);
         assert_eq!(
             rendered,
-            concat!(
-                "market_data source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 server_time=1782897900000 count=1 has_more=true next_cursor=MTc4Mjg4NDY0MTAwMDAwMDo0\n",
-                "market address=0:4a04daaf8aff55a23c8dd5edabf7c81eeb300c7b5d70ad0c6fa955c25eab0b76 model_ref=qwen--qwen3--32b producer=- name=- version=- status=TRADING quote_asset=SHELL maker_commission=-0.02 taker_commission=0.025 price_precision=9 quantity_precision=0 tick_size=0.000000001 step_size=1 min_notional=0.000000001 reference_price=- created_at=1782897852\n"
+            format!(
+                concat!(
+                    "market_data source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 server_time=1782897900000 count=1 has_more=true next_cursor=MTc4Mjg4NDY0MTAwMDAwMDo0\n",
+                    "market address={address} model_ref=qwen--qwen3--32b producer=- name=- version=- status=TRADING quote_asset=SHELL maker_commission=-0.02 taker_commission=0.025 price_precision=9 quantity_precision=0 tick_size=0.000000001 step_size=1 min_notional=0.000000001 reference_price=- created_at=1782897852\n"
+                ),
+                address = canonical_address()
             )
         );
     }
@@ -456,11 +494,14 @@ mod tests {
         let rendered = render_depth_table(&response, DEFAULT_INDEXER_URL);
         assert_eq!(
             rendered,
-            concat!(
-                "depth source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 address=0:4a04daaf8aff55a23c8dd5edabf7c81eeb300c7b5d70ad0c6fa955c25eab0b76 last_update_id=1782897900:7 bid_levels=1 ask_levels=2\n",
-                "bid price_per_tick=1000 ticks=4\n",
-                "ask price_per_tick=1100 ticks=2\n",
-                "ask price_per_tick=1200 ticks=1\n"
+            format!(
+                concat!(
+                    "depth source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 address={address} last_update_id=1782897900:7 bid_levels=1 ask_levels=2\n",
+                    "bid price_per_tick=1000 ticks=4\n",
+                    "ask price_per_tick=1100 ticks=2\n",
+                    "ask price_per_tick=1200 ticks=1\n"
+                ),
+                address = canonical_address()
             )
         );
     }

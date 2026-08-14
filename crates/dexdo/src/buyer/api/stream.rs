@@ -3,11 +3,44 @@ use crate::buyer::verify::{StreamVerifier, Verdict};
 use dexdo_proto::CanonChunk;
 use tokio_stream::StreamExt;
 
+pub(super) enum CanonStreamError {
+    Upstream(tonic::Status),
+    Local(String),
+}
+
+impl CanonStreamError {
+    pub(super) fn is_capacity(&self) -> bool {
+        matches!(self, Self::Upstream(status) if status.code() == tonic::Code::ResourceExhausted)
+    }
+
+    pub(super) fn policy_message(&self) -> &str {
+        match self {
+            Self::Upstream(status) => status.message(),
+            Self::Local(message) => message,
+        }
+    }
+}
+
+impl From<String> for CanonStreamError {
+    fn from(message: String) -> Self {
+        Self::Local(message)
+    }
+}
+
+impl std::fmt::Display for CanonStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Upstream(status) => status.fmt(formatter),
+            Self::Local(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub(super) enum CanonStreamNext {
     Chunk(CanonChunk),
     End,
     Bailed,
-    Errored(String),
+    Errored(CanonStreamError),
 }
 
 pub(super) struct CanonStreamDriver {
@@ -39,7 +72,9 @@ impl CanonStreamDriver {
     pub(super) async fn next(&mut self) -> CanonStreamNext {
         if *self.session_closed.borrow() {
             return CanonStreamNext::Errored(
-                "deal session closed after accepted-output deadline".to_string(),
+                "deal session closed after accepted-output deadline"
+                    .to_string()
+                    .into(),
             );
         }
         let next = tokio::select! {
@@ -47,7 +82,9 @@ impl CanonStreamDriver {
             changed = self.session_closed.changed() => {
                 if changed.is_ok() && *self.session_closed.borrow() {
                     return CanonStreamNext::Errored(
-                        "deal session closed after accepted-output deadline".to_string(),
+                        "deal session closed after accepted-output deadline"
+                            .to_string()
+                            .into(),
                     );
                 }
                 self.upstream.next().await
@@ -63,7 +100,7 @@ impl CanonStreamDriver {
                     CanonStreamNext::Chunk(chunk)
                 }
             }
-            Some(Err(e)) => CanonStreamNext::Errored(e.to_string()),
+            Some(Err(e)) => CanonStreamNext::Errored(CanonStreamError::Upstream(e)),
             None => CanonStreamNext::End,
         }
     }

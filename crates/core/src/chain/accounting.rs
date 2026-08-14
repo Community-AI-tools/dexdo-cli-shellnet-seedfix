@@ -71,6 +71,35 @@ pub fn subscription_buy_reserve(
     })
 }
 
+/// Checked ordinary BUY preflight reserve at `max_price_per_tick`.
+/// `contracts/dex/PrivateNote.sol:748` debits `bond = 2 * clearingPrice` on every BUY fill.
+/// Before matching, the client can prove that debit only at its known ceiling,
+/// `max_price_per_tick`. This thin ordinary entry point delegates to
+/// [`subscription_buy_reserve`] so the deposit, bond, and total stay in one checked
+/// implementation.
+pub fn ordinary_buy_reserve(
+    ticks: u128,
+    max_price_per_tick: u128,
+) -> Result<SubscriptionBuyReserve, String> {
+    subscription_buy_reserve(ticks, max_price_per_tick)
+}
+
+#[cfg(test)]
+mod ordinary_buy_reserve_tests {
+    use super::{ordinary_buy_reserve, subscription_buy_reserve};
+
+    #[test]
+    fn ordinary_and_subscription_buy_reserves_match_at_the_same_inputs() {
+        let ticks = 3;
+        let price_per_tick = 1_000_000;
+
+        assert_eq!(
+            ordinary_buy_reserve(ticks, price_per_tick),
+            subscription_buy_reserve(ticks, price_per_tick)
+        );
+    }
+}
+
 /// Require the exact subscription reserve before a money submit.
 /// Both underfunding and overfunding are rejected: a subscription message carries precisely the
 /// fee-inclusive service deposit plus its separate limit-priced buyer bond.
@@ -225,7 +254,8 @@ pub fn coalesce_equivalent_resting_asks(
                         .join(",");
                     return Err(format!(
                         "duplicate active sell orders for one TokenContract have conflicting terms/state: \
-                         {tc} at order_ids [{ids}]. Refusing to coalesce ambiguous liquidity."
+                         {} at order_ids [{ids}]. Refusing to coalesce ambiguous liquidity.",
+                        crate::address::display_self_dapp(&tc)
                     ));
                 }
             }
@@ -257,10 +287,8 @@ fn exact_never_opened_funded_time(state: DealChainState) -> Option<u64> {
         && state.probe_tick == 0
         && state.finalized_owed == 0
         && state.tokens_final == 0
-        && state.tokens_superseded == 0
         && state.tokens_pending == 0
         && state.probe_time == 0
-        && state.prev_claim_time == funded_time
         && state.last_claim_time == funded_time
         && state.dispute_time == 0)
         .then_some(funded_time)
@@ -272,6 +300,7 @@ pub fn check_matched_token_contract_state(
     now_secs: u64,
     match_open_timeout_secs: u64,
 ) -> Result<MatchedTokenContractStatus, String> {
+    let token_contract = crate::address::display_self_dapp(token_contract);
     if state.disputed {
         return Err(format!(
             "reported match {token_contract} is disputed immediately after fill: funded={} opened={} \
@@ -299,17 +328,15 @@ pub fn check_matched_token_contract_state(
         format!(
             "reported match {token_contract} is not the authoritative funded-never-opened shape: \
              probeAccepted={} deposit={} probeTick={} finalizedOwed={} tokensFinal={} \
-             tokensSuperseded={} tokensPending={} probeTime={} prevClaimTime={} lastClaimTime={} \
+             tokensPending={} probeTime={} lastClaimTime={} \
              fundedTime={:?} disputeTime={}. Refusing to wait for handover or offer cleanup.",
             state.probe_accepted,
             state.deposit,
             state.probe_tick,
             state.finalized_owed,
             state.tokens_final,
-            state.tokens_superseded,
             state.tokens_pending,
             state.probe_time,
-            state.prev_claim_time,
             state.last_claim_time,
             state.funded_time,
             state.dispute_time,
@@ -691,17 +718,15 @@ pub fn check_reclaimable(
         format!(
             "reclaim: CLOSED deal is not the authoritative never-opened shape; refusing \
              streamCleanup before submit (probeAccepted={} deposit={} probeTick={} \
-             finalizedOwed={} tokensFinal={} tokensSuperseded={} tokensPending={} probeTime={} \
-             prevClaimTime={} lastClaimTime={} fundedTime={:?} disputeTime={})",
+             finalizedOwed={} tokensFinal={} tokensPending={} probeTime={} \
+             lastClaimTime={} fundedTime={:?} disputeTime={})",
             state.probe_accepted,
             state.deposit,
             state.probe_tick,
             state.finalized_owed,
             state.tokens_final,
-            state.tokens_superseded,
             state.tokens_pending,
             state.probe_time,
-            state.prev_claim_time,
             state.last_claim_time,
             state.funded_time,
             state.dispute_time,

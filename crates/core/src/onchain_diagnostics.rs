@@ -66,119 +66,119 @@ pub fn sanitize_onchain_submit_payload(value: &Value) -> Value {
     sanitize_value(value, &secrets)
 }
 
+/// Every error code the vendored contract sources declare, under the name they declare it with.
+/// The comment on each arm is the exact declaring line, so a name can be checked against the
+/// Solidity rather than against this table's own past -- which is how the table came to carry
+/// constants that had been deleted two generations earlier.
+/// **These numbers are not one namespace.** `dex::` is the `Errors` base every contract under
+/// `contracts/dex` inherits and `airegistry::` is the `AiRegistryErrors` base under
+/// `contracts/airegistry`; `iob::`, `modelregistry::` and `oracleeventlist::` are constants a
+/// single contract declares privately. The spaces overlap in both directions: 101, 102 and 103
+/// are each declared twice with different meanings. Contracts 4.0.35 deleted the four names that
+/// nothing raised any more -- `dex::ERR_ALREADY_CLAIMED` 108, `dex::ERR_WRONG_HASH` 136,
+/// `airegistry::ERR_NOT_INITIALIZED` 305 and `dex::ERR_BAD_TOKEN_CONTRACT` 406 -- and they are gone
+/// from here with them, which is why 342 `iob::ERR_BAD_TOKEN_CONTRACT` no longer has a same-named
+/// twin. `dex::ERR_NOT_INITIALIZED` 114 survives and is unrelated to the deleted 305. A number
+/// therefore does
+/// not by itself determine a meaning, so this returns every declared candidate and
+/// `contract_error_label` marks the undecided ones rather than picking one.
 pub fn contract_error_names(code: i64) -> &'static [&'static str] {
     match code {
-        101 => &["dex::ERR_INVALID_SENDER"],
-        102 => &["dex::ERR_LOW_VALUE"],
-        103 => &["dex::ERR_ALREADY_RESOLVED"],
-        107 => &["dex::ERR_ALREADY_INITIALIZED"],
-        108 => &["dex::ERR_ALREADY_CLAIMED"],
-        114 => &["dex::ERR_NOT_INITIALIZED"],
-        115 => &["dex::ERR_NOT_WINNER"],
-        116 => &["dex::ERR_NOT_APPROVED"],
-        117 => &["dex::ERR_ALREADY_APPROVED"],
-        118 => &["dex::ERR_INSUFFICIENT_NETWORK_FEE"],
-        120 => &["dex::ERR_STAKE_PERIOD_ENDED"],
-        121 => &["dex::ERR_NOTE_BUSY"],
-        122 => &["dex::ERR_STAKE_NOT_APPROVED"],
-        123 => &["dex::ERR_WRONG_DEADLINE"],
-        124 => &["dex::ERR_STAKE_NOT_STARTED"],
-        125 => &["dex::ERR_RESULT_NOT_STARTED"],
-        126 => &["dex::ERR_RESULT_ENDED"],
-        127 => &["dex::ERR_INVALID_CURRENCY_COUNT"],
-        128 => &["dex::ERR_ZERO_TOKEN_AMOUNT"],
-        129 => &["dex::ERR_INVALID_PARAMS"],
-        130 => &["dex::ERR_INVALID_OUTCOME_ID"],
-        131 => &["dex::ERR_OUTCOMES_NOT_SET"],
-        132 => &["dex::ERR_ALREADY_CANCELLED"],
-        133 => &["dex::ERR_NOT_CANCELLED"],
-        134 => &["dex::ERR_LONG_ARRAY"],
-        135 => &["dex::ERR_ALREADY_VOTED"],
-        136 => &["dex::ERR_WRONG_HASH"],
-        137 => &["dex::ERR_INVALID_ZKPROOF"],
-        138 => &["dex::ERR_INVALID_TOKEN_TYPE"],
-        139 => &["dex::ERR_NOT_APPROVED_BY_ORACLE"],
-        140 => &["dex::ERR_PROPOSAL_NOT_EXISTS"],
-        141 => &["dex::ERR_NOT_ALLOWED"],
-        142 => &["dex::ERR_STAKE_NOT_EXISTS"],
-        143 => &["dex::ERR_HAS_DEBT"],
-        144 => &["dex::ERR_NON_ZERO_BALANCE"],
-        145 => &["dex::ERR_COUPON_POOL_LIMIT_EXCEEDED"],
-        146 => &["dex::ERR_NO_COUPON_AVAILABLE"],
-        147 => &["dex::ERR_INVALID_BET_TYPE"],
-        148 => &["dex::ERR_COUPON_ALREADY_EXISTS"],
-        149 => &["dex::ERR_COUPON_ACTIVE"],
-        150 => &["dex::ERR_DEBT_NON_ZERO"],
-        151 => &["dex::ERR_INVALID_STATE"],
-        152 => &["dex::ERR_DEPLOYER_NOT_COVERED"],
-        153 => &["dex::ERR_NOT_FROZEN"],
-        154 => &["dex::ERR_ALREADY_FROZEN"],
-        155 => &["dex::ERR_MERGE_SOLVENCY"],
-        156 => &["dex::ERR_NOT_STAKEEND"],
-        157 => &["dex::ERR_INVALID_EPOCH"],
-        158 => &["dex::ERR_ORDER_NOT_FOUND"],
-        159 => &["dex::ERR_EPOCH_NOT_ENDED"],
-        160 => &["dex::ERR_ORDER_TOO_SMALL"],
-        161 => &["dex::ERR_BATCH_TOO_LARGE"],
-        162 => &["dex::ERR_EMPTY_BATCH"],
-        163 => &["dex::ERR_AMOUNT_NOT_LOT_MULTIPLE"],
-        164 => &["dex::ERR_PRICE_NOT_TICK_MULTIPLE"],
-        165 => &["dex::ERR_ORDERBOOK_NOT_SHUTDOWN"],
-        166 => &["dex::ERR_INSOLVENT"],
-        167 => &["dex::ERR_OPEN_ORDERS_EXIST"],
-        168 => &["dex::ERR_NOTIONAL_OVERFLOW"],
-        301 => &["airegistry::ERR_NOT_OWNER"],
-        302 => &["airegistry::ERR_INVALID_SENDER"],
-        303 => &["airegistry::ERR_ZERO_AMOUNT"],
-        304 => &["airegistry::ERR_ALREADY_REGISTERED"],
-        305 => &["airegistry::ERR_NOT_INITIALIZED"],
-        306 => &["airegistry::ERR_INSUFFICIENT_TOKENS"],
-        307 => &["airegistry::ERR_CONTRACT_LOCKED"],
-        308 => &["airegistry::ERR_NOT_RESERVED"],
-        309 => &["airegistry::ERR_RESERVATION_OVERFLOW"],
-        310 => &["airegistry::ERR_NOT_EMPTY"],
-        311 => &["airegistry::ERR_NO_SHELL"],
-        312 => &["airegistry::ERR_BAD_FEE_BPS"],
-        313 => &["airegistry::ERR_BAD_PARAM"],
-        314 => &["airegistry::ERR_OVERFLOW"],
-        315 => &["airegistry::ERR_FIRST_BATCH_LIMIT"],
-        316 => &["airegistry::ERR_BAD_CODE_HASH"],
-        317 => &["airegistry::ERR_SINGLE_SESSION_REQUIRED"],
-        318 => &["airegistry::ERR_NOT_FUNDED"],
-        319 => &["airegistry::ERR_ALREADY_FUNDED"],
-        320 => &["airegistry::ERR_NOT_OPEN"],
-        321 => &["airegistry::ERR_ALREADY_OPEN"],
-        322 => &["airegistry::ERR_NOT_BUYER"],
-        323 => &["airegistry::ERR_SETTLE_WINDOW_OPEN"],
-        324 => &["airegistry::ERR_DISPUTED"],
-        325 => &["airegistry::ERR_NOT_DISPUTED"],
-        326 => &["airegistry::ERR_DISPUTE_WINDOW_OPEN"],
-        327 => &["airegistry::ERR_STREAM_TIMEOUT_OPEN"],
-        328 => &["airegistry::ERR_INSUFFICIENT_DEPOSIT"],
-        329 => &["airegistry::ERR_STILL_OPEN"],
-        332 => &["airegistry::ERR_BOND_NOT_FUNDED"],
-        333 => &[
-            "airegistry::ERR_BOND_ALREADY_FUNDED",
-            "iob::ERR_NOT_DEPLOYER_NOTE",
+        100 => &["modelregistry::ERR_NOT_OWNER"], // contracts/airegistry/ModelRegistry.sol:43
+        101 => &[
+            "dex::ERR_INVALID_SENDER", // contracts/dex/modifiers/errors.sol:14
+            "modelregistry::ERR_NO_PUBKEY", // contracts/airegistry/ModelRegistry.sol:44
         ],
-        334 => &["airegistry::ERR_NOT_PROBE", "iob::ERR_NO_LIQUIDITY"],
-        335 => &["airegistry::ERR_ALREADY_STREAMING", "iob::ERR_BAD_FLAGS"],
-        336 => &["iob::ERR_EXPIRED"],
-        337 => &["iob::ERR_FOK_UNFILLED"],
-        338 => &["iob::ERR_NOT_SUB"],
-        339 => &["iob::ERR_NOTHING_TO_CLAIM"],
-        340 => &["iob::ERR_QUEUE_FULL"],
-        341 => &["iob::ERR_NOT_SELF"],
-        342 => &["iob::ERR_BAD_TOKEN_CONTRACT"],
-        343 => &["iob::ERR_NAME_TOO_LONG"],
-        344 => &["iob::ERR_BAD_MODEL_NAME"],
-        400 => &["dex::ERR_MESSAGE_IS_EXIST"],
-        401 => &["dex::ERR_MESSAGE_WITH_HUGE_EXPIREAT"],
-        402 => &["dex::ERR_MESSAGE_EXPIRED"],
-        403 => &["dex::ERR_INVALID_HISTORY_PROOF"],
-        404 => &["dex::ERR_NORM_REFUND_PENDING"],
-        405 => &["dex::ERR_STREAM_LOCKED"],
-        406 => &["dex::ERR_BAD_TOKEN_CONTRACT"],
+        102 => &[
+            "dex::ERR_LOW_VALUE", // contracts/dex/modifiers/errors.sol:17
+            "modelregistry::ERR_NOT_MODEL", // contracts/airegistry/ModelRegistry.sol:45
+        ],
+        103 => &[
+            "dex::ERR_ALREADY_RESOLVED", // contracts/dex/modifiers/errors.sol:20
+            "modelregistry::ERR_NAME_TOO_LONG", // contracts/airegistry/ModelRegistry.sol:46
+        ],
+        107 => &["dex::ERR_ALREADY_INITIALIZED"], // contracts/dex/modifiers/errors.sol:23
+        114 => &["dex::ERR_NOT_INITIALIZED"], // contracts/dex/modifiers/errors.sol:29
+        116 => &["dex::ERR_NOT_APPROVED"], // contracts/dex/modifiers/errors.sol:33
+        120 => &["dex::ERR_STAKE_PERIOD_ENDED"], // contracts/dex/modifiers/errors.sol:38
+        121 => &["dex::ERR_NOTE_BUSY"], // contracts/dex/modifiers/errors.sol:41
+        122 => &["dex::ERR_STAKE_NOT_APPROVED"], // contracts/dex/modifiers/errors.sol:44
+        124 => &["dex::ERR_STAKE_NOT_STARTED"], // contracts/dex/modifiers/errors.sol:48
+        125 => &["dex::ERR_RESULT_NOT_STARTED"], // contracts/dex/modifiers/errors.sol:51
+        126 => &["dex::ERR_RESULT_ENDED"], // contracts/dex/modifiers/errors.sol:54
+        128 => &["dex::ERR_ZERO_TOKEN_AMOUNT"], // contracts/dex/modifiers/errors.sol:58
+        129 => &["dex::ERR_INVALID_PARAMS"], // contracts/dex/modifiers/errors.sol:61
+        130 => &["dex::ERR_INVALID_OUTCOME_ID"], // contracts/dex/modifiers/errors.sol:64
+        132 => &["dex::ERR_ALREADY_CANCELLED"], // contracts/dex/modifiers/errors.sol:68
+        133 => &["dex::ERR_NOT_CANCELLED"], // contracts/dex/modifiers/errors.sol:71
+        137 => &["dex::ERR_INVALID_ZKPROOF"], // contracts/dex/modifiers/errors.sol:79
+        138 => &["dex::ERR_INVALID_TOKEN_TYPE"], // contracts/dex/modifiers/errors.sol:82
+        141 => &["dex::ERR_NOT_ALLOWED"], // contracts/dex/modifiers/errors.sol:87
+        142 => &["dex::ERR_STAKE_NOT_EXISTS"], // contracts/dex/modifiers/errors.sol:90
+        143 => &["dex::ERR_HAS_DEBT"], // contracts/dex/modifiers/errors.sol:93
+        144 => &["dex::ERR_NON_ZERO_BALANCE"], // contracts/dex/modifiers/errors.sol:96
+        145 => &["dex::ERR_COUPON_POOL_LIMIT_EXCEEDED"], // contracts/dex/modifiers/errors.sol:99
+        146 => &["dex::ERR_NO_COUPON_AVAILABLE"], // contracts/dex/modifiers/errors.sol:102
+        147 => &["dex::ERR_INVALID_BET_TYPE"], // contracts/dex/modifiers/errors.sol:105
+        148 => &["dex::ERR_COUPON_ALREADY_EXISTS"], // contracts/dex/modifiers/errors.sol:108
+        149 => &["dex::ERR_COUPON_ACTIVE"], // contracts/dex/modifiers/errors.sol:111
+        150 => &["dex::ERR_DEBT_NON_ZERO"], // contracts/dex/modifiers/errors.sol:114
+        151 => &["dex::ERR_INVALID_STATE"], // contracts/dex/modifiers/errors.sol:117
+        154 => &["dex::ERR_ALREADY_FROZEN"], // contracts/dex/modifiers/errors.sol:122
+        156 => &["dex::ERR_NOT_STAKEEND"], // contracts/dex/modifiers/errors.sol:126
+        158 => &["dex::ERR_ORDER_NOT_FOUND"], // contracts/dex/modifiers/errors.sol:130
+        160 => &["dex::ERR_ORDER_TOO_SMALL"], // contracts/dex/modifiers/errors.sol:134
+        161 => &["dex::ERR_BATCH_TOO_LARGE"], // contracts/dex/modifiers/errors.sol:137
+        162 => &["dex::ERR_EMPTY_BATCH"], // contracts/dex/modifiers/errors.sol:140
+        163 => &["dex::ERR_AMOUNT_NOT_LOT_MULTIPLE"], // contracts/dex/modifiers/errors.sol:143
+        164 => &["dex::ERR_PRICE_NOT_TICK_MULTIPLE"], // contracts/dex/modifiers/errors.sol:146
+        165 => &["dex::ERR_ORDERBOOK_NOT_SHUTDOWN"], // contracts/dex/modifiers/errors.sol:149
+        167 => &["dex::ERR_OPEN_ORDERS_EXIST"], // contracts/dex/modifiers/errors.sol:154
+        168 => &["dex::ERR_NOTIONAL_OVERFLOW"], // contracts/dex/modifiers/errors.sol:156
+        169 => &["dex::ERR_STAKE_EXISTS"], // contracts/dex/modifiers/errors.sol:161
+        170 => &["dex::ERR_NOT_ALLOWED_CONSTRUCTOR"], // contracts/dex/modifiers/errors.sol:166
+        301 => &["airegistry::ERR_NOT_OWNER"], // contracts/airegistry/modifiers/errors.sol:4
+        302 => &["airegistry::ERR_INVALID_SENDER"], // contracts/airegistry/modifiers/errors.sol:5
+        303 => &["airegistry::ERR_ZERO_AMOUNT"], // contracts/airegistry/modifiers/errors.sol:6
+        304 => &["airegistry::ERR_ALREADY_REGISTERED"], // contracts/airegistry/modifiers/errors.sol:7
+        306 => &["airegistry::ERR_INSUFFICIENT_TOKENS"], // contracts/airegistry/modifiers/errors.sol:9
+        311 => &["airegistry::ERR_NO_SHELL"], // contracts/airegistry/modifiers/errors.sol:10
+        313 => &["airegistry::ERR_BAD_PARAM"], // contracts/airegistry/modifiers/errors.sol:11
+        314 => &["airegistry::ERR_OVERFLOW"], // contracts/airegistry/modifiers/errors.sol:12
+        316 => &["airegistry::ERR_BAD_CODE_HASH"], // contracts/airegistry/modifiers/errors.sol:13
+        318 => &["airegistry::ERR_NOT_FUNDED"], // contracts/airegistry/modifiers/errors.sol:15
+        319 => &["airegistry::ERR_ALREADY_FUNDED"], // contracts/airegistry/modifiers/errors.sol:16
+        320 => &["airegistry::ERR_NOT_OPEN"], // contracts/airegistry/modifiers/errors.sol:17
+        321 => &["airegistry::ERR_ALREADY_OPEN"], // contracts/airegistry/modifiers/errors.sol:18
+        322 => &["airegistry::ERR_NOT_BUYER"], // contracts/airegistry/modifiers/errors.sol:19
+        323 => &["airegistry::ERR_SETTLE_WINDOW_OPEN"], // contracts/airegistry/modifiers/errors.sol:20
+        324 => &["airegistry::ERR_DISPUTED"], // contracts/airegistry/modifiers/errors.sol:21
+        325 => &["airegistry::ERR_NOT_DISPUTED"], // contracts/airegistry/modifiers/errors.sol:22
+        326 => &["airegistry::ERR_DISPUTE_WINDOW_OPEN"], // contracts/airegistry/modifiers/errors.sol:23
+        327 => &["airegistry::ERR_STREAM_TIMEOUT_OPEN"], // contracts/airegistry/modifiers/errors.sol:24
+        328 => &["airegistry::ERR_INSUFFICIENT_DEPOSIT"], // contracts/airegistry/modifiers/errors.sol:25
+        329 => &["airegistry::ERR_STILL_OPEN"], // contracts/airegistry/modifiers/errors.sol:26
+        332 => &["airegistry::ERR_BOND_NOT_FUNDED"], // contracts/airegistry/modifiers/errors.sol:30
+        333 => &["airegistry::ERR_BOND_ALREADY_FUNDED"], // contracts/airegistry/modifiers/errors.sol:31
+        334 => &["iob::ERR_NO_LIQUIDITY"], // contracts/airegistry/InferenceOrderBook.sol:116
+        335 => &["iob::ERR_BAD_FLAGS"], // contracts/airegistry/InferenceOrderBook.sol:117
+        336 => &["airegistry::ERR_OFFER_LIVE"], // contracts/airegistry/modifiers/errors.sol:37
+        340 => &["iob::ERR_QUEUE_FULL"], // contracts/airegistry/InferenceOrderBook.sol:119
+        342 => &["iob::ERR_BAD_TOKEN_CONTRACT"], // contracts/airegistry/InferenceOrderBook.sol:120
+        343 => &["iob::ERR_NAME_TOO_LONG"], // contracts/airegistry/InferenceOrderBook.sol:121
+        344 => &["iob::ERR_BAD_MODEL_NAME"], // contracts/airegistry/InferenceOrderBook.sol:122
+        345 => &["iob::ERR_NOT_DEPLOYER_NOTE"], // contracts/airegistry/InferenceOrderBook.sol:115
+        346 => &["iob::ERR_EXPIRED"], // contracts/airegistry/InferenceOrderBook.sol:118
+        350 => &["oracleeventlist::ERR_NOT_RANGE_EVENT"], // contracts/dex/OracleEventList.sol:34
+        400 => &["dex::ERR_MESSAGE_IS_EXIST"], // contracts/dex/modifiers/errors.sol:171
+        401 => &["dex::ERR_MESSAGE_WITH_HUGE_EXPIREAT"], // contracts/dex/modifiers/errors.sol:174
+        402 => &["dex::ERR_MESSAGE_EXPIRED"], // contracts/dex/modifiers/errors.sol:177
+        403 => &["dex::ERR_INVALID_HISTORY_PROOF"], // contracts/dex/modifiers/errors.sol:185
+        404 => &["dex::ERR_NORM_REFUND_PENDING"], // contracts/dex/modifiers/errors.sol:191
+        405 => &["dex::ERR_SELL_DEADLINE_TOO_LONG"], // contracts/dex/modifiers/errors.sol:197
+        407 => &["dex::ERR_BAD_GAS_MIX"], // contracts/dex/modifiers/errors.sol:209
+        408 => &["dex::ERR_BELOW_GAS_DEPOSIT"], // contracts/dex/modifiers/errors.sol:216
+        409 => &["dex::ERR_FEE_TYPE_NOT_DEPOSITABLE"], // contracts/dex/modifiers/errors.sol:222
         _ => &[],
     }
 }
@@ -250,16 +250,56 @@ fn action_result_code_fragment(action: &ExitCode) -> String {
     )
 }
 
+/// The action phase has its own result-code space(`32`..`50`) and never carries a compute-phase
+/// `require` code, so the contract table is not the table to read here. Falling through to it
+/// meant an action result could be reported under a compute-phase constant's name -- the same
+/// defect as reading a number in the wrong contract's table, one phase apart.
 fn action_result_code_label(code: i64) -> Option<String> {
-    if code == 38 {
-        return Some("insufficient extra currency / no_funds".to_string());
-    }
-    contract_error_label(code)
+    (code == 38).then(|| "insufficient extra currency / no_funds".to_string())
 }
 
-fn contract_error_label(code: i64) -> Option<String> {
-    let names = contract_error_names(code);
-    (!names.is_empty()).then(|| names.join("|"))
+/// The parenthesised label a user-facing message puts next to a compute-phase exit code: the
+/// declaring contract's namespace and the constant's name, `unknown contract error code` when no
+/// vendored source declares the number, and `ambiguous: a|b` when more than one does.
+/// **Every message that shows an exit code must go through this.** The namespace prefix is not
+/// decoration: `ERR_INVALID_SENDER` is 101 in the `dex` base and 302 in the `airegistry` one, and
+/// 101/102/103 each carry two unrelated meanings, so a name without its table is a coin flip
+/// stated as a fact. A bare number is the other failure mode -- it reads as a code the client
+/// looked up and was content with.
+pub fn contract_error_label(code: i64) -> Option<String> {
+    // 0 is success, not an error whose name we failed to find.
+    if code == 0 {
+        return None;
+    }
+    Some(match contract_error_names(code) {
+        // No contract source declares this number. Said out loud rather than left as a bare
+        // number: bare reads as a code the client looked up and was content with, and the one
+        // outcome worse than no name is a confident wrong one.
+        [] => "unknown contract error code".to_string(),
+        [only] => (*only).to_string(),
+        // More than one contract family declares this number and the response carries nothing
+        // that says which one answered. Both meanings are shown and marked, because choosing one
+        // would be a guess presented as a fact.
+        many => format!("ambiguous: {}", many.join("|")),
+    })
+}
+
+/// The parenthesised label for a compute-phase exit code returned by a contract whose sources
+/// this repo does not vendor, naming that contract and the reason no constant accompanies the
+/// number. `None` for 0, which is success.
+/// [`contract_error_label`] answers out of the vendored `contracts/dex` and `contracts/airegistry`
+/// declarations, so putting a code through it asserts that the contract which answered inherits
+/// one of those bases. The funding wallet does not: `UpdateCustodianMultisigWallet_v2` inherits
+/// neither `dex::Errors` nor `AiRegistryErrors`, so its 103 is not
+/// `ambiguous: dex::ERR_ALREADY_RESOLVED|modelregistry::ERR_NAME_TOO_LONG` -- it is the wallet's
+/// own number, out of a table this repo does not carry, and printing two names from two tables
+/// that contract does not declare is the exact defect the module doc above warns about, one
+/// contract further out. So the number is shown with the reason it has no name, which is a fact,
+/// rather than with names from the wrong table, which is a guess stated as one.
+pub fn unvendored_contract_error_label(contract: &str, code: i64) -> Option<String> {
+    (code != 0).then(|| {
+        format!("{contract} exit code; this repo vendors no source that declares its error codes")
+    })
 }
 
 fn value_to_string(value: Option<&Value>) -> Option<String> {
@@ -553,6 +593,348 @@ fn mask_exact_secrets(text: &str, secrets: &HashSet<String>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// The five files that declare a contract error code, and the namespace this client renders
+    /// each of them under. This is a transcription of the contract layout, not of the table under
+    /// test: `dex/modifiers/errors.sol` is the `Errors` base every dex contract inherits,
+    /// `airegistry/modifiers/errors.sol` is the `AiRegistryErrors` base, and the remaining three
+    /// contracts declare private constants of their own on top of (or, for `ModelRegistry`,
+    /// entirely outside) those bases.
+    const DECLARING_SOURCES: &[(&str, &str)] = &[
+        ("contracts/dex/modifiers/errors.sol", "dex"),
+        ("contracts/dex/OracleEventList.sol", "oracleeventlist"),
+        ("contracts/airegistry/modifiers/errors.sol", "airegistry"),
+        ("contracts/airegistry/InferenceOrderBook.sol", "iob"),
+        ("contracts/airegistry/ModelRegistry.sol", "modelregistry"),
+    ];
+
+    /// Read the contract sources and return `code -> {namespace::NAME}` exactly as declared.
+    /// This is what makes the table tests answer's fourth question. The oracle is
+    /// the vendored Solidity, which this change does not touch; if the contracts renumber a code
+    /// and the table below does not follow, the comparison goes red without anyone editing a
+    /// second copy of the answer. A test that compared the table against a constant shipped
+    /// beside it would stay green through exactly the drift it exists to catch.
+    fn codes_declared_by_the_contract_sources() -> BTreeMap<i64, BTreeSet<String>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut declared: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+        for (relative, namespace) in DECLARING_SOURCES {
+            let path = root.join(relative);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("contract source {} is unreadable: {e}", path.display())
+            });
+            for line in text.lines() {
+                // Cut trailing comments first, so a line that merely mentions a retired name in
+                // prose is not read as a declaration of it.
+                let code_part = line.split("//").next().unwrap_or("");
+                let tokens: Vec<&str> = code_part.split_whitespace().collect();
+                let [ty, keyword, name, rest @ ..] = tokens.as_slice() else {
+                    continue;
+                };
+                if *ty != "uint16" || *keyword != "constant" || !name.starts_with("ERR_") {
+                    continue;
+                }
+                let Some(value) = rest.iter().skip_while(|t| **t != "=").nth(1) else {
+                    continue;
+                };
+                let Ok(code) = value.trim_end_matches(';').parse::<i64>() else {
+                    continue;
+                };
+                declared
+                    .entry(code)
+                    .or_default()
+                    .insert(format!("{namespace}::{name}"));
+            }
+        }
+        assert!(
+            declared.len() > 50,
+            "parsed only {} codes from the contract sources; the parser, not the table, is broken",
+            declared.len()
+        );
+        declared
+    }
+
+    fn rendered_names(code: i64) -> BTreeSet<String> {
+        contract_error_names(code)
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    fn displayed_for_exit_code(code: i64) -> String {
+        validate_onchain_submit_response(json!({"result": {"exit_code": code}}))
+            .unwrap_err()
+            .to_string()
+    }
+
+    /// E2E-RCPT-15: the rendered set equals the declared set for every number, both directions.
+    #[test]
+    fn decoder_names_exactly_what_the_contract_sources_declare() {
+        let declared = codes_declared_by_the_contract_sources();
+        let mut wrong = Vec::new();
+        for (code, names) in &declared {
+            let rendered = rendered_names(*code);
+            if rendered != *names {
+                wrong.push(format!(
+                    "  {code}: contracts declare {names:?}, client renders {rendered:?}"
+                ));
+            }
+        }
+        // The other direction: a number the client names but no contract declares. This is the
+        // half that a "does every contract code have a name?" check silently passes.
+        for code in 0..=1000 {
+            if !declared.contains_key(&code) && !contract_error_names(code).is_empty() {
+                wrong.push(format!(
+                    "  {code}: no contract source declares it, client renders {:?}",
+                    rendered_names(code)
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "client error table disagrees with the contract sources:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// E2E-RCPT-15, by literal. Every number here was named by a previous contract generation and
+    /// is declared by no line of `42c6b3a9`'s sources; the name beside it is what the reviewed
+    /// client still rendered. Spelled out rather than derived so that deleting the parser above
+    /// cannot quietly take this assertion with it.
+    #[test]
+    fn superseded_names_are_not_rendered_at_their_old_numbers() {
+        for (code, superseded) in [
+            (115i64, "dex::ERR_NOT_WINNER"),
+            (117, "dex::ERR_ALREADY_APPROVED"),
+            (118, "dex::ERR_INSUFFICIENT_NETWORK_FEE"),
+            (123, "dex::ERR_WRONG_DEADLINE"),
+            (127, "dex::ERR_INVALID_CURRENCY_COUNT"),
+            (131, "dex::ERR_OUTCOMES_NOT_SET"),
+            (134, "dex::ERR_LONG_ARRAY"),
+            (135, "dex::ERR_ALREADY_VOTED"),
+            (139, "dex::ERR_NOT_APPROVED_BY_ORACLE"),
+            (140, "dex::ERR_PROPOSAL_NOT_EXISTS"),
+            (152, "dex::ERR_DEPLOYER_NOT_COVERED"),
+            (153, "dex::ERR_NOT_FROZEN"),
+            (155, "dex::ERR_MERGE_SOLVENCY"),
+            (157, "dex::ERR_INVALID_EPOCH"),
+            (159, "dex::ERR_EPOCH_NOT_ENDED"),
+            (166, "dex::ERR_INSOLVENT"),
+            (307, "airegistry::ERR_CONTRACT_LOCKED"),
+            (308, "airegistry::ERR_NOT_RESERVED"),
+            (309, "airegistry::ERR_RESERVATION_OVERFLOW"),
+            (310, "airegistry::ERR_NOT_EMPTY"),
+            (312, "airegistry::ERR_BAD_FEE_BPS"),
+            (315, "airegistry::ERR_FIRST_BATCH_LIMIT"),
+            (317, "airegistry::ERR_SINGLE_SESSION_REQUIRED"),
+            (337, "iob::ERR_FOK_UNFILLED"),
+            (338, "iob::ERR_NOT_SUB"),
+            (339, "iob::ERR_NOTHING_TO_CLAIM"),
+            (341, "iob::ERR_NOT_SELF"),
+        ] {
+            assert!(
+                contract_error_names(code).is_empty(),
+                "{code} is declared by no contract source, but the client still names it {:?} \
+                 (superseded name: {superseded})",
+                rendered_names(code)
+            );
+            let displayed = displayed_for_exit_code(code);
+            assert!(
+                !displayed.contains(superseded),
+                "exit {code} must not be reported as {superseded}: {displayed}"
+            );
+        }
+    }
+
+    /// E2E-RCPT-16, by literal. Numbers and names transcribed from `42c6b3a9`'s sources at the
+    /// cited line; none is read back out of the table under test.
+    #[test]
+    fn every_declared_code_a_user_can_meet_has_its_contract_name() {
+        for (code, expected, site) in [
+            // contracts/dex/modifiers/errors.sol
+            (
+                141i64,
+                "dex::ERR_NOT_ALLOWED",
+                "dex/modifiers/errors.sol:87",
+            ),
+            (169, "dex::ERR_STAKE_EXISTS", "dex/modifiers/errors.sol:161"),
+            (
+                170,
+                "dex::ERR_NOT_ALLOWED_CONSTRUCTOR",
+                "dex/modifiers/errors.sol:166",
+            ),
+            (
+                405,
+                "dex::ERR_SELL_DEADLINE_TOO_LONG",
+                "dex/modifiers/errors.sol:197",
+            ),
+            (407, "dex::ERR_BAD_GAS_MIX", "dex/modifiers/errors.sol:209"),
+            (
+                408,
+                "dex::ERR_BELOW_GAS_DEPOSIT",
+                "dex/modifiers/errors.sol:216",
+            ),
+            (
+                409,
+                "dex::ERR_FEE_TYPE_NOT_DEPOSITABLE",
+                "dex/modifiers/errors.sol:222",
+            ),
+            // contracts/airegistry/ModelRegistry.sol -- its own space, no shared base.
+            (
+                100,
+                "modelregistry::ERR_NOT_OWNER",
+                "airegistry/ModelRegistry.sol:43",
+            ),
+            // contracts/dex/OracleEventList.sol -- a private constant above the dex base.
+            (
+                350,
+                "oracleeventlist::ERR_NOT_RANGE_EVENT",
+                "dex/OracleEventList.sol:34",
+            ),
+            // contracts/airegistry/InferenceOrderBook.sol -- the book's own space.
+            (
+                345,
+                "iob::ERR_NOT_DEPLOYER_NOTE",
+                "airegistry/InferenceOrderBook.sol:115",
+            ),
+            (
+                346,
+                "iob::ERR_EXPIRED",
+                "airegistry/InferenceOrderBook.sol:118",
+            ),
+            // contracts/airegistry/modifiers/errors.sol -- the shared airegistry base.
+            (
+                333,
+                "airegistry::ERR_BOND_ALREADY_FUNDED",
+                "airegistry/modifiers/errors.sol:31",
+            ),
+            (
+                336,
+                "airegistry::ERR_OFFER_LIVE",
+                "airegistry/modifiers/errors.sol:37",
+            ),
+        ] {
+            let displayed = displayed_for_exit_code(code);
+            assert!(
+                displayed.contains(expected),
+                "exit {code} is declared {expected} at {site}, client reported: {displayed}"
+            );
+        }
+    }
+
+    /// E2E-RCPT-16: an unnamed code says so. A bare number reads like a code the client checked
+    /// and found unremarkable; the point of the row is that the client admits it has no name.
+    #[test]
+    fn an_undeclared_code_is_reported_as_unknown_not_named() {
+        for code in [777i64, 999, 1_000_000] {
+            let displayed = displayed_for_exit_code(code);
+            assert!(
+                displayed.contains(&format!("exit_code={code}")),
+                "{displayed}"
+            );
+            assert!(
+                displayed.contains("unknown contract error code"),
+                "exit {code} is declared nowhere and must say so: {displayed}"
+            );
+            assert!(!displayed.contains("ERR_"), "{displayed}");
+        }
+        // Exit code 0 is success, not an unnamed error, and must not be labelled at all.
+        let zero_is_not_an_error = validate_onchain_submit_response(json!({
+            "error": {"code": "TVM_ERROR", "message": "x", "data": {"compute": {"exit_code": 0}}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !zero_is_not_an_error.contains("unknown contract error code"),
+            "{zero_is_not_an_error}"
+        );
+    }
+
+    /// E2E-RCPT-17: 101, 102 and 103 are each declared twice, in two independent code spaces, and
+    /// nothing in the response says which contract answered. Rendering one of the two as though
+    /// it were the answer is the failure; both, marked undecided, is the requirement.
+    #[test]
+    fn a_number_two_tables_both_claim_is_never_rendered_as_one_certain_name() {
+        for (code, dex_name, registry_name) in [
+            (
+                101i64,
+                "dex::ERR_INVALID_SENDER",
+                "modelregistry::ERR_NO_PUBKEY",
+            ),
+            (102, "dex::ERR_LOW_VALUE", "modelregistry::ERR_NOT_MODEL"),
+            (
+                103,
+                "dex::ERR_ALREADY_RESOLVED",
+                "modelregistry::ERR_NAME_TOO_LONG",
+            ),
+        ] {
+            let rendered = rendered_names(code);
+            assert!(
+                rendered.contains(dex_name) && rendered.contains(registry_name),
+                "{code} is declared both as {dex_name} and as {registry_name}; client renders {rendered:?}"
+            );
+            let displayed = displayed_for_exit_code(code);
+            assert!(
+                displayed.contains("ambiguous:"),
+                "exit {code} has two declared meanings and must not read as one settled name: \
+                 {displayed}"
+            );
+            assert!(displayed.contains(dex_name), "{displayed}");
+            assert!(displayed.contains(registry_name), "{displayed}");
+        }
+    }
+
+    /// E2E-RCPT-17, the other half: marking everything undecided would also pass the test above.
+    #[test]
+    fn a_number_only_one_table_declares_is_not_marked_ambiguous() {
+        for (code, only) in [
+            (345i64, "iob::ERR_NOT_DEPLOYER_NOTE"),
+            (408, "dex::ERR_BELOW_GAS_DEPOSIT"),
+            (336, "airegistry::ERR_OFFER_LIVE"),
+        ] {
+            let displayed = displayed_for_exit_code(code);
+            assert!(displayed.contains(only), "{displayed}");
+            assert!(
+                !displayed.contains("ambiguous:"),
+                "exit {code} has exactly one declared meaning and must be reported as settled: \
+                 {displayed}"
+            );
+        }
+    }
+
+    /// E2E-RCPT-10: 405 named a constant two generations old. The number was reused, so the old
+    /// name is not merely stale -- it describes a condition that cannot occur, and the seller who
+    /// meets it is told to look for something that does not exist.
+    #[test]
+    fn a_reused_number_is_named_by_its_current_meaning_not_its_old_one() {
+        let displayed = displayed_for_exit_code(405);
+        assert!(
+            displayed.contains("dex::ERR_SELL_DEADLINE_TOO_LONG"),
+            "405 is declared ERR_SELL_DEADLINE_TOO_LONG at \
+             42c6b3a9:contracts/dex/modifiers/errors.sol:197: {displayed}"
+        );
+        assert!(
+            !displayed.contains("ERR_STREAM_LOCKED"),
+            "405 no longer means the stream lock: {displayed}"
+        );
+    }
+
+    /// The action phase has its own result-code space(`32`..`50`); a compute-phase `require`
+    /// code never appears there. Borrowing the contract table for it is the same defect as
+    /// reading a number in the wrong contract's table, with the tables one phase apart.
+    #[test]
+    fn an_action_result_code_is_not_named_from_the_compute_table() {
+        let displayed = validate_onchain_submit_response(json!({
+            "result": {"exit_code": 0, "action": {"result_code": 141}, "aborted": false}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(displayed.contains("action_result_code=141"), "{displayed}");
+        assert!(
+            !displayed.contains("ERR_NOT_ALLOWED"),
+            "an action-phase result code must not be named from the compute table: {displayed}"
+        );
+    }
 
     #[test]
     fn zero_exit_code_stays_successful() {
@@ -737,6 +1119,50 @@ mod tests {
             already_funded.contains("airegistry::ERR_BOND_ALREADY_FUNDED"),
             "{already_funded}"
         );
+    }
+
+    /// The order book's two live codes moved in contracts 4.0.33(333 -> 345, 336 -> 346) so that a
+    /// number stops carrying two meanings. Asserting the new numbers alone would still pass if the
+    /// old entries were left behind, so each case also asserts the book's name is absent from the
+    /// number it vacated -- a stale duplicate is the failure this test exists to catch.
+    #[test]
+    fn book_codes_moved_off_the_shared_table() {
+        for (code, name, vacated) in [
+            (345u64, "iob::ERR_NOT_DEPLOYER_NOTE", 333u64),
+            (346, "iob::ERR_EXPIRED", 336),
+        ] {
+            let moved = validate_onchain_submit_response(json!({"result": {"exit_code": code}}))
+                .unwrap_err()
+                .to_string();
+            assert!(moved.contains(name), "{code} should name {name}: {moved}");
+
+            let old = validate_onchain_submit_response(json!({"result": {"exit_code": vacated}}))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !old.contains(name),
+                "{vacated} still names {name}, so the number kept two meanings: {old}"
+            );
+        }
+    }
+
+    /// A number the book vacated is not thereby unused: 336 stayed live in the shared table as
+    /// ERR_OFFER_LIVE, and removing its arm alongside the renumbering left it resolving to nothing.
+    /// Reported by review after it had shipped, which is why the codes a user actually meets are
+    /// asserted by name here rather than left to the reader of the table.
+    #[test]
+    fn live_codes_outside_the_renumbering_still_resolve() {
+        for (code, name) in [
+            (336u64, "airegistry::ERR_OFFER_LIVE"),
+            (407, "dex::ERR_BAD_GAS_MIX"),
+            (408, "dex::ERR_BELOW_GAS_DEPOSIT"),
+            (409, "dex::ERR_FEE_TYPE_NOT_DEPOSITABLE"),
+        ] {
+            let err = validate_onchain_submit_response(json!({"result": {"exit_code": code}}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "exit {code} should name {name}: {err}");
+        }
     }
 
     #[test]

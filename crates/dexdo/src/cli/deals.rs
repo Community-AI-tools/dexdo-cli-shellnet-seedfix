@@ -2,11 +2,57 @@
 //! `deals`/`status`/`close` without reassembling low-level addresses.
 
 use anyhow::{bail, Result};
-use dexdo_core::{DealBuyerBond, DealChainState, MarketManifest};
+#[cfg(any(feature = "shellnet", test))]
+use dexdo_core::DealBuyerBond;
+use dexdo_core::{DealChainState, MarketManifest};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub(crate) const DEAL_HANDLE_VERSION: u32 = 1;
+/// Durable deal-record schema written by this runtime. An absent field is the understood
+/// pre-versioning schema 0; this value changes only when the record meaning changes.
+pub(crate) const DEAL_HANDLE_VERSION: u32 = 2;
+
+const LAST_OBSERVED_PROMOTION_FIELD: &str = "last_observed_promotion";
+
+#[derive(Debug, Deserialize)]
+struct DealHandleVersionProbe {
+    #[serde(default)]
+    version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DealHandleSchemaTooNew {
+    handle: String,
+    record_version: u32,
+    max_supported_version: u32,
+}
+
+impl DealHandleSchemaTooNew {
+    pub(crate) fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    pub(crate) fn record_version(&self) -> u32 {
+        self.record_version
+    }
+
+    pub(crate) fn max_supported_version(&self) -> u32 {
+        self.max_supported_version
+    }
+}
+
+impl std::fmt::Display for DealHandleSchemaTooNew {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "deal handle {} carries schema version {}, but this runtime understands through {}; \
+             keep the older runtime pinned until that deal terminates",
+            self.handle, self.record_version, self.max_supported_version
+        )
+    }
+}
+
+impl std::error::Error for DealHandleSchemaTooNew {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,13 +80,14 @@ pub(crate) struct DealEndpointInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DealHandle {
+    #[serde(default)]
     pub(crate) version: u32,
     pub(crate) handle: String,
     pub(crate) role: DealHandleRole,
     pub(crate) network: String,
     // issue: addresses are written canonically and read in either form, so a handle file written
     // by an older version keeps loading while a new one carries the DApp identity.
-    #[serde(with = "dexdo_core::address::serde_canonical")]
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
     pub(crate) token_contract: String,
     #[serde(with = "dexdo_core::address::serde_canonical")]
     pub(crate) note_addr: String,
@@ -57,8 +104,38 @@ pub(crate) struct DealHandle {
     pub(crate) created_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The last claim-pipeline values read from a live `TokenContract.getState()`.
+/// `last_claim_time` is deliberately named after the getter field. It is the chain timestamp that
+/// accompanied the pair, not proof that the pair was still current when a later close executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LastObservedPromotion {
+    #[serde(with = "decimal_u128")]
+    pub(crate) tokens_final: u128,
+    #[serde(with = "decimal_u128")]
+    pub(crate) tokens_pending: u128,
+    pub(crate) last_claim_time: u64,
+}
+
+impl From<DealChainState> for LastObservedPromotion {
+    fn from(state: DealChainState) -> Self {
+        Self {
+            tokens_final: state.tokens_final,
+            tokens_pending: state.tokens_pending,
+            last_claim_time: state.last_claim_time,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DealRecord {
+    pub(crate) handle: DealHandle,
+    pub(crate) last_observed_promotion: Option<LastObservedPromotion>,
+}
+
+// `Placed`/`FundedButNeverOpened`/`Disputed` are produced only by the shellnet chain-state summariser.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DealStateKind {
     Placed,
     FundedButNeverOpened,
@@ -69,7 +146,6 @@ pub(crate) enum DealStateKind {
 }
 
 impl DealStateKind {
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Placed => "placed",
@@ -82,7 +158,7 @@ impl DealStateKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct DealStateSummary {
     pub(crate) kind: DealStateKind,
     pub(crate) funded: bool,
@@ -95,17 +171,14 @@ pub(crate) struct DealStateSummary {
     pub(crate) buyer_bond_required: u128,
     pub(crate) finalized_owed: u128,
     pub(crate) tokens_final: u128,
-    pub(crate) tokens_superseded: u128,
     pub(crate) tokens_pending: u128,
     pub(crate) funded_time: Option<u64>,
     pub(crate) probe_time: u64,
-    pub(crate) prev_claim_time: u64,
     pub(crate) last_claim_time: u64,
     pub(crate) dispute_time: u64,
 }
 
 impl DealStateSummary {
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) fn buyer_locked(&self) -> Result<u128> {
         self.deposit
             .checked_add(self.probe_tick)
@@ -123,13 +196,14 @@ pub(crate) fn classify_deal_state(
     Ok(summarize_chain_state(state, buyer_bond))
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[cfg(feature = "shellnet")]
 pub(crate) fn summarize_deal_snapshot(
     snapshot: &dexdo_core::DealChainSnapshot,
 ) -> DealStateSummary {
     summarize_chain_state(snapshot.state, snapshot.buyer_bond)
 }
 
+#[cfg(any(feature = "shellnet", test))]
 fn summarize_chain_state(state: DealChainState, buyer_bond: DealBuyerBond) -> DealStateSummary {
     let kind = if state.disputed {
         DealStateKind::Disputed
@@ -156,17 +230,15 @@ fn summarize_chain_state(state: DealChainState, buyer_bond: DealBuyerBond) -> De
         buyer_bond_required: buyer_bond.bond_required,
         finalized_owed: state.finalized_owed,
         tokens_final: state.tokens_final,
-        tokens_superseded: state.tokens_superseded,
         tokens_pending: state.tokens_pending,
         funded_time: state.funded_time,
         probe_time: state.probe_time,
-        prev_claim_time: state.prev_claim_time,
         last_claim_time: state.last_claim_time,
         dispute_time: state.dispute_time,
     }
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[cfg(feature = "shellnet")]
 pub(crate) fn deal_state_getter_json(state: DealChainState) -> serde_json::Value {
     serde_json::json!({
         "funded": state.funded,
@@ -177,10 +249,8 @@ pub(crate) fn deal_state_getter_json(state: DealChainState) -> serde_json::Value
         "probeTick": state.probe_tick.to_string(),
         "finalizedOwed": state.finalized_owed.to_string(),
         "tokensFinal": state.tokens_final.to_string(),
-        "tokensSuperseded": state.tokens_superseded.to_string(),
         "tokensPending": state.tokens_pending.to_string(),
         "probeTime": state.probe_time.to_string(),
-        "prevClaimTime": state.prev_claim_time.to_string(),
         "lastClaimTime": state.last_claim_time.to_string(),
         "disputeTime": state.dispute_time.to_string(),
         "fundedTime": state.funded_time.unwrap_or(0).to_string(),
@@ -188,10 +258,7 @@ pub(crate) fn deal_state_getter_json(state: DealChainState) -> serde_json::Value
 }
 
 pub(crate) fn default_deals_dir() -> Result<PathBuf> {
-    let proj = directories::ProjectDirs::from("ai", "gosh", "dexdo").ok_or_else(|| {
-        anyhow::anyhow!("could not determine the platform data directory; pass --deals-dir")
-    })?;
-    Ok(proj.data_dir().join("deals"))
+    crate::cli::data_dir::automatic("deals")
 }
 
 pub(crate) fn resolve_deals_dir(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -201,7 +268,6 @@ pub(crate) fn resolve_deals_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn make_token_contract_id(token_contract: &str) -> String {
     let clean = token_contract
         .trim()
@@ -217,7 +283,6 @@ pub(crate) fn make_token_contract_id(token_contract: &str) -> String {
     format!("deal-{clean}")
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn make_handle_id(token_contract: &str, role: DealHandleRole) -> String {
     format!(
         "{}-{}",
@@ -226,28 +291,84 @@ pub(crate) fn make_handle_id(token_contract: &str, role: DealHandleRole) -> Stri
     )
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn handle_path(dir: &Path, handle: &str) -> PathBuf {
     dir.join(format!("{handle}.json"))
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn save_deal_handle(dir: &Path, handle: &DealHandle) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("create deals dir {}: {e}", dir.display()))?;
     let path = handle_path(dir, &handle.handle);
-    let bytes = serde_json::to_vec_pretty(handle)?;
+    // A runtime restart rewrites the same durable identity. Retain a valid observation already in
+    // that record rather than erasing the only non-circular audit fact before a later settlement.
+    let last_observed_promotion = if path.exists() {
+        let record = load_deal_record(&path)?;
+        same_deal_side(&record.handle, handle)
+            .then_some(record.last_observed_promotion)
+            .flatten()
+    } else {
+        None
+    };
+    let bytes = serialize_deal_record(handle, last_observed_promotion)?;
     write_private_atomic(&path, &bytes)?;
     Ok(path)
 }
 
 pub(crate) fn load_deal_handle(path: &Path) -> Result<DealHandle> {
+    Ok(load_deal_record(path)?.handle)
+}
+
+pub(crate) fn load_deal_record(path: &Path) -> Result<DealRecord> {
     let s = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read deal handle {}: {e}", path.display()))?;
-    let h: DealHandle = serde_json::from_str(&s)
+    let probe: DealHandleVersionProbe = serde_json::from_str(&s)
+        .map_err(|e| anyhow::anyhow!("parse deal handle {}: {e}", path.display()))?;
+    let handle = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    validate_deal_handle_schema_version(&handle, probe.version)?;
+    let mut value: serde_json::Value = serde_json::from_str(&s)
+        .map_err(|e| anyhow::anyhow!("parse deal handle {}: {e}", path.display()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "parse deal handle {}: expected a JSON object",
+            path.display()
+        )
+    })?;
+    let last_observed_promotion = object
+        .remove(LAST_OBSERVED_PROMOTION_FIELD)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parse deal handle {} field {LAST_OBSERVED_PROMOTION_FIELD}: {e}",
+                path.display()
+            )
+        })?
+        .flatten();
+    let h: DealHandle = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("parse deal handle {}: {e}", path.display()))?;
     validate_deal_handle(&h)?;
-    Ok(h)
+    Ok(DealRecord {
+        handle: h,
+        last_observed_promotion,
+    })
+}
+
+pub(crate) fn persist_last_observed_promotion(
+    path: &Path,
+    observation: LastObservedPromotion,
+) -> Result<()> {
+    let mut record = load_deal_record(path)?;
+    if record.handle.version == DEAL_HANDLE_VERSION
+        && record.last_observed_promotion == Some(observation)
+    {
+        return Ok(());
+    }
+    record.handle.version = DEAL_HANDLE_VERSION;
+    let bytes = serialize_deal_record(&record.handle, Some(observation))?;
+    write_private_atomic(path, &bytes)
 }
 
 pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>> {
@@ -274,7 +395,6 @@ pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>
     Ok(out)
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn resolve_deal_ref(
     input: &str,
     dir: &Path,
@@ -396,7 +516,27 @@ fn validate_explicit_handle_args(
     Ok(())
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+fn same_deal_side(left: &DealHandle, right: &DealHandle) -> bool {
+    left.role == right.role
+        && normalize_addr(&left.token_contract) == normalize_addr(&right.token_contract)
+        && normalize_addr(&left.note_addr) == normalize_addr(&right.note_addr)
+}
+
+fn serialize_deal_record(
+    handle: &DealHandle,
+    last_observed_promotion: Option<LastObservedPromotion>,
+) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(handle)?;
+    value
+        .as_object_mut()
+        .expect("DealHandle serializes as a JSON object")
+        .insert(
+            LAST_OBSERVED_PROMOTION_FIELD.to_string(),
+            serde_json::to_value(last_observed_promotion)?,
+        );
+    Ok(serde_json::to_vec_pretty(&value)?)
+}
+
 pub(crate) fn now_unix() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -409,14 +549,7 @@ pub(crate) fn normalize_addr(s: &str) -> String {
 }
 
 pub(crate) fn validate_deal_handle(h: &DealHandle) -> Result<()> {
-    if h.version != DEAL_HANDLE_VERSION {
-        bail!(
-            "deal handle {} has unsupported version {}; expected {}",
-            h.handle,
-            h.version,
-            DEAL_HANDLE_VERSION
-        );
-    }
+    validate_deal_handle_schema_version(&h.handle, h.version)?;
     if h.handle.trim().is_empty() {
         bail!("deal handle has empty handle id");
     }
@@ -434,8 +567,8 @@ pub(crate) fn validate_deal_handle(h: &DealHandle) -> Result<()> {
             bail!(
                 "deal handle {} market token_contract {} != handle token_contract {}",
                 h.handle,
-                market.token_contract,
-                h.token_contract
+                dexdo_core::address::display_self_dapp(&market.token_contract),
+                dexdo_core::address::display_self_dapp(&h.token_contract)
             );
         }
     }
@@ -445,6 +578,17 @@ pub(crate) fn validate_deal_handle(h: &DealHandle) -> Result<()> {
             "deal handle {} contains forbidden secret-bearing field `{field}`",
             h.handle
         );
+    }
+    Ok(())
+}
+
+fn validate_deal_handle_schema_version(handle: &str, version: u32) -> Result<()> {
+    if version > DEAL_HANDLE_VERSION {
+        return Err(anyhow::Error::new(DealHandleSchemaTooNew {
+            handle: handle.to_string(),
+            record_version: version,
+            max_supported_version: DEAL_HANDLE_VERSION,
+        }));
     }
     Ok(())
 }
@@ -491,7 +635,6 @@ fn is_secret_field_name(key: &str) -> bool {
         || key.ends_with("_seed")
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
@@ -546,6 +689,26 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+mod decimal_u128 {
+    use serde::{de::Error as _, Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +754,9 @@ mod tests {
     /// Issue: a deal handle is written with canonical `<dapp_id>::<account_id>` addresses and is
     /// read back from either that or a legacy `0:<account_id>` file, so an existing deals dir keeps
     /// resolving to the same handle after the upgrade.
+    /// The DApp half is role-specific. A per-deal `TokenContract` is a self-DApp account - its own
+    /// `info.dapp_id` IS its account id - so it is written `<account_id>::<account_id>`. `note_addr`
+    /// and `order_book` are system contracts of the shared dexdo DApp.
     #[test]
     fn deal_handle_writes_canonical_addresses_and_reads_legacy_ones() {
         let account = |c: char| std::iter::repeat_n(c, 64).collect::<String>();
@@ -602,14 +768,14 @@ mod tests {
 
         let json = serde_json::to_string(&handle).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        for (field, c) in [
-            ("token_contract", '3'),
-            ("note_addr", '4'),
-            ("order_book", '1'),
+        for (field, dapp, c) in [
+            ("token_contract", account('3'), '3'),
+            ("note_addr", dexdo_core::DEXDO_DAPP_ID.to_string(), '4'),
+            ("order_book", dexdo_core::DEXDO_DAPP_ID.to_string(), '1'),
         ] {
             assert_eq!(
                 v[field].as_str().unwrap(),
-                format!("{}::{}", dexdo_core::DEXDO_DAPP_ID, account(c)),
+                format!("{dapp}::{}", account(c)),
                 "{field} was not written canonically"
             );
         }
@@ -618,8 +784,15 @@ mod tests {
             "an absent address became a value"
         );
 
-        // The canonical file and the legacy file it replaces load to the same handle.
-        let legacy_json = json.replace(&format!("{}::", dexdo_core::DEXDO_DAPP_ID), "0:");
+        // The canonical file and the legacy file it replaces load to the same handle. Both DApp
+        // halves are stripped, so the fixture is the pre- file rather than a half-migrated one.
+        let legacy_json = json
+            .replace(&format!("{}::", dexdo_core::DEXDO_DAPP_ID), "0:")
+            .replace(&format!("{}::", account('3')), "0:");
+        assert!(
+            !legacy_json.contains("::"),
+            "the legacy fixture still carries a DApp half: {legacy_json}"
+        );
         assert_ne!(legacy_json, json);
         assert_eq!(
             serde_json::from_str::<DealHandle>(&legacy_json).unwrap(),
@@ -690,10 +863,8 @@ mod tests {
                 "probeTick": probe_tick.to_string(),
                 "finalizedOwed": "0",
                 "tokensFinal": "0",
-                "tokensSuperseded": "0",
                 "tokensPending": "0",
                 "probeTime": "0",
-                "prevClaimTime": "0",
                 "lastClaimTime": "0",
                 "disputeTime": "0",
                 "fundedTime": "0"
@@ -736,13 +907,13 @@ mod tests {
         incomplete
             .as_object_mut()
             .unwrap()
-            .remove("tokensSuperseded");
+            .remove("tokensPending");
         assert!(
             classify_deal_state(&incomplete, ordinary_bond)
                 .unwrap_err()
                 .to_string()
-                .contains("tokensSuperseded"),
-            "incomplete 4.0.31 state must fail closed"
+                .contains("tokensPending"),
+            "an incomplete state must fail closed"
         );
 
         let overflow = state(true, true, true, false, u128::MAX, 1);
@@ -929,5 +1100,57 @@ mod tests {
                 .0,
             path
         );
+    }
+
+    #[test]
+    fn last_observed_promotion_is_persisted_in_the_existing_deal_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = save_deal_handle(temp.path(), &sample_handle()).unwrap();
+        let observed = LastObservedPromotion {
+            tokens_final: 2 * dexdo_core::TICK_SIZE,
+            tokens_pending: 3 * dexdo_core::TICK_SIZE,
+            last_claim_time: 1_754_006_400,
+        };
+
+        persist_last_observed_promotion(&path, observed).unwrap();
+
+        let record = load_deal_record(&path).unwrap();
+        assert_eq!(record.last_observed_promotion, Some(observed));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            json["last_observed_promotion"]["tokens_final"],
+            serde_json::json!((2 * dexdo_core::TICK_SIZE).to_string())
+        );
+        assert_eq!(
+            json["last_observed_promotion"]["tokens_pending"],
+            serde_json::json!((3 * dexdo_core::TICK_SIZE).to_string())
+        );
+        assert_eq!(
+            json["last_observed_promotion"]["last_claim_time"],
+            serde_json::json!(1_754_006_400_u64)
+        );
+    }
+
+    #[test]
+    fn absent_observation_and_an_observed_zero_pair_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = save_deal_handle(temp.path(), &sample_handle()).unwrap();
+
+        let absent = load_deal_record(&path).unwrap();
+        assert_eq!(absent.last_observed_promotion, None);
+        let absent_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(absent_json["last_observed_promotion"].is_null());
+
+        let zero = LastObservedPromotion {
+            tokens_final: 0,
+            tokens_pending: 0,
+            last_claim_time: 1_754_006_401,
+        };
+        persist_last_observed_promotion(&path, zero).unwrap();
+        let observed = load_deal_record(&path).unwrap();
+        assert_eq!(observed.last_observed_promotion, Some(zero));
+        assert_ne!(observed.last_observed_promotion, None);
     }
 }

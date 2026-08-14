@@ -353,11 +353,18 @@ mod tests {
                 ("modelHash", "uint256"),
                 ("tokenContract", "address"),
                 ("orderId", "uint128"),
+                // 4.0.33 threads the caller's own order id back to the note, between the book's
+                // `orderId` and `isBuy` -- see `onInferencePlaced` in `contracts/dex/PrivateNote.sol`
+                // and the matching `IPrivateNote` declaration in
+                // `contracts/airegistry/InferenceOrderBook.sol`. It is a positional insertion, so a
+                // pin that omits it does not merely under-specify the shape: every field after it
+                // is described at the wrong offset.
+                ("clientOrderId", "uint64"),
                 ("isBuy", "bool"),
                 ("price", "uint256"),
                 ("ticks", "uint128"),
             ],
-            "4.0.26 onInferencePlaced callback shape drifted"
+            "onInferencePlaced callback shape drifted from the vendored PrivateNote ABI"
         );
 
         let ev = abi["events"]

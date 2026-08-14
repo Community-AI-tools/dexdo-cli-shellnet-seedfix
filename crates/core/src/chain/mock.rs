@@ -47,10 +47,8 @@ struct StreamCell {
     fee_accrued: u128,
     /// Exact raw-token claim pipeline, matching TokenContract `_tokensFinal/_tokensPend1/_tokensPend2`.
     tokens_final: u128,
-    tokens_superseded: u128,
     tokens_pending: u128,
     /// Landing times for the two raw pending slots.
-    prev_claim_time: u64,
     last_claim_time: u64,
     seller_received: u128,
     buyer_refunded: u128,
@@ -88,6 +86,24 @@ struct MockState {
     /// Seller(hex of the note's ed-pubkey) per offer -- for discovery/blacklist.
     #[serde(default)]
     offer_sellers: HashMap<TokenContract, String>,
+    /// Absolute SELL deadline per offer, anchored ONCE when the offer was posted.
+    /// The chain anchors it the same way -- `block.timestamp + ttl` inside
+    /// `PrivateNote.postSellOffer`(`contracts/dex/PrivateNote.sol:793`) -- so it must be stored, not
+    /// recomputed per read: a deadline that moves every time somebody looks is not a deadline, and a
+    /// resting order would never reach it.
+    #[serde(default)]
+    offer_deadlines: HashMap<TokenContract, u64>,
+    /// Constructor-bound `TokenContract.getDeal()` terms, kept for as long as the deal exists.
+    /// `_pricePerTick` and `_maxTicks` are TC statics: they outlive every ask posted against them and
+    /// never change, which is exactly why they are the authoritative remaining capacity of an unsold
+    /// deal after its ask expired off the book.
+    #[serde(default)]
+    deal_terms: HashMap<TokenContract, (u64, u64)>,
+    /// How many of this TC's asks have already been reaped by expiry.
+    /// The book never reuses an order id, so the successor of a reaped ask must not carry the id that
+    /// was just reaped.
+    #[serde(default)]
+    expired_generations: HashMap<TokenContract, u128>,
     matches: HashMap<TokenContract, Match>,
     /// Wall-clock source cursor for owner-facing mock fill events.
     #[serde(default)]
@@ -98,8 +114,38 @@ struct MockState {
     subscription_orders: HashMap<u128, OrderBookOrder>,
     #[serde(default)]
     subscription_order_books: HashMap<u128, String>,
+    /// Subscription BUYs that have LEFT the book, and how.
+    /// Removal used to drop the row, which threw the fact away: a lifecycle command could reach a
+    /// terminal and then neither re-read it nor answer a retry with it. The row is kept so the end
+    /// of the lifecycle stays observable, which is what an orchestrator reconciles against.
+    #[serde(default)]
+    subscription_terminal_orders: HashMap<u128, MockSubscriptionTerminal>,
     #[serde(default)]
     next_subscription_order_id: u128,
+}
+
+/// Why a subscription BUY is no longer in the mock book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MockSubscriptionExit {
+    /// Its owner asked the book to take it out.
+    Cancelled,
+    /// Its deadline had passed and the book swept it.
+    Expired,
+}
+
+/// One subscription BUY as it left the mock book, with the escrow the book itself paid back.
+/// `refunded` is recorded by the removal that paid it, and a reader reports THAT number rather than
+/// re-deriving one from `order.escrow`. On the deployed book the removal and the money are two
+/// separate announcements -- `InferenceOrderBook.sol:387-393`, "the refund and the reason are
+/// separate facts" -- and collapsing them here would let a reader report a refund the book never
+/// made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MockSubscriptionTerminal {
+    pub order: OrderBookOrder,
+    pub order_book: String,
+    pub reason: MockSubscriptionExit,
+    pub refunded: u128,
 }
 
 fn invalid_persisted_state(token_contract: &str, reason: impl std::fmt::Display) -> ChainError {
@@ -230,49 +276,28 @@ fn validate_persisted_stream(
             ),
         ));
     }
-    if cell.tokens_final > cell.tokens_superseded || cell.tokens_superseded > cell.tokens_pending {
+    if cell.tokens_final > cell.tokens_pending {
         return Err(invalid_persisted_state(
             token_contract,
             format_args!(
-                "claim pipeline is not monotonic: tokensFinal={} tokensSuperseded={} tokensPending={}",
-                cell.tokens_final, cell.tokens_superseded, cell.tokens_pending
+                "claim pipeline is not monotonic: tokensFinal={} tokensPending={}",
+                cell.tokens_final, cell.tokens_pending
             ),
         ));
     }
-    if cell.prev_claim_time > cell.last_claim_time {
+    if cell.last_claim_time > now {
         return Err(invalid_persisted_state(
             token_contract,
             format_args!(
-                "claim timestamps regress: prevClaimTime={} lastClaimTime={}",
-                cell.prev_claim_time, cell.last_claim_time
+                "claim timestamp is in the future: lastClaimTime={} now={now}",
+                cell.last_claim_time
             ),
-        ));
-    }
-    if cell.prev_claim_time > now || cell.last_claim_time > now {
-        return Err(invalid_persisted_state(
-            token_contract,
-            format_args!(
-                "claim timestamp is in the future: prevClaimTime={} lastClaimTime={} now={now}",
-                cell.prev_claim_time, cell.last_claim_time
-            ),
-        ));
-    }
-    if (cell.prev_claim_time == 0) != (cell.last_claim_time == 0) {
-        return Err(invalid_persisted_state(
-            token_contract,
-            "only one claim timestamp is present",
         ));
     }
     if cell.tokens_pending != 0 && cell.last_claim_time == 0 {
         return Err(invalid_persisted_state(
             token_contract,
             "non-zero claim pipeline has no landing timestamp",
-        ));
-    }
-    if cell.tokens_superseded > cell.tokens_final && cell.prev_claim_time == 0 {
-        return Err(invalid_persisted_state(
-            token_contract,
-            "superseded claim has no prevClaimTime",
         ));
     }
     if cell.dispute_time > now {
@@ -358,7 +383,6 @@ fn validate_persisted_stream(
     match cell.machine.state() {
         StreamState::Streaming { trusted, pending } => {
             let raw_final = raw_ticks("tokensFinal", cell.tokens_final)?;
-            let raw_superseded = raw_ticks("tokensSuperseded", cell.tokens_superseded)?;
             let raw_pending = raw_ticks("tokensPending", cell.tokens_pending)?;
             if *pending != raw_pending {
                 return Err(invalid_persisted_state(
@@ -368,23 +392,17 @@ fn validate_persisted_stream(
                     ),
                 ));
             }
-            let raw_trusted = if cell.tokens_superseded < cell.tokens_pending {
-                raw_superseded
-            } else {
-                raw_final
-            };
-            if *trusted != raw_trusted {
+            if *trusted != raw_final {
                 return Err(invalid_persisted_state(
                     token_contract,
                     format_args!(
-                        "machine trusted ticks {trusted} disagree with raw trusted ticks {raw_trusted}"
+                        "machine trusted ticks {trusted} disagree with raw trusted ticks {raw_final}"
                     ),
                 ));
             }
         }
         StreamState::Disputed { trusted, contested } => {
             let raw_final = raw_ticks("tokensFinal", cell.tokens_final)?;
-            let raw_superseded = raw_ticks("tokensSuperseded", cell.tokens_superseded)?;
             let raw_pending = raw_ticks("tokensPending", cell.tokens_pending)?;
             let machine_pending = trusted.checked_add(*contested).ok_or_else(|| {
                 invalid_persisted_state(
@@ -401,16 +419,11 @@ fn validate_persisted_stream(
                     ),
                 ));
             }
-            let raw_trusted = if cell.tokens_superseded < cell.tokens_pending {
-                raw_superseded
-            } else {
-                raw_final
-            };
-            if *trusted != raw_trusted {
+            if *trusted != raw_final {
                 return Err(invalid_persisted_state(
                     token_contract,
                     format_args!(
-                        "machine trusted ticks {trusted} disagree with raw trusted ticks {raw_trusted}"
+                        "machine trusted ticks {trusted} disagree with raw trusted ticks {raw_final}"
                     ),
                 ));
             }
@@ -702,7 +715,7 @@ impl MockChainBackend {
         note: &dyn Note,
     ) -> Result<Option<OrderBookOrder>, ChainError> {
         let _g = self.lock.lock().unwrap();
-        let state = self.load_state()?;
+        let state = self.swept_state(order_id)?;
         let owner = format!("0:{}", note_id_hex(&note.pubkey()));
         Ok(state
             .subscription_orders
@@ -717,6 +730,29 @@ impl MockChainBackend {
             .cloned())
     }
 
+    /// Read one owned subscription BUY that has already LEFT the mock book.
+    /// `None` means the book has no record of this id for this note under this order book at all --
+    /// a mistyped id, not a terminal. That distinction is the reason this is a separate reader from
+    /// [`MockChainBackend::subscription_order`]: "gone because it ended" and "never here" call for
+    /// opposite actions from a machine consumer.
+    pub fn subscription_terminal_order(
+        &self,
+        order_book: &str,
+        order_id: u128,
+        note: &dyn Note,
+    ) -> Result<Option<MockSubscriptionTerminal>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let state = self.swept_state(order_id)?;
+        let owner = format!("0:{}", note_id_hex(&note.pubkey()));
+        Ok(state
+            .subscription_terminal_orders
+            .get(&order_id)
+            .filter(|terminal| {
+                terminal.order.owner_note == owner && terminal.order_book == order_book
+            })
+            .cloned())
+    }
+
     /// Cancel one owned resting mock subscription BUY and return its exact escrow refund.
     pub fn cancel_subscription_order(
         &self,
@@ -725,7 +761,7 @@ impl MockChainBackend {
         note: &dyn Note,
     ) -> Result<OrderBookOrder, ChainError> {
         let _g = self.lock.lock().unwrap();
-        let mut state = self.load_state()?;
+        let mut state = self.swept_state(order_id)?;
         let owner = format!("0:{}", note_id_hex(&note.pubkey()));
         let order = state
             .subscription_orders
@@ -743,10 +779,46 @@ impl MockChainBackend {
                     "mock subscription order {order_id} is absent or owned by another note"
                 ))
             })?;
-        state.subscription_orders.remove(&order_id);
-        state.subscription_order_books.remove(&order_id);
+        let refunded = order.escrow;
+        remove_subscription_order_from_book(
+            &mut state,
+            order_id,
+            MockSubscriptionExit::Cancelled,
+            refunded,
+        );
         self.store_state(&state)?;
         Ok(order)
+    }
+
+    /// The persisted state with the deployed book's own bid-expiry sweep applied to one order id.
+    /// `InferenceOrderBook.expireOrder` is permissionless, silent on a row that is gone or still
+    /// live, and `_removeExpiredBid` refunds the buyer's escrow as it removes the row. The practice
+    /// book runs no second process to call it, so it sweeps the row a subscription command names.
+    /// The CLIENT still decides nothing from a clock: it reads what the book removed and what the
+    /// book paid back, exactly as it does against the deployed one.
+    fn swept_state(&self, order_id: u128) -> Result<MockState, ChainError> {
+        let mut state = self.load_state()?;
+        let now = unix_now_secs();
+        let expired = state
+            .subscription_orders
+            .get(&order_id)
+            .is_some_and(|order| order.deadline != 0 && order.deadline <= now);
+        if !expired {
+            return Ok(state);
+        }
+        let refunded = state
+            .subscription_orders
+            .get(&order_id)
+            .map(|order| order.escrow)
+            .unwrap_or_default();
+        remove_subscription_order_from_book(
+            &mut state,
+            order_id,
+            MockSubscriptionExit::Expired,
+            refunded,
+        );
+        self.store_state(&state)?;
+        Ok(state)
     }
 
     /// Submit buyer STOP from a persisted mock runtime handle.
@@ -921,6 +993,36 @@ impl MockChainBackend {
     }
 }
 
+/// Take one subscription BUY out of the mock book and keep it as a terminal fact.
+/// The book row and its order-book binding go, so nothing can match, cancel or expire it a second
+/// time; what stays is the record of how it left and what the book paid back. A no-op when the id
+/// is not in the book, which is what makes both removals idempotent -- the deployed `expireOrder` is
+/// silent on a row that is already gone, and a retried cancel must be answerable rather than an
+/// error.
+fn remove_subscription_order_from_book(
+    state: &mut MockState,
+    order_id: u128,
+    reason: MockSubscriptionExit,
+    refunded: u128,
+) {
+    let Some(order) = state.subscription_orders.remove(&order_id) else {
+        return;
+    };
+    let order_book = state
+        .subscription_order_books
+        .remove(&order_id)
+        .unwrap_or_default();
+    state.subscription_terminal_orders.insert(
+        order_id,
+        MockSubscriptionTerminal {
+            order,
+            order_book,
+            reason,
+            refunded,
+        },
+    );
+}
+
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -931,6 +1033,21 @@ fn unix_now_secs() -> u64 {
 fn mock_order_id(token_contract: &str) -> u128 {
     let digest = Sha256::digest(token_contract.as_bytes());
     u128::from_be_bytes(digest[..16].try_into().expect("SHA-256 prefix"))
+}
+
+/// The id of this TC's CURRENT ask.
+/// Generation zero is the historical id, so nothing that never expires an order sees a change. Each
+/// reaped generation moves it, because `InferenceOrderBook` allocates a new id per posting and never
+/// hands a reaped one back -- a successor that reused it would be indistinguishable from the order it
+/// replaced, in the book and in every assertion about "exactly one live offer".
+fn mock_current_order_id(state: &MockState, token_contract: &str) -> u128 {
+    mock_order_id(token_contract).wrapping_add(
+        state
+            .expired_generations
+            .get(token_contract)
+            .copied()
+            .unwrap_or(0),
+    )
 }
 
 fn mock_now_unix() -> i64 {
@@ -1059,12 +1176,10 @@ fn mock_deal_state(
             deposit: if cell.closed { 0 } else { cell.buyer_locked },
             finalized_owed: cell.seller_received,
             tokens_final: cell.tokens_final,
-            tokens_superseded: cell.tokens_superseded,
             tokens_pending: cell.tokens_pending,
             probe_tick: cell.probe_locked,
             funded_time: Some(funded_time),
             probe_time: cell.probe_time,
-            prev_claim_time: cell.prev_claim_time,
             // Non-zero once opened: the mock has no clock, but callers use this only to tell an
             // opened-and-settled deal from a never-opened one.
             last_claim_time: cell.last_claim_time,
@@ -1099,12 +1214,10 @@ fn mock_deal_state(
         deposit,
         finalized_owed: 0,
         tokens_final: 0,
-        tokens_superseded: 0,
         tokens_pending: 0,
         probe_tick: 0,
         funded_time: Some(funded_time),
         probe_time: 0,
-        prev_claim_time: funded_time,
         last_claim_time: funded_time,
         dispute_time: 0,
     }))
@@ -1196,12 +1309,13 @@ fn claim_deadline_reached(
     Ok(now >= due)
 }
 
+/// Contracts 4.0.35 collapsed the claim conveyor to two slots: `_tokensFinal <- _tokensPend`, with
+/// `CLAIM_PROMOTE_WINDOW == MIN_CLAIM_INTERVAL`, so the arrival of the next claim finalizes the
+/// previous one and at most one tick is ever unpromoted.
 fn promote_once(cell: &mut StreamCell) {
-    if cell.tokens_superseded > cell.tokens_final {
-        cell.tokens_final = cell.tokens_superseded;
+    if cell.tokens_pending > cell.tokens_final {
+        cell.tokens_final = cell.tokens_pending;
     }
-    cell.tokens_superseded = cell.tokens_pending;
-    cell.prev_claim_time = cell.last_claim_time;
 }
 
 fn promote_due(
@@ -1210,14 +1324,6 @@ fn promote_due(
     now: u64,
     consts: &ProtocolConsts,
 ) -> Result<(), ChainError> {
-    if claim_deadline_reached(
-        token_contract,
-        cell.prev_claim_time,
-        consts.claim_promote_window,
-        now,
-    )? {
-        promote_once(cell);
-    }
     if claim_deadline_reached(
         token_contract,
         cell.last_claim_time,
@@ -1235,21 +1341,13 @@ fn has_due_claim(
     now: u64,
     consts: &ProtocolConsts,
 ) -> Result<bool, ChainError> {
-    let previous = cell.tokens_superseded > cell.tokens_final
-        && claim_deadline_reached(
-            token_contract,
-            cell.prev_claim_time,
-            consts.claim_promote_window,
-            now,
-        )?;
-    let newest = cell.tokens_pending > cell.tokens_superseded
+    Ok(cell.tokens_pending > cell.tokens_final
         && claim_deadline_reached(
             token_contract,
             cell.last_claim_time,
             consts.claim_promote_window,
             now,
-        )?;
-    Ok(previous || newest)
+        )?)
 }
 
 fn void_claims_at(
@@ -1258,16 +1356,6 @@ fn void_claims_at(
     at: u64,
     consts: &ProtocolConsts,
 ) -> Result<(), ChainError> {
-    if cell.tokens_superseded > cell.tokens_final
-        && claim_deadline_reached(
-            token_contract,
-            cell.prev_claim_time,
-            consts.claim_promote_window,
-            at,
-        )?
-    {
-        cell.tokens_final = cell.tokens_superseded;
-    }
     if cell.tokens_pending > cell.tokens_final
         && claim_deadline_reached(
             token_contract,
@@ -1278,7 +1366,6 @@ fn void_claims_at(
     {
         cell.tokens_final = cell.tokens_pending;
     }
-    cell.tokens_superseded = cell.tokens_final;
     cell.tokens_pending = cell.tokens_final;
     Ok(())
 }
@@ -1898,6 +1985,10 @@ fn stop_mock_stream(
 
 #[async_trait]
 impl ChainBackend for MockChainBackend {
+    fn network(&self) -> &str {
+        "mock"
+    }
+
     async fn discover_offers(&self) -> Result<Vec<OfferListing>, ChainError> {
         let _g = self.lock.lock().unwrap();
         let st = self.load_state()?;
@@ -1958,8 +2049,71 @@ impl ChainBackend for MockChainBackend {
         st.offer_sellers
             .entry(offer.token_contract.clone())
             .or_insert(seller_id);
+        // A SELL's deadline is mandatory and capped: `PrivateNote.postSellOffer` refuses `ttl == 0`
+        // and requires `ttl <= MAX_SELL_TTL` (`contracts/dex/PrivateNote.sol:41,792`,
+        // `ERR_SELL_DEADLINE_TOO_LONG`). The mock posts at the same canonical TTL the real backend
+        // does, anchored here and only here.
+        st.offer_deadlines.insert(
+            offer.token_contract.clone(),
+            unix_now_secs() + crate::params::MAX_SELL_TTL.as_secs(),
+        );
+        // `getDeal()` is constructor-bound, so it is recorded once and never re-derived from a later
+        // posting: a successor ask that quietly changed the deal's terms would be a different deal
+        // .
+        st.deal_terms
+            .entry(offer.token_contract.clone())
+            .or_insert((offer.price_per_tick, offer.max_ticks));
         st.offers.insert(offer.token_contract.clone(), offer);
         self.store_state(&st)
+    }
+
+    /// `expireOrder` as the book implements it.
+    /// Permissionless and idempotent in BOTH directions: `_doExpire` silently ignores an order that
+    /// is already gone and one whose deadline has not passed
+    /// (`contracts/airegistry/InferenceOrderBook.sol:1679-1691`), so a keeper may spam it and racing
+    /// callers are harmless. Removing a SELL frees the deal's `_offerPosted` latch through
+    /// `onSellClosed` -- modelled here by the ask leaving `offers`, which is the same fact this mock
+    /// reports as the latch -- while the deal itself, its terms and its capacity survive
+    /// (`contracts/airegistry/InferenceOrderBook.sol:1138-1149`).
+    async fn expire_resting_sell_order(
+        &self,
+        token_contract: &TokenContract,
+        order_id: u128,
+    ) -> Result<(), ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let mut st = self.load_state()?;
+        if !st.offers.contains_key(token_contract)
+            || mock_current_order_id(&st, token_contract) != order_id
+        {
+            return Ok(());
+        }
+        let live = st
+            .offer_deadlines
+            .get(token_contract)
+            .copied()
+            .is_none_or(|deadline| unix_now_secs() < deadline);
+        if live {
+            return Ok(());
+        }
+        st.offers.remove(token_contract);
+        *st.expired_generations
+            .entry(token_contract.clone())
+            .or_insert(0) += 1;
+        self.store_state(&st)
+    }
+
+    async fn token_contract_offer_latch(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealOfferLatch>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        if !st.deal_terms.contains_key(token_contract) && !st.offers.contains_key(token_contract) {
+            return Ok(None);
+        }
+        Ok(Some(DealOfferLatch {
+            offer_posted: st.offers.contains_key(token_contract),
+        }))
     }
 
     async fn confirm_offer_outcome(
@@ -1975,7 +2129,7 @@ impl ChainBackend for MockChainBackend {
             .offers
             .contains_key(token_contract)
             .then(|| SellOfferOutcome::Rested {
-                order_id: mock_order_id(token_contract),
+                order_id: mock_current_order_id(&st, token_contract),
             }))
     }
 
@@ -1994,14 +2148,21 @@ impl ChainBackend for MockChainBackend {
             .map(|seller| format!("0:{seller}"))
             .unwrap_or_default();
         Ok(vec![OrderBookOrder {
-            order_id: mock_order_id(token_contract),
+            order_id: mock_current_order_id(&st, token_contract),
             owner_note: owner,
             token_contract: Some(token_contract.clone()),
             is_buy: false,
             price_per_tick: u128::from(offer.price_per_tick),
             ticks: u128::from(offer.max_ticks),
             escrow: 0,
-            deadline: 0,
+            // The deadline anchored when this offer was posted. A zero here would be a shape the chain
+            // cannot produce, and every deadline-aware view reads it as malformed; the
+            // fallback covers only a state file written before this field existed.
+            deadline: st
+                .offer_deadlines
+                .get(token_contract)
+                .copied()
+                .unwrap_or_else(|| unix_now_secs() + crate::params::MAX_SELL_TTL.as_secs()),
             flags: offer.flags,
             timestamp: 0,
         }])
@@ -2014,7 +2175,7 @@ impl ChainBackend for MockChainBackend {
     ) -> Result<(), ChainError> {
         let _g = self.lock.lock().unwrap();
         let mut st = self.load_state()?;
-        let expected = mock_order_id(token_contract);
+        let expected = mock_current_order_id(&st, token_contract);
         if order_id != expected || !st.offers.contains_key(token_contract) {
             return Err(ChainError::Chain(format!(
                 "resting SELL {order_id} is absent for TokenContract {token_contract}"
@@ -2066,11 +2227,19 @@ impl ChainBackend for MockChainBackend {
     ) -> Result<Option<(u64, u64)>, ChainError> {
         let _g = self.lock.lock().unwrap();
         let st = self.load_state()?;
+        // the deal's constructor-bound terms come first, because they are the ones that survive
+        // the ask leaving the book. Falling back to a resting or consumed ask keeps every caller that
+        // predates `deal_terms` reading exactly what it read before.
         Ok(st
-            .offers
+            .deal_terms
             .get(token_contract)
-            .or_else(|| st.matched_offers.get(token_contract))
-            .map(|offer| (offer.price_per_tick, offer.max_ticks)))
+            .copied()
+            .or_else(|| {
+                st.offers
+                    .get(token_contract)
+                    .or_else(|| st.matched_offers.get(token_contract))
+                    .map(|offer| (offer.price_per_tick, offer.max_ticks))
+            }))
     }
 
     async fn poll_seller_fills(
@@ -2096,7 +2265,7 @@ impl ChainBackend for MockChainBackend {
                     (
                         created_at,
                         MatchedFill {
-                            order_id: mock_order_id(token_contract),
+                            order_id: mock_current_order_id(&st, token_contract),
                             token_contract: token_contract.clone(),
                             ticks: u128::from(
                                 st.matched_ticks
@@ -2200,9 +2369,7 @@ impl ChainBackend for MockChainBackend {
             },
             fee_accrued: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
-            prev_claim_time: opened_at,
             last_claim_time: opened_at,
             seller_received: 0,
             buyer_refunded: 0,
@@ -2336,9 +2503,7 @@ impl ChainBackend for MockChainBackend {
         subscription.period_start = accepted_at;
         subscription.week_base_tokens = 0;
         cell.tokens_final = TICK_SIZE;
-        cell.tokens_superseded = TICK_SIZE;
         cell.tokens_pending = TICK_SIZE;
-        cell.prev_claim_time = accepted_at;
         cell.last_claim_time = accepted_at;
         self.store_state(&st)
     }
@@ -2471,9 +2636,9 @@ impl ChainBackend for MockChainBackend {
             )));
         }
         promote_due(token_contract, cell, claim_time, &self.consts)?;
-        if cell.tokens_superseded != cell.tokens_pending {
+        if cell.tokens_pending != cell.tokens_final {
             return Err(ChainError::Chain(format!(
-                "claim_tokens: {token_contract} older claim slot is still inside its promotion window"
+                "claim_tokens: {token_contract} pending claim slot is still inside its promotion window"
             )));
         }
         let machine_ticks = u64::try_from(cumulative_tokens.div_ceil(TICK_SIZE)).map_err(|_| {
@@ -2484,7 +2649,6 @@ impl ChainBackend for MockChainBackend {
         cell.machine
             .on_claim(machine_ticks)
             .map_err(|e| ChainError::EndpointsFile(e.0.to_string()))?;
-        cell.prev_claim_time = cell.last_claim_time;
         cell.tokens_pending = cumulative_tokens;
         cell.last_claim_time = claim_time;
         self.store_state(&st)
@@ -2613,7 +2777,6 @@ impl ChainBackend for MockChainBackend {
                 pre_bonds,
                 post_state: Some(SettlementActionPostState {
                     tokens_final: cell.tokens_final.into(),
-                    tokens_superseded: cell.tokens_superseded.into(),
                     tokens_pending: cell.tokens_pending.into(),
                     seller_bond_held: cell.seller_locked.into(),
                     seller_bond_required: bond_required.into(),
@@ -3039,66 +3202,8 @@ impl ChainBackend for MockChainBackend {
 mod tests {
     use super::*;
     use crate::note::LocalNote;
-    use proptest::prelude::*;
 
     const TEST_PRICE: Shell = PRICE_STEP as Shell;
-
-    fn assert_mock_money_conserved(
-        chain: &MockChainBackend,
-        token_contract: &str,
-        buyer_funding: u128,
-        seller_funding: u128,
-    ) {
-        let state = chain.load_state().unwrap();
-        let cell = state.streams.get(token_contract).unwrap();
-        let held = cell
-            .buyer_locked
-            .checked_add(cell.probe_locked)
-            .and_then(|amount| amount.checked_add(cell.buyer_bond))
-            .and_then(|amount| amount.checked_add(cell.seller_locked))
-            .and_then(|amount| amount.checked_add(cell.fee_accrued))
-            .unwrap();
-        let outputs = cell
-            .seller_received
-            .checked_add(cell.buyer_refunded)
-            .and_then(|amount| amount.checked_add(cell.burned))
-            .unwrap();
-        assert_eq!(
-            buyer_funding + seller_funding,
-            held + outputs,
-            "mock TokenContract {token_contract} must conserve buyer escrow/bond plus seller bond"
-        );
-    }
-
-    async fn open_subscription_fixture(
-        chain: &MockChainBackend,
-        token_contract: &str,
-        seller: &LocalNote,
-        buyer: &LocalNote,
-        price: Shell,
-        max_ticks: u64,
-    ) {
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: price,
-                    max_ticks,
-                    token_contract: token_contract.to_string(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                seller,
-            )
-            .await
-            .unwrap();
-        chain
-            .place_buy(&token_contract.to_string(), buyer)
-            .await
-            .unwrap();
-        chain
-            .open_stream(&token_contract.to_string(), vec![], seller)
-            .await
-            .unwrap();
-    }
 
     async fn open_ordinary_fixture(
         chain: &MockChainBackend,
@@ -3143,33 +3248,12 @@ mod tests {
         chain.store_state(&state).unwrap();
     }
 
-    fn mature_all_claim_slots(chain: &MockChainBackend, token_contract: &str) {
-        let mut state = chain.load_state().unwrap();
-        let cell = state.streams.get_mut(token_contract).unwrap();
-        let matured_at = unix_now_secs()
-            .saturating_sub(ProtocolConsts::canonical().claim_promote_window.as_secs());
-        cell.prev_claim_time = matured_at;
-        cell.last_claim_time = matured_at;
-        chain.store_state(&state).unwrap();
-    }
-
     fn elapse_min_claim_interval(chain: &MockChainBackend, token_contract: &str) {
         let mut state = chain.load_state().unwrap();
         let cell = state.streams.get_mut(token_contract).unwrap();
         let interval = chain.consts.min_claim_interval.as_secs();
-        cell.prev_claim_time = cell.prev_claim_time.saturating_sub(interval);
         cell.last_claim_time = cell.last_claim_time.saturating_sub(interval);
         chain.store_state(&state).unwrap();
-    }
-
-    fn subscription_funding(price: Shell, max_ticks: u64) -> (u128, u128) {
-        let token_contract = "test-subscription-funding".to_string();
-        let tokens = u128::from(max_ticks) * TICK_SIZE;
-        let (pay, fee) =
-            token_pay_and_fee(&token_contract, tokens, price, &ProtocolConsts::canonical())
-                .unwrap();
-        let buyer = pay + fee + 2 * u128::from(price);
-        (buyer, 2 * u128::from(price))
     }
 
     async fn assert_corrupt_restart_rejected_without_mutation(
@@ -3203,97 +3287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_sell_terms_and_match_volume_follow_the_canonical_contract_bounds() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[81u8; 32]);
-        let buyer = LocalNote::from_seed(&[82u8; 32]);
-        let max_price = u64::MAX - (u64::MAX % TEST_PRICE);
-        let invalid = [
-            ("one-tick", TEST_PRICE, 1, 0),
-            ("bad-price-step", TEST_PRICE + 1, 2, 0),
-            ("market-sell", TEST_PRICE, 2, flags::MARKET),
-            (
-                "post-only-taker",
-                TEST_PRICE,
-                2,
-                flags::POST_ONLY | flags::IOC,
-            ),
-            ("ioc-fok", TEST_PRICE, 2, flags::IOC | flags::FOK),
-            ("unknown-flag", TEST_PRICE, 2, 0x80),
-            ("sub-without-aon", TEST_PRICE, 4, flags::SUBSCRIPTION),
-            (
-                "sub-bad-term",
-                TEST_PRICE,
-                6,
-                flags::AON | flags::SUBSCRIPTION,
-            ),
-            ("value-overflow", max_price, u64::MAX, 0),
-        ];
-        for (name, price_per_tick, max_ticks, order_flags) in invalid {
-            let error = chain
-                .post_offer(
-                    SellOffer {
-                        price_per_tick,
-                        max_ticks,
-                        token_contract: format!("tc-{name}"),
-                        flags: order_flags,
-                    },
-                    &seller,
-                )
-                .await
-                .expect_err("malformed sell terms must not enter the mock book");
-            assert!(!error.to_string().is_empty(), "{name}");
-        }
-        assert!(chain.discover_offers().await.unwrap().is_empty());
-
-        let tc = "tc-minimum-fill".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 2,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        let before = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .place_buy_ticks(&tc, &buyer, 1)
-            .await
-            .expect_err("a one-tick deal cannot fund a TokenContract");
-        assert!(error.to_string().contains("must be within 2"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before);
-
-        let aon_tc = "tc-aon-partial-fill".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: aon_tc.clone(),
-                    flags: flags::AON,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain
-            .place_buy_ticks(&aon_tc, &buyer, 2)
-            .await
-            .expect_err("AON must not partially fund one deal");
-    }
-
-    #[tokio::test]
-    async fn mock_deal_state_uses_exact_fill_fee_and_lifecycle_times() {
+    async fn mock_deal_state_classifies_openable_and_open_matches() {
         let base_dir = tempfile::tempdir().expect("test temp dir");
         let base = base_dir.path();
         let chain = MockChainBackend::new(
@@ -3304,7 +3298,6 @@ mod tests {
         let seller = LocalNote::from_seed(&[83u8; 32]);
         let buyer = LocalNote::from_seed(&[84u8; 32]);
         let tc = "tc-contract-state-shape".to_string();
-        let before_match = unix_now_secs();
         chain
             .post_offer(
                 SellOffer {
@@ -3319,15 +3312,7 @@ mod tests {
             .unwrap();
         chain.place_buy_ticks(&tc, &buyer, 2).await.unwrap();
         let unopened = chain.deal_state(&tc).await.unwrap().unwrap();
-        let (pay, fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, TEST_PRICE, &ProtocolConsts::canonical())
-                .unwrap();
-        assert_eq!(unopened.deposit, pay + fee);
         let funded_time = unopened.funded_time.unwrap();
-        assert!(funded_time >= before_match);
-        assert_eq!(unopened.prev_claim_time, funded_time);
-        assert_eq!(unopened.last_claim_time, funded_time);
-        assert_eq!(unopened.probe_time, 0);
         crate::chain::check_matched_token_contract_state(
             &tc,
             unopened,
@@ -3338,77 +3323,123 @@ mod tests {
         assert!(chain.read_openable_match_now(&tc).await.unwrap().is_some());
 
         chain.open_stream(&tc, vec![], &seller).await.unwrap();
-        let opened = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert_eq!(opened.funded_time, unopened.funded_time);
-        assert_ne!(opened.probe_time, 0);
         let open_error = chain
             .read_openable_match_now(&tc)
             .await
             .expect_err("an already-open deal is not a seller resume match");
         assert!(open_error.to_string().contains("already open"));
-
-        chain.seller_stop(&tc).await.unwrap();
-        let terminal_error = chain
-            .read_openable_match_now(&tc)
-            .await
-            .expect_err("a terminal deal is not a seller resume match");
-        assert!(terminal_error.to_string().contains("terminal"));
     }
 
+    /// the mock book must expire an ask the way the deployed one does, because the seller's
+    /// relist is decided entirely by what it reads back afterwards.
+    /// `expireOrder` is permissionless and idempotent: a gone order AND a still-live one are silent
+    /// no-ops(`contracts/airegistry/InferenceOrderBook.sol:1679-1691`). Reaping a SELL frees the
+    /// deal's `_offerPosted` latch through `onSellClosed` while the deal, its constructor-bound terms
+    /// and its capacity survive (`contracts/airegistry/InferenceOrderBook.sol:1138-1149`,
+    /// `contracts/airegistry/TokenContract.sol:729-736`), and the successor gets a new order id
+    /// because the book never hands a removed one back.
     #[tokio::test]
-    async fn cleanup_unopened_waits_and_refunds_exact_deposit_and_bonds() {
+    async fn a_lapsed_ask_is_reaped_once_and_leaves_the_deal_relistable() {
         let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
         let chain = MockChainBackend::new(
-            base.join("eps.json"),
+            base_dir.path().join("eps.json"),
             ProtocolConsts::canonical(),
             DobParams::canonical(),
         );
-        let seller = LocalNote::from_seed(&[85u8; 32]);
-        let buyer = LocalNote::from_seed(&[86u8; 32]);
-        let tc = "tc-cleanup-unopened-accounting".to_string();
+        let seller = LocalNote::from_seed(&[91u8; 32]);
+        let tc = "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let offer = SellOffer {
+            price_per_tick: TEST_PRICE,
+            max_ticks: 64,
+            token_contract: tc.clone(),
+            flags: 0,
+        };
+        chain.post_offer(offer.clone(), &seller).await.unwrap();
+        let resting = chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap();
+        assert_eq!(resting.len(), 1, "one ask rests for the deal");
+        let first_id = resting[0].order_id;
+        assert_eq!(
+            chain.token_contract_offer_latch(&tc).await.unwrap(),
+            Some(DealOfferLatch {
+                offer_posted: true,
+                }),
+            "posting an ask sets the deal's own latch"
+        );
+
+        // A live order is refused, silently: this is not a back-door cancel.
+        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        assert_eq!(
+            chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap().len(),
+            1,
+            "an ask whose deadline has not passed is not expirable by anyone"
+        );
+
+        // The clock moves; the deal does not.
+        let mut state = chain.load_state().unwrap();
+        *state.offer_deadlines.get_mut(&tc).unwrap() = unix_now_secs() - 1;
+        chain.store_state(&state).unwrap();
+
         chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 8,
-                    token_contract: tc.clone(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                &seller,
-            )
+            .expire_resting_sell_order(&tc, first_id.wrapping_add(1_000))
             .await
             .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        let state = chain.deal_state(&tc).await.unwrap().unwrap();
-        let before = std::fs::read(&chain.state_path).unwrap();
-        let early = chain
-            .cleanup_unopened(&tc)
-            .await
-            .expect_err("cleanupUnopened must wait for MATCH_OPEN_TIMEOUT");
-        assert!(early.to_string().contains("MATCH_OPEN_TIMEOUT"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before);
-
-        let mut persisted = chain.load_state().unwrap();
-        persisted.match_created_at.insert(
-            tc.clone(),
-            i64::try_from(unix_now_secs() - MATCH_OPEN_TIMEOUT_SECS - 1).unwrap(),
-        );
-        chain.store_state(&persisted).unwrap();
-        let settlement = chain.cleanup_unopened(&tc).await.unwrap();
-        let bond = 2 * u128::from(TEST_PRICE);
         assert_eq!(
-            settlement,
-            Settlement::SellerNoShow {
-                to_buyer_refund: state.deposit + bond,
-                seller_bond_returned: bond,
-            }
+            chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap().len(),
+            1,
+            "an id that is not this deal's resting ask removes nothing"
         );
-        assert!(chain.deal_state(&tc).await.unwrap().is_none());
+
+        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        assert!(
+            chain
+                .raw_resting_sell_orders_for_tc(&tc)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the lapsed ask is gone from the book"
+        );
+        assert_eq!(
+            chain.token_contract_offer_latch(&tc).await.unwrap(),
+            Some(DealOfferLatch {
+                offer_posted: false,
+                }),
+            "the removal freed the deal's latch, which is what makes it re-listable"
+        );
+        assert_eq!(
+            chain.sell_offer_terms(&tc).await.unwrap(),
+            Some((TEST_PRICE, 64)),
+            "getDeal is constructor-bound: the deal's capacity outlives the ask posted against it"
+        );
+
+        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        assert!(
+            chain
+                .raw_resting_sell_orders_for_tc(&tc)
+                .await
+                .unwrap()
+                .is_empty(),
+            "reaping an order that is already gone is a no-op, so keepers may race and spam it"
+        );
+
+        chain.post_offer(offer, &seller).await.unwrap();
+        let successor = chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap();
+        assert_eq!(successor.len(), 1, "exactly one successor rests");
+        assert_ne!(
+            successor[0].order_id, first_id,
+            "a reaped order id is never handed back to the successor"
+        );
+        assert_eq!(
+            successor[0].ticks, 64,
+            "the successor carries the deal's whole remaining capacity"
+        );
+        assert!(
+            successor[0].deadline > unix_now_secs(),
+            "the successor is anchored to a fresh finite deadline"
+        );
     }
 
     #[tokio::test]
-    async fn dispute_receipt_is_nonterminal_and_snapshot_arithmetic_fails_closed() {
+    async fn snapshot_arithmetic_fails_closed() {
         let base_dir = tempfile::tempdir().expect("test temp dir");
         let base = base_dir.path();
         let chain = MockChainBackend::new(
@@ -3421,23 +3452,6 @@ mod tests {
         let tc = "tc-dispute-receipt".to_string();
         open_ordinary_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE).await;
         let before = chain.checked_snapshot(&tc).await.unwrap().unwrap();
-        let settlement = chain.dispute(&tc, &buyer).await.unwrap();
-        let Settlement::AuthoritativeReceipt(receipt) = settlement else {
-            panic!("dispute opening must return a nonterminal receipt")
-        };
-        assert_eq!(receipt.action, SettlementAction::Dispute);
-        assert!(matches!(
-            receipt.event,
-            SettlementActionEvent::StreamDisputed { .. }
-        ));
-        assert!(receipt.post_state.as_ref().unwrap().disputed);
-        let receipt_json = serde_json::to_value(&receipt).unwrap();
-        assert!(receipt_json.get("toSeller").is_none());
-        assert!(receipt_json.get("refundToBuyer").is_none());
-        let after = chain.checked_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(after.seller_locked, before.seller_locked);
-        assert_eq!(after.buyer_locked, before.buyer_locked);
-        assert!(!after.closed);
 
         let mut persisted = chain.load_state().unwrap();
         let cell = persisted.streams.get_mut(&tc).unwrap();
@@ -3463,960 +3477,6 @@ mod tests {
             .await
             .expect_err("cross-getter bond drift must reject the snapshot");
         assert!(incoherent.to_string().contains("exceeds bondRequired"));
-    }
-
-    #[tokio::test]
-    async fn accept_probe_rejects_the_canonical_window_across_restart_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        assert_eq!(consts.probe_window.as_secs(), 180);
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[71u8; 32]);
-        let buyer = LocalNote::from_seed(&[72u8; 32]);
-        let tc = "tc-probe-window-restart".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain
-            .open_stream(&tc, vec![1, 2, 3], &seller)
-            .await
-            .unwrap();
-
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        let before_state = std::fs::read(&restarted.state_path).unwrap();
-        let before_endpoints = std::fs::read(&restarted.endpoints_path).unwrap();
-        let before = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let error = restarted
-            .accept_probe(&tc)
-            .await
-            .expect_err("the canonical probe window must survive process restart");
-        assert!(error.to_string().contains("probe window is still open"));
-        assert_eq!(std::fs::read(&restarted.state_path).unwrap(), before_state);
-        assert_eq!(
-            std::fs::read(&restarted.endpoints_path).unwrap(),
-            before_endpoints
-        );
-        assert_eq!(restarted.deal_snapshot(&tc).await.unwrap().unwrap(), before);
-
-        let mut claim_aged = restarted.load_state().unwrap();
-        let old_claim_time = unix_now_secs().saturating_sub(consts.probe_window.as_secs());
-        let cell = claim_aged.streams.get_mut(&tc).unwrap();
-        cell.prev_claim_time = old_claim_time;
-        cell.last_claim_time = old_claim_time;
-        restarted.store_state(&claim_aged).unwrap();
-        let claim_aged_state = std::fs::read(&restarted.state_path).unwrap();
-        let claim_aged_snapshot = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let error = restarted
-            .accept_probe(&tc)
-            .await
-            .expect_err("aging claim timestamps alone must not mature the probe");
-        assert!(error.to_string().contains("probe window is still open"));
-        assert_eq!(
-            std::fs::read(&restarted.state_path).unwrap(),
-            claim_aged_state
-        );
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            claim_aged_snapshot
-        );
-
-        elapse_probe_window(&restarted, &tc);
-        restarted.accept_probe(&tc).await.unwrap();
-        assert!(
-            restarted
-                .deal_state(&tc)
-                .await
-                .unwrap()
-                .unwrap()
-                .probe_accepted
-        );
-    }
-
-    #[tokio::test]
-    async fn open_stream_rejects_duplicate_and_terminal_reopen_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[73u8; 32]);
-        let buyer = LocalNote::from_seed(&[74u8; 32]);
-        let tc = "tc-stream-reopen-restart".to_string();
-        let original_handover = vec![1, 2, 3];
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain
-            .open_stream(&tc, original_handover.clone(), &seller)
-            .await
-            .unwrap();
-
-        let active_state = std::fs::read(&chain.state_path).unwrap();
-        let active_endpoints = std::fs::read(&chain.endpoints_path).unwrap();
-        let duplicate = chain
-            .open_stream(&tc, vec![9, 9, 9], &seller)
-            .await
-            .expect_err("an active stream must never be overwritten");
-        assert!(duplicate
-            .to_string()
-            .contains("already open persisted stream"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), active_state);
-        assert_eq!(
-            std::fs::read(&chain.endpoints_path).unwrap(),
-            active_endpoints
-        );
-        assert_eq!(
-            chain.read_handover(&tc).await.unwrap(),
-            Some(original_handover.clone())
-        );
-
-        chain.seller_stop(&tc).await.unwrap();
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        let terminal_state = std::fs::read(&restarted.state_path).unwrap();
-        let terminal_endpoints = std::fs::read(&restarted.endpoints_path).unwrap();
-        let terminal = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let reopen = restarted
-            .open_stream(&tc, vec![8, 8, 8], &seller)
-            .await
-            .expect_err("a terminal stream must never reopen after restart");
-        assert!(reopen.to_string().contains("terminal persisted stream"));
-        assert_eq!(
-            std::fs::read(&restarted.state_path).unwrap(),
-            terminal_state
-        );
-        assert_eq!(
-            std::fs::read(&restarted.endpoints_path).unwrap(),
-            terminal_endpoints
-        );
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            terminal
-        );
-        assert_eq!(
-            restarted.read_handover(&tc).await.unwrap(),
-            Some(original_handover)
-        );
-    }
-
-    #[tokio::test]
-    async fn buyer_and_seller_stop_reject_a_disputed_stream_across_restart_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[75u8; 32]);
-        let buyer = LocalNote::from_seed(&[76u8; 32]);
-        let tc = "tc-disputed-stop-restart".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain
-            .open_stream(&tc, vec![1, 2, 3], &seller)
-            .await
-            .unwrap();
-        chain.dispute(&tc, &buyer).await.unwrap();
-
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        let before_state = std::fs::read(&restarted.state_path).unwrap();
-        let before_endpoints = std::fs::read(&restarted.endpoints_path).unwrap();
-        let before = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let buyer_stop = restarted
-            .stop(&tc, &buyer)
-            .await
-            .expect_err("buyer stop must not bypass an open dispute");
-        assert!(buyer_stop.to_string().contains("is disputed"));
-        assert_eq!(std::fs::read(&restarted.state_path).unwrap(), before_state);
-        assert_eq!(
-            std::fs::read(&restarted.endpoints_path).unwrap(),
-            before_endpoints
-        );
-        assert_eq!(restarted.deal_snapshot(&tc).await.unwrap().unwrap(), before);
-
-        let seller_stop = restarted
-            .seller_stop(&tc)
-            .await
-            .expect_err("seller stop must not bypass an open dispute");
-        assert!(seller_stop.to_string().contains("is disputed"));
-        assert_eq!(std::fs::read(&restarted.state_path).unwrap(), before_state);
-        assert_eq!(
-            std::fs::read(&restarted.endpoints_path).unwrap(),
-            before_endpoints
-        );
-        assert_eq!(restarted.deal_snapshot(&tc).await.unwrap().unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn probe_claim_state_matches_the_contract_seed() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[17u8; 32]);
-        let buyer = LocalNote::from_seed(&[18u8; 32]);
-        let tc = "tc-probe-claim-seed".to_string();
-
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain.open_stream(&tc, vec![], &seller).await.unwrap();
-
-        let before = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert!(!before.probe_accepted);
-        assert_eq!(before.tokens_final, 0);
-        assert_eq!(before.tokens_pending, 0);
-
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        let accepted = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert!(accepted.probe_accepted);
-        assert_eq!(accepted.tokens_final, TICK_SIZE);
-        assert_eq!(accepted.tokens_pending, TICK_SIZE);
-    }
-
-    #[tokio::test]
-    async fn stream_money_writes_require_the_canonical_deal_actor_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[19u8; 32]);
-        let buyer = LocalNote::from_seed(&[20u8; 32]);
-        let stranger = LocalNote::from_seed(&[21u8; 32]);
-        let tc = "tc-mock-stream-actors".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 4,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-
-        let before_open = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .open_stream(&tc, vec![1, 2, 3], &buyer)
-            .await
-            .expect_err("the buyer must not open the seller's stream");
-        assert!(error
-            .to_string()
-            .contains("requires the matched seller note"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_open);
-        assert_eq!(chain.read_handover(&tc).await.unwrap(), None);
-
-        chain
-            .open_stream(&tc, vec![1, 2, 3], &seller)
-            .await
-            .unwrap();
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        let before_claim = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .claim_tokens(&tc, &buyer, 2 * TICK_SIZE)
-            .await
-            .expect_err("the buyer must not submit seller consumption claims");
-        assert!(error
-            .to_string()
-            .contains("requires the matched seller note"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_claim);
-
-        let before_stop = std::fs::read(&chain.state_path).unwrap();
-        let wrong_buyer_addr = format!("mock:{}", note_id_hex(&stranger.pubkey()));
-        let error = chain
-            .stop_by_buyer_note_addr(&tc, &wrong_buyer_addr)
-            .await
-            .expect_err("a forged mock buyer handle must not submit STOP");
-        assert!(error
-            .to_string()
-            .contains("requires the matched buyer note"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_stop);
-
-        let error = chain
-            .stop(&tc, &seller)
-            .await
-            .expect_err("the seller must not submit the buyer's STOP");
-        assert!(error
-            .to_string()
-            .contains("requires the matched buyer note"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_stop);
-
-        for wrong_actor in [&seller, &stranger] {
-            let before_dispute = std::fs::read(&chain.state_path).unwrap();
-            let error = chain
-                .dispute(&tc, wrong_actor)
-                .await
-                .expect_err("only the buyer may open a dispute");
-            assert!(error
-                .to_string()
-                .contains("requires the matched buyer note"));
-            assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_dispute);
-        }
-    }
-
-    #[tokio::test]
-    async fn matched_tc_cannot_rebind_its_first_seller_or_buyer() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let first_seller = LocalNote::from_seed(&[51u8; 32]);
-        let second_seller = LocalNote::from_seed(&[52u8; 32]);
-        let first_buyer = LocalNote::from_seed(&[53u8; 32]);
-        let second_buyer = LocalNote::from_seed(&[54u8; 32]);
-        let tc = "tc-mock-match-actors".to_string();
-        let offer = SellOffer {
-            price_per_tick: TEST_PRICE,
-            max_ticks: 4,
-            token_contract: tc.clone(),
-            flags: 0,
-        };
-
-        chain
-            .post_offer(offer.clone(), &first_seller)
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &first_buyer).await.unwrap();
-
-        let before_repost = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .post_offer(offer.clone(), &second_seller)
-            .await
-            .expect_err("a filled TokenContract must not be rebound to another seller");
-        assert!(error.to_string().contains("was already filled/matched"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_repost);
-
-        // A stale/corrupt active row must not let a second BUY overwrite the authoritative Match.
-        let mut persisted = chain.load_state().unwrap();
-        persisted.offers.insert(tc.clone(), offer);
-        chain.store_state(&persisted).unwrap();
-        let before_rematch = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .place_buy(&tc, &second_buyer)
-            .await
-            .expect_err("an existing Match must keep its first buyer");
-        assert!(error
-            .to_string()
-            .contains("already matched; refusing to replace its buyer"));
-        assert_eq!(std::fs::read(&chain.state_path).unwrap(), before_rematch);
-
-        let restarted = MockChainBackend::new(
-            endpoints,
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let state = restarted.load_state().unwrap();
-        assert_eq!(
-            state.offer_sellers.get(&tc),
-            Some(&note_id_hex(&first_seller.pubkey()))
-        );
-        assert_eq!(
-            state.matches.get(&tc).unwrap().buyer_pubkey,
-            first_buyer.pubkey()
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_unfunded_tc_keeps_its_original_seller_across_restart() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let original_seller = LocalNote::from_seed(&[61u8; 32]);
-        let wrong_seller = LocalNote::from_seed(&[62u8; 32]);
-        let buyer = LocalNote::from_seed(&[63u8; 32]);
-        let tc = "tc-mock-cancelled-seller-binding".to_string();
-        let offer = SellOffer {
-            price_per_tick: TEST_PRICE,
-            max_ticks: 4,
-            token_contract: tc.clone(),
-            flags: 0,
-        };
-
-        chain
-            .post_offer(offer.clone(), &original_seller)
-            .await
-            .unwrap();
-        chain
-            .cancel_resting_sell_order(&tc, mock_order_id(&tc))
-            .await
-            .unwrap();
-
-        let cancelled = chain.load_state().unwrap();
-        assert!(!cancelled.offers.contains_key(&tc));
-        assert_eq!(
-            cancelled.offer_sellers.get(&tc),
-            Some(&note_id_hex(&original_seller.pubkey()))
-        );
-        let original_snapshot = chain
-            .note_snapshot(&original_seller.pubkey())
-            .await
-            .unwrap();
-        assert!(original_snapshot.offers.is_empty());
-        assert!(original_snapshot.deals.is_empty());
-
-        let cancelled_bytes = std::fs::read(&chain.state_path).unwrap();
-        let error = chain
-            .post_offer(offer.clone(), &wrong_seller)
-            .await
-            .expect_err("a cancelled TokenContract must remain bound to its first seller");
-        assert!(error.to_string().contains("original seller"));
-        assert_eq!(
-            std::fs::read(&chain.state_path).unwrap(),
-            cancelled_bytes,
-            "wrong-seller repost must fail before mutating persisted state"
-        );
-
-        let restarted = MockChainBackend::new(
-            endpoints,
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let error = restarted
-            .post_offer(offer.clone(), &wrong_seller)
-            .await
-            .expect_err("restart must preserve the original seller binding");
-        assert!(error.to_string().contains("original seller"));
-        assert_eq!(
-            std::fs::read(&restarted.state_path).unwrap(),
-            cancelled_bytes,
-            "wrong-seller repost after restart must be byte-identical no-op"
-        );
-
-        restarted
-            .post_offer(offer.clone(), &original_seller)
-            .await
-            .expect("the original seller may repost the still-unfunded TokenContract");
-        let resting = restarted.raw_resting_sell_orders_for_tc(&tc).await.unwrap();
-        assert_eq!(resting.len(), 1);
-        assert_eq!(
-            resting[0].owner_note,
-            format!("0:{}", note_id_hex(&original_seller.pubkey()))
-        );
-
-        restarted.place_buy(&tc, &buyer).await.unwrap();
-        let funded_bytes = std::fs::read(&restarted.state_path).unwrap();
-        let error = restarted
-            .post_offer(offer, &original_seller)
-            .await
-            .expect_err("a matched/funded TokenContract must never be reposted");
-        assert!(error.to_string().contains("already filled/matched"));
-        assert_eq!(
-            std::fs::read(&restarted.state_path).unwrap(),
-            funded_bytes,
-            "matched/funded rejection must not mutate persisted state"
-        );
-    }
-
-    #[tokio::test]
-    async fn equal_cumulative_claim_retry_is_rejected_after_close() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[37u8; 32]);
-        let buyer = LocalNote::from_seed(&[38u8; 32]);
-        let price = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let tc = "tc-equal-claim-after-close".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, price).await;
-
-        chain.stop(&tc, &buyer).await.unwrap();
-        let before = chain.deal_state(&tc).await.unwrap().unwrap();
-        let error = chain
-            .claim_tokens(&tc, &seller, before.tokens_pending)
-            .await
-            .expect_err("a closed deal must reject an equal cumulative claim retry");
-        assert!(
-            error
-                .to_string()
-                .contains("is not an open undisputed accepted deal"),
-            "{error}"
-        );
-        assert_eq!(chain.deal_state(&tc).await.unwrap().unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn equal_cumulative_claim_retry_is_rejected_during_dispute() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[39u8; 32]);
-        let buyer = LocalNote::from_seed(&[40u8; 32]);
-        let price = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let tc = "tc-equal-claim-during-dispute".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, price).await;
-
-        chain.dispute(&tc, &buyer).await.unwrap();
-        let before = chain.deal_state(&tc).await.unwrap().unwrap();
-        let error = chain
-            .claim_tokens(&tc, &seller, before.tokens_pending)
-            .await
-            .expect_err("a disputed deal must reject an equal cumulative claim retry");
-        assert!(
-            error
-                .to_string()
-                .contains("is not an open undisputed accepted deal"),
-            "{error}"
-        );
-        assert_eq!(chain.deal_state(&tc).await.unwrap().unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn claim_uses_real_time_and_rejects_pre_interval_across_restart_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[51u8; 32]);
-        let buyer = LocalNote::from_seed(&[52u8; 32]);
-        let tc = "tc-real-claim-clock".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE).await;
-
-        let opened = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert!(opened.last_claim_time <= unix_now_secs());
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        let before = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let too_early = restarted
-            .claim_tokens(&tc, &seller, TICK_SIZE + 1)
-            .await
-            .expect_err("the canonical 60 second minimum interval must survive restart");
-        assert!(
-            too_early
-                .to_string()
-                .contains("minimum claim interval is still open"),
-            "{too_early}"
-        );
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            before,
-            "a too-early claim must not mutate the persisted high-water or timestamps"
-        );
-
-        elapse_min_claim_interval(&restarted, &tc);
-        let submitted_after = unix_now_secs();
-        restarted
-            .claim_tokens(&tc, &seller, TICK_SIZE + 1)
-            .await
-            .unwrap();
-        let accepted = restarted.deal_state(&tc).await.unwrap().unwrap();
-        assert_eq!(accepted.tokens_pending, TICK_SIZE + 1);
-        assert!(accepted.last_claim_time >= submitted_after);
-        assert!(
-            accepted.last_claim_time <= unix_now_secs(),
-            "the mock must never manufacture and persist a future claim timestamp"
-        );
-    }
-
-    #[tokio::test]
-    async fn claim_rejects_physical_over_rate_after_restart_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts {
-            min_claim_interval: std::time::Duration::from_secs(1),
-            min_seconds_per_tick: std::time::Duration::from_secs(3_600),
-            ..ProtocolConsts::canonical()
-        };
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[53u8; 32]);
-        let buyer = LocalNote::from_seed(&[54u8; 32]);
-        let tc = "tc-claim-over-rate".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE).await;
-        elapse_min_claim_interval(&chain, &tc);
-
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        let before = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let over_rate = restarted
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .expect_err("one tick cannot be produced in one second under the persisted rate floor");
-        assert!(
-            over_rate
-                .to_string()
-                .contains("exceeds the physical rate allowance"),
-            "{over_rate}"
-        );
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            before,
-            "an over-rate claim must not mutate the persisted high-water or timestamps"
-        );
-        assert!(before.state.last_claim_time <= unix_now_secs());
-    }
-
-    #[tokio::test]
-    async fn raw_cumulative_claims_preserve_sub_tick_precision_and_exact_payment() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let consts = ProtocolConsts::canonical();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[33u8; 32]);
-        let buyer = LocalNote::from_seed(&[34u8; 32]);
-        let price = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let tc = "tc-raw-cumulative".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, price).await;
-
-        for tokens in [TICK_SIZE - 1, TICK_SIZE, TICK_SIZE + 1] {
-            let (pay, fee) = token_pay_and_fee(&tc, tokens, price, &consts).unwrap();
-            let expected_pay = tokens * u128::from(price) / TICK_SIZE;
-            let expected_fee = expected_pay * u128::from(consts.platform_fee_bps) / 10_000;
-            assert_eq!((pay, fee), (expected_pay, expected_fee));
-        }
-
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, TICK_SIZE + 5)
-            .await
-            .unwrap();
-        let first = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert_eq!(first.tokens_final, TICK_SIZE);
-        assert_eq!(first.tokens_superseded, TICK_SIZE);
-        assert_eq!(first.tokens_pending, TICK_SIZE + 5);
-
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, TICK_SIZE + 10)
-            .await
-            .unwrap();
-        let second = chain.deal_state(&tc).await.unwrap().unwrap();
-        assert_eq!(second.tokens_final, TICK_SIZE);
-        assert_eq!(second.tokens_superseded, TICK_SIZE + 5);
-        assert_eq!(second.tokens_pending, TICK_SIZE + 10);
-        let restarted = MockChainBackend::new(
-            endpoints,
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        assert_eq!(restarted.deal_state(&tc).await.unwrap().unwrap(), second);
-        let before_final = chain.load_state().unwrap();
-        let before_final = before_final.streams.get(&tc).unwrap();
-        let (_, probe_fee) = token_pay_and_fee(&tc, TICK_SIZE, price, &consts).unwrap();
-        assert_eq!(before_final.seller_received, u128::from(price));
-        assert_eq!(before_final.fee_accrued, probe_fee);
-
-        let fresh = restarted.finalize(&tc).await.unwrap_err();
-        assert!(fresh
-            .to_string()
-            .contains("no claim whose promotion window elapsed"));
-        mature_all_claim_slots(&restarted, &tc);
-
-        restarted.finalize(&tc).await.unwrap();
-        let finalized = restarted.load_state().unwrap();
-        let finalized = finalized.streams.get(&tc).unwrap();
-        assert_eq!(finalized.tokens_final, TICK_SIZE + 10);
-        assert_eq!(finalized.seller_received, u128::from(price));
-        assert_eq!(finalized.fee_accrued, probe_fee);
-        restarted.stop(&tc, &buyer).await.unwrap();
-        let closed = restarted.load_state().unwrap();
-        let closed = closed.streams.get(&tc).unwrap();
-        let (final_pay, final_fee) =
-            token_pay_and_fee(&tc, TICK_SIZE + 10, price, &consts).unwrap();
-        let rebate = u128::from(crate::settle::rebate(1, price, &consts));
-        assert_eq!(
-            closed.seller_received,
-            final_pay + 2 * u128::from(price) + rebate
-        );
-        assert_eq!(closed.fee_accrued, 0);
-        assert_eq!(closed.burned, final_fee - rebate);
-        let (buyer_pay, buyer_fee) = token_pay_and_fee(&tc, 4 * TICK_SIZE, price, &consts).unwrap();
-        assert_mock_money_conserved(
-            &restarted,
-            &tc,
-            buyer_pay + buyer_fee,
-            2 * u128::from(price),
-        );
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(16))]
-
-        #[test]
-        fn raw_claim_payment_is_invariant_to_chunking(
-            first_delta in 1u128..=500_000,
-            second_delta in 1u128..=500_000,
-        ) {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let base_dir = tempfile::tempdir().expect("test temp dir");
-                let base = base_dir.path();
-                let chain = MockChainBackend::new(
-                    base.join("eps.json"),
-                    ProtocolConsts::canonical(),
-                    DobParams::canonical(),
-                );
-                let seller = LocalNote::from_seed(&[35u8; 32]);
-                let buyer = LocalNote::from_seed(&[36u8; 32]);
-                let price = u64::try_from(crate::params::PRICE_STEP).unwrap();
-                let target = TICK_SIZE + first_delta + second_delta;
-
-                open_ordinary_fixture(&chain, "tc-one-claim", &seller, &buyer, price).await;
-                elapse_min_claim_interval(&chain, "tc-one-claim");
-                chain
-                    .claim_tokens(&"tc-one-claim".to_string(), &seller, target)
-                    .await
-                    .unwrap();
-                mature_all_claim_slots(&chain, "tc-one-claim");
-                chain.finalize(&"tc-one-claim".to_string()).await.unwrap();
-                chain
-                    .stop(&"tc-one-claim".to_string(), &buyer)
-                    .await
-                    .unwrap();
-
-                open_ordinary_fixture(&chain, "tc-two-claims", &seller, &buyer, price).await;
-                elapse_min_claim_interval(&chain, "tc-two-claims");
-                chain
-                    .claim_tokens(
-                        &"tc-two-claims".to_string(),
-                        &seller,
-                        TICK_SIZE + first_delta,
-                    )
-                    .await
-                    .unwrap();
-                elapse_min_claim_interval(&chain, "tc-two-claims");
-                chain
-                    .claim_tokens(&"tc-two-claims".to_string(), &seller, target)
-                    .await
-                    .unwrap();
-                mature_all_claim_slots(&chain, "tc-two-claims");
-                chain.finalize(&"tc-two-claims".to_string()).await.unwrap();
-                chain
-                    .stop(&"tc-two-claims".to_string(), &buyer)
-                    .await
-                    .unwrap();
-
-                let state = chain.load_state().unwrap();
-                let one = state.streams.get("tc-one-claim").unwrap();
-                let two = state.streams.get("tc-two-claims").unwrap();
-                let (expected_pay, expected_fee) = token_pay_and_fee(
-                    &"tc-one-claim".to_string(),
-                    target,
-                    price,
-                    &ProtocolConsts::canonical(),
-                )
-                .unwrap();
-                let delivered_ticks = u64::try_from(target / TICK_SIZE).unwrap();
-                let expected_rebate = u128::from(crate::settle::rebate(
-                    delivered_ticks,
-                    price,
-                    &ProtocolConsts::canonical(),
-                ));
-                let (funded_pay, funded_fee) = token_pay_and_fee(
-                    &"tc-one-claim".to_string(),
-                    4 * TICK_SIZE,
-                    price,
-                    &ProtocolConsts::canonical(),
-                )
-                .unwrap();
-                prop_assert_eq!(one.tokens_final, target);
-                prop_assert_eq!(two.tokens_final, target);
-                prop_assert_eq!(one.seller_received, two.seller_received);
-                prop_assert_eq!(one.burned, two.burned);
-                prop_assert_eq!(one.buyer_refunded, two.buyer_refunded);
-                prop_assert_eq!(
-                    one.seller_received,
-                    expected_pay + 2 * u128::from(price) + expected_rebate,
-                );
-                prop_assert_eq!(one.burned, expected_fee - expected_rebate);
-                prop_assert_eq!(
-                    one.buyer_refunded,
-                    funded_pay + funded_fee - expected_pay - expected_fee,
-                );
-                Ok(())
-            })?;
-        }
-    }
-
-    #[tokio::test]
-    async fn probe_acceptance_latch_survives_terminal_restart() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[19u8; 32]);
-        let buyer = LocalNote::from_seed(&[20u8; 32]);
-
-        for (token_contract, accept_probe) in
-            [("tc-pre-probe-stop", false), ("tc-post-probe-stop", true)]
-        {
-            let token_contract = token_contract.to_string();
-            chain
-                .post_offer(
-                    SellOffer {
-                        price_per_tick: TEST_PRICE,
-                        max_ticks: 4,
-                        token_contract: token_contract.clone(),
-                        flags: 0,
-                    },
-                    &seller,
-                )
-                .await
-                .unwrap();
-            chain.place_buy(&token_contract, &buyer).await.unwrap();
-            chain
-                .open_stream(&token_contract, Vec::new(), &seller)
-                .await
-                .unwrap();
-            if accept_probe {
-                elapse_probe_window(&chain, &token_contract);
-                chain.accept_probe(&token_contract).await.unwrap();
-            }
-            chain.stop(&token_contract, &buyer).await.unwrap();
-            let expected_tokens_final = if accept_probe { TICK_SIZE } else { 0 };
-            assert_eq!(
-                chain
-                    .deal_state(&token_contract)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .tokens_final,
-                expected_tokens_final
-            );
-            assert_eq!(
-                chain.snapshot(&token_contract).await.unwrap().tokens_final,
-                expected_tokens_final
-            );
-
-            let restarted = MockChainBackend::new(
-                endpoints.clone(),
-                ProtocolConsts::canonical(),
-                DobParams::canonical(),
-            );
-            let state = restarted
-                .deal_state(&token_contract)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(state.is_stopped());
-            assert_eq!(state.probe_accepted, accept_probe);
-            assert_eq!(
-                state.tokens_final, expected_tokens_final,
-                "terminal raw tokensFinal must survive StreamMachine close and restart"
-            );
-            assert_eq!(
-                restarted
-                    .snapshot(&token_contract)
-                    .await
-                    .unwrap()
-                    .tokens_final,
-                expected_tokens_final
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn dispute_time_is_exposed_and_survives_restart() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[37u8; 32]);
-        let buyer = LocalNote::from_seed(&[38u8; 32]);
-        let tc = "tc-dispute-time".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE).await;
-        assert_eq!(
-            chain.deal_state(&tc).await.unwrap().unwrap().dispute_time,
-            0
-        );
-
-        chain.dispute(&tc, &buyer).await.unwrap();
-        let raised_at = chain.deal_state(&tc).await.unwrap().unwrap().dispute_time;
-        assert_ne!(raised_at, 0);
-
-        let restarted = MockChainBackend::new(
-            endpoints,
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        assert_eq!(
-            restarted
-                .deal_state(&tc)
-                .await
-                .unwrap()
-                .unwrap()
-                .dispute_time,
-            raised_at,
-            "getState disputeTime must remain the exact dispute instant after restart"
-        );
     }
 
     #[tokio::test]
@@ -4460,9 +3520,7 @@ mod tests {
             "buyer_bond",
             "fee_accrued",
             "tokens_final",
-            "tokens_superseded",
             "tokens_pending",
-            "prev_claim_time",
             "last_claim_time",
             "dispute_time",
         ] {
@@ -4509,7 +3567,6 @@ mod tests {
         let mut state = chain.load_state().unwrap();
         let cell = state.streams.get_mut(&tc).unwrap();
         cell.tokens_final = impossible;
-        cell.tokens_superseded = impossible;
         cell.tokens_pending = impossible;
         let subscription = state.deal_subscriptions.get_mut(&tc).unwrap();
         subscription.funded_tokens = impossible;
@@ -4528,133 +3585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_claim_and_lifecycle_sidecars_fail_closed_before_state_use() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[55u8; 32]);
-        let buyer = LocalNote::from_seed(&[56u8; 32]);
-        let tc = "tc-corrupt-persisted-claims".to_string();
-        open_ordinary_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE).await;
-        let original: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&chain.state_path).unwrap()).unwrap();
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["tokens_final"] = serde_json::json!(TICK_SIZE + 1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "claim pipeline is not monotonic",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["tokens_superseded"] = serde_json::json!(TICK_SIZE + 1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "claim pipeline is not monotonic",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        let last = original["streams"][&tc]["last_claim_time"]
-            .as_u64()
-            .unwrap();
-        corrupted["streams"][&tc]["prev_claim_time"] = serde_json::json!(last + 1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "claim timestamps regress",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["last_claim_time"] = serde_json::json!(unix_now_secs() + 3_600);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "claim timestamp is in the future",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["prev_claim_time"] = serde_json::json!(0);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "only one claim timestamp is present",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["prev_claim_time"] = serde_json::json!(0);
-        corrupted["streams"][&tc]["last_claim_time"] = serde_json::json!(0);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "non-zero claim pipeline has no landing timestamp",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["closed"] = serde_json::json!(true);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "flags disagree with machine state",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["disputed"] = serde_json::json!(true);
-        corrupted["streams"][&tc]["dispute_time"] = serde_json::json!(unix_now_secs());
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "flags disagree with machine state",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["probe_accepted"] = serde_json::json!(false);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "unaccepted probe carries a non-zero claim pipeline",
-        )
-        .await;
-
-        let mut corrupted = original;
-        corrupted["deal_subscriptions"]
-            .as_object_mut()
-            .unwrap()
-            .remove(&tc);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "funded Match has no persisted deal shape",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn corrupt_deal_bindings_and_machine_counters_fail_closed_without_mutation() {
+    async fn corrupt_persisted_actor_bindings_fail_closed_without_mutation() {
         let base_dir = tempfile::tempdir().expect("test temp dir");
         let base = base_dir.path();
         let endpoints = base.join("eps.json");
@@ -4683,53 +3614,6 @@ mod tests {
         .await;
 
         let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["machine"]["price"] = serde_json::json!(1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "machine price 1 disagrees with matched price 1000000000",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["max_ticks"] = serde_json::json!(5);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "stream maxTicks 5 disagree with matched ticks 4",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["machine"]["state"]["Streaming"]["pending"] =
-            serde_json::json!(99);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "machine pending ticks 99 disagree with raw pending ticks 1",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["streams"][&tc]["tokens_final"] = serde_json::json!(TICK_SIZE);
-        corrupted["streams"][&tc]["tokens_superseded"] = serde_json::json!(3 * TICK_SIZE);
-        corrupted["streams"][&tc]["tokens_pending"] = serde_json::json!(4 * TICK_SIZE);
-        corrupted["streams"][&tc]["machine"]["state"]["Streaming"]["trusted"] =
-            serde_json::json!(2);
-        corrupted["streams"][&tc]["machine"]["state"]["Streaming"]["pending"] =
-            serde_json::json!(4);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "machine trusted ticks 2 disagree with raw trusted ticks 3",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
         corrupted["offer_sellers"]
             .as_object_mut()
             .unwrap()
@@ -4741,1483 +3625,5 @@ mod tests {
             "funded deal has no persisted seller actor",
         )
         .await;
-
-        let mut corrupted = original;
-        corrupted["deal_subscriptions"][&tc]["funded_tokens"] = serde_json::json!(5 * TICK_SIZE);
-        corrupted["deal_subscriptions"][&tc]["tokens_per_week"] = serde_json::json!(5 * TICK_SIZE);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "fundedTokens 5000000 disagree with matched volume 4000000",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn corrupt_subscription_sidecars_reject_every_canonical_bound_without_mutation() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[57u8; 32]);
-        let buyer = LocalNote::from_seed(&[58u8; 32]);
-        let tc = "tc-corrupt-persisted-subscription".to_string();
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, TEST_PRICE, 8).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        let original: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&chain.state_path).unwrap()).unwrap();
-        let shape = &original["deal_subscriptions"][&tc];
-        let funded = shape["funded_tokens"].as_u64().unwrap();
-        let tokens_per_week = shape["tokens_per_week"].as_u64().unwrap();
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["deal_flags"] = serde_json::json!(0x80);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "unknown deal-shape bits",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["deal_flags"] = serde_json::json!(0);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "contradictory subscription flag/subWeeks",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["sub_weeks"] = serde_json::json!(3);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "does not equal the canonical",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["week_index"] = serde_json::json!(5);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "weekIndex 5 exceeds subWeeks",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["tokens_paid"] = serde_json::json!(funded + 1);
-        assert_corrupt_restart_rejected_without_mutation(&endpoints, &tc, corrupted, "tokensPaid")
-            .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["week_base_tokens"] = serde_json::json!(funded + 1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "weekBaseTokens",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["tokens_per_week"] =
-            serde_json::json!(tokens_per_week + 1);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "does not equal fundedTokens",
-        )
-        .await;
-
-        let mut corrupted = original.clone();
-        corrupted["deal_subscriptions"][&tc]["period_start"] =
-            serde_json::json!(unix_now_secs() + 3_600);
-        assert_corrupt_restart_rejected_without_mutation(&endpoints, &tc, corrupted, "periodStart")
-            .await;
-
-        let mut corrupted = original;
-        corrupted["deal_subscriptions"][&tc]["deal_flags"] = serde_json::json!(0);
-        corrupted["deal_subscriptions"][&tc]["sub_weeks"] = serde_json::json!(0);
-        assert_corrupt_restart_rejected_without_mutation(
-            &endpoints,
-            &tc,
-            corrupted,
-            "ordinary deal has contradictory weekly state",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn mock_subscription_shape_uses_matched_funded_volume() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[21u8; 32]);
-        let buyer = LocalNote::from_seed(&[22u8; 32]);
-        let tc = "tc-subscription-shape".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 8,
-                    token_contract: tc.clone(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-
-        let shape = chain.deal_subscription(&tc).await.unwrap().unwrap();
-        assert!(shape.is_subscription());
-        assert_eq!(shape.deal_flags, flags::SUBSCRIPTION);
-        assert_eq!(shape.funded_tokens, 8 * TICK_SIZE);
-        assert_eq!(shape.tokens_per_week, 2 * TICK_SIZE);
-        assert_ne!(shape.period_start, 0);
-        let snapshot = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(snapshot.subscription, shape);
-        assert!(snapshot.state.funded);
-        assert!(!snapshot.state.opened);
-        assert_eq!(snapshot.buyer_bond.bond_held, 2 * u128::from(TEST_PRICE));
-        assert_eq!(
-            snapshot.buyer_bond.bond_required,
-            2 * u128::from(TEST_PRICE)
-        );
-    }
-
-    /// PHASE 2 against the contract-faithful mock: a boundary the clock has crossed and nobody
-    /// has charged. The client twin computed from those recorded books is UNDERSTATED, and computed
-    /// from the state the booking publishes it is the contract's own cap -- which is why the running
-    /// route books first and computes from what comes back rather than deciding which phase it is in.
-    #[tokio::test]
-    async fn unbooked_boundary_understates_the_weekly_ceiling_until_it_is_booked() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[41u8; 32]);
-        let buyer = LocalNote::from_seed(&[42u8; 32]);
-        let tc = "tc-subscription-booked-ceiling".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 8,
-                    token_contract: tc.clone(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain.open_stream(&tc, vec![], &seller).await.unwrap();
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        // Week one is partly consumed, so the base the next week is measured from is not zero.
-        chain.claim_tokens(&tc, &seller, TICK_SIZE).await.unwrap();
-
-        // The clock crosses one boundary; nobody has charged it yet.
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-
-        let stale = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(
-            stale.subscription.week_index, 0,
-            "the getter lags until a week is booked"
-        );
-        let recorded = super::subscription_claim_cap_at(&stale.state, &stale.subscription).unwrap();
-
-        chain.settle_week(&tc).await.unwrap();
-        let booked = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(booked.subscription.week_index, 1);
-        let applied =
-            super::subscription_claim_cap_at(&booked.state, &booked.subscription).unwrap();
-        assert_eq!(
-            applied,
-            booked.subscription.week_base_tokens + booked.subscription.tokens_per_week,
-            "computed from booked state, the client twin is the contract's own cap"
-        );
-        assert_eq!(
-            booked.subscription.week_base_tokens, booked.state.tokens_pending,
-            "the booking re-bases the week on the cumulative claim, forfeiting what week one left"
-        );
-        assert!(
-            recorded < applied,
-            "across an unbooked boundary the recorded books understate the cap: recorded {recorded} \
-             vs applied {applied}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mock_subscription_crosses_boundaries_without_rolling_unused_quota() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let chain = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[23u8; 32]);
-        let buyer = LocalNote::from_seed(&[24u8; 32]);
-        let tc = "tc-subscription-boundaries".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 8,
-                    token_contract: tc.clone(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain.open_stream(&tc, vec![], &seller).await.unwrap();
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        let accepted = chain.deal_subscription(&tc).await.unwrap().unwrap();
-        assert_eq!(accepted.week_index, 0);
-        assert_eq!(accepted.tokens_paid, TICK_SIZE);
-        assert_ne!(accepted.period_start, 0);
-        assert_eq!(accepted.week_base_tokens, 0);
-
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-
-        let first_boundary = chain.deal_subscription(&tc).await.unwrap().unwrap();
-        assert_eq!(first_boundary.week_index, 1);
-        assert_eq!(first_boundary.tokens_paid, 2 * TICK_SIZE);
-        assert_eq!(first_boundary.week_base_tokens, TICK_SIZE);
-        let first_money = chain.snapshot(&tc).await.unwrap();
-        let p = u128::from(TEST_PRICE);
-        let (gross_pay, gross_fee) =
-            token_pay_and_fee(&tc, 8 * TICK_SIZE, TEST_PRICE, &ProtocolConsts::canonical())
-                .unwrap();
-        let (paid, paid_fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, TEST_PRICE, &ProtocolConsts::canonical())
-                .unwrap();
-        assert_eq!(first_money.seller_received, 2 * p);
-        assert_eq!(
-            first_money.buyer_locked,
-            gross_pay + gross_fee - paid - paid_fee + 2 * p
-        );
-        assert!(!first_money.closed);
-
-        let restarted = MockChainBackend::new(
-            endpoints.clone(),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        assert_eq!(
-            restarted.deal_subscription(&tc).await.unwrap().unwrap(),
-            first_boundary,
-            "the exact eight-field subscription state must survive process restart"
-        );
-
-        // Week one consumed only the probe. Week two therefore exposes exactly two more ticks,
-        // up to cumulative tick three; the unused tick from week one cannot roll forward.
-        elapse_min_claim_interval(&restarted, &tc);
-        restarted
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .unwrap();
-        elapse_min_claim_interval(&restarted, &tc);
-        restarted
-            .claim_tokens(&tc, &seller, 3 * TICK_SIZE)
-            .await
-            .unwrap();
-        let error = restarted
-            .claim_tokens(&tc, &seller, 4 * TICK_SIZE)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("does not roll forward"),
-            "{error}"
-        );
-
-        let mut persisted = restarted.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - 2 * SUB_WEEK_LEN.as_secs();
-        restarted.store_state(&persisted).unwrap();
-        restarted.settle_week(&tc).await.unwrap();
-        let second_boundary = restarted.deal_subscription(&tc).await.unwrap().unwrap();
-        assert_eq!(second_boundary.week_index, 2);
-        assert_eq!(second_boundary.tokens_paid, 4 * TICK_SIZE);
-        assert_eq!(second_boundary.week_base_tokens, 3 * TICK_SIZE);
-
-        let mut persisted = restarted.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start =
-            unix_now_secs() - u64::from(SUBSCRIPTION_WEEKS) * SUB_WEEK_LEN.as_secs();
-        restarted.store_state(&persisted).unwrap();
-        mature_all_claim_slots(&restarted, &tc);
-        restarted.settle_week(&tc).await.unwrap();
-
-        let terminal = restarted.deal_subscription(&tc).await.unwrap().unwrap();
-        assert_eq!(terminal.week_index, SUBSCRIPTION_WEEKS);
-        assert_eq!(terminal.tokens_paid, terminal.funded_tokens);
-        assert_eq!(terminal.week_base_tokens, 3 * TICK_SIZE);
-        let terminal_snapshot = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert!(terminal_snapshot.state.is_stopped());
-        assert_eq!(terminal_snapshot.seller_bond.bond_held, 0);
-        assert_eq!(terminal_snapshot.buyer_bond.bond_held, 0);
-        let terminal_money = restarted.snapshot(&tc).await.unwrap();
-        let rebate = checked_mul_div_floor(
-            &tc,
-            3 * p,
-            3 * u128::from(ProtocolConsts::canonical().rebate_slope_bps),
-            10_000,
-            "test rebate",
-        )
-        .unwrap();
-        assert_eq!(terminal_money.seller_received, 10 * p + rebate);
-        assert_eq!(terminal_money.buyer_locked, 0);
-        assert_eq!(terminal_money.buyer_refunded, 2 * p);
-        assert_eq!(terminal_money.burned, gross_fee - rebate);
-        assert!(terminal_money.closed);
-
-        let terminal_retry = restarted.settle_week(&tc).await.unwrap_err();
-        assert!(
-            terminal_retry
-                .to_string()
-                .contains("not an open accepted subscription"),
-            "{terminal_retry}"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_term_subscription_claim_is_frozen_while_equal_retry_and_close_window_remain() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[61u8; 32]);
-        let buyer = LocalNote::from_seed(&[62u8; 32]);
-        let tc = "tc-post-term-subscription-claim-cap".to_string();
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .unwrap();
-
-        let claim_landed_at = chain
-            .deal_state(&tc)
-            .await
-            .unwrap()
-            .unwrap()
-            .last_claim_time;
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start =
-            unix_now_secs() - u64::from(SUBSCRIPTION_WEEKS) * SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-
-        let at_term = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(at_term.subscription.week_index, SUBSCRIPTION_WEEKS);
-        assert_eq!(
-            at_term.subscription.tokens_paid,
-            at_term.subscription.funded_tokens
-        );
-        assert_eq!(at_term.state.tokens_pending, 2 * TICK_SIZE);
-        assert_eq!(at_term.state.last_claim_time, claim_landed_at);
-        assert!(
-            at_term.state.opened,
-            "the fresh tail keeps final close pending"
-        );
-
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        restarted
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .expect("an equal cumulative retry remains an idempotent no-op after term");
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            at_term,
-            "the equal retry must not move timestamps, weekly state, or money"
-        );
-
-        let growth = restarted
-            .claim_tokens(&tc, &seller, 3 * TICK_SIZE)
-            .await
-            .expect_err("a completed four-week term has no fifth-week claim capacity");
-        assert!(
-            growth
-                .to_string()
-                .contains("current subscription cap 2000000"),
-            "{growth}"
-        );
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            at_term,
-            "rejected post-term growth must not mutate timestamps, weekly state, or money"
-        );
-
-        restarted.settle_week(&tc).await.unwrap();
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            at_term,
-            "permissionless settlement must leave a still-fresh final claim open"
-        );
-        mature_all_claim_slots(&restarted, &tc);
-        restarted.settle_week(&tc).await.unwrap();
-        let closed = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert!(closed.state.is_stopped());
-        assert_eq!(closed.state.tokens_final, 2 * TICK_SIZE);
-        assert_eq!(closed.state.tokens_pending, 2 * TICK_SIZE);
-    }
-
-    #[tokio::test]
-    async fn max_price_full_subscription_keeps_exact_monotonic_u128_fees() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[43u8; 32]);
-        let buyer = LocalNote::from_seed(&[44u8; 32]);
-        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let price = u64::MAX - (u64::MAX % step);
-        let max_ticks = u64::try_from(crate::params::SUBSCRIPTION_MAX_TICKS).unwrap();
-        let tc = "tc-max-price-subscription".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        let mut previous_fee = 0;
-        for week in 1..=SUBSCRIPTION_WEEKS {
-            let mut state = chain.load_state().unwrap();
-            state.deal_subscriptions.get_mut(&tc).unwrap().period_start =
-                unix_now_secs() - u64::from(week) * SUB_WEEK_LEN.as_secs();
-            chain.store_state(&state).unwrap();
-            if week == SUBSCRIPTION_WEEKS {
-                mature_all_claim_slots(&chain, &tc);
-            }
-            chain
-                .settle_week(&tc)
-                .await
-                .unwrap_or_else(|error| panic!("week {week} must not brick: {error}"));
-
-            if week < SUBSCRIPTION_WEEKS {
-                let state = chain.load_state().unwrap();
-                let cell = state.streams.get(&tc).unwrap();
-                let subscription = state.deal_subscriptions.get(&tc).unwrap();
-                let (_, expected_fee) = token_pay_and_fee(
-                    &tc,
-                    subscription.tokens_paid,
-                    price,
-                    &ProtocolConsts::canonical(),
-                )
-                .unwrap();
-                assert_eq!(cell.fee_accrued, expected_fee);
-                assert!(
-                    cell.fee_accrued > previous_fee,
-                    "cumulative weekly fee must increase at boundary {week}"
-                );
-                previous_fee = cell.fee_accrued;
-            }
-        }
-
-        let terminal = chain.snapshot(&tc).await.unwrap();
-        assert!(terminal.closed);
-        assert_eq!(terminal.buyer_locked, 0);
-        assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-    }
-
-    #[tokio::test]
-    async fn mock_subscription_settlement_rejects_pre_probe_and_pre_boundary() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[25u8; 32]);
-        let buyer = LocalNote::from_seed(&[26u8; 32]);
-        let tc = "tc-subscription-settle-gates".to_string();
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: TEST_PRICE,
-                    max_ticks: 8,
-                    token_contract: tc.clone(),
-                    flags: flags::AON | flags::SUBSCRIPTION,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain.open_stream(&tc, vec![], &seller).await.unwrap();
-
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        let pre_probe = chain.settle_week(&tc).await.unwrap_err();
-        assert!(
-            pre_probe
-                .to_string()
-                .contains("not an open accepted subscription"),
-            "{pre_probe}"
-        );
-
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        let pre_boundary = chain.settle_week(&tc).await.unwrap_err();
-        assert!(
-            pre_boundary
-                .to_string()
-                .contains("no crossed weekly boundary"),
-            "{pre_boundary}"
-        );
-
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .week_base_tokens = u128::MAX;
-        chain.store_state(&persisted).unwrap();
-        let malformed_cap = chain
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .unwrap_err();
-        assert!(malformed_cap.to_string().contains("weekBaseTokens"));
-        assert!(malformed_cap.to_string().contains("exceeds fundedTokens"));
-    }
-
-    #[tokio::test]
-    async fn subscription_buyer_stop_charges_started_week_but_seller_stop_charges_only_elapsed() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[27u8; 32]);
-        let buyer = LocalNote::from_seed(&[28u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-
-        for (tc, buyer_ends) in [("tc-buyer-midweek", true), ("tc-seller-midweek", false)] {
-            open_subscription_fixture(&chain, tc, &seller, &buyer, price, max_ticks).await;
-            elapse_probe_window(&chain, tc);
-            chain.accept_probe(&tc.to_string()).await.unwrap();
-            if buyer_ends {
-                chain.stop(&tc.to_string(), &buyer).await.unwrap();
-            } else {
-                chain.seller_stop(&tc.to_string()).await.unwrap();
-            }
-            let shape = chain
-                .deal_subscription(&tc.to_string())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(shape.week_index, u8::from(buyer_ends));
-            assert_eq!(
-                shape.tokens_paid,
-                if buyer_ends {
-                    shape.tokens_per_week
-                } else {
-                    TICK_SIZE
-                }
-            );
-            let state = chain.load_state().unwrap();
-            let cell = state.streams.get(tc).unwrap();
-            let rebate = checked_mul_div_floor(
-                &tc.to_string(),
-                u128::from(price),
-                u128::from(chain.consts.rebate_slope_bps),
-                10_000,
-                "test rebate",
-            )
-            .unwrap();
-            let expected_to_seller =
-                u128::from(if buyer_ends { 2 * price } else { price }) + seller_funding + rebate;
-            assert_eq!(cell.seller_received, expected_to_seller);
-            assert_eq!(cell.buyer_bond, 0);
-            assert_eq!(cell.seller_locked, 0);
-            assert_eq!(
-                chain
-                    .deal_state(&tc.to_string())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .finalized_owed,
-                expected_to_seller,
-                "the returned 2P seller bond is part of canonical finalizedOwed"
-            );
-            if buyer_ends {
-                assert_eq!(
-                    chain.buyer_stop_settlement(&tc.to_string()).await.unwrap(),
-                    Some((expected_to_seller, cell.buyer_refunded)),
-                    "the mock StreamStopped receipt must expose earnings plus returned 2P bond"
-                );
-            }
-            assert_mock_money_conserved(&chain, tc, buyer_funding, seller_funding);
-        }
-    }
-
-    #[tokio::test]
-    async fn subscription_seller_stop_pays_zero_for_matured_current_week_consumption() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[63u8; 32]);
-        let buyer = LocalNote::from_seed(&[64u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let tc = "tc-subscription-seller-stop-current-week".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        // Week one is under-consumed but paid in full. Week two then matures two more claimed
-        // ticks; sellerStop must not turn either into a current-week payment.
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-        for cumulative in [2 * TICK_SIZE, 3 * TICK_SIZE] {
-            elapse_min_claim_interval(&chain, &tc);
-            chain.claim_tokens(&tc, &seller, cumulative).await.unwrap();
-        }
-        mature_all_claim_slots(&chain, &tc);
-
-        let settlement = chain.seller_stop(&tc).await.unwrap();
-        let shape = chain.deal_subscription(&tc).await.unwrap().unwrap();
-        assert_eq!(shape.week_index, 1);
-        assert_eq!(shape.tokens_paid, 2 * TICK_SIZE);
-
-        let (completed_week_pay, completed_week_fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, price, &consts).unwrap();
-        let delivered_ticks = 3u128;
-        let rebate_rate = u128::from(consts.rebate_slope_bps)
-            .saturating_mul(delivered_ticks)
-            .min(u128::from(consts.rebate_max_bps));
-        let rebate = checked_mul_div_floor(
-            &tc,
-            delivered_ticks * u128::from(price),
-            rebate_rate,
-            10_000,
-            "seller-stop test rebate",
-        )
-        .unwrap()
-        .min(completed_week_fee);
-        let expected_refund = buyer_funding - completed_week_pay - completed_week_fee;
-        assert_eq!(
-            settlement,
-            Settlement::AmicableSplit {
-                to_seller_ticks: 2,
-                to_buyer_refund: expected_refund,
-            }
-        );
-
-        let terminal = chain.load_state().unwrap();
-        let cell = terminal.streams.get(&tc).unwrap();
-        assert_eq!(cell.tokens_final, 3 * TICK_SIZE);
-        assert_eq!(
-            cell.seller_received,
-            completed_week_pay + rebate + seller_funding,
-            "matured current-week consumption adds zero to sellerStop payout"
-        );
-        assert_eq!(cell.buyer_refunded, expected_refund);
-        assert_eq!(cell.burned, completed_week_fee - rebate);
-        assert_eq!(cell.buyer_bond, 0);
-        assert_eq!(cell.seller_locked, 0);
-        assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-    }
-
-    #[tokio::test]
-    async fn subscription_buyer_concession_preserves_week_claim_bonds_and_conservation_after_restart(
-    ) {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[45u8; 32]);
-        let buyer = LocalNote::from_seed(&[46u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let tc = "tc-subscription-concession".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        // Close week one by contract time. Its whole two-tick quota is take-or-pay and remains
-        // seller-owned regardless of the later dispute.
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-
-        // In week two the older 2T cumulative claim is trusted at dispute time, while the newest
-        // 3T claim remains contestable. D is valued from weekBase=1T, so the two-tick claimed tail
-        // reaches the protocol's 2P cap even though tokensPaid already includes week one's 2T.
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .unwrap();
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, 3 * TICK_SIZE)
-            .await
-            .unwrap();
-        let dispute_at = unix_now_secs();
-        let mut persisted = chain.load_state().unwrap();
-        let cell = persisted.streams.get_mut(&tc).unwrap();
-        cell.prev_claim_time = dispute_at - consts.claim_promote_window.as_secs();
-        cell.last_claim_time = dispute_at;
-        chain.store_state(&persisted).unwrap();
-        chain.dispute(&tc, &buyer).await.unwrap();
-
-        let before_restart = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert!(before_restart.state.disputed);
-        assert_eq!(before_restart.state.tokens_final, TICK_SIZE);
-        assert_eq!(before_restart.state.tokens_superseded, 2 * TICK_SIZE);
-        assert_eq!(before_restart.state.tokens_pending, 3 * TICK_SIZE);
-        assert_eq!(before_restart.subscription.week_index, 1);
-        assert_eq!(before_restart.subscription.tokens_paid, 2 * TICK_SIZE);
-        assert_eq!(before_restart.subscription.week_base_tokens, TICK_SIZE);
-
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            before_restart,
-            "all dispute, weekly, claim, and bond fields must survive process restart"
-        );
-
-        let (one_tick_pay, one_tick_fee) =
-            token_pay_and_fee(&tc, TICK_SIZE, price, &consts).unwrap();
-        let (claimed_pay, claimed_fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, price, &consts).unwrap();
-        let buyer_stake = (claimed_pay + claimed_fee).min(2 * u128::from(price));
-        let (future_pay, future_fee) =
-            token_pay_and_fee(&tc, 4 * TICK_SIZE, price, &consts).unwrap();
-        let future_refund = future_pay + future_fee;
-        let surviving_buyer_bond = 2 * u128::from(price) - buyer_stake;
-        let expected_buyer_refund = future_refund + surviving_buyer_bond;
-        let completed_week_pay = 2 * u128::from(price);
-        let current_trusted_pay = u128::from(price);
-        let expected_seller = completed_week_pay + current_trusted_pay + seller_funding;
-        let (_, earned_fee) = token_pay_and_fee(&tc, 3 * TICK_SIZE, price, &consts).unwrap();
-        let unearned_current_week = one_tick_pay + one_tick_fee;
-        let expected_burn = buyer_stake + earned_fee + unearned_current_week;
-
-        let settlement = restarted.release_dispute(&tc).await.unwrap();
-        assert_eq!(
-            settlement,
-            Settlement::SellerNoShow {
-                to_buyer_refund: expected_buyer_refund,
-                seller_bond_returned: seller_funding,
-            }
-        );
-        let terminal = restarted.load_state().unwrap();
-        let cell = terminal.streams.get(&tc).unwrap();
-        assert!(cell.closed);
-        assert!(!cell.disputed);
-        assert_eq!(cell.tokens_final, 2 * TICK_SIZE);
-        assert_eq!(cell.tokens_superseded, 2 * TICK_SIZE);
-        assert_eq!(cell.tokens_pending, 2 * TICK_SIZE);
-        assert_eq!(cell.seller_received, expected_seller);
-        assert_eq!(cell.buyer_refunded, expected_buyer_refund);
-        assert_eq!(cell.burned, expected_burn);
-        assert_eq!(cell.fee_accrued, 0);
-        assert_eq!(cell.buyer_locked, 0);
-        assert_eq!(cell.buyer_bond, 0);
-        assert_eq!(cell.seller_locked, 0);
-        assert_mock_money_conserved(&restarted, &tc, buyer_funding, seller_funding);
-    }
-
-    #[tokio::test]
-    async fn subscription_dispute_timeout_is_reachable_at_deadline_and_burns_equal_stakes() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[47u8; 32]);
-        let buyer = LocalNote::from_seed(&[48u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let tc = "tc-subscription-dispute-timeout".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        chain.dispute(&tc, &buyer).await.unwrap();
-
-        let before_early_attempt = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        let early = chain.resolve_dispute_timeout(&tc).await.expect_err(
-            "permissionless timeout resolution must wait for the persisted dispute deadline",
-        );
-        assert!(early.to_string().contains("dispute window is still open"));
-        assert_eq!(
-            chain.deal_snapshot(&tc).await.unwrap().unwrap(),
-            before_early_attempt,
-            "an early timeout attempt must not mutate any deal field"
-        );
-
-        let mut persisted = chain.load_state().unwrap();
-        let eligible_dispute_time = unix_now_secs() - consts.dispute_window.as_secs();
-        let cell = persisted.streams.get_mut(&tc).unwrap();
-        cell.dispute_time = eligible_dispute_time;
-        cell.prev_claim_time = eligible_dispute_time;
-        cell.last_claim_time = eligible_dispute_time;
-        chain.store_state(&persisted).unwrap();
-        let eligible = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            eligible,
-            "the authoritative timeout anchor must survive process restart"
-        );
-
-        let (gross_pay, gross_fee) =
-            token_pay_and_fee(&tc, u128::from(max_ticks) * TICK_SIZE, price, &consts).unwrap();
-        let gross_deposit = gross_pay + gross_fee;
-        let stake = u128::from(price);
-        let expected_buyer_refund = gross_deposit + stake;
-        let settlement = restarted.resolve_dispute_timeout(&tc).await.unwrap();
-        assert_eq!(
-            settlement,
-            Settlement::SellerNoShow {
-                to_buyer_refund: expected_buyer_refund,
-                seller_bond_returned: stake,
-            }
-        );
-        let terminal = restarted.load_state().unwrap();
-        let cell = terminal.streams.get(&tc).unwrap();
-        assert!(cell.closed);
-        assert!(!cell.disputed);
-        assert_eq!(cell.seller_received, stake);
-        assert_eq!(cell.buyer_refunded, expected_buyer_refund);
-        assert_eq!(cell.burned, 2 * stake);
-        assert_eq!(cell.buyer_locked, 0);
-        assert_eq!(cell.probe_locked, 0);
-        assert_eq!(cell.buyer_bond, 0);
-        assert_eq!(cell.seller_locked, 0);
-        assert_mock_money_conserved(&restarted, &tc, buyer_funding, seller_funding);
-
-        let terminal_snapshot = restarted.deal_snapshot(&tc).await.unwrap().unwrap();
-        let retry = restarted.resolve_dispute_timeout(&tc).await.unwrap_err();
-        assert!(retry.to_string().contains("is not in a timed dispute"));
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            terminal_snapshot,
-            "a terminal timeout retry must fail without changing the settlement"
-        );
-    }
-
-    #[tokio::test]
-    async fn subscription_dispute_timeout_preserves_proved_pay_and_burns_equal_contested_stakes() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let endpoints = base.join("eps.json");
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(endpoints.clone(), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[49u8; 32]);
-        let buyer = LocalNote::from_seed(&[50u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let tc = "tc-subscription-dispute-timeout-accounting".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, 2 * TICK_SIZE)
-            .await
-            .unwrap();
-        elapse_min_claim_interval(&chain, &tc);
-        chain
-            .claim_tokens(&tc, &seller, 3 * TICK_SIZE)
-            .await
-            .unwrap();
-        chain.dispute(&tc, &buyer).await.unwrap();
-
-        // Keep the whole persisted history internally consistent while moving it to the exact
-        // permissionless deadline: one completed week, one started week, an older trusted 2T claim,
-        // and a newest contestable 3T claim at the dispute instant.
-        let eligible_dispute_time = unix_now_secs() - consts.dispute_window.as_secs();
-        let mut persisted = chain.load_state().unwrap();
-        let cell = persisted.streams.get_mut(&tc).unwrap();
-        cell.dispute_time = eligible_dispute_time;
-        cell.prev_claim_time = eligible_dispute_time - consts.claim_promote_window.as_secs();
-        cell.last_claim_time = eligible_dispute_time;
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = eligible_dispute_time - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-
-        let eligible = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        let restarted = MockChainBackend::new(endpoints, consts, DobParams::canonical());
-        assert_eq!(
-            restarted.deal_snapshot(&tc).await.unwrap().unwrap(),
-            eligible,
-            "the nontrivial timeout claim and weekly state must survive restart"
-        );
-
-        let (one_tick_pay, one_tick_fee) =
-            token_pay_and_fee(&tc, TICK_SIZE, price, &consts).unwrap();
-        let (claimed_pay, claimed_fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, price, &consts).unwrap();
-        let stake = (claimed_pay + claimed_fee).min(2 * u128::from(price));
-        let (future_pay, future_fee) =
-            token_pay_and_fee(&tc, 4 * TICK_SIZE, price, &consts).unwrap();
-        let future_refund = future_pay + future_fee;
-        let surviving_buyer_bond = 2 * u128::from(price) - stake;
-        let surviving_seller_bond = seller_funding - stake;
-        let expected_buyer_refund = future_refund + surviving_buyer_bond;
-        let proved_pay = 3 * u128::from(price);
-        let expected_seller = proved_pay + surviving_seller_bond;
-        let (_, earned_fee) = token_pay_and_fee(&tc, 3 * TICK_SIZE, price, &consts).unwrap();
-        let unearned_current_week = one_tick_pay + one_tick_fee;
-        let expected_burn = stake + stake + earned_fee + unearned_current_week;
-
-        let settlement = restarted.resolve_dispute_timeout(&tc).await.unwrap();
-        assert_eq!(
-            settlement,
-            Settlement::SellerNoShow {
-                to_buyer_refund: expected_buyer_refund,
-                seller_bond_returned: surviving_seller_bond,
-            }
-        );
-        let terminal = restarted.load_state().unwrap();
-        let cell = terminal.streams.get(&tc).unwrap();
-        assert!(cell.closed);
-        assert!(!cell.disputed);
-        assert_eq!(cell.tokens_final, 2 * TICK_SIZE);
-        assert_eq!(cell.tokens_superseded, 2 * TICK_SIZE);
-        assert_eq!(cell.tokens_pending, 2 * TICK_SIZE);
-        assert_eq!(cell.seller_received, expected_seller);
-        assert_eq!(cell.buyer_refunded, expected_buyer_refund);
-        assert_eq!(cell.burned, expected_burn);
-        assert_eq!(cell.fee_accrued, 0);
-        assert_eq!(cell.buyer_locked, 0);
-        assert_eq!(cell.buyer_bond, 0);
-        assert_eq!(cell.seller_locked, 0);
-        assert_mock_money_conserved(&restarted, &tc, buyer_funding, seller_funding);
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(16))]
-
-        #[test]
-        fn ordinary_raw_sub_tick_dispute_uses_canonical_stake_and_conserves_money(
-            raw_tail in 1u128..TICK_SIZE,
-        ) {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let base_dir = tempfile::tempdir().expect("test temp dir");
-                let base = base_dir.path();
-                let consts = ProtocolConsts::canonical();
-                let chain = MockChainBackend::new(
-                    base.join("eps.json"),
-                    consts,
-                    DobParams::canonical(),
-                );
-                let seller = LocalNote::from_seed(&[55u8; 32]);
-                let buyer = LocalNote::from_seed(&[56u8; 32]);
-                let price = 1_000_000_000;
-                let p = u128::from(price);
-                let tc = "tc-ordinary-raw-dispute-floor".to_string();
-                open_ordinary_fixture(&chain, &tc, &seller, &buyer, price).await;
-                elapse_min_claim_interval(&chain, &tc);
-                chain
-                    .claim_tokens(&tc, &seller, TICK_SIZE + raw_tail)
-                    .await
-                    .unwrap();
-                chain.dispute(&tc, &buyer).await.unwrap();
-
-                let (gross_pay, gross_fee) =
-                    token_pay_and_fee(&tc, 4 * TICK_SIZE, price, &consts).unwrap();
-                let buyer_funding = gross_pay + gross_fee;
-                let seller_funding = 2 * p;
-                let (_, probe_fee) =
-                    token_pay_and_fee(&tc, TICK_SIZE, price, &consts).unwrap();
-                let raw_value = token_pay_and_fee(&tc, raw_tail, price, &consts).unwrap();
-                let stake = (raw_value.0 + raw_value.1).max(p).min(2 * p);
-                assert!(stake >= p);
-                let expected_refund = buyer_funding - p - probe_fee - stake;
-                let settlement = chain.release_dispute(&tc).await.unwrap();
-                assert_eq!(
-                    settlement,
-                    Settlement::SellerNoShow {
-                        to_buyer_refund: expected_refund,
-                        seller_bond_returned: seller_funding,
-                    }
-                );
-                let terminal = chain.load_state().unwrap();
-                let cell = terminal.streams.get(&tc).unwrap();
-                assert_eq!(cell.tokens_final, TICK_SIZE);
-                assert_eq!(cell.seller_received, p + seller_funding);
-                assert_eq!(cell.buyer_refunded, expected_refund);
-                assert_eq!(cell.burned, stake + probe_fee);
-                assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-
-            });
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(16))]
-
-        #[test]
-        fn subscription_raw_sub_tick_dispute_uses_symmetric_canonical_stake(
-            raw_tail in 1u128..TICK_SIZE,
-        ) {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let consts = ProtocolConsts::canonical();
-                let price = TEST_PRICE;
-                let p = u128::from(price);
-                let max_ticks = 8;
-                let mut outcomes = Vec::new();
-
-                for timed_out in [false, true] {
-                    let base_dir = tempfile::tempdir().expect("test temp dir");
-                    let base = base_dir.path();
-                    let chain = MockChainBackend::new(
-                        base.join("eps.json"),
-                        consts,
-                        DobParams::canonical(),
-                    );
-                    let seller = LocalNote::from_seed(&[57u8; 32]);
-                    let buyer = LocalNote::from_seed(&[58u8; 32]);
-                    let tc = "tc-subscription-raw-dispute-floor".to_string();
-                    let (buyer_funding, seller_funding) =
-                        subscription_funding(price, max_ticks);
-                    open_subscription_fixture(
-                        &chain,
-                        &tc,
-                        &seller,
-                        &buyer,
-                        price,
-                        max_ticks,
-                    )
-                    .await;
-                    elapse_probe_window(&chain, &tc);
-                    chain.accept_probe(&tc).await.unwrap();
-                    elapse_min_claim_interval(&chain, &tc);
-                    chain
-                        .claim_tokens(&tc, &seller, TICK_SIZE + raw_tail)
-                        .await
-                        .unwrap();
-                    chain.dispute(&tc, &buyer).await.unwrap();
-
-                    let raw_value = token_pay_and_fee(&tc, raw_tail, price, &consts).unwrap();
-                    let expected_stake = (raw_value.0 + raw_value.1).max(p).min(2 * p);
-                    assert!(expected_stake >= p);
-                    let (future_pay, future_fee) =
-                        token_pay_and_fee(&tc, 6 * TICK_SIZE, price, &consts).unwrap();
-                    let future_refund = future_pay + future_fee;
-
-                    if timed_out {
-                        let eligible = unix_now_secs() - consts.dispute_window.as_secs();
-                        let mut persisted = chain.load_state().unwrap();
-                        let cell = persisted.streams.get_mut(&tc).unwrap();
-                        cell.probe_time =
-                            eligible.saturating_sub(consts.probe_window.as_secs());
-                        cell.prev_claim_time = eligible;
-                        cell.last_claim_time = eligible;
-                        cell.dispute_time = eligible;
-                        persisted
-                            .deal_subscriptions
-                            .get_mut(&tc)
-                            .unwrap()
-                            .period_start = eligible;
-                        chain.store_state(&persisted).unwrap();
-                    }
-
-                    let settlement = if timed_out {
-                        chain.resolve_dispute_timeout(&tc).await.unwrap()
-                    } else {
-                        chain.release_dispute(&tc).await.unwrap()
-                    };
-                    let (settlement_refund, seller_bond_returned) = match settlement {
-                        Settlement::SellerNoShow {
-                            to_buyer_refund,
-                            seller_bond_returned,
-                        } => (to_buyer_refund, seller_bond_returned),
-                        other => panic!("unexpected subscription dispute settlement: {other:?}"),
-                    };
-                    let surviving_buyer_bond = settlement_refund
-                        .checked_sub(future_refund)
-                        .expect("refund contains the unstarted-week refund");
-                    let buyer_stake = 2 * p - surviving_buyer_bond;
-                    assert_eq!(buyer_stake, expected_stake);
-
-                    let terminal = chain.load_state().unwrap();
-                    let cell = terminal.streams.get(&tc).unwrap();
-                    assert_eq!(cell.tokens_final, TICK_SIZE);
-                    assert_eq!(cell.buyer_refunded, settlement_refund);
-                    assert_eq!(cell.seller_received, p + seller_bond_returned);
-                    assert_mock_money_conserved(
-                        &chain,
-                        &tc,
-                        buyer_funding,
-                        seller_funding,
-                    );
-                    outcomes.push((
-                        settlement_refund,
-                        seller_bond_returned,
-                        cell.burned,
-                        buyer_stake,
-                    ));
-
-                }
-
-                let concession = outcomes[0];
-                let timeout = outcomes[1];
-                assert_eq!(concession.0, timeout.0);
-                assert_eq!(concession.3, timeout.3);
-                assert_eq!(concession.1 - timeout.1, concession.3);
-                assert_eq!(timeout.2 - concession.2, concession.3);
-            });
-        }
-    }
-
-    #[tokio::test]
-    async fn subscription_raw_claim_tail_caps_dispute_at_two_p_and_conserves_money() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let consts = ProtocolConsts::canonical();
-        let chain = MockChainBackend::new(base.join("eps.json"), consts, DobParams::canonical());
-        let seller = LocalNote::from_seed(&[59u8; 32]);
-        let buyer = LocalNote::from_seed(&[60u8; 32]);
-        let price = 1_000_000_000;
-        let p = u128::from(price);
-        let max_ticks = 8;
-        let tc = "tc-subscription-raw-dispute-cap".to_string();
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-        open_subscription_fixture(&chain, &tc, &seller, &buyer, price, max_ticks).await;
-        elapse_probe_window(&chain, &tc);
-        chain.accept_probe(&tc).await.unwrap();
-        let mut persisted = chain.load_state().unwrap();
-        persisted
-            .deal_subscriptions
-            .get_mut(&tc)
-            .unwrap()
-            .period_start = unix_now_secs() - SUB_WEEK_LEN.as_secs();
-        chain.store_state(&persisted).unwrap();
-        chain.settle_week(&tc).await.unwrap();
-        for cumulative in [2 * TICK_SIZE, 3 * TICK_SIZE - 1] {
-            elapse_min_claim_interval(&chain, &tc);
-            chain.claim_tokens(&tc, &seller, cumulative).await.unwrap();
-        }
-        let dispute_at = unix_now_secs();
-        let mut persisted = chain.load_state().unwrap();
-        let cell = persisted.streams.get_mut(&tc).unwrap();
-        cell.prev_claim_time = dispute_at - consts.claim_promote_window.as_secs();
-        cell.last_claim_time = dispute_at;
-        chain.store_state(&persisted).unwrap();
-        let before_dispute = chain.deal_snapshot(&tc).await.unwrap().unwrap();
-        assert_eq!(before_dispute.subscription.week_base_tokens, TICK_SIZE);
-        assert_eq!(before_dispute.state.tokens_final, TICK_SIZE);
-        assert_eq!(before_dispute.state.tokens_pending, 3 * TICK_SIZE - 1);
-        chain.dispute(&tc, &buyer).await.unwrap();
-
-        let claimed_from_week_base = 2 * TICK_SIZE - 1;
-        let (raw_claimed_pay, raw_claimed_fee) =
-            token_pay_and_fee(&tc, claimed_from_week_base, price, &consts).unwrap();
-        assert!(raw_claimed_pay + raw_claimed_fee > 2 * p);
-        let stake = 2 * p;
-        let (future_pay, future_fee) =
-            token_pay_and_fee(&tc, 4 * TICK_SIZE, price, &consts).unwrap();
-        let future_refund = future_pay + future_fee;
-        let (proved_pay, earned_fee) =
-            token_pay_and_fee(&tc, 3 * TICK_SIZE, price, &consts).unwrap();
-        let (gross_pay, gross_fee) = token_pay_and_fee(&tc, 8 * TICK_SIZE, price, &consts).unwrap();
-        let remaining_deposit = gross_pay + gross_fee - proved_pay - earned_fee;
-        let unearned_started_week = remaining_deposit - future_refund;
-        let expected_burn = stake + earned_fee + unearned_started_week;
-        let expected_seller = proved_pay + seller_funding;
-
-        let settlement = chain.release_dispute(&tc).await.unwrap();
-        assert_eq!(
-            settlement,
-            Settlement::SellerNoShow {
-                to_buyer_refund: future_refund,
-                seller_bond_returned: seller_funding,
-            }
-        );
-        let terminal = chain.load_state().unwrap();
-        let cell = terminal.streams.get(&tc).unwrap();
-        assert_eq!(cell.tokens_final, 2 * TICK_SIZE);
-        assert_eq!(cell.seller_received, expected_seller);
-        assert_eq!(cell.buyer_refunded, future_refund);
-        assert_eq!(cell.burned, expected_burn);
-        assert_mock_money_conserved(&chain, &tc, buyer_funding, seller_funding);
-    }
-
-    #[tokio::test]
-    async fn subscription_pre_probe_terminal_paths_price_each_party_exactly() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[29u8; 32]);
-        let buyer = LocalNote::from_seed(&[30u8; 32]);
-        let price = TEST_PRICE;
-        let max_ticks = 8;
-        let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-
-        open_subscription_fixture(
-            &chain,
-            "tc-buyer-pre-probe",
-            &seller,
-            &buyer,
-            price,
-            max_ticks,
-        )
-        .await;
-        chain
-            .stop(&"tc-buyer-pre-probe".to_string(), &buyer)
-            .await
-            .unwrap();
-        let buyer_stop_state = chain.load_state().unwrap();
-        let buyer_stop = buyer_stop_state.streams.get("tc-buyer-pre-probe").unwrap();
-        assert_eq!(buyer_stop.burned, 2 * u128::from(price));
-        assert_eq!(buyer_stop.seller_received, u128::from(price));
-        assert_eq!(buyer_stop.buyer_refunded, buyer_funding - u128::from(price));
-        assert_mock_money_conserved(&chain, "tc-buyer-pre-probe", buyer_funding, seller_funding);
-
-        open_subscription_fixture(
-            &chain,
-            "tc-seller-pre-probe",
-            &seller,
-            &buyer,
-            price,
-            max_ticks,
-        )
-        .await;
-        chain
-            .seller_stop(&"tc-seller-pre-probe".to_string())
-            .await
-            .unwrap();
-        let seller_stop_state = chain.load_state().unwrap();
-        let seller_stop = seller_stop_state
-            .streams
-            .get("tc-seller-pre-probe")
-            .unwrap();
-        assert_eq!(seller_stop.burned, u128::from(price));
-        assert_eq!(seller_stop.seller_received, u128::from(price));
-        assert_eq!(seller_stop.buyer_refunded, buyer_funding);
-        assert_mock_money_conserved(&chain, "tc-seller-pre-probe", buyer_funding, seller_funding);
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(16))]
-
-        #[test]
-        fn subscription_terminal_paths_conserve_all_buyer_and_seller_funds(
-            ticks_per_week in 1u64..=32,
-            buyer_ends in any::<bool>(),
-            pre_probe in any::<bool>(),
-        ) {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async {
-                let base_dir = tempfile::tempdir().expect("test temp dir");
-                let base = base_dir.path();
-                let chain = MockChainBackend::new(
-                    base.join("eps.json"),
-                    ProtocolConsts::canonical(),
-                    DobParams::canonical(),
-                );
-                let seller = LocalNote::from_seed(&[31u8; 32]);
-                let buyer = LocalNote::from_seed(&[32u8; 32]);
-                let price = 1_000_000_000;
-                let max_ticks = ticks_per_week * u64::from(SUBSCRIPTION_WEEKS);
-                let (buyer_funding, seller_funding) = subscription_funding(price, max_ticks);
-                let tc = "tc-subscription-property";
-                open_subscription_fixture(
-                    &chain,
-                    tc,
-                    &seller,
-                    &buyer,
-                    price,
-                    max_ticks,
-                )
-                .await;
-                if !pre_probe {
-                    elapse_probe_window(&chain, tc);
-                    chain.accept_probe(&tc.to_string()).await.unwrap();
-                }
-                if buyer_ends {
-                    chain.stop(&tc.to_string(), &buyer).await.unwrap();
-                } else {
-                    chain.seller_stop(&tc.to_string()).await.unwrap();
-                }
-                assert_mock_money_conserved(
-                    &chain,
-                    tc,
-                    buyer_funding,
-                    seller_funding,
-                );
-            });
-        }
-    }
-
-    #[tokio::test]
-    async fn high_price_timeout_rejects_legacy_wrapped_seller_lock() {
-        let base_dir = tempfile::tempdir().expect("test temp dir");
-        let base = base_dir.path();
-        let chain = MockChainBackend::new(
-            base.join("eps.json"),
-            ProtocolConsts::canonical(),
-            DobParams::canonical(),
-        );
-        let seller = LocalNote::from_seed(&[15u8; 32]);
-        let buyer = LocalNote::from_seed(&[16u8; 32]);
-        let tc = "tc-high-price-timeout".to_string();
-        let step = u64::try_from(crate::params::PRICE_STEP).unwrap();
-        let price = u64::MAX - (u64::MAX % step);
-        let p = u128::from(price);
-        let wrapped_legacy_bond = u128::from((2 * p) as u64);
-
-        chain
-            .post_offer(
-                SellOffer {
-                    price_per_tick: price,
-                    max_ticks: 2,
-                    token_contract: tc.clone(),
-                    flags: 0,
-                },
-                &seller,
-            )
-            .await
-            .unwrap();
-        chain.place_buy(&tc, &buyer).await.unwrap();
-        chain.open_stream(&tc, vec![], &seller).await.unwrap();
-
-        let mut state = chain.load_state().unwrap();
-        state.streams.get_mut(&tc).unwrap().seller_locked = wrapped_legacy_bond;
-        chain.store_state(&state).unwrap();
-
-        // A terminal path RELEASES what is held rather than subtracting an independently computed figure
-        // from it, so a corrupted persisted lock can no longer cause a silent under-return: whatever value
-        // the cell carries leaves it, and the buyer's escrow is refunded whole because nothing was claimed.
-        let settlement = chain.seller_stop(&tc).await.unwrap();
-        let (buyer_pay, buyer_fee) =
-            token_pay_and_fee(&tc, 2 * TICK_SIZE, price, &ProtocolConsts::canonical()).unwrap();
-        let buyer_refund = buyer_pay + buyer_fee;
-        assert_eq!(
-            settlement,
-            Settlement::AmicableSplit {
-                to_seller_ticks: 0,
-                to_buyer_refund: buyer_refund,
-            },
-            "nothing was claimed, so the seller earns nothing and the escrow goes back"
-        );
-        let closed = chain.snapshot(&tc).await.unwrap();
-        assert!(closed.closed);
-        assert_eq!(
-            closed.seller_locked, 0,
-            "the whole held bond is released, whatever its persisted value was"
-        );
-        assert_eq!(closed.buyer_locked, 0);
-        assert_eq!(
-            closed.buyer_refunded, buyer_refund,
-            "the buyer's escrow is conserved"
-        );
     }
 }

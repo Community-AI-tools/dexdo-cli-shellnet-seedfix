@@ -3,11 +3,14 @@
 //! signs it with the note's private key; the gateway verifies the signature against the buyer's pubkey
 //! recorded in the `token_contract` at match time, and only then forwards the stream.
 
+use crate::seller::capacity::{lock_or_recover, POISONED_LOCK_MESSAGE};
 use dexdo_core::note::{verify, NotePubkey, Signature};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 pub(crate) const HEALTH_CHALLENGE_TC: &str = "seller-readiness";
+const AUTH_BUYER_PUBKEYS_LOCK: &str = "seller auth buyer_pubkeys";
+const AUTH_ISSUED_LOCK: &str = "seller auth issued";
 
 /// The challenge bytes the buyer signs: a nonce hard-bound to the
 /// `token_contract` -- an intercepted signature cannot be replayed on another deal.
@@ -37,24 +40,20 @@ impl AuthRegistry {
 
     /// Register the buyer's pubkey for a contract(the seller learned it from the match).
     pub fn register(&self, token_contract: &str, buyer_pubkey: NotePubkey) {
-        self.buyer_pubkeys
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.buyer_pubkeys, AUTH_BUYER_PUBKEYS_LOCK)
             .insert(token_contract.to_string(), buyer_pubkey);
     }
 
     /// Retire one terminal/failed deal without touching authorization for other
     /// TokenContracts served by the same gateway.
     pub fn unregister(&self, token_contract: &str) {
-        self.buyer_pubkeys.lock().unwrap().remove(token_contract);
-        self.issued.lock().unwrap().remove(token_contract);
+        lock_or_recover(&self.buyer_pubkeys, AUTH_BUYER_PUBKEYS_LOCK).remove(token_contract);
+        lock_or_recover(&self.issued, AUTH_ISSUED_LOCK).remove(token_contract);
     }
 
     /// Issue a challenge nonce bound to the contract.
     pub fn issue_challenge(&self, token_contract: &str, nonce: Vec<u8>) {
-        self.issued
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.issued, AUTH_ISSUED_LOCK)
             .entry(token_contract.to_string())
             .or_default()
             .insert(nonce);
@@ -62,7 +61,13 @@ impl AuthRegistry {
 
     /// Remove one exact internally-owned challenge without affecting concurrent buyer challenges.
     pub(crate) fn discard_challenge(&self, token_contract: &str, nonce: &[u8]) -> bool {
-        let mut issued = self.issued.lock().unwrap();
+        let mut issued = match self.issued.lock() {
+            Ok(issued) => issued,
+            Err(_) => {
+                tracing::error!("{POISONED_LOCK_MESSAGE}: {AUTH_ISSUED_LOCK}");
+                return false;
+            }
+        };
         let empty = {
             let Some(outstanding) = issued.get_mut(token_contract) else {
                 return false;
@@ -100,14 +105,26 @@ impl AuthRegistry {
         nonce: &[u8],
         signature: &Signature,
     ) -> bool {
-        let pubkey = match self.buyer_pubkeys.lock().unwrap().get(token_contract) {
-            Some(pk) => pk.clone(),
-            None => return false,
+        let pubkey = match self.buyer_pubkeys.lock() {
+            Ok(pubkeys) => match pubkeys.get(token_contract) {
+                Some(pubkey) => pubkey.clone(),
+                None => return false,
+            },
+            Err(_) => {
+                tracing::error!("{POISONED_LOCK_MESSAGE}: {AUTH_BUYER_PUBKEYS_LOCK}");
+                return false;
+            }
         };
         // Confirm this exact nonce is outstanding, but do NOT consume it before verifying the signature.
-        match self.issued.lock().unwrap().get(token_contract) {
-            Some(outstanding) if outstanding.contains(nonce) => {}
-            _ => return false,
+        match self.issued.lock() {
+            Ok(issued) => match issued.get(token_contract) {
+                Some(outstanding) if outstanding.contains(nonce) => {}
+                _ => return false,
+            },
+            Err(_) => {
+                tracing::error!("{POISONED_LOCK_MESSAGE}: {AUTH_ISSUED_LOCK}");
+                return false;
+            }
         }
         let msg = challenge_bytes(token_contract, nonce);
         if !verify(&pubkey, &msg, signature) {
@@ -125,6 +142,10 @@ impl Default for AuthRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "auth_1157_tests.rs"]
+mod issue_1157_tests;
 
 #[cfg(test)]
 mod tests {

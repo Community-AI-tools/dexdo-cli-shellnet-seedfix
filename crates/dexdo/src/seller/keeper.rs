@@ -11,6 +11,10 @@ use dexdo_core::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+fn display_token_contract(token_contract: &str) -> String {
+    dexdo_core::address::display_self_dapp(token_contract)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeeperSnapshot {
     deal: DealChainState,
@@ -178,7 +182,8 @@ async fn drive_subscription_keeper_with_clock_and_observer(
         {
             KeeperStep::NotSubscription => {
                 return Err(ChainError::Chain(format!(
-                    "TokenContract {token_contract}: subscription keeper was started for an ordinary deal"
+                    "TokenContract {}: subscription keeper was started for an ordinary deal",
+                    display_token_contract(token_contract)
                 )));
             }
             KeeperStep::Terminal(tokens_final) => return Ok(tokens_final),
@@ -203,8 +208,9 @@ async fn keeper_step(
             Ok(KeeperStep::Terminal(tokens_final))
         } else {
             Err(ChainError::Chain(format!(
-                "TokenContract {token_contract}: keeper getters returned no data before a live subscription \
-                 was established"
+                "TokenContract {}: keeper getters returned no data before a live subscription \
+                 was established",
+                display_token_contract(token_contract)
             )))
         };
     };
@@ -281,7 +287,8 @@ fn plan(
     let idle = bounds.min_claim_interval;
     if idle.is_zero() {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: getConfig().minClaimInterval is zero; refusing a busy keeper loop"
+            "TokenContract {}: getConfig().minClaimInterval is zero; refusing a busy keeper loop",
+            display_token_contract(token_contract)
         )));
     }
     if !deal.opened || !deal.probe_accepted || deal.disputed {
@@ -291,21 +298,17 @@ fn plan(
     let promote = bounds.promote_window;
     if promote.is_zero() {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: derived CLAIM_PROMOTE_WINDOW is zero"
+            "TokenContract {}: derived CLAIM_PROMOTE_WINDOW is zero",
+            display_token_contract(token_contract)
         )));
     }
 
-    let prev_deadline = (deal.tokens_superseded > deal.tokens_final)
-        .then(|| {
-            checked_deadline(
-                deal.prev_claim_time,
-                promote,
-                token_contract,
-                "prevClaimTime",
-            )
-        })
-        .transpose()?;
-    let last_deadline = (deal.tokens_pending > deal.tokens_superseded)
+    // Contracts 4.0.35 collapsed the claim conveyor to two slots, so there is one unpromoted claim
+    // and one deadline instead of two. `CLAIM_PROMOTE_WINDOW == MIN_CLAIM_INTERVAL` now, which is
+    // what makes a second unpromoted slot unreachable rather than merely unobserved -- and `promote`
+    // above is that same number, derived in `ClaimBounds::from_config` from the rate floor rather
+    // than from twice it, so this deadline is the one the chain itself promotes at.
+    let last_deadline = (deal.tokens_pending > deal.tokens_final)
         .then(|| {
             checked_deadline(
                 deal.last_claim_time,
@@ -316,9 +319,7 @@ fn plan(
         })
         .transpose()?;
 
-    if prev_deadline.is_some_and(|deadline| now >= deadline)
-        || last_deadline.is_some_and(|deadline| now >= deadline)
-    {
+    if last_deadline.is_some_and(|deadline| now >= deadline) {
         return Ok(KeeperPlan::Finalize);
     }
 
@@ -354,12 +355,7 @@ fn plan(
     }
 
     let mut delay = idle;
-    for deadline in [
-        prev_deadline,
-        last_deadline,
-        next_boundary,
-        final_close_deadline,
-    ]
+    for deadline in [last_deadline, next_boundary, final_close_deadline]
     .into_iter()
     .flatten()
     {
@@ -378,14 +374,15 @@ fn validate_snapshot(
     let subscription = snapshot.subscription;
     let malformed = |reason: String| {
         ChainError::Chain(format!(
-            "TokenContract {token_contract}: malformed subscription keeper state: {reason}"
+            "TokenContract {}: malformed subscription keeper state: {reason}",
+            display_token_contract(token_contract)
         ))
     };
 
-    if deal.tokens_final > deal.tokens_superseded || deal.tokens_superseded > deal.tokens_pending {
+    if deal.tokens_final > deal.tokens_pending {
         return Err(malformed(format!(
-            "claim pipeline regressed (final={}, superseded={}, pending={})",
-            deal.tokens_final, deal.tokens_superseded, deal.tokens_pending
+            "claim pipeline regressed (final={}, pending={})",
+            deal.tokens_final, deal.tokens_pending
         )));
     }
     if deal.opened && !deal.funded {
@@ -428,17 +425,6 @@ fn validate_snapshot(
                     "accepted subscription has lastClaimTime=0".to_string(),
                 ));
             }
-            if deal.prev_claim_time > deal.last_claim_time {
-                return Err(malformed(format!(
-                    "prevClaimTime {} exceeds lastClaimTime {}",
-                    deal.prev_claim_time, deal.last_claim_time
-                )));
-            }
-            if deal.tokens_superseded > deal.tokens_final && deal.prev_claim_time == 0 {
-                return Err(malformed(
-                    "superseded claim has prevClaimTime=0".to_string(),
-                ));
-            }
         }
     }
     Ok(())
@@ -452,7 +438,8 @@ fn checked_deadline(
 ) -> Result<u64, ChainError> {
     anchor.checked_add(duration.as_secs()).ok_or_else(|| {
         ChainError::Chain(format!(
-            "TokenContract {token_contract}: {field} + deadline overflows unix seconds"
+            "TokenContract {}: {field} + deadline overflows unix seconds",
+            display_token_contract(token_contract)
         ))
     })
 }
@@ -465,7 +452,8 @@ fn next_week_boundary(
         .checked_add(1)
         .ok_or_else(|| {
             ChainError::Chain(format!(
-                "TokenContract {token_contract}: weekIndex increment overflow"
+                "TokenContract {}: weekIndex increment overflow",
+                display_token_contract(token_contract)
             ))
         })?;
     let offset = SUB_WEEK_LEN
@@ -473,7 +461,8 @@ fn next_week_boundary(
         .checked_mul(next_week)
         .ok_or_else(|| {
             ChainError::Chain(format!(
-                "TokenContract {token_contract}: subscription week offset overflow"
+                "TokenContract {}: subscription week offset overflow",
+                display_token_contract(token_contract)
             ))
         })?;
     subscription
@@ -481,7 +470,8 @@ fn next_week_boundary(
         .checked_add(offset)
         .ok_or_else(|| {
             ChainError::Chain(format!(
-                "TokenContract {token_contract}: periodStart + subscription week offset overflows"
+                "TokenContract {}: periodStart + subscription week offset overflows",
+                display_token_contract(token_contract)
             ))
         })
 }
@@ -493,20 +483,23 @@ fn scheduled_week_target(
 ) -> Result<u8, ChainError> {
     let elapsed = now.checked_sub(subscription.period_start).ok_or_else(|| {
         ChainError::Chain(format!(
-            "TokenContract {token_contract}: current time precedes subscription periodStart"
+            "TokenContract {}: current time precedes subscription periodStart",
+            display_token_contract(token_contract)
         ))
     })?;
     let elapsed_weeks = elapsed / SUB_WEEK_LEN.as_secs();
     let target = elapsed_weeks.min(u64::from(subscription.sub_weeks));
     let target = u8::try_from(target).map_err(|_| {
         ChainError::Chain(format!(
-            "TokenContract {token_contract}: scheduled subscription week target does not fit uint8"
+            "TokenContract {}: scheduled subscription week target does not fit uint8",
+            display_token_contract(token_contract)
         ))
     })?;
     if target <= subscription.week_index {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: due settleWeek did not advance its scheduled target \
+            "TokenContract {}: due settleWeek did not advance its scheduled target \
              beyond current weekIndex {}",
+            display_token_contract(token_contract),
             subscription.week_index
         )));
     }
@@ -573,19 +566,22 @@ fn reconcile_write(
             .map(|error| format!("; submit error: {error}"))
             .unwrap_or_default();
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: settleWeek expected exact scheduled weekIndex \
+            "TokenContract {}: settleWeek expected exact scheduled weekIndex \
              {target} or terminal state, observed weekIndex {}{submit}",
+            display_token_contract(token_contract),
             after.subscription.week_index
         )));
     }
 
     if let Err(error) = submit {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: {action:?} failed and strict state did not advance: {error}"
+            "TokenContract {}: {action:?} failed and strict state did not advance: {error}",
+            display_token_contract(token_contract)
         )));
     }
     Err(ChainError::Chain(format!(
-        "TokenContract {token_contract}: {action:?} returned success without a strict state transition"
+        "TokenContract {}: {action:?} returned success without a strict state transition",
+        display_token_contract(token_contract)
     )))
 }
 
@@ -597,10 +593,7 @@ fn ensure_non_regressing_transition(
     let terminal_transition = !before.deal.is_stopped() && after.deal.is_stopped();
     let accepted_probe_now = !before.deal.probe_accepted && after.deal.probe_accepted;
     if after.deal.tokens_final < before.deal.tokens_final
-        || (!terminal_transition
-            && (after.deal.tokens_superseded < before.deal.tokens_superseded
-                || after.deal.tokens_pending < before.deal.tokens_pending))
-        || after.deal.prev_claim_time < before.deal.prev_claim_time
+        || (!terminal_transition && after.deal.tokens_pending < before.deal.tokens_pending)
         || after.deal.last_claim_time < before.deal.last_claim_time
         || (before.deal.probe_accepted && !after.deal.probe_accepted)
         || after.subscription.week_index < before.subscription.week_index
@@ -609,7 +602,8 @@ fn ensure_non_regressing_transition(
         || after.subscription.period_start < before.subscription.period_start
     {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: keeper observed regressing accepted state"
+            "TokenContract {}: keeper observed regressing accepted state",
+            display_token_contract(token_contract)
         )));
     }
     for (name, unchanged) in [
@@ -632,13 +626,15 @@ fn ensure_non_regressing_transition(
     ] {
         if !unchanged {
             return Err(ChainError::Chain(format!(
-                "TokenContract {token_contract}: immutable subscription field {name} changed after keeper write"
+                "TokenContract {}: immutable subscription field {name} changed after keeper write",
+                display_token_contract(token_contract)
             )));
         }
     }
     if after.subscription.period_start != before.subscription.period_start && !accepted_probe_now {
         return Err(ChainError::Chain(format!(
-            "TokenContract {token_contract}: immutable subscription field periodStart changed after keeper write"
+            "TokenContract {}: immutable subscription field periodStart changed after keeper write",
+            display_token_contract(token_contract)
         )));
     }
     Ok(())
@@ -670,7 +666,7 @@ mod tests {
         }
     }
 
-    fn deal(final_ticks: u128, superseded_ticks: u128, pending_ticks: u128) -> DealChainState {
+    fn deal(final_ticks: u128, pending_ticks: u128) -> DealChainState {
         DealChainState {
             funded: true,
             opened: true,
@@ -679,13 +675,11 @@ mod tests {
             deposit: 1_000_000,
             finalized_owed: 0,
             tokens_final: final_ticks * TICK_SIZE,
-            tokens_superseded: superseded_ticks * TICK_SIZE,
             tokens_pending: pending_ticks * TICK_SIZE,
             probe_tick: 0,
             funded_time: Some(900),
             probe_time: 950,
-            prev_claim_time: START,
-            last_claim_time: START + 5,
+            last_claim_time: START,
             dispute_time: 0,
         }
     }
@@ -707,14 +701,9 @@ mod tests {
         }
     }
 
-    fn snapshot(
-        final_ticks: u128,
-        superseded_ticks: u128,
-        pending_ticks: u128,
-        week_index: u8,
-    ) -> KeeperSnapshot {
+    fn snapshot(final_ticks: u128, pending_ticks: u128, week_index: u8) -> KeeperSnapshot {
         KeeperSnapshot {
-            deal: deal(final_ticks, superseded_ticks, pending_ticks),
+            deal: deal(final_ticks, pending_ticks),
             subscription: subscription(week_index),
         }
     }
@@ -1017,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn observer_receives_wait_pre_post_and_terminal_snapshots_from_the_keeper_reads() {
-        let mut probing = snapshot(1, 1, 1, 0);
+        let mut probing = snapshot(1, 1, 0);
         probing.deal.probe_accepted = false;
         let waiting = ScriptedBackend::new(probing);
         let waiting_observer = RecordingObserver::recording();
@@ -1042,7 +1031,7 @@ mod tests {
             vec![Some((false, TICK_SIZE, 0)), Some((true, 2 * TICK_SIZE, 0)),]
         );
 
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let mut after = before;
         after.subscription.week_index = 1;
         after.subscription.tokens_paid = after.subscription.tokens_per_week;
@@ -1066,7 +1055,7 @@ mod tests {
         );
         assert_eq!(backend.reads(), 3);
 
-        let terminal = ScriptedBackend::new(snapshot(2, 2, 2, SUBSCRIPTION_WEEKS));
+        let terminal = ScriptedBackend::new(snapshot(2, 2, SUBSCRIPTION_WEEKS));
         terminal.push_settle(Effect::Replace(None));
         let terminal_observer = RecordingObserver::recording();
         assert!(matches!(
@@ -1092,13 +1081,11 @@ mod tests {
 
     #[tokio::test]
     async fn probe_acceptance_reanchors_period_start_once_and_then_freezes_it() {
-        let mut funded = snapshot(1, 1, 1, 0);
+        let mut funded = snapshot(1, 1, 0);
         funded.deal.probe_accepted = false;
         funded.deal.tokens_final = 0;
-        funded.deal.tokens_superseded = 0;
         funded.deal.tokens_pending = 0;
         funded.deal.probe_tick = 1;
-        funded.deal.prev_claim_time = 900;
         funded.deal.last_claim_time = 900;
         funded.subscription.tokens_paid = 0;
         funded.subscription.period_start = 900;
@@ -1116,9 +1103,7 @@ mod tests {
         accepted.deal.probe_accepted = true;
         accepted.deal.probe_tick = 0;
         accepted.deal.tokens_final = TICK_SIZE;
-        accepted.deal.tokens_superseded = TICK_SIZE;
         accepted.deal.tokens_pending = TICK_SIZE;
-        accepted.deal.prev_claim_time = START;
         accepted.deal.last_claim_time = START;
         accepted.subscription.tokens_paid = TICK_SIZE;
         accepted.subscription.period_start = START;
@@ -1156,7 +1141,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_dispute_resolution_may_collapse_claim_slots_below_week_high_water() {
-        let mut boundary = snapshot(1, 2, 3, 1);
+        let mut boundary = snapshot(1, 3, 1);
         boundary.subscription.week_base_tokens = 3 * TICK_SIZE;
         let backend = ScriptedBackend::new(boundary);
         let mut cursor = KeeperCursor::default();
@@ -1183,7 +1168,6 @@ mod tests {
         resolved.deal.disputed = false;
         resolved.deal.deposit = 0;
         resolved.deal.probe_tick = 0;
-        resolved.deal.tokens_superseded = resolved.deal.tokens_final;
         resolved.deal.tokens_pending = resolved.deal.tokens_final;
         backend.set_current(Some(resolved));
         assert!(matches!(
@@ -1203,7 +1187,6 @@ mod tests {
             KeeperStep::Wait(_)
         ));
         let mut active_collapse = boundary;
-        active_collapse.deal.tokens_superseded = active_collapse.deal.tokens_final;
         active_collapse.deal.tokens_pending = active_collapse.deal.tokens_final;
         active_backend.set_current(Some(active_collapse));
         let error = step_with_cursor(&active_backend, START + 2, &mut active_cursor, &())
@@ -1227,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn observer_failure_before_a_write_is_fail_closed() {
         for ordinal in [1, 2] {
-            let backend = ScriptedBackend::new(snapshot(1, 1, 1, 0));
+            let backend = ScriptedBackend::new(snapshot(1, 1, 0));
             let observer = RecordingObserver::failing_on(ordinal);
             let error = step_with_observer(&backend, START + SUB_WEEK_LEN.as_secs(), &observer)
                 .await
@@ -1241,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn observer_failure_after_an_applied_write_propagates_without_replay() {
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let mut after = before;
         after.subscription.week_index = 1;
         after.subscription.tokens_paid = after.subscription.tokens_per_week;
@@ -1271,7 +1254,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_snapshot_is_rejected_before_observer_or_write() {
-        let backend = ScriptedBackend::new(snapshot(2, 1, 3, 0));
+        let backend = ScriptedBackend::new(snapshot(3, 2, 0));
         let observer = RecordingObserver::recording();
         let error = step_with_observer(&backend, START + WINDOW, &observer)
             .await
@@ -1284,7 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduling_to_prewrite_rollback_is_rejected_before_observer_or_write() {
-        let scheduled = snapshot(2, 2, 2, 1);
+        let scheduled = snapshot(2, 2, 1);
         let mut regressed = scheduled;
         regressed.subscription.week_index = 0;
         regressed.subscription.tokens_paid = TICK_SIZE;
@@ -1314,7 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn loop_to_loop_high_water_rollbacks_never_submit_a_second_write() {
         for regression in ["claim", "claim_time", "probe", "week", "immutable"] {
-            let before = snapshot(2, 2, 2, 0);
+            let before = snapshot(2, 2, 0);
             let mut advanced = before;
             advanced.subscription.week_index = 1;
             advanced.subscription.tokens_paid = advanced.subscription.tokens_per_week;
@@ -1341,11 +1324,10 @@ mod tests {
             match regression {
                 "claim" => {
                     regressed.deal.tokens_final = TICK_SIZE;
-                    regressed.deal.tokens_superseded = TICK_SIZE;
                     regressed.deal.tokens_pending = TICK_SIZE;
                 }
                 "claim_time" => {
-                    regressed.deal.last_claim_time = regressed.deal.prev_claim_time;
+                    regressed.deal.last_claim_time -= 1;
                 }
                 "probe" => {
                     regressed.deal.probe_accepted = false;
@@ -1390,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_advance_delegates_the_only_finalize_submit_to_the_keeper() {
-        let before = snapshot(1, 2, 2, 0);
+        let before = snapshot(1, 2, 0);
         let backend = ScriptedBackend::new(before);
         let mut after = before;
         after.deal.tokens_final = 2 * TICK_SIZE;
@@ -1433,17 +1415,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_claim_slots_obey_window_minus_one_exact_and_plus_one() {
-        for (name, state, anchor) in [
-            ("superseded", snapshot(1, 2, 2, 0), START),
-            ("newest", snapshot(1, 1, 2, 0), START + 5),
-        ] {
+    async fn the_claim_slot_obeys_window_minus_one_exact_and_plus_one() {
+        for (name, state, anchor) in [("newest", snapshot(1, 2, 0), START)] {
             for (offset, due) in [(WINDOW - 1, false), (WINDOW, true), (WINDOW + 1, true)] {
                 let backend = ScriptedBackend::new(state);
                 if due {
                     let mut promoted = state;
                     promoted.deal.tokens_final = 2 * TICK_SIZE;
-                    promoted.deal.tokens_superseded = 2 * TICK_SIZE;
                     backend.push_finalize(Effect::Replace(Some(promoted)));
                 }
                 let result = step(&backend, anchor + offset).await.expect(name);
@@ -1458,18 +1436,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn older_slot_promotion_confirms_before_the_newest_slot_is_due() {
-        let mut before = snapshot(1, 2, 3, 0);
-        before.deal.prev_claim_time = START;
-        before.deal.last_claim_time = START + WINDOW;
+    async fn a_promotion_confirms_before_the_next_claim_is_due() {
+        let mut before = snapshot(1, 3, 0);
+        before.deal.last_claim_time = START;
 
-        // TokenContract 4.0.31 promotes the due older slot into `tokensFinal`, then moves the
-        // still-contestable newest slot into `tokensSuperseded`. Full `tokensPending` equality is
-        // deliberately not expected until the newest slot serves its own window.
+        // TokenContract 4.0.35 promotes the one pending slot whole(`_tokensFinal <- _tokensPend`),
+        // and a claim landing in the same moment re-anchors `lastClaimTime` and starts its OWN
+        // window. Full `tokensPending` equality is deliberately not expected until it serves it.
         let mut after = before;
-        after.deal.tokens_final = 2 * TICK_SIZE;
-        after.deal.tokens_superseded = 3 * TICK_SIZE;
-        after.deal.prev_claim_time = before.deal.last_claim_time;
+        after.deal.tokens_final = 3 * TICK_SIZE;
+        after.deal.tokens_pending = 4 * TICK_SIZE;
+        after.deal.last_claim_time = START + WINDOW;
 
         let backend = ScriptedBackend::new(before);
         backend.push_finalize(Effect::Replace(Some(after)));
@@ -1492,7 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_finalize_response_is_accepted_only_from_strict_promotion() {
-        let before = snapshot(1, 2, 2, 0);
+        let before = snapshot(1, 2, 0);
         let mut after = before;
         after.deal.tokens_final = 2 * TICK_SIZE;
         let backend = ScriptedBackend::new(before);
@@ -1516,14 +1493,14 @@ mod tests {
 
     #[tokio::test]
     async fn zero_delta_and_success_without_transition_send_nothing_or_fail_closed() {
-        let equal = ScriptedBackend::new(snapshot(2, 2, 2, 0));
+        let equal = ScriptedBackend::new(snapshot(2, 2, 0));
         assert!(matches!(
             step(&equal, START + WINDOW).await.unwrap(),
             KeeperStep::Wait(_)
         ));
         assert_eq!(equal.calls(), (0, 0));
 
-        let due = ScriptedBackend::new(snapshot(1, 2, 2, 0));
+        let due = ScriptedBackend::new(snapshot(1, 2, 0));
         due.push_finalize(Effect::Fail);
         let error = step(&due, START + WINDOW).await.unwrap_err().to_string();
         assert!(
@@ -1532,7 +1509,7 @@ mod tests {
         );
         assert_eq!(due.calls(), (1, 0));
 
-        let false_success = ScriptedBackend::new(snapshot(1, 2, 2, 0));
+        let false_success = ScriptedBackend::new(snapshot(1, 2, 0));
         false_success.push_finalize(Effect::NoTransition);
         let error = step(&false_success, START + WINDOW)
             .await
@@ -1544,9 +1521,10 @@ mod tests {
         );
     }
 
+    /// E2E-ROW: E2E-SUB-12/L0
     #[tokio::test]
     async fn exact_week_boundary_and_one_or_many_missed_weeks_use_one_call() {
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let early = ScriptedBackend::new(before);
         assert!(matches!(
             step(&early, START + SUB_WEEK_LEN.as_secs() - 1)
@@ -1575,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn missed_week_settle_rejects_partial_advancement() {
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let mut partial = before;
         partial.subscription.week_index = 1;
         partial.subscription.tokens_paid = partial.subscription.tokens_per_week;
@@ -1600,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_settle_response_and_restart_from_advanced_index_do_not_replay() {
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let mut after = before;
         after.subscription.week_index = 2;
         after.subscription.tokens_paid = 20 * TICK_SIZE;
@@ -1629,7 +1607,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_week_charges_then_promotes_then_closes_on_permissionless_retry() {
-        let mut week_three = snapshot(1, 1, 2, SUBSCRIPTION_WEEKS - 1);
+        let mut week_three = snapshot(1, 2, SUBSCRIPTION_WEEKS - 1);
         week_three.deal.last_claim_time =
             START + u64::from(SUBSCRIPTION_WEEKS) * SUB_WEEK_LEN.as_secs() - 5;
         let backend = ScriptedBackend::new(week_three);
@@ -1658,7 +1636,6 @@ mod tests {
 
         let mut promoted = charged;
         promoted.deal.tokens_final = 2 * TICK_SIZE;
-        promoted.deal.tokens_superseded = 2 * TICK_SIZE;
         backend.push_finalize(Effect::Replace(Some(promoted)));
         assert_eq!(
             step(&backend, charged.deal.last_claim_time + WINDOW)
@@ -1679,7 +1656,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_or_dispute_racing_either_action_is_never_replayed() {
-        let finalize_before = snapshot(1, 2, 2, 0);
+        let finalize_before = snapshot(1, 2, 0);
         let finalize = ScriptedBackend::new(finalize_before);
         finalize.push_finalize(Effect::ReplaceAndLoseResponse(None));
         assert!(matches!(
@@ -1704,7 +1681,7 @@ mod tests {
         ));
         assert_eq!(finalize_dispute.calls(), (1, 0));
 
-        let settle_before = snapshot(1, 1, 1, 0);
+        let settle_before = snapshot(1, 1, 0);
         let settle = ScriptedBackend::new(settle_before);
         let mut disputed = settle_before;
         disputed.deal.disputed = true;
@@ -1725,13 +1702,11 @@ mod tests {
 
     #[tokio::test]
     async fn claim_between_authoritative_snapshots_avoids_a_stale_finalize() {
-        let before = snapshot(1, 1, 2, 0);
+        let before = snapshot(1, 2, 0);
         let now = before.deal.last_claim_time + WINDOW;
         let mut after = before;
         after.deal.tokens_final = 2 * TICK_SIZE;
-        after.deal.tokens_superseded = 2 * TICK_SIZE;
         after.deal.tokens_pending = 3 * TICK_SIZE;
-        after.deal.prev_claim_time = before.deal.last_claim_time;
         after.deal.last_claim_time = now;
 
         let backend = ScriptedBackend::new(before);
@@ -1747,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn settle_between_authoritative_snapshots_uses_the_advanced_week_without_replay() {
-        let before = snapshot(1, 1, 1, 0);
+        let before = snapshot(1, 1, 0);
         let mut after = before;
         after.subscription.week_index = 1;
         after.subscription.tokens_paid = after.subscription.tokens_per_week;
@@ -1767,7 +1742,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_destruction_between_authoritative_snapshots_is_not_written() {
-        let before = snapshot(1, 2, 2, 0);
+        let before = snapshot(1, 2, 0);
         let backend = ScriptedBackend::new(before);
         backend.set_current(None);
         backend.push_snapshot_reads([Some(before), None]);
@@ -1781,7 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_absence_is_terminal_only_after_live_context() {
-        let backend = ScriptedBackend::new(snapshot(1, 1, 1, 0));
+        let backend = ScriptedBackend::new(snapshot(1, 1, 0));
         backend.set_current(None);
         let error = keeper_step(
             &backend,
@@ -1798,7 +1773,7 @@ mod tests {
         assert_eq!(backend.calls(), (0, 0));
 
         let mut live = KeeperCursor {
-            last_accepted: Some(snapshot(7, 7, 7, 0)),
+            last_accepted: Some(snapshot(7, 7, 0)),
         };
         assert!(matches!(
             keeper_step(&backend, &TC.to_string(), bounds(), START, &mut live, &())
@@ -1811,7 +1786,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_or_regressing_state_fails_closed() {
-        let mut malformed = snapshot(2, 1, 3, 0);
+        let mut malformed = snapshot(3, 2, 0);
         let backend = ScriptedBackend::new(malformed);
         assert!(step(&backend, START + WINDOW)
             .await
@@ -1820,7 +1795,7 @@ mod tests {
             .contains("claim pipeline regressed"));
         assert_eq!(backend.calls(), (0, 0));
 
-        malformed = snapshot(1, 1, 1, 0);
+        malformed = snapshot(1, 1, 0);
         malformed.subscription.period_start = u64::MAX;
         let overflow = ScriptedBackend::new(malformed);
         assert!(step(&overflow, u64::MAX)
@@ -1830,7 +1805,7 @@ mod tests {
             .contains("overflows"));
         assert_eq!(overflow.calls(), (0, 0));
 
-        let before = snapshot(1, 1, 1, 1);
+        let before = snapshot(1, 1, 1);
         let mut regressed = before;
         regressed.subscription.week_index = 0;
         regressed.subscription.tokens_paid = TICK_SIZE;
@@ -1845,29 +1820,29 @@ mod tests {
 
     #[tokio::test]
     async fn cross_field_state_fails_before_writes() {
-        for mut malformed in [
-            snapshot(1, 1, 41, 0),
-            snapshot(1, 1, 1, 0),
-            snapshot(1, 2, 2, 0),
+        let claimed_past_the_funded_term = snapshot(1, 41, 0);
+        let mut week_base_above_the_claim = snapshot(1, 1, 0);
+        week_base_above_the_claim.subscription.week_base_tokens = 2 * TICK_SIZE;
+        let mut accepted_without_a_claim_anchor = snapshot(1, 2, 0);
+        accepted_without_a_claim_anchor.deal.last_claim_time = 0;
+
+        for (name, malformed) in [
+            ("tokensPending above fundedTokens", claimed_past_the_funded_term),
+            ("weekBaseTokens above tokensPending", week_base_above_the_claim),
+            ("accepted with lastClaimTime=0", accepted_without_a_claim_anchor),
         ] {
-            if malformed.deal.tokens_pending > malformed.subscription.funded_tokens {
-                // already malformed
-            } else if malformed.deal.tokens_superseded > malformed.deal.tokens_final {
-                malformed.deal.prev_claim_time = malformed.deal.last_claim_time + 1;
-            } else {
-                malformed.subscription.week_base_tokens = 2 * TICK_SIZE;
-            }
             let backend = ScriptedBackend::new(malformed);
-            assert!(step(&backend, START + SUB_WEEK_LEN.as_secs())
-                .await
-                .is_err());
-            assert_eq!(backend.calls(), (0, 0));
+            assert!(
+                step(&backend, START + SUB_WEEK_LEN.as_secs()).await.is_err(),
+                "{name} must fail closed"
+            );
+            assert_eq!(backend.calls(), (0, 0), "{name} wrote before failing");
         }
     }
 
     #[tokio::test]
     async fn ordinary_deal_never_enters_keeper_or_writes() {
-        let mut ordinary = snapshot(1, 1, 1, 0);
+        let mut ordinary = snapshot(1, 1, 0);
         ordinary.subscription.deal_flags = 0;
         ordinary.subscription.sub_weeks = 0;
         ordinary.subscription.tokens_per_week = ordinary.subscription.funded_tokens;
@@ -1899,7 +1874,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_task_cancellation_performs_zero_chain_writes() {
-        let backend = Arc::new(ScriptedBackend::new(snapshot(1, 1, 1, 0)));
+        let backend = Arc::new(ScriptedBackend::new(snapshot(1, 1, 0)));
         let task_backend = backend.clone();
         let task = tokio::spawn(async move {
             let token_contract = TC.to_string();
@@ -1919,7 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn injected_clock_drives_one_post_term_retry_to_terminal() {
-        let backend = ScriptedBackend::new(snapshot(2, 2, 2, SUBSCRIPTION_WEEKS));
+        let backend = ScriptedBackend::new(snapshot(2, 2, SUBSCRIPTION_WEEKS));
         backend.push_settle(Effect::Replace(None));
         let token_contract = TC.to_string();
         let finalized = drive_subscription_keeper_with_clock(
@@ -1950,7 +1925,7 @@ mod tests {
                 }),
             lost_response in any::<bool>(),
         ) {
-            let before = snapshot(1, 1, 1, current_week);
+            let before = snapshot(1, 1, current_week);
             let now =
                 START + u64::from(elapsed_week) * SUB_WEEK_LEN.as_secs();
             let action = KeeperPlan::SettleWeek(elapsed_week);
@@ -2081,7 +2056,7 @@ mod tests {
 
     #[test]
     fn planner_uses_only_canonical_deadlines() {
-        let state = snapshot(1, 1, 1, 0);
+        let state = snapshot(1, 1, 0);
         assert_eq!(
             plan(state, bounds(), START + 1, &TC.to_string()).unwrap(),
             KeeperPlan::Wait(Duration::from_secs(2))

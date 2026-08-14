@@ -4,8 +4,9 @@
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
-    cap_canon_to_grant, handle_stream_error_policy, ApiDeal, ApiState, ConsumerRequestGuard,
-    DeadGatewayAction, DealInitError, RouteBudget, StreamErrorPolicyAction,
+    cap_canon_to_grant, handle_stream_error_policy, is_capacity_backpressure,
+    report_request_delivery, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
+    DealInitError, DeliveryEvents, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
 };
 use crate::buyer::render::{self, OpenAiChatRequest};
 use axum::extract::State;
@@ -125,7 +126,7 @@ pub async fn chat_completions(
                 retries += 1;
                 tracing::warn!(
                     error = %error,
-                    token_contract = %deal.route.token_contract,
+                    token_contract = %super::display_token_contract(&deal.route.token_contract),
                     "consumer API: upstream open failed; retrying once per dead_gateway=retry_then_reclaim"
                 );
             }
@@ -135,15 +136,42 @@ pub async fn chat_completions(
     let upstream = match upstream {
         Ok(stream) => stream,
         Err(error) => {
+            // The seller answered, and its answer was "not yet" -- request-scoped, not a dead
+            // gateway. The local caller retries; the deal is left alone.
+            if is_capacity_backpressure(&error) {
+                request_guard.complete();
+                return reject(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &format!(
+                        "the deal has no delivery capacity for this request yet; retry once the \
+                         trial tick has been accepted: {error}"
+                    ),
+                );
+            }
+            // the retry above logs at WARN, and until now the DEFINITIVE refusal logged
+            // nothing at all -- a run that ended in a dead gateway had no ERROR line for an
+            // operator filtering by level, and the address that was tried appeared nowhere in
+            // the log at any verbosity. Retries stay WARN; this one is terminal.
+            tracing::error!(
+                error = %error,
+                endpoint = %deal.route.handover.endpoint,
+                token_contract = %super::display_token_contract(&deal.route.token_contract),
+                retries,
+                "consumer API: upstream open failed definitively; settling the deal as a dead gateway"
+            );
             deal.session
                 .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
                 .await;
+            // The bare `{error}` here rendered `transport error` and nothing else: the stage and
+            // every cause under it were dropped, leaving the operator with a dead gateway and no
+            // way to tell a refused connect from a TLS alert or an h2 rejection.
+            let detail = crate::buyer::tls::dial_failure_detail(&error);
             let reason = if retries == 0 {
-                format!("upstream open failed: {error}")
+                format!("upstream open failed: {detail}")
             } else if retries == 1 {
-                format!("upstream open failed after retry: {error}")
+                format!("upstream open failed after retry: {detail}")
             } else {
-                format!("upstream open failed after {retries} retries: {error}")
+                format!("upstream open failed after {retries} retries: {detail}")
             };
             return reject(StatusCode::BAD_GATEWAY, &reason);
         }
@@ -152,6 +180,7 @@ pub async fn chat_completions(
     // Session-scoped: the deal is NOT STOPped at this request's end -- it lives for the next
     // request and is settled once at session end(graceful shutdown) or on a verification-bail. The handler
     // settles the shared session ONLY on a bail(the seller cheated -> end the session, bail off B3/B10).
+    let delivery_events = state.delivery_events.clone();
     if stream {
         sse_response(
             upstream,
@@ -161,6 +190,7 @@ pub async fn chat_completions(
             max_tokens,
             deal,
             request_guard,
+            delivery_events,
         )
         .into_response()
     } else {
@@ -172,6 +202,7 @@ pub async fn chat_completions(
             max_tokens,
             deal,
             request_guard,
+            delivery_events,
         )
         .await
         .into_response()
@@ -181,6 +212,7 @@ pub async fn chat_completions(
 /// Re-render the canonical stream to OpenAI-SSE(B19, R6): `chat.completion.chunk` deltas ->
 /// terminal chunk with `finish_reason` -> `data: [DONE]`. Accounting/verification happen before
 /// re-rendering.
+#[allow(clippy::too_many_arguments)]
 fn sse_response(
     upstream: tonic::Streaming<CanonChunk>,
     id: String,
@@ -189,6 +221,7 @@ fn sse_response(
     max_tokens: u64,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
+    delivery_events: Option<DeliveryEvents>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let sse = async_stream::stream! {
         let mut driver = CanonStreamDriver::new(
@@ -226,7 +259,7 @@ fn sse_response(
             if let Err(error) =
                 request_guard.record_delivered(&deal, driver.received().saturating_sub(before))
             {
-                stream_error = Some(error);
+                stream_error = Some(error.into());
                 break;
             }
             if !chunk.text.is_empty() {
@@ -246,8 +279,9 @@ fn sse_response(
         if bailed {
             deal.session.settle_verification_bail("verify-bail").await;
         } else if let Some(e) = &stream_error {
-            if handle_stream_error_policy(&deal, received, e).await
-                == StreamErrorPolicyAction::RequestScoped
+            if e.is_capacity()
+                || handle_stream_error_policy(&deal, received, e.policy_message()).await
+                    == StreamErrorPolicyAction::RequestScoped
             {
                 request_guard.complete();
             }
@@ -259,18 +293,39 @@ fn sse_response(
         } else {
             request_guard.complete();
         }
-        // the terminal chunk does NOT pass off a bail or an upstream error as a clean `stop` --
-        // bail -> `content_filter`, transport error -> `error`, otherwise an honest `stop`.
+        // the terminal chunk does NOT pass off a bail or an upstream error as a clean
+        // `stop` -- bail -> `content_filter`, capacity refusal -> `capacity`, other transport error ->
+        // `error`, otherwise an honest `stop`.
+        // `length` used to require `received == 0`, so every truncation that had already
+        // rendered a token fell through to `stop`. A stream cut at 1,972,000 of a 2,000,000 grant
+        // was then byte-identical to a finished answer, and a consumer paying per token had no way
+        // to tell that its answer stopped short. `length` is the one value in the OpenAI enum that
+        // says "the cap ended this", and the cap ends it at any `received`, not only at zero.
         let finish_reason = if bailed {
             "content_filter"
-        } else if capped && received == 0 {
-            // The seller answered; this request's remaining grant could not admit the first chunk.
+        } else if capped {
             "length"
+        } else if stream_error.as_ref().is_some_and(|error| error.is_capacity()) {
+            "capacity"
         } else if stream_error.is_some() || received == 0 {
             "error"
         } else {
             "stop"
         };
+        report_request_delivery(
+            delivery_events.as_ref(),
+            RequestDelivery {
+                token_contract: deal.route.token_contract.clone(),
+                protocol: "openai",
+                streamed: true,
+                grant_tokens: max_tokens,
+                rendered_tokens: received,
+                route_delivered_tokens: deal.session.route_delivered_tokens(),
+                finish_reason,
+                truncated_by_grant: capped,
+                ended_before_grant: received < max_tokens,
+            },
+        );
         yield Ok(Event::default().data(render::openai_final_chunk(&id, &model, created, finish_reason)));
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -297,6 +352,7 @@ pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Ev
 }
 
 /// Non-streaming(B19): collect the entire canonical stream into a single `chat.completion`.
+#[allow(clippy::too_many_arguments)]
 async fn aggregate_response(
     upstream: tonic::Streaming<CanonChunk>,
     id: String,
@@ -305,6 +361,7 @@ async fn aggregate_response(
     max_tokens: u64,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
+    delivery_events: Option<DeliveryEvents>,
 ) -> Response {
     let mut content = String::new();
     let mut capped = false;
@@ -340,7 +397,7 @@ async fn aggregate_response(
         if let Err(error) =
             request_guard.record_delivered(&deal, driver.received().saturating_sub(before))
         {
-            stream_error = Some(error);
+            stream_error = Some(error.into());
             break;
         }
         content.push_str(&chunk.text);
@@ -353,31 +410,61 @@ async fn aggregate_response(
     let bailed = driver.bailed();
     let received = driver.received();
     drop(driver);
+    // every terminal below records the same three figures, including the two that answer 502.
+    // A request that failed after paying for output is exactly the one worth being able to attribute.
+    let report = |finish_reason: &'static str| {
+        report_request_delivery(
+            delivery_events.as_ref(),
+            RequestDelivery {
+                token_contract: deal.route.token_contract.clone(),
+                protocol: "openai",
+                streamed: false,
+                grant_tokens: max_tokens,
+                rendered_tokens: received,
+                route_delivered_tokens: deal.session.route_delivered_tokens(),
+                finish_reason,
+                truncated_by_grant: capped,
+                ended_before_grant: received < max_tokens,
+            },
+        );
+    };
     if bailed {
         deal.session.settle_verification_bail("verify-bail").await;
     } else if let Some(e) = stream_error {
-        if handle_stream_error_policy(&deal, received, &e).await
+        if e.is_capacity() {
+            request_guard.complete();
+            report("capacity");
+            let body = render::openai_completion(&id, &model, created, &content, "capacity");
+            return ([(http::header::CONTENT_TYPE, "application/json")], body).into_response();
+        }
+        if handle_stream_error_policy(&deal, received, e.policy_message()).await
             == StreamErrorPolicyAction::RequestScoped
         {
             request_guard.complete();
         }
+        report("error");
         return reject(StatusCode::BAD_GATEWAY, &format!("stream error: {e}"));
     } else if received == 0 && !capped {
         let heartbeat = deal.accepted_output_guard();
         deal.session
             .settle_empty_stream("empty-stream", &heartbeat)
             .await;
+        report("error");
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
     request_guard.complete();
-    // verification bail -> `content_filter`, so the consumer can tell an aborted response apart.
+    // verification bail -> `content_filter`; capacity refusal returned above ->
+    // `capacity`. Neither can be mistaken for an honest completion.
+    // `length` no longer requires `received == 0` -- a grant that cut the answer after some of
+    // it had already been aggregated said `stop`, which is indistinguishable from a complete answer.
     let finish_reason = if bailed {
         "content_filter"
-    } else if capped && received == 0 {
+    } else if capped {
         "length"
     } else {
         "stop"
     };
+    report(finish_reason);
     let body = render::openai_completion(&id, &model, created, &content, finish_reason);
     ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }

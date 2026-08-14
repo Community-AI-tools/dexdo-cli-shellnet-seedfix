@@ -333,6 +333,38 @@ pub(crate) struct SellerRuntimePolicy {
     pub(crate) max_open_deals: u64,
 }
 
+/// What to offer an operator who has to fill this field in.
+/// The schema accepts more than the runtime executes: `seller.on.after_deal_done` parses
+/// `republish` and `republish_with_backoff`, and `seller.on.buyer_no_show` parses
+/// `cleanup_and_republish` and `cleanup_and_retire`, but this daemon cannot perform a fresh-TC
+/// republish or a buyer-side cleanup, and refuses them at startup.
+/// Listing them as plain choices sends the operator to fill the policy with a value that fails a
+/// minute later, at a place that names a different field. So the ones the runtime executes are
+/// offered first, and the rest are named as what they are -- parsed, not executable today.
+fn allowed_for_operator(path: &str, kind: FieldKind) -> String {
+    let runtime: &[&str] = match path {
+        "seller.on.after_deal_done" => SELLER_RUNTIME_AFTER_DONE,
+        "seller.on.buyer_no_show" => SELLER_RUNTIME_BUYER_NO_SHOW,
+        _ => return kind.allowed(),
+    };
+    let FieldKind::Choice(all) = kind else {
+        return kind.allowed();
+    };
+    let rest = all
+        .iter()
+        .filter(|option| !runtime.contains(*option))
+        .copied()
+        .collect::<Vec<_>>();
+    if rest.is_empty() {
+        return runtime.join(" | ");
+    }
+    format!(
+        "{} (accepted but not executable by this runtime: {})",
+        runtime.join(" | "),
+        rest.join(" | ")
+    )
+}
+
 pub(crate) fn validate_seller_runtime_capabilities(policy: &SellerRuntimePolicy) -> Result<()> {
     let unsupported = [
         (
@@ -377,7 +409,19 @@ fn role_fields(role: RuntimeRole) -> &'static [PolicyField] {
     }
 }
 
+fn seller_chain_unavailable_field() -> PolicyField {
+    PolicyField {
+        path: "seller.on.chain_unavailable",
+        kind: FieldKind::Choice(
+            dexdo::seller::gateway::ChainUnavailableAction::supported_values(),
+        ),
+    }
+}
+
 pub(crate) fn default_policy_path() -> Result<PathBuf> {
+    if let Some(root) = crate::cli::data_dir::explicit() {
+        return Ok(root.join("policy.json"));
+    }
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var_os("APPDATA")
@@ -456,6 +500,11 @@ fn refresh_seller_legend(value: &mut Value) {
         "_legend.allowed.seller.on.buyer_no_show",
         Value::from(SellerBuyerNoShowAction::runtime_supported_values().join(" | ")),
     );
+    set_path(
+        value,
+        "_legend.allowed.seller.on.chain_unavailable",
+        Value::from(dexdo::seller::gateway::ChainUnavailableAction::supported_values().join(" | ")),
+    );
 }
 
 fn field_valid(value: Option<&Value>, kind: FieldKind) -> bool {
@@ -531,7 +580,12 @@ fn validate_unknown_fields(value: &Value) -> Vec<PolicyProblem> {
             problems.extend(validate_object_key_set(
                 on,
                 "seller.on",
-                &["after_deal_done", "buyer_no_show", "dispute_against_me"],
+                &[
+                    "after_deal_done",
+                    "buyer_no_show",
+                    "dispute_against_me",
+                    "chain_unavailable",
+                ],
             ));
         }
     }
@@ -549,8 +603,21 @@ fn validate_value(value: &Value, role: RuntimeRole) -> Vec<PolicyProblem> {
     }
     for field in role_fields(role) {
         if !field_valid(get_path(value, field.path), field.kind) {
-            problems.push(problem(field.path, field.kind.allowed()));
+            problems.push(problem(field.path, allowed_for_operator(field.path, field.kind)));
         }
+    }
+    let chain_unavailable = seller_chain_unavailable_field();
+    if role == RuntimeRole::Seller
+        && get_path(value, chain_unavailable.path).is_some()
+        && !field_valid(
+            get_path(value, chain_unavailable.path),
+            chain_unavailable.kind,
+        )
+    {
+        problems.push(problem(
+            chain_unavailable.path,
+            chain_unavailable.kind.allowed(),
+        ));
     }
     problems
 }
@@ -689,6 +756,20 @@ pub(crate) fn load_seller_runtime_policy(explicit: Option<&Path>) -> Result<Sell
     Ok(policy)
 }
 
+pub(crate) fn load_seller_chain_unavailable_action(
+    explicit: Option<&Path>,
+) -> Result<dexdo::seller::gateway::ChainUnavailableAction> {
+    let value = validate_policy_file(explicit, RuntimeRole::Seller)?;
+    let Some(value) = get_path(&value, "seller.on.chain_unavailable").and_then(Value::as_str)
+    else {
+        return Ok(dexdo::seller::gateway::ChainUnavailableAction::default());
+    };
+    Ok(
+        dexdo::seller::gateway::ChainUnavailableAction::from_config(value)
+            .expect("validated optional chain-unavailable action"),
+    )
+}
+
 fn scaffold_roles(value: &mut Value, role: PolicyRoleArg) {
     if !value.is_object() {
         *value = Value::Object(Map::new());
@@ -734,6 +815,11 @@ fn scaffold_roles(value: &mut Value, role: PolicyRoleArg) {
                 Value::from(field.kind.allowed()),
             );
         }
+        set_missing_path(
+            value,
+            "seller.on.chain_unavailable",
+            Value::from(dexdo::seller::gateway::ChainUnavailableAction::default().as_str()),
+        );
         refresh_seller_legend(value);
     }
 }
@@ -1126,3 +1212,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+#[path = "policy_1196_tests.rs"]
+mod issue_1196_tests;
+
+#[cfg(test)]
+#[path = "policy_fixture_gate_tests.rs"]
+mod policy_fixture_gate_tests;

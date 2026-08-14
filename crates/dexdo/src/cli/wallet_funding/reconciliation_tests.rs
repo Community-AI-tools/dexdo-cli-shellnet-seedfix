@@ -1,0 +1,744 @@
+//! item 2: how a funding request leaves the Vault's queue, and what may follow each way.
+//! A request vanishing from the queue means either that it EXECUTED or that it EXPIRED, and the two
+//! are opposite in money terms: after the first, another submit transfers a second time out of a
+//! cold Vault; after the second, another submit is the only way the Hot is ever funded. The rule the
+//! specification fixes is that queue disappearance ALONE must never authorize another submit.
+//! Every test here drives the real entry point [`ensure_hot_funded_with_turn`] through the real
+//! production provider [`AckinackiVaultProvider`], composed exactly as a money command composes it -
+//! the journal is read first and what it recorded is handed to the provider, then the mechanism runs.
+//! Only the chain underneath is scripted. A test that called the provider's matcher directly, or
+//! that wrote an end state by hand, would prove a path no command can reach.
+
+use std::cell::{Cell, RefCell};
+
+use super::providers::{
+    AckinackiVaultProvider, QueuedTransfer, VaultChain, VaultQueueEvent, VaultQueueEventKind,
+};
+use super::*;
+
+const SHELL: u32 = 2;
+const REQUIRED: u128 = 1_000;
+const WINDOW: u64 = 3_600;
+const QUEUED_AT: u64 = 1_000_000;
+
+fn hex64(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+fn hot_address() -> String {
+    format!("{}::{}", hex64(0xa1), hex64(0xa1))
+}
+
+fn vault_address() -> String {
+    format!("{}::{}", hex64(0xb2), hex64(0xb2))
+}
+
+fn creator() -> String {
+    hex64(0xc3)
+}
+
+fn binding() -> HotFundingBinding {
+    HotFundingBinding {
+        provider: WalletProvider::AckinackiWallet,
+        network: "shellnet".to_string(),
+        hot_address: hot_address(),
+        vault_address: Some(vault_address()),
+    }
+}
+
+fn requirements() -> FundingRequirements {
+    FundingRequirements::new([(SHELL, REQUIRED)])
+}
+
+/// One check-and-arrange pass, then give up. Every reconciliation test wants exactly one pass.
+fn bounds() -> FundingWaitBounds {
+    FundingWaitBounds {
+        timeout: Duration::ZERO,
+        poll: Duration::from_millis(1),
+        lock_timeout: Duration::from_millis(200),
+        lock_poll: Duration::from_millis(1),
+    }
+}
+
+/// A budget wide enough for the balance to arrive mid-wait, so the CONTINUE path is the one under
+/// test rather than the timeout.
+fn patient_bounds() -> FundingWaitBounds {
+    FundingWaitBounds {
+        timeout: Duration::from_secs(30),
+        ..bounds()
+    }
+}
+
+/// The transfer the first run creates, as the Vault's queue would report it back.
+fn queued(id: u64, shortfall: u128) -> QueuedTransfer {
+    QueuedTransfer {
+        id,
+        creator_pubkey: Some(creator()),
+        dest: hot_address(),
+        value: vault_to_hot_native_value(),
+        cc: [(SHELL, shortfall)].into_iter().collect(),
+        send_flags: VAULT_TO_HOT_SEND_FLAGS,
+        bounce: VAULT_TO_HOT_BOUNCE,
+        dapp_id: hex64(0xa1),
+        payload: None,
+    }
+}
+
+fn submitted_event(id: u64, at: u64) -> VaultQueueEvent {
+    VaultQueueEvent {
+        kind: VaultQueueEventKind::Submitted,
+        transaction_id: id,
+        dest: hot_address(),
+        value: vault_to_hot_native_value(),
+        dapp_id: hex64(0xa1),
+        message_id: format!("msg-submitted-{id}"),
+        created_at: at,
+    }
+}
+
+fn sent_event(id: u64, at: u64) -> VaultQueueEvent {
+    VaultQueueEvent {
+        kind: VaultQueueEventKind::Sent,
+        transaction_id: id,
+        dest: hot_address(),
+        value: vault_to_hot_native_value(),
+        dapp_id: hex64(0xa1),
+        message_id: format!("msg-sent-{id}"),
+        created_at: at,
+    }
+}
+
+/// A scripted Vault. Every answer is a fact some real chain could return; nothing here decides.
+struct FakeVault {
+    queue: RefCell<Vec<QueuedTransfer>>,
+    history: RefCell<Vec<VaultQueueEvent>>,
+    window: u64,
+    now: Cell<u64>,
+    queue_error: RefCell<Option<String>>,
+    history_error: RefCell<Option<String>>,
+    submits: Cell<usize>,
+    submitted: RefCell<Vec<FundingFingerprint>>,
+    next_id: Cell<u64>,
+    /// Optional malformed queue id reported by a submit receipt.
+    reported_pending_id: RefCell<Option<String>>,
+    /// When set, the submit's outcome cannot be established.
+    indeterminate: Cell<bool>,
+}
+
+impl FakeVault {
+    fn empty() -> Self {
+        Self {
+            queue: RefCell::new(Vec::new()),
+            history: RefCell::new(Vec::new()),
+            window: WINDOW,
+            now: Cell::new(QUEUED_AT),
+            queue_error: RefCell::new(None),
+            history_error: RefCell::new(None),
+            submits: Cell::new(0),
+            submitted: RefCell::new(Vec::new()),
+            next_id: Cell::new(7),
+            reported_pending_id: RefCell::new(None),
+            indeterminate: Cell::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl VaultChain for &FakeVault {
+    async fn queue(&self) -> Result<Vec<QueuedTransfer>> {
+        if let Some(error) = self.queue_error.borrow().as_ref() {
+            bail!("{error}");
+        }
+        Ok(self.queue.borrow().clone())
+    }
+
+    async fn history(&self) -> Result<Vec<VaultQueueEvent>> {
+        if let Some(error) = self.history_error.borrow().as_ref() {
+            bail!("{error}");
+        }
+        Ok(self.history.borrow().clone())
+    }
+
+    async fn expiration_window_secs(&self) -> Result<u64> {
+        Ok(self.window)
+    }
+
+    async fn chain_time_secs(&self) -> Result<u64> {
+        Ok(self.now.get())
+    }
+
+    async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
+        self.submits.set(self.submits.get() + 1);
+        self.submitted.borrow_mut().push(fingerprint.clone());
+        if self.indeterminate.get() {
+            return Ok(SubmitOutcome::Indeterminate {
+                reason: "no receipt".to_string(),
+            });
+        }
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        // A real Vault takes the request into its queue and records that it did.
+        let shortfall = fingerprint.cc.get(&SHELL).copied().unwrap_or_default();
+        self.queue.borrow_mut().push(queued(id, shortfall));
+        self.history
+            .borrow_mut()
+            .push(submitted_event(id, self.now.get()));
+        Ok(SubmitOutcome::Accepted {
+            transaction_hash: Some(format!("tx-{id}")),
+            pending_transaction_id: Some(
+                self.reported_pending_id
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| id.to_string()),
+            ),
+        })
+    }
+}
+
+/// A Hot whose balance is whatever the test says it is.
+struct FakeHot {
+    balances: RefCell<Vec<u128>>,
+    last: Cell<u128>,
+    reads: Cell<usize>,
+}
+
+impl FakeHot {
+    fn always(balance: u128) -> Self {
+        Self {
+            balances: RefCell::new(Vec::new()),
+            last: Cell::new(balance),
+            reads: Cell::new(0),
+        }
+    }
+
+    fn then_always(mut first: Vec<u128>, last: u128) -> Self {
+        first.reverse();
+        Self {
+            balances: RefCell::new(first),
+            last: Cell::new(last),
+            reads: Cell::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl HotBalanceReader for FakeHot {
+    async fn hot_balances(&self, _hot: &CanonicalAddress) -> Result<HotBalances> {
+        self.reads.set(self.reads.get() + 1);
+        let balance = self.balances.borrow_mut().pop().unwrap_or_else(|| self.last.get());
+        Ok(HotBalances::new([(SHELL, balance)]))
+    }
+}
+
+fn record_of(dir: &Path) -> Option<FundingJournalRecord> {
+    load_funding_journal(dir, "shellnet", &hot_address()).expect("read journal")
+}
+
+/// One run of a money command's funding step, composed exactly as production composes it: read the
+/// journal under the held turn, hand what it recorded to the provider, then run the mechanism.
+async fn money_command_run(dir: &Path, vault: &FakeVault, hot: &FakeHot) -> Result<FundedHot> {
+    money_command_run_with(dir, vault, hot, bounds()).await
+}
+
+async fn money_command_run_with(
+    dir: &Path,
+    vault: &FakeVault,
+    hot: &FakeHot,
+    bounds: FundingWaitBounds,
+) -> Result<FundedHot> {
+    let recorded = record_of(dir)
+        .filter(FundingJournalRecord::is_open)
+        .map(|record| record.recorded_request());
+    let provider = AckinackiVaultProvider::new(vault, recorded);
+    let binding = binding();
+    ensure_hot_funded_with_turn(
+        &HotFundingContext {
+            binding: &binding,
+            requirements: &requirements(),
+            operation: "note deploy",
+            creator_pubkey: &creator(),
+            data_dir: dir,
+            bounds,
+        },
+        HotTurn::AcquireOwn,
+        hot,
+        &provider,
+    )
+    .await
+}
+
+fn temp() -> tempfile::TempDir {
+    tempfile::tempdir().expect("temp data dir")
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rule: queue disappearance alone never authorizes another submit
+// ---------------------------------------------------------------------------------------------
+
+/// THE money-safety property. The request executed - the human confirmed it and the transfer left
+/// the Vault - so the queue no longer holds it. A client that read that emptiness as "my request is
+/// not there, so I never made one" would transfer a second time out of a cold wallet.
+#[tokio::test]
+async fn a_request_the_chain_shows_executed_is_never_submitted_again() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+
+    // Run 1: nothing queued yet, so the request is created.
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1, "the first run creates the request");
+    let after_first = record_of(dir.path()).expect("run 1 left a record");
+    assert_eq!(after_first.state, FundingState::Submitted);
+    assert_eq!(after_first.generation, 1);
+    assert_eq!(after_first.pending_transaction_id.as_deref(), Some("7"));
+
+    // The human confirms it in the wallet app: it leaves the queue AND the wallet emits the
+    // execution event. The Hot's balance has not caught up yet - which is precisely the window in
+    // which a naive client resubmits.
+    vault.queue.borrow_mut().clear();
+    vault
+        .history
+        .borrow_mut()
+        .push(sent_event(7, QUEUED_AT + 60));
+
+    // Run 2: the same command again.
+    let hot = FakeHot::always(0);
+    let second = money_command_run(dir.path(), &vault, &hot).await;
+    assert!(second.is_err(), "the balance has not arrived, so the wait still fails");
+
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "a request proven to have EXECUTED must never be submitted a second time: that is the \
+         double transfer out of the cold Vault"
+    );
+    let after_second = record_of(dir.path()).expect("run 2 kept the record");
+    assert_eq!(
+        after_second.state,
+        FundingState::Executed,
+        "the record must carry the verdict the chain gave, not merely stay `submitted`"
+    );
+    assert_eq!(
+        after_second.generation, 1,
+        "an executed request does not retire its generation: the money it moved is this generation's"
+    );
+    let evidence = after_second.evidence.expect("the verdict must retain its evidence");
+    assert_eq!(evidence.verdict, "executed");
+    assert!(
+        evidence.source.contains("msg-sent-7"),
+        "the evidence must name the finalized message it was read from: {evidence:?}"
+    );
+}
+
+/// The opposite reading of the SAME observable. The request was never confirmed and the wallet's own
+/// expiration window has passed, so it can no longer execute: no money left the Vault, and a fresh
+/// request is now the only way the Hot is ever funded.
+#[tokio::test]
+async fn a_request_the_chain_shows_expired_unexecuted_is_submitted_again_as_a_new_generation() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1);
+    assert_eq!(record_of(dir.path()).expect("record").generation, 1);
+
+    // Nobody confirmed it. It ages out of the queue, and the wallet emits no execution event.
+    vault.queue.borrow_mut().clear();
+    vault.now.set(QUEUED_AT + WINDOW + 1);
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        2,
+        "a request proven to have EXPIRED without executing must be replaced: refusing to would \
+         leave the Hot permanently unfundable"
+    );
+    let after = record_of(dir.path()).expect("record");
+    assert_eq!(
+        after.generation, 2,
+        "the replacement is a NEW generation, so the retired one can never be matched again"
+    );
+    assert_eq!(after.state, FundingState::Submitted);
+    assert_eq!(
+        after.pending_transaction_id.as_deref(),
+        Some("8"),
+        "the new generation carries its own queue id"
+    );
+}
+
+/// The state between the two: gone from the live queue, no execution event, and still inside the
+/// window in which the human can confirm it. Neither verdict is proven, so nothing is submitted.
+#[tokio::test]
+async fn a_disappearance_that_proves_neither_verdict_submits_nothing() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1);
+
+    // It is not in the live queue this instant - a stale read, a reorganised view, anything - but
+    // the deadline has not passed and no execution event exists.
+    vault.queue.borrow_mut().clear();
+    vault.now.set(QUEUED_AT + WINDOW - 1);
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "queue disappearance ALONE must never authorize another submit"
+    );
+    let after = record_of(dir.path()).expect("record");
+    assert_eq!(
+        after.state,
+        FundingState::Submitted,
+        "an unproven disappearance must not advance the record either"
+    );
+    assert!(after.evidence.is_none(), "there was no evidence to record");
+}
+
+/// An unreadable history is not an expired request. This is the same rule as the unreadable queue,
+/// one layer down, and it is the one a flaky gateway exercises in production.
+#[tokio::test]
+async fn an_unreadable_history_never_authorizes_another_submit() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1);
+
+    vault.queue.borrow_mut().clear();
+    vault.now.set(QUEUED_AT + WINDOW + 1);
+    *vault.history_error.borrow_mut() = Some("502 Bad Gateway".to_string());
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "a chain read that failed means unknown, and unknown must never permit a submit"
+    );
+    assert_eq!(record_of(dir.path()).expect("record").state, FundingState::Submitted);
+}
+
+/// A submit whose result was never observed leaves no queue id. The wallet's own
+/// `TransactionSubmitted` recovers it, so the request is still recognised as ours - and, being
+/// recognised, is not submitted again.
+#[tokio::test]
+async fn an_unobserved_submit_is_recovered_from_the_wallets_own_submitted_event() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    vault.indeterminate.set(true);
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1);
+    let after_first = record_of(dir.path()).expect("record");
+    assert_eq!(
+        after_first.state,
+        FundingState::Prepared,
+        "an unobserved submit must NOT be recorded as submitted"
+    );
+    assert!(after_first.pending_transaction_id.is_none());
+
+    // On chain it DID land, and then it executed. The client never learned either.
+    vault.indeterminate.set(false);
+    vault.history.borrow_mut().push(submitted_event(42, QUEUED_AT));
+    vault.history.borrow_mut().push(sent_event(42, QUEUED_AT + 30));
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "the request landed and executed; the repeat must recognise it from the wallet's own \
+         events rather than reading the empty queue as absence"
+    );
+    let after = record_of(dir.path()).expect("record");
+    assert_eq!(after.state, FundingState::Executed);
+}
+
+/// The verdict a LOCAL clock is never allowed to reach.
+/// The submit's result was never observed, so no queue id was recorded, and the wallet's finalized
+/// history carries no `TransactionSubmitted` for it either. There is therefore no chain time to date
+/// an expiry deadline from. Dating it from the journal's own creation time instead would let a
+/// client whose clock had drifted - or whose history read came back silently short - resubmit a
+/// request that had in fact executed, and that is the double transfer out of a cold Vault. The
+/// asymmetry settles it: a wrong "expired" is unrecoverable, a wrong "I cannot tell" costs one more
+/// run. Absence of evidence is refused rather than read as evidence of expiry.
+#[tokio::test]
+async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_retried() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    vault.indeterminate.set(true);
+    // A chain clock far past anything the LOCAL record could date a deadline to: measured from
+    // `created_at_unix`, the wallet's window would have elapsed many times over by now.
+    vault.now.set(unix_now_secs() + WINDOW * 10);
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(vault.submits.get(), 1, "the first run creates the request");
+    let after_first = record_of(dir.path()).expect("run 1 left a record");
+    assert_eq!(
+        after_first.state,
+        FundingState::Prepared,
+        "an unobserved submit is recorded as prepared and nothing more"
+    );
+    assert!(after_first.pending_transaction_id.is_none());
+    assert!(
+        vault.history.borrow().is_empty(),
+        "the wallet never recorded the admission, which is the state under test"
+    );
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "with no TransactionSubmitted there is no chain time to measure an expiry from, and a \
+         local clock may never conclude one: refusing costs a re-run, retrying can transfer twice"
+    );
+    let after = record_of(dir.path()).expect("run 2 kept the record");
+    assert_eq!(
+        after.state,
+        FundingState::Prepared,
+        "a state the chain did not prove advances nothing"
+    );
+    assert_eq!(
+        after.generation, 1,
+        "a generation is retired only by PROVEN expiry, and nothing here proved one"
+    );
+    assert!(after.evidence.is_none(), "there was no evidence to record");
+}
+
+/// The refusal has to be actionable, and it has to keep reporting apart from deciding.
+/// An operator told only that something "could not be established" has nothing to do. They are told
+/// which transfer to look for, so they can settle it by looking at the Vault's pending list - the
+/// one observation that actually resolves this. The local deadline is reported alongside, because it
+/// is useful, and marked as authorizing nothing, because it is not what decided.
+#[tokio::test]
+async fn the_refusal_names_the_request_and_reports_the_local_deadline_without_acting_on_it() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    vault.indeterminate.set(true);
+    vault.now.set(unix_now_secs() + WINDOW * 10);
+
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    // The balance arrives mid-wait, so the run returns and carries the notice the funding step
+    // reached - which is how a caller ever sees the verdict rather than only its side effects.
+    let hot = FakeHot::then_always(vec![0], REQUIRED);
+    let funded = money_command_run_with(dir.path(), &vault, &hot, patient_bounds())
+        .await
+        .expect("the balance arrives and the command continues");
+
+    let FundingNotice::RequestIndeterminate { reason } = funded.notice else {
+        panic!(
+            "a request that cannot be dated from chain fact must stay indeterminate, never become \
+             a verdict: {:?}",
+            funded.notice
+        );
+    };
+    assert!(
+        reason.contains("no TransactionSubmitted"),
+        "the refusal must say exactly what is missing: {reason}"
+    );
+    assert!(
+        reason.contains(&hot_address()) && reason.contains(&creator()),
+        "the refusal must name the transfer the operator should go and look for: {reason}"
+    );
+    assert!(
+        reason.contains("authorizing nothing"),
+        "the local deadline is reported, never the thing that decided: {reason}"
+    );
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "and, having decided nothing, it transferred nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The money command continues once the balance arrives
+// ---------------------------------------------------------------------------------------------
+
+/// The step the whole flow exists for: the command does not fail on an insufficient balance, it
+/// arranges the top-up, waits, and CONTINUES - holding the turn, with the balances it actually read.
+#[tokio::test]
+async fn the_money_command_continues_once_the_balance_arrives() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    // Short, short, then funded - the human confirmed the Vault transfer in between.
+    let hot = FakeHot::then_always(vec![0, 400], REQUIRED);
+
+    let funding = money_command_run_with(dir.path(), &vault, &hot, patient_bounds());
+    let confirmation = async {
+        while vault.submits.get() == 0 {
+            tokio::task::yield_now().await;
+        }
+        vault.queue.borrow_mut().clear();
+        vault
+            .history
+            .borrow_mut()
+            .push(sent_event(7, QUEUED_AT + 60));
+    };
+    let (funded, ()) = tokio::join!(funding, confirmation);
+    let funded = funded.expect("the balance arrives and the command continues");
+
+    assert_eq!(
+        funded.observed.get(SHELL),
+        REQUIRED,
+        "the caller must be handed the balances the FINAL check actually read"
+    );
+    assert!(
+        requirements().met_by(&funded.observed),
+        "the command may only continue against a balance that meets its requirement"
+    );
+    assert_eq!(funded.notice, FundingNotice::RequestSubmitted);
+    assert!(
+        hot.reads.get() >= 3,
+        "the wait must have re-read the balance rather than trusting the request"
+    );
+    let closed = record_of(dir.path()).expect("record");
+    assert_eq!(
+        closed.state,
+        FundingState::Satisfied,
+        "only an observed balance closes the record"
+    );
+    assert_eq!(
+        closed.satisfied_balances.as_ref().and_then(|b| b.get(&SHELL)),
+        Some(&REQUIRED)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The record carries what reconciliation needs
+// ---------------------------------------------------------------------------------------------
+
+/// Every field the specification names for the fingerprint, on the record, frozen for the
+/// generation - and the same fingerprint on the wire, because both come from one derivation.
+#[tokio::test]
+async fn the_record_freezes_the_full_fingerprint_the_submit_used() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let record = record_of(dir.path()).expect("record");
+    let fingerprint = &record.fingerprint;
+    assert_eq!(fingerprint.creator, creator());
+    assert_eq!(fingerprint.dest, hot_address());
+    assert_eq!(
+        fingerprint.dapp_id,
+        hex64(0xa1),
+        "a Vault -> Hot transfer is addressed into the Hot's OWN self-DApp, never the dexdo one"
+    );
+    assert_ne!(fingerprint.dapp_id, "4");
+    assert_eq!(fingerprint.value, vault_to_hot_native_value());
+    assert_eq!(fingerprint.cc.get(&SHELL), Some(&REQUIRED));
+    assert_eq!(fingerprint.send_flags, VAULT_TO_HOT_SEND_FLAGS);
+    assert_eq!(fingerprint.bounce, VAULT_TO_HOT_BOUNCE);
+    assert_eq!(fingerprint.payload_hash, payload_hash(VAULT_TO_HOT_PAYLOAD));
+
+    let on_the_wire = vault.submitted.borrow();
+    let on_the_wire = on_the_wire.first().expect("the provider was asked to submit");
+    assert_eq!(
+        on_the_wire, fingerprint,
+        "the transfer that went on the wire and the transfer the journal claims went on the wire \
+         must be the same one"
+    );
+}
+
+/// The frozen fingerprint is the generation's, not today's. A later run whose shortfall has moved
+/// must still be looking for the transfer the earlier run created, or it cannot recognise it.
+#[tokio::test]
+async fn a_moved_shortfall_does_not_move_the_frozen_fingerprint() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    let first = record_of(dir.path()).expect("record").fingerprint;
+    assert_eq!(first.cc.get(&SHELL), Some(&REQUIRED));
+
+    // The Hot has moved: today's shortfall is 600, not 1000.
+    let hot = FakeHot::always(400);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let after = record_of(dir.path()).expect("record");
+    assert_eq!(
+        after.fingerprint, first,
+        "the fingerprint is frozen for the generation; recomputing it would make the request in \
+         the queue unrecognisable, and an unrecognisable request reads as absence"
+    );
+    assert_eq!(vault.submits.get(), 1, "the queued request was still recognised");
+}
+
+/// A version-1 record is refused rather than guessed at. It has no fingerprint and no generation,
+/// and inventing them would make a request already on chain unrecognisable.
+#[test]
+fn a_record_from_before_the_fingerprint_is_refused_rather_than_migrated() {
+    let dir = temp();
+    ensure_funding_requests_dir(dir.path()).expect("dir");
+    let path = funding_journal_path(dir.path(), "shellnet", &hot_address());
+    std::fs::write(
+        &path,
+        br#"{"version":1,"provider":"ackinacki-wallet","network":"shellnet","hot_address":"x"}"#,
+    )
+    .expect("write");
+    let error = load_funding_journal(dir.path(), "shellnet", &hot_address())
+        .expect_err("a record this client cannot read must not be acted on");
+    let message = error.to_string();
+    assert!(message.contains("version 1"), "{message}");
+    assert!(message.contains("Do not delete it"), "{message}");
+}
+
+/// The journal stays non-secret: the new fields are amounts, ids, verdicts and timestamps.
+#[tokio::test]
+async fn the_extended_record_carries_no_secret() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let raw = std::fs::read_to_string(funding_journal_path(
+        dir.path(),
+        "shellnet",
+        &hot_address(),
+    ))
+    .expect("read raw");
+    assert!(raw.contains("\"fingerprint\""), "{raw}");
+    assert!(raw.contains("\"generation\""), "{raw}");
+    assert!(
+        !raw.contains("secret") && !raw.contains("seed") && !raw.contains("phrase"),
+        "the journal is non-secret by construction: {raw}"
+    );
+}
+
+/// A `BTreeMap<u32, _>` is the journal's currency map, and it must survive the JSON round trip that
+/// turns every key into a string. A record that came back with a different `cc` would not match the
+/// request it describes.
+#[tokio::test]
+async fn the_fingerprints_currency_map_survives_the_journal_round_trip() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let written = record_of(dir.path()).expect("record");
+    store_funding_journal(dir.path(), &written).expect("re-store");
+    let read_back = record_of(dir.path()).expect("record");
+    assert_eq!(read_back, written);
+    assert_eq!(read_back.fingerprint.cc, written.fingerprint.cc);
+}
+
+mod pr1332_regressions;

@@ -21,6 +21,60 @@ pub fn normalize_wallet_address(s: &str) -> Result<String, String> {
         .map_err(|e| e.replacen("invalid address", "invalid wallet address", 1))
 }
 
+/// Normalize a multisig custodian public key to the comparable 64-hex lowercase form.
+/// `getCustodians` renders `owner_pubkey` as an unsigned 256-bit integer, so a key whose leading
+/// bytes are zero comes back short and with an `0x` prefix, while a key derived locally is bare and
+/// already 64 chars. Comparing the two textually without this is how a custodian that IS ours reads
+/// as "not a custodian". The answer decides whether a wallet we cannot sign for gets recorded.
+/// `None` = not a public key at all(empty, over-long, non-hex), which callers must treat as a
+/// mismatch rather than coerce.
+pub fn normalize_multisig_pubkey(pubkey: &str) -> Option<String> {
+    let pubkey = pubkey.trim();
+    let pubkey = pubkey
+        .strip_prefix("0x")
+        .or_else(|| pubkey.strip_prefix("0X"))
+        .unwrap_or(pubkey);
+    if pubkey.is_empty()
+        || pubkey.len() > 64
+        || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(format!("{pubkey:0>64}").to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod multisig_pubkey_tests {
+    use super::normalize_multisig_pubkey;
+
+    /// The three renderings of one key -- bare, `0x`-prefixed, and left-truncated by the getter's
+    /// integer rendering -- must all compare equal.
+    #[test]
+    fn one_key_normalizes_to_one_form() {
+        let expected = format!("{}cafe", "0".repeat(60));
+        for rendering in ["0xcafe", "0XCAFE", "cafe", "  cafe  ", &expected.to_uppercase()] {
+            assert_eq!(
+                normalize_multisig_pubkey(rendering).as_deref(),
+                Some(expected.as_str()),
+                "rendering {rendering} must normalize to the comparable form"
+            );
+        }
+    }
+
+    /// Anything that is not a public key stays `None`: a mismatch must never be manufactured by
+    /// padding garbage out to 64 chars.
+    #[test]
+    fn non_keys_are_refused_rather_than_padded() {
+        for bad in ["", "0x", "  ", "nothex", &"a".repeat(65), "0x?"] {
+            assert_eq!(
+                normalize_multisig_pubkey(bad),
+                None,
+                "{bad} is not a public key"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

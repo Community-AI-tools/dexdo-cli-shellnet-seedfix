@@ -2,34 +2,52 @@
 //! `dexdo orders list` and `dexdo market` read the same book through different paths and show
 //! different subsets of it, so they legitimately disagree. Until now neither said where its rows
 //! came from or how fresh they were, so the divergence read as contradictory truth (, third
-//! motivating example). Both now print the same keys with the same meaning, so a difference reads
-//! as "different scope" or "indexer lag" rather than "one of these is lying".
+//! motivating example). `dexdo market-data depth` adds a third, raw indexer view. All three print
+//! the same keys with the same meaning, so a difference reads as "different scope" or "indexer lag"
+//! rather than "one of these is lying".
 
 /// Rows folded from the order book's own chain events(authoritative).
 pub(crate) const ROWS_CHAIN_EVENTS: &str = "chain:order-book-events";
 /// Rows read through the legacy contract getters(the fallback when the event fold is unavailable).
 pub(crate) const ROWS_CHAIN_GETTERS: &str = "chain:getters";
+/// Aggregated bid/ask levels returned by the indexer depth endpoint.
+pub(crate) const ROWS_INDEXER_DEPTH: &str = "indexer:depth-levels";
 /// Only the querying note's own resting orders(`orders list`).
 pub(crate) const SCOPE_OWNER_RESTING: &str = "owner-resting-orders";
 /// Only asks a buy could actually match(`market`).
 pub(crate) const SCOPE_EXECUTABLE_ASKS: &str = "executable-asks";
+/// Raw indexer levels; neither expiry nor TokenContract liveness is applied(`market-data depth`).
+pub(crate) const SCOPE_RAW_INDEXER_LEVELS_UNGATED: &str =
+    "raw-indexer-levels-ungated";
 
-/// Wall-clock seconds at which the snapshot was read. `0` if the clock is before the epoch.
-pub(crate) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
+/// Wall-clock seconds at which the snapshot was read. A pre-epoch clock is an error.
+pub(crate) fn now_unix_at(
+    now: std::time::SystemTime,
+) -> Result<u64, dexdo_core::ChainError> {
+    now
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
+        .map_err(|error| {
+            dexdo_core::ChainError::Chain(format!(
+                "cannot derive a finite render snapshot timestamp from the system clock: {error}"
+            ))
+        })
 }
 
-/// The provenance suffix, in ONE vocabulary so the two views can be compared key for key.
+pub(crate) fn now_unix() -> Result<u64, dexdo_core::ChainError> {
+    now_unix_at(std::time::SystemTime::now())
+}
+
+/// The provenance suffix, in ONE vocabulary so the views can be compared key for key.
 /// * `source` -- where the freshness marker came from: `indexer`(lags the chain by design) or
 /// `chain`.
 /// * `last_update_id` -- that marker, `-` when the source does not publish one.
 /// * `as_of` -- Unix seconds at which this snapshot was read.
-/// * `rows` -- where the displayed rows came from([`ROWS_CHAIN_EVENTS`] / [`ROWS_CHAIN_GETTERS`]).
+/// * `rows` -- where the displayed rows came from ([`ROWS_CHAIN_EVENTS`] / [`ROWS_CHAIN_GETTERS`] /
+/// [`ROWS_INDEXER_DEPTH`]).
 /// * `scope` -- which subset of the book is displayed ([`SCOPE_OWNER_RESTING`] /
-/// [`SCOPE_EXECUTABLE_ASKS`]); a differing scope is the other reason two views disagree.
+/// [`SCOPE_EXECUTABLE_ASKS`] / [`SCOPE_RAW_INDEXER_LEVELS_UNGATED`]); a differing scope is the
+/// other reason two views disagree.
 pub(crate) fn render(
     source: &str,
     last_update_id: &str,
@@ -82,6 +100,9 @@ mod tests {
     #[test]
     fn as_of_is_a_real_unix_timestamp() {
         // Sanity: not zero, and after this code was written.
-        assert!(now_unix() > 1_700_000_000, "clock is before 2023");
+        assert!(
+            now_unix().expect("system clock") > 1_700_000_000,
+            "clock is before 2023"
+        );
     }
 }

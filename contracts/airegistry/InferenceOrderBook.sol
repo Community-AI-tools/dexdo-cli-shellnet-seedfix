@@ -12,13 +12,17 @@ import "../dex/PrivateNote.sol";
 import "./TokenContract.sol";
 // Sell-offer guard(cont.): the RootModel type gives the stateInit data layout so we can
 // recompute the seller's RootModel address(the TC's `_rootModelAddress`) from its pinned
-// CODE HASH + the canonical SuperRoot -- see `_rootModelAddr` / `_tokenContractAddr`.
+// CODE HASH + the canonical SuperRoot -- see `DexLib.computeRootModelAddressFromHash` and
+// the note's `_tokenContractAddr`. (The note's own `_rootModelAddr` wrapper is gone: the
+// super root deploys RootModels now, so a note has no reason to derive that address.)
 import "./RootModel.sol";
 
 /// @notice Handover: the matched seller's `token_contract` receives the deal's
 /// SHELL and binds the buyer note.
 interface ITokenContractDeal {
-    function fundFromOrderBook(address buyerNote, uint256 buyerPubkey, uint8 dealFlags) external;
+    /// @dev `paid` LEADS the parameter list so it survives a bounce -- see `onBounce`. Do not
+    /// reorder: an address in front is 267 bits and would push it past the 256-bit window.
+    function fundFromOrderBook(uint128 paid, address buyerNote, uint256 buyerPubkey, uint8 dealFlags) external;
     // Called when the TC's resting sell offer is cancelled (removed WITHOUT a
     // fill) so the TC can clear its `_offerPosted` latch and re-list.
     function onSellClosed() external;
@@ -33,8 +37,18 @@ interface IWeeklyMedianSink {
 /// just its own note's ext-out and learn the deal `tokenContract`. The note authenticates the
 /// caller as the canonical book for `_modelHash`(pinned IOB code).
 interface IPrivateNote {
-    function onInferencePlaced(uint256 modelHash, address tokenContract, uint128 orderId, bool isBuy, uint256 price, uint128 ticks) external;
-    function onInferenceFilled(uint256 modelHash, address tokenContract, uint128 orderId, uint128 ticks, uint256 clearingPrice, bool isBuy) external;
+    function onInferencePlaced(uint256 modelHash, address tokenContract, uint128 orderId, uint64 clientOrderId, bool isBuy, uint256 price, uint128 ticks) external;
+    function onInferenceFilled(uint256 modelHash, address tokenContract, uint128 orderId, uint64 clientOrderId, uint128 ticks, uint256 clearingPrice, uint128 spent, bool isBuy) external;
+    /// @notice The third outcome family(task Q): the book took the request, refused it, and gave
+    /// the money back -- without a bounce and without ever creating an order.
+    /// @dev ONE MESSAGE, BOTH HALVES. The refund used to travel as an ordinary `creditFromBook`
+    /// while the reason went out as an event to a watcher, so the note received money and
+    /// could not say what for: no order id had ever been assigned, and the amount alone
+    /// does not identify a request. Splitting them also left a window in which the note
+    /// had cleared its pending record and the credit had not yet arrived.
+    function onInferenceRejected(uint256 modelHash, uint64 clientOrderId, uint8 reason, uint128 refunded) external;
+    /// @dev Sent from the book's ONE removal point, so cancel, expiry and fill all reach it.
+    function onInferenceOrderRemoved(uint256 modelHash, uint128 orderId, uint8 cause, uint128 refunded) external;
 }
 
 /// @title InferenceOrderBook -- full price->time CLOB with a queued,
@@ -54,12 +68,12 @@ interface IPrivateNote {
 /// quote/base + collateral, event-resolution shutdown, and PN callbacks
 /// (inference order entry is fire-and-forget; the note tracks via getters).
 contract InferenceOrderBook is AiRegistryModifiers {
-    string constant version = "4.0.32";
+    string constant version = "4.0.35";
 
     // ! Re-pin whenever dex/PrivateNote is recompiled (note<->OB layout coupling:
     // the note bakes this book's state layout via `new InferenceOrderBook`, so any
     // OB layout change forces a note rebuild -> new note hash -> re-pin -> OB rebuild).
-    uint256 constant NOTE_CODE_HASH  = 0x87bd964e2170630f7e6cc18935a5751569b630aae1b80b0057604ffe64f21a5a;
+    uint256 constant NOTE_CODE_HASH  = 0x57e85fa67cc90284b907ea7e9d8c6d35830c02d14bd04d4be6ec884b5748ca0c;
     uint16  constant NOTE_CODE_DEPTH = 20;
 
     // Canonical inference TokenContract(deal contract) code. placeSellOffer verifies
@@ -67,15 +81,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // statics -- else a fill would route the BUYER's SHELL to a fake (the IOB is the
     // contract that forwards SHELL on a fill, so the check must live HERE, not only in
     // the note: placeSellOffer is public and a direct call would bypass a note check).
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xb866fde2d1a021d357b7fb75d7dd7dd39b125e101c3cfa32045a8a6f9e9ab8c0;
-    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 18;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xa67e1ae0a748f902b248a035eabbcfc6393b3154fed7d7002e0defae8b6d685d;
+    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 17;
 
     // Canonical RootModel code. The seller's per-deal TokenContract is bound to its RootModel
     // (its `_rootModelAddress` static is the seller's RootModel, NOT address(0)). To verify a
     // TokenContract the IOB first recomputes the seller's RootModel address from this pinned code
     // hash + the canonical SuperRoot, then derives the TC address from it(see _tokenContractAddr).
     // Re-pin whenever airegistry/RootModel is recompiled.
-    uint256 constant ROOT_MODEL_CODE_HASH  = 0x8f14a5df64341d261dfd00ff996bf90ba750f78baa3104fba1a72279a6afb6ff;
+    uint256 constant ROOT_MODEL_CODE_HASH  = 0x287831837ad23d5216956ccca347c65eecb31b56eb95e7ce0fe3bbf9f2edcff4;
     uint16  constant ROOT_MODEL_CODE_DEPTH = 8;
 
     // Canonical AI SuperRoot account id(workchain 0). Every RootModel registers under it via its
@@ -89,10 +103,18 @@ contract InferenceOrderBook is AiRegistryModifiers {
     uint256 constant SUPER_ROOT_ADDR = 0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c;
 
     // Local errors(NOT in shared AiRegistryErrors -- avoids rippling RootModel/TC/SuperRoot pins).
-    uint16 constant ERR_NOT_DEPLOYER_NOTE = 333;
+    // THESE NUMBERS MUST NOT APPEAR IN THE SHARED TABLE. This contract INHERITS that table, so a
+    // number declared in both resolves here to the local name and, everywhere a human looks it up,
+    // to the shared one. The code still behaves correctly; the DIAGNOSIS breaks, which is worse
+    // than a wrong number because it fails in the direction of confident wrong answers. Exit 333
+    // used to read as `ERR_BOND_ALREADY_FUNDED`("the bond is already funded") when the book meant
+    // `ERR_NOT_DEPLOYER_NOTE`, and exit 336 as `ERR_OFFER_LIVE` when the book meant `ERR_EXPIRED`.
+    // Both cost real debugging time, so they moved to 345/346 -- free in BOTH tables. Check any new
+    // number against both with `lint_error_code_collisions.py`.
+    uint16 constant ERR_NOT_DEPLOYER_NOTE = 345;
     uint16 constant ERR_NO_LIQUIDITY      = 334;
     uint16 constant ERR_BAD_FLAGS         = 335;
-    uint16 constant ERR_EXPIRED           = 336;
+    uint16 constant ERR_EXPIRED           = 346;
     uint16 constant ERR_QUEUE_FULL        = 340;
     uint16 constant ERR_BAD_TOKEN_CONTRACT = 342;
     uint16 constant ERR_NAME_TOO_LONG      = 343;
@@ -159,14 +181,32 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // that happens, so the budget is set where such a run is implausible rather than merely rare.
     uint16 constant MAX_PRECHECK_SCAN    = 400;
     // Ceiling on the value one queue-head transaction can send out. Derived, not guessed:
-    // MAX_MATCHES_PER_CALL fills x 3 valued messages x REGISTER_FORWARD_VALUE, plus room for the
+    // MAX_MATCHES_PER_CALL fills x 4 valued messages x REGISTER_FORWARD_VALUE, plus room for the
     // taker's own finalisation(placement mirror, offer-latch release, escrow refund) and the
-    // self-call that continues the queue. Keep in step with MAX_MATCHES_PER_CALL and
-    // REGISTER_FORWARD_VALUE -- raising either without raising this leaves the deep-match path
-    // unfunded, and an under-funded action phase stops the queue rather than one order.
-    uint64  constant MATCH_TX_BUDGET     = 512 vmshell;
+    // self-call that continues the queue.
+    // THE FOURTH MESSAGE IS THE REMOVAL MIRROR. Three of them belong to the fill itself -- the
+    // handover to the deal and one confirmation to each side's note. The fourth comes from
+    // `_removeFromBook`, the single point where an order ceases to exist: it tells the owner's
+    // note, and a taker-BUY removes the maker on EVERY match, partial ones included. So a deep
+    // buy pays it thirty times over, and it is not optional -- the note's outstanding-order guard
+    // is what would rest forever without it.
+    // Keep in step with MAX_MATCHES_PER_CALL and REGISTER_FORWARD_VALUE -- raising either without
+    // raising this leaves the deep-match path unfunded, and an under-funded action phase stops the
+    // queue rather than one order. That is not hypothetical: this comment said THREE while the
+    // code sent four, and the derivation went on looking correct while the budget silently no
+    // longer covered it.
+    uint64  constant MATCH_TX_BUDGET     = 1000 vmshell;
 
     // Queue(circular).
+    // Why an order left the book. The note mirrors this to its owner, who otherwise sees one
+    // undifferentiated "gone" for five different endings and cannot tell a cancel he asked for
+    // from an expiry he did not, nor learn what came back.
+    uint8 constant REMOVED_FILLED    = 1; // consumed by a match
+    uint8 constant REMOVED_CANCELLED = 2; // the owner asked
+    uint8 constant REMOVED_EXPIRED   = 3; // the deadline passed
+    uint8 constant REMOVED_DUST      = 4; // below the tradeable minimum, refunded in full
+    uint8 constant REMOVED_REJECTED  = 5; // a cancel was refused; NOTHING was removed
+
     uint8 constant QENTRY_PLACE      = 1;
     uint8 constant QENTRY_CANCEL     = 2;
     uint8 constant QENTRY_CANCEL_ALL = 3;
@@ -179,12 +219,22 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // InferenceOrderCancelRejected.reason -- a cancel with no order or a foreign owner.
     uint8 constant CANCEL_REJ_NOT_FOUND = 0;
     uint8 constant CANCEL_REJ_NOT_OWNER = 1;
+    // The queue was full when the cancel arrived. UNLIKE THE OTHER TWO, THE ORDER IS STILL ALIVE:
+    // this reason says "ask again", not "it is gone", and the note must keep its record. Telling
+    // the two apart is the whole reason a reason code exists here.
+    uint8 constant CANCEL_REJ_QUEUE_FULL = 2;
 
     // InferenceOrderRejected.reason -- a submission that never became an order, so it has no id to
     // report and no `InferenceOrderPlaced` was ever emitted for it.
     uint8 constant PLACE_REJ_POST_ONLY = 0;
     uint8 constant PLACE_REJ_FOK       = 1;
     uint8 constant PLACE_REJ_EXPIRED   = 2;
+    // NOT A REJECTION. The request was ACCEPTED and has simply run out of road: a taker-only order
+    // that met what liquidity there was, or a remainder too small to rest. The note is told through
+    // the same entry point because it needs the same two things -- the money and the number -- but
+    // the reason is distinct, because "we would not take this" and "we took it and it is finished"
+    // are different facts to whoever reads the outcome.
+    uint8 constant PLACE_END_TAKER     = 3;
 
     // Reference-price stats.
     uint64  constant SECS_PER_DAY  = 86400;
@@ -212,6 +262,11 @@ contract InferenceOrderBook is AiRegistryModifiers {
         uint128 filledAccum;
         uint128 escrow; // BUY: SHELL budget held; SELL: 0
         uint64  deadline; // BUY GTD(0 = GTC)
+        // The number the NOTE gave this request before it was sent(task Q). The book does not
+        // interpret it and never generates one -- it carries it so every answer can name which
+        // request it answers. `uint64` and not wider on purpose: it has to survive a bounce, where
+        // only the leading bits of the body come back.
+        uint64  clientOrderId;
         uint64  ts;
         uint8   flags;
         bool    isBuy;
@@ -254,6 +309,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         uint128 escrow; // BUY budget received; SELL 0
         address tokenContract; // SELL TC
         uint64  deadline;
+        uint64  clientOrderId; // the note's own number for this request(task Q); 0 on non-place
         uint128 targetOrderId; // CANCEL target
         // Match continuation cursor(taker crossing > one tx of liquidity):
         uint128 contOrderId; // assigned on first run; 0 = not started
@@ -277,6 +333,40 @@ contract InferenceOrderBook is AiRegistryModifiers {
     mapping(address => uint128) _finalizedSeen;
 
     address _deployerNote;
+
+    // THE BOOK HOLDS NO MONEY AT ALL(generation 4.0.33) -- not for a moment, and there is
+    // deliberately no balance variable here.
+    // It used to have custody: escrow arrived as ECC[2] and sat on this account between placement
+    // and fill. It no longer does. The book is a matcher and a registry of orders; the money lives
+    // as records on the note and on the deal, and every figure the book moves is one it was already
+    // recording anyway -- `e.escrow`, per order. An aggregate balance would be nothing but the sum
+    // of those records: a second source of truth for the same money, and the only thing a second
+    // source of truth reliably does is drift from the first.
+    // So the escrow is charged where it is owned -- `leftoverEscrow -= cost`, `_orders[cur].escrow =
+    // mk.escrow - cost` -- and the book passes the number on. Two things follow, and both are load-
+    // bearing: no outgoing message from this contract may attach `currencies`, and no incoming one
+    // may be read for them.
+    // WHAT THAT COSTS, STATED PLAINLY. Under currency an escrow proved itself -- ECC on a message
+    // cannot be invented, so `placeBuyOrder` could believe `msg.currencies` without asking who
+    // called. A figure carries no such proof, so the derivation of the caller's note address now
+    // does the work the currency used to do. That check is not a formality here; it is the entire
+    // reason an `escrow` argument is not free money.
+
+    /// @notice Buyer note behind each dispatched-but-unconfirmed handover, keyed by the DEAL.
+    /// @dev Not custody -- the book holds nothing. It is the one fact a bounce cannot carry: the
+    /// bounced window fits the function id and `paid` and nothing more, so if the handover
+    /// comes back there would otherwise be no way to say whose escrow it was. Keyed by deal
+    /// because one match walk dispatches to many of them; cleared as soon as the handover
+    /// is answered either way.
+    mapping(address => address) _handoverBuyer;
+
+    // There is NO ledger of undelivered refunds here, and no `retryCredit` to drain one. Both
+    // existed briefly and were removed: they answered a failure mode this rewrite had invented for
+    // itself by letting a note refuse an incoming credit. A note cannot refuse -- see
+    // `PrivateNote.creditFromBook` -- so the refusal, the ledger and the retry all go together.
+    // The wider rule they violated: NOTHING IN THIS SYSTEM RETRIES. A movement that did not go
+    // through did not go through. A ledger of owed-but-unsent figures is a debt the contract
+    // promises to settle later, and nothing here settles debts.
 
     event InferenceOrderPlaced(uint128 orderId, bool isBuy, uint256 price, uint128 ticks, address note, address tokenContract, uint64 deadline, uint8 flags);
     event InferenceOrderCancelled(uint128 orderId, uint128 refunded, address note);
@@ -401,12 +491,99 @@ contract InferenceOrderBook is AiRegistryModifiers {
         gosh.mintshellq(MATCH_TX_BUDGET);
     }
 
-    function _payShell(address to, uint128 amount) private pure {
-        if (amount == 0) { return; }
-        mapping(uint32 => varuint32) ecc;
-        ecc[SHELL_ECC_ID] = varuint32(amount);
-        to.transfer({value: 1 vmshell, bounce: false, flag: 1, currencies: ecc});
+    /// @notice Pass `amount` on to the note `to`(generation 4.0.33) -- refunds, leftovers, cancels.
+    /// @dev The book subtracts nothing of its own here, because it owns nothing: the figure was
+    /// charged against the ORDER(`e.escrow`) by the caller, and this hands the same figure
+    /// to the note that owned that order. One record down, one record up.
+    /// Every `to` on this path is a note the book learned from an order it authenticated at
+    /// placement, so it is not naming arbitrary addresses; the note checks anyway, deriving
+    /// this book from `_modelHash` -- one book per model -- and rejecting anything else.
+    /// `bounce: true` and a pending record, for the same reason as the handover below: a
+    /// credit that never lands must not evaporate a buyer's refund.
+    /// @dev `view`, not the default: since the book stopped holding money this touches no state of
+    /// its own -- it reads `_modelHash` and passes a figure on. That the compiler can say so is
+    /// itself the check that the custody removal is complete on this path.
+    /// @notice Answer a placement that was refused without ever becoming an order(task Q).
+    /// @dev THE THIRD OUTCOME FAMILY, and the one that had no answer at all. A POST_ONLY that
+    /// would cross, an FOK that cannot fill whole, a request whose deadline had already
+    /// passed -- the book returns normally in each case, so there is no bounce; and no order
+    /// id was ever assigned, so nothing in the refund identified the request. The note saw
+    /// a credit appear and had to guess what it was for.
+    /// ONE MESSAGE CARRIES BOTH the refund and the number, and that is deliberate. Sending
+    /// the money as an ordinary credit and the reason as a second message would leave a
+    /// window where the note has cleared its pending record and has not yet been paid --
+    /// which is exactly the state the pending record exists to forbid.
+    /// `bounce: false`, like every other mirror: the note is derived, present, and has no
+    /// branch that can refuse this.
+    function _rejectToNote(address note, uint64 clientOrderId, uint8 reason, uint128 refunded) private view {
+        IPrivateNote(note).onInferenceRejected{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
+            _modelHash, clientOrderId, reason, refunded);
     }
+
+    function _payShell(address to, uint128 amount) private view {
+        if (amount == 0) { return; }
+        IPrivateBalanceFromBook(to).creditFromBook{value: 1 vmshell, bounce: true, flag: 1}(
+            amount, _modelHash);
+    }
+
+    /// @notice Recover a figure whose credit never landed(generation 4.0.33).
+    /// @dev The book has NO BALANCE to restore into -- it holds nothing -- so a bounce cannot be
+    /// answered by putting money back on a total. It has to be re-aimed at the party the
+    /// figure belongs to, and that means knowing WHO, which the bounce itself cannot say:
+    /// the window carries the leading bits of the body, and `paid`(128) already fills it
+    /// alongside the function id(32); a note address is 267 bits and would not fit beside
+    /// them however the parameters are ordered. So `msg.sender` answers "who bounced" and
+    /// `_inFlight` answers "on whose behalf" -- a record of dispatched-but-unconfirmed
+    /// figures, not custody of money.
+    /// It is keyed by counterparty rather than held in one slot BECAUSE ONE MATCH WALK
+    /// HANDS OFF TO MANY DEALS -- up to `MAX_MATCHES_PER_CALL` -- so a single pending field,
+    /// the shape a note can afford for its one-at-a-time transfer, could not say which of
+    /// them failed.
+    onBounce(TvmSlice body) external {
+        // A bounce arrives with whatever value survived the failed hop, which can be very little,
+        // and the handover branch below SENDS -- it re-aims the escrow at the buyer. The book lives
+        // in a configured dapp and can mint, so it tops itself up rather than letting a buyer's
+        // refund depend on how much gas happened to come back. (`PrivateNote.onBounce` does the
+        // same; the deal's cannot, and that is called out where it is written.)
+        ensureBalance();
+        uint32 functionId = body.load(uint32);
+        // There is NO branch for a bounced `creditFromBook`, and that is the design, not an
+        // omission: a note cannot refuse money, so a refund it was sent is a refund it took. The
+        // branch that stood here recorded such refusals into a `_strandedRefund` ledger a
+        // `retryCredit` could re-send -- a cure for an illness this rewrite briefly invented by
+        // guarding the note's credit entries. With the guards gone the illness is gone, and a
+        // retry ledger would only be a place for debts to accumulate that nothing ever settles.
+        // Nothing in this system retries: a movement that did not go through did not go through.
+        if (functionId == abi.functionId(ITokenContractDeal.fundFromOrderBook)) {
+            // The deal refused the handover or does not exist. The escrow belongs to the BUYER, not
+            // to the deal that failed, which is why the buyer's note was recorded at dispatch: it
+            // cannot be read back out of the bounce. This is a REDIRECT, not a retry -- the figure
+            // goes to a different party than the one that turned it down.
+            uint128 paid = body.load(uint128);
+            address buyerNote = _handoverBuyer[msg.sender];
+            delete _handoverBuyer[msg.sender];
+            if (buyerNote.value != 0) { _payShell(buyerNote, paid); }
+        }
+    }
+
+    /// @notice The deal confirms it credited a handover; the pending record is dropped.
+    /// @dev Without this the `_handoverBuyer` entry would outlive the fill it was written for --
+    /// one row per funded deal, never cleared, in a book that funds deals for a living.
+    /// It also makes the record mean what its name says: entries that remain are handovers
+    /// still unanswered, so a stuck one is visible instead of buried among successes.
+    /// Deleting on the DEAL'S OWN say-so is safe because deletion can only lose the record
+    /// of a handover that succeeded: a deal that lies here erases its own claim to a refund
+    /// it never received, which harms nobody but itself. Deriving the caller canonically
+    /// would prove it is a real deal and still not prove it is the one that was paid, so
+    /// the entry's own key does that job -- a deal with no entry deletes nothing.
+    function onHandoverAccepted() public {
+        ensureBalance();
+        delete _handoverBuyer[msg.sender];
+    }
+
+
+    /// @notice Buyer note behind an unanswered handover to `deal`, or `addr_none` if there is none.
+    function getHandoverBuyer(address deal) external view returns (address) { return _handoverBuyer[deal]; }
 
     function _tickFee(uint256 p) private pure returns (uint256) {
         return (p * uint256(PLATFORM_FEE_BPS)) / uint256(BPS_DENOMINATOR);
@@ -469,9 +646,27 @@ contract InferenceOrderBook is AiRegistryModifiers {
         if (oTail == 0) { _ownerHead[o.note] = orderId; } else { _orders[oTail].nextInOwner = orderId; }
         _ownerTail[o.note] = orderId;
         _orderCount++;
+
+        // TELL THE OWNER'S NOTE THE ORDER IS RESTING. This is the only place in the book where an
+        // order STARTS existing, exactly as `_removeFromBook` is the only place one stops -- so the
+        // note's outstanding-order record is written and cleared from a matched pair of points, and
+        // an order can neither be recorded without resting nor rest without being recorded.
+        // IT USED TO BE SENT AT PLACEMENT, BEFORE MATCHING, AND THAT WAS THE BUG. A taker that
+        // filled completely -- every IOC/FOK/MARKET, and any limit order the book could satisfy --
+        // was announced as resting and then never inserted, so nothing ever removed it. The note
+        // kept the record forever, `_restingInf` never emptied, and `withdrawTokens` refused for
+        // good: a guard written against withdrawing TOO EARLY turned into withdrawing NEVER.
+        // The client event `InferenceOrderPlaced` deliberately stays at the placement site. The two
+        // signals mean different things and now say so: the event means ACCEPTED, this mirror means
+        // RESTING. Conflating them is what produced the defect.
+        // `bounce: false`, like the removal mirror: a note that cannot take this must not be able
+        // to stall an insertion, which happens inside the match walk and would stall it for both
+        // sides.
+        IPrivateNote(o.note).onInferencePlaced{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
+            _modelHash, o.tokenContract, orderId, o.clientOrderId, o.isBuy, o.price, o.amount);
     }
 
-    function _removeFromBook(uint128 orderId) private {
+    function _removeFromBook(uint128 orderId, uint8 cause, uint128 refunded) private {
         Order o = _orders[orderId];
         // Idempotency guard: a removed/empty slot has amount 0. Prevents a double
         // _removeFromBook from underflowing _orderCount below(see OrderBook).
@@ -488,6 +683,21 @@ contract InferenceOrderBook is AiRegistryModifiers {
         if (oPrev == 0) { _ownerHead[o.note] = oNext; } else { _orders[oPrev].nextInOwner = oNext; }
         if (oNext == 0) { _ownerTail[o.note] = oPrev; } else { _orders[oNext].prevInOwner = oPrev; }
 
+        // TELL THE OWNER'S NOTE THE ORDER IS GONE. This is the only place in the book where an
+        // order ceases to exist -- cancel, expiry and fill all arrive here -- so one send covers all
+        // three reasons, and no fourth reason can be added without passing through this line.
+        // Without it the note would never learn that a resting order was removed: a cancel or an
+        // expiry refunds through `creditFromBook`, which carries an amount and a model hash and no
+        // identifier at all, so the record written at placement would rest forever and the note
+        // would become permanently unwithdrawable -- a worse failure than the one being fixed.
+        // `bounce: false` and deliberately non-blocking: a note that cannot take this message must
+        // not be able to stall a removal, because removals happen inside the match walk and would
+        // stall it for BOTH sides. The cost of that choice is stated at the note's counters -- a
+        // mirror that never arrives leaves the guard silent rather than broken.
+        IPrivateNote(o.note).onInferenceOrderRemoved{
+            value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false
+        }(_modelHash, orderId, cause, refunded);
+
         delete _orders[orderId];
         _orderCount--;
     }
@@ -499,7 +709,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         /// @param dealFlags The DEAL slice of the buyer's order flags (`DEAL_FLAGS_MASK`: TEE +
     /// SUBSCRIPTION). Execution bits stay in the book; these describe what was bought and
     /// select the TokenContract's settlement branch.
-    function _settleFill(uint128 makerId, uint128 takerId, address buyerNote, address sellerNote, uint256 buyerPubkey, address sellerTC, uint128 trade, uint256 clearing, bool takerIsBuy, uint8 dealFlags) private returns (uint128) {
+    function _settleFill(uint128 makerId, uint128 takerId, address buyerNote, address sellerNote, uint256 buyerPubkey, address sellerTC, uint128 trade, uint256 clearing, bool takerIsBuy, uint8 dealFlags, uint64 takerClientId) private returns (uint128) {
         uint128 cost = uint128(uint256(trade) * _unit(clearing));
         // A subscription carries the buyer's own `2P` on top of the escrow it spends. The book does
         // not hold it -- it forwards deposit and bond together and the TC separates them -- but the
@@ -508,11 +718,23 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // clearing never exceeds that, so the escrow always covers this.
         uint128 bond = (dealFlags & FLAG_SUBSCRIPTION) != 0 ? uint128(2 * clearing) : 0;
         uint128 debit = cost + bond;
-        mapping(uint32 => varuint32) ecc;
-        ecc[SHELL_ECC_ID] = varuint32(debit);
+        // The handover(generation 4.0.33). What used to ride as ECC[2] on this message is now the
+        // leading argument. The book takes nothing off itself -- it never held this; the figure was
+        // charged against the buyer's order -- and the deal believes the number only because it
+        // re-derives this book from `_modelHash` before crediting anything.
+        // `bounce: true`, where the currency version could afford `bounce: false`. Then, a refused
+        // fill left the SHELL sitting on the deal's account and the deal refunded it onward, so the
+        // money was somewhere real either way. Now a refusal means the buyer's order was debited for
+        // a credit that never happened, and the bounce is the only thing that says so. The deal
+        // still refunds non-fundable fills itself rather than reverting; the bounce covers the
+        // narrower case where it never got that far -- a call arriving before RootPN told it which
+        // book to trust, or a deal that no longer exists.
+        // The buyer is recorded FIRST, before the call: the escrow is his, and if this comes back
+        // the bounce can carry the figure but not the name.
+        _handoverBuyer[sellerTC] = buyerNote;
         ITokenContractDeal(sellerTC).fundFromOrderBook{
-            value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false, currencies: ecc
-        }(buyerNote, buyerPubkey, dealFlags);
+            value: REGISTER_FORWARD_VALUE, flag: 1, bounce: true
+        }(debit, buyerNote, buyerPubkey, dealFlags);
         _executedNotional += uint128(uint256(trade) * clearing);
         _executedTicks    += trade;
         _matchSeq += 1;
@@ -530,10 +752,21 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // on which side is the taker). bounce:false -- the mirror is best-effort and never blocks the fill.
         uint128 buyerOrderId  = takerIsBuy ? takerId : makerId;
         uint128 sellerOrderId = takerIsBuy ? makerId : takerId;
+        // EACH SIDE GETS ITS OWN CLIENT NUMBER, and only one of the two is at hand. The MAKER is
+        // resting, so its number is in storage under its id; the TAKER may never have been
+        // inserted, so its number arrives as an argument. Reading both from storage would work for
+        // the maker and silently yield zero for the taker -- the case this whole task is about.
+        uint64 makerClientId  = _orders[makerId].clientOrderId;
+        uint64 buyerClientId  = takerIsBuy ? takerClientId : makerClientId;
+        uint64 sellerClientId = takerIsBuy ? makerClientId : takerClientId;
+        // `debit` -- WHAT ACTUALLY LEFT THE ESCROW, not `trade * clearing`. The two differ by the
+        // subscription bond, and the note subtracts this figure from its in-flight record, so a
+        // recomputed approximation would leave that record permanently short or permanently over.
+        // The seller side carries it too and ignores it: a sell has no client record to reduce.
         IPrivateNote(buyerNote).onInferenceFilled{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
-            _modelHash, sellerTC, buyerOrderId, trade, clearing, true);
+            _modelHash, sellerTC, buyerOrderId, buyerClientId, trade, clearing, debit, true);
         IPrivateNote(sellerNote).onInferenceFilled{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
-            _modelHash, sellerTC, sellerOrderId, trade, clearing, false);
+            _modelHash, sellerTC, sellerOrderId, sellerClientId, trade, clearing, debit, false);
         // The BUYER's escrow is debited by what actually left the book, bond included -- the caller
         // subtracts this from `leftoverEscrow` or the maker's stored escrow, and an amount short of
         // what was sent would leave the book crediting escrow it no longer holds.
@@ -698,7 +931,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     function _match(
         uint128 takerId, bool takerIsBuy, uint256 takerPrice, bool isMarket,
         address takerNote, address takerTC, uint256 takerBuyerPubkey, uint128 amount, uint128 buyEscrow,
-        uint128 resumeFrom, uint8 takerFlags
+        uint128 resumeFrom, uint8 takerFlags, uint64 takerClientId
     ) private returns (uint128 remaining, uint128 leftoverEscrow, bool capped, uint128 nextResume) {
         remaining = amount;
         leftoverEscrow = buyEscrow;
@@ -813,14 +1046,22 @@ contract InferenceOrderBook is AiRegistryModifiers {
                     // left by a partial fill): refund the owner IN FULL and remove it. Removing --
                     // rather than skipping -- keeps the scan bounded and stops dust from
                     // accumulating in the book.
-                    _refundAndRemove(cur);
+                    _refundAndRemove(cur, REMOVED_DUST);
                     cur = nextOrd;
                     continue;
                 }
 
                 // The deal descriptors are always the BUYER's: a subscription is bought, not sold.
                 uint8 buyFlags    = takerIsBuy ? takerFlags    : mk.flags;
-                uint128 cost = _settleFill(takerIsBuy ? cur : takerId, takerIsBuy ? takerId : cur, buyerNote, sellerNote, buyerPubkey, sellerTC, trade, clearing, takerIsBuy, buyFlags & DEAL_FLAGS_MASK);
+                // MAKER IS THE RESTING ORDER AND TAKER IS THE INCOMING ONE, always. Which side
+                // buys does not enter into it, and selecting them by `takerIsBuy` here was the
+                // defect: on a taker SELL it handed `makerId` the incoming id and `takerId` the
+                // resting one. `_settleFill` then swaps by the same flag to decide which id
+                // belongs to the buyer -- correctly -- so the two swaps composed and every note
+                // received its COUNTERPARTY's order id, in the mirror and in the event alike.
+                // The swap inside `_settleFill` is right and stays; it was being fed already
+                // reversed, and fixing both would reverse a third time.
+                uint128 cost = _settleFill(cur, takerId, buyerNote, sellerNote, buyerPubkey, sellerTC, trade, clearing, takerIsBuy, buyFlags & DEAL_FLAGS_MASK, takerClientId);
 
                 if (takerIsBuy) { leftoverEscrow -= cost; } else { _orders[cur].escrow = mk.escrow - cost; }
 
@@ -828,11 +1069,11 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 // SELL offer = one-deal slot -> consumed on match(taker BUY), even
                 // on partial. BUY maker(taker SELL) is reduced(spans deals).
                 if (takerIsBuy) {
-                    _removeFromBook(cur); // maker SELL: no buyer escrow to return
+                    _removeFromBook(cur, REMOVED_FILLED, 0); // maker SELL: no buyer escrow to return
                 } else if (mk.amount == trade) {
                     // Fully-filled maker BUY: the residual escrow(over-fund + clearing-remainder)
                     // returns to the buyer.
-                    _refundAndRemove(cur);
+                    _refundAndRemove(cur, REMOVED_FILLED);
                 } else {
                     _orders[cur].amount = mk.amount - trade;
                 }
@@ -857,10 +1098,11 @@ contract InferenceOrderBook is AiRegistryModifiers {
         return deadline != 0 && block.timestamp >= deadline;
     }
 
-    function _refundAndRemove(uint128 orderId) private {
+    function _refundAndRemove(uint128 orderId, uint8 cause) private {
         Order o = _orders[orderId];
         uint128 refund = o.escrow;
-        _removeFromBook(orderId);
+        // The note is told the SAME figure this function is about to pay out, from the same read.
+        _removeFromBook(orderId, cause, refund);
         if (refund > 0) { _payShell(o.note, refund); emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(orderId, o.note, refund); }
     }
 
@@ -871,7 +1113,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     /// expiry entry point(match sweep + `_doExpire`).
     function _removeExpiredBid(uint128 orderId) private {
         address note = _orders[orderId].note;
-        _refundAndRemove(orderId);
+        _refundAndRemove(orderId, REMOVED_EXPIRED);
         emit InferenceOrderExpired{dest: address.makeAddrExtern(OrderExpiredEmit, bitCntAddress)}(orderId, true, note, address(0));
     }
 
@@ -882,7 +1124,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     function _removeExpiredSell(uint128 orderId) private {
         Order o = _orders[orderId];
         address tc = o.tokenContract;
-        _removeFromBook(orderId);
+        _removeFromBook(orderId, REMOVED_EXPIRED, 0); // an ask holds no escrow
         if (tc != address(0)) {
             ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
         }
@@ -898,7 +1140,8 @@ contract InferenceOrderBook is AiRegistryModifiers {
     /// @notice Rest leftover(limit) or refund(taker-only / market) after a match completes.
     function _finalizeTaker(
         uint128 orderId, uint256 buyerPubkey, bool isBuy, uint256 storedPrice, address note, address tc,
-        uint128 remaining, uint128 leftover, uint128 initialAmount, uint8 flags, uint64 deadline
+        uint128 remaining, uint128 leftover, uint128 initialAmount, uint8 flags, uint64 deadline,
+        uint64 clientOrderId
     ) private {
         bool takerOnly = (flags & FLAG_MARKET) != 0 || (flags & (FLAG_IOC | FLAG_FOK)) != 0;
         if (isBuy) {
@@ -906,16 +1149,24 @@ contract InferenceOrderBook is AiRegistryModifiers {
             // so resting it would only leave unfillable dust. Refund the leftover escrow
             // instead of inserting it -- same as the fully-filled/taker-only case.
             if (remaining < 2 || takerOnly) {
-                if (leftover > 0) { _payShell(note, leftover); }
                 // Terminal for `orderId` whether or not anything came back: the placement was
                 // announced with this id, so its disappearance has to be announced with it too.
                 emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(orderId, note, leftover);
+                // AND ANNOUNCED TO THE NOTE, not only to the watcher. The event goes off-chain; the
+                // note's in-flight record lives here and is what refuses a withdrawal. Until this
+                // line the record simply stayed -- the request had been accepted, so no rejection
+                // fired, and it had not rested, so no removal fired either.
+                // One message carries the money and the number, exactly as the three refusals do.
+                // No condition on whether anything filled: after the fill mirror learned to
+                // SUBTRACT, the record already holds precisely what is left, so the same call is
+                // correct for a partial fill and for no fill at all.
+                _rejectToNote(note, clientOrderId, PLACE_END_TAKER, leftover);
                 return;
             }
             _insertIntoBook(orderId, Order({
                 note: note, buyerPubkey: buyerPubkey, tokenContract: address(0), price: storedPrice,
                 amount: remaining, initialAmount: initialAmount, filledAccum: initialAmount - remaining,
-                escrow: leftover, deadline: deadline, ts: uint64(block.timestamp),
+                escrow: leftover, deadline: deadline, clientOrderId: clientOrderId, ts: uint64(block.timestamp),
                 flags: flags, isBuy: true,
                 nextAtPrice: 0, prevAtPrice: 0, nextInOwner: 0, prevInOwner: 0
             }));
@@ -926,7 +1177,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
                     amount: remaining, initialAmount: initialAmount, filledAccum: initialAmount - remaining,
                     // A SELL carries a MANDATORY absolute deadline;
                     // carry it onto the resting remainder so the ask stays expirable.
-                    escrow: 0, deadline: deadline, ts: uint64(block.timestamp),
+                    escrow: 0, deadline: deadline, clientOrderId: clientOrderId, ts: uint64(block.timestamp),
                     flags: flags, isBuy: false,
                     nextAtPrice: 0, prevAtPrice: 0, nextInOwner: 0, prevInOwner: 0
                 }));
@@ -960,34 +1211,42 @@ contract InferenceOrderBook is AiRegistryModifiers {
         _queueSize--;
     }
 
-    function _enqueuePlace(address owner, uint256 buyerPubkey, bool isBuy, uint8 flags, uint256 price, uint128 amount, uint128 escrow, address tc, uint64 deadline) private {
+    function _enqueuePlace(address owner, uint256 buyerPubkey, bool isBuy, uint8 flags, uint256 price, uint128 amount, uint128 escrow, address tc, uint64 deadline, uint64 clientOrderId) private {
         require(_queueSize < QUEUE_PLACE_LIMIT, ERR_QUEUE_FULL);
         uint8 slot = _allocSlot();
         _queue[slot] = QueueEntry({
             entryType: QENTRY_PLACE, owner: owner, buyerPubkey: buyerPubkey, isBuy: isBuy, flags: flags, price: price,
             amount: amount, escrow: escrow, tokenContract: tc, deadline: deadline,
-            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
+            clientOrderId: clientOrderId, targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
     }
 
-    function _enqueueCancel(address owner, uint128 targetOrderId) private {
-        require(_queueSize < QUEUE_CAPACITY, ERR_QUEUE_FULL);
+    /// @dev Returns false instead of reverting when the queue is full. A revert here unwound the
+    /// whole transaction, so the owner's note saw a BOUNCE -- and a bounce carries no reason,
+    /// only the fact of failure. The note read that as "the cancel did not happen" in the one
+    /// way that matters and dropped its record of a LIVE order. Refusing softly keeps the
+    /// decision where the data is: the book knows why, and says so.
+    function _enqueueCancel(address owner, uint128 targetOrderId) private returns (bool) {
+        if (_queueSize >= QUEUE_CAPACITY) { return false; }
         uint8 slot = _allocSlot();
         _queue[slot] = QueueEntry({
             entryType: QENTRY_CANCEL, owner: owner, buyerPubkey: 0, isBuy: false, flags: 0, price: 0,
             amount: 0, escrow: 0, tokenContract: address(0), deadline: 0,
-            targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
+            clientOrderId: 0, targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
+        return true;
     }
 
-    function _enqueueCancelAll(address owner) private {
-        require(_queueSize < QUEUE_CAPACITY, ERR_QUEUE_FULL);
+    /// @dev Same soft refusal as `_enqueueCancel`, same reason.
+    function _enqueueCancelAll(address owner) private returns (bool) {
+        if (_queueSize >= QUEUE_CAPACITY) { return false; }
         uint8 slot = _allocSlot();
         _queue[slot] = QueueEntry({
             entryType: QENTRY_CANCEL_ALL, owner: owner, buyerPubkey: 0, isBuy: false, flags: 0, price: 0,
             amount: 0, escrow: 0, tokenContract: address(0), deadline: 0,
-            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
+            clientOrderId: 0, targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
+        return true;
     }
 
     // Subscription place is a book insertion -> gated by QUEUE_PLACE_LIMIT like a normal place.
@@ -1006,7 +1265,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         _queue[slot] = QueueEntry({
             entryType: QENTRY_EXPIRE, owner: address(0), buyerPubkey: 0, isBuy: false, flags: 0, price: 0,
             amount: 0, escrow: 0, tokenContract: address(0), deadline: 0,
-            targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
+            clientOrderId: 0, targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
     }
 
@@ -1066,16 +1325,24 @@ contract InferenceOrderBook is AiRegistryModifiers {
             uint128 refund = 0;
             if (e.isBuy) {
                 refund = firstRun ? e.escrow : e.contLeftover;
-                if (refund > 0) { _payShell(e.owner, refund); }
             } else if (e.tokenContract != address(0)) {
                 ITokenContractDeal(e.tokenContract).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
             }
             if (firstRun) {
-                emit InferenceOrderRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(
+                emit InferenceOrderRejected{dest: address.makeAddrExtern(OrderRejectedEmit, bitCntAddress)}(
                     PLACE_REJ_EXPIRED, e.owner, e.tokenContract, refund);
+                // Money and reason in one message, named by the number the note itself chose.
+                _rejectToNote(e.owner, e.clientOrderId, PLACE_REJ_EXPIRED, refund);
             } else {
                 emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(
                     e.contOrderId, e.owner, refund);
+                // THE SAME TWO THINGS THE FIRST-RUN BRANCH DOES, and until now this one did
+                // neither. A continuation whose deadline passed emitted an event and returned:
+                // the leftover escrow was never paid back and the note was never told, so the
+                // money was gone and the in-flight record stayed forever.
+                // `e.clientOrderId` survives into the continuation because the queue entry is
+                // rewritten whole, not rebuilt -- the number the note chose is still there.
+                _rejectToNote(e.owner, e.clientOrderId, PLACE_REJ_EXPIRED, refund);
             }
             return false;
         }
@@ -1106,44 +1373,50 @@ contract InferenceOrderBook is AiRegistryModifiers {
             // AON-incompatible sizes; `_executableCrosses` skips those, mirroring `_match`.
             if ((e.flags & FLAG_POST_ONLY) != 0 && _executableCrosses(e.isBuy, e.price, takerFlags, e.amount)) {
                 uint128 back = 0;
-                if (e.isBuy && e.escrow > 0) { back = e.escrow; _payShell(e.owner, back); }
+                if (e.isBuy && e.escrow > 0) { back = e.escrow; }
                 else if (!e.isBuy && e.tokenContract != address(0)) {
                     // SELL rejected before resting -> notify the TC (onSellClosed frees
                     // the `_offerPosted` latch) so it stays usable.
                     ITokenContractDeal(e.tokenContract).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
                 }
-                emit InferenceOrderRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(
+                emit InferenceOrderRejected{dest: address.makeAddrExtern(OrderRejectedEmit, bitCntAddress)}(
                     PLACE_REJ_POST_ONLY, e.owner, e.tokenContract, back);
+                // Money and reason together, named by the note's own number.
+                _rejectToNote(e.owner, e.clientOrderId, PLACE_REJ_POST_ONLY, back);
                 return false;
             }
             // FOK: precise all-or-nothing pre-check(per-order simulation of `_match`).
             if ((e.flags & FLAG_FOK) != 0 && !_fokFullyFillable(e.isBuy, e.price, isMarket, e.amount, e.escrow, takerFlags)) {
                 uint128 back = 0;
-                if (e.isBuy && e.escrow > 0) { back = e.escrow; _payShell(e.owner, back); }
+                if (e.isBuy && e.escrow > 0) { back = e.escrow; }
                 else if (!e.isBuy && e.tokenContract != address(0)) {
                     ITokenContractDeal(e.tokenContract).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(); // free the TC's offer latch
                 }
-                emit InferenceOrderRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(
+                emit InferenceOrderRejected{dest: address.makeAddrExtern(OrderRejectedEmit, bitCntAddress)}(
                     PLACE_REJ_FOK, e.owner, e.tokenContract, back);
+                // Money and reason together, named by the note's own number.
+                _rejectToNote(e.owner, e.clientOrderId, PLACE_REJ_FOK, back);
                 return false;
             }
 
-            // Mirror the placement ONLY after the rejection checks pass -- a crossing POST_ONLY or
-            // under-liquid FOK returns above without inserting/filling, so it must NOT emit
-            // InferenceOrderPlaced / onInferencePlaced (else clients would track an order that
-            // never rested). The id is taken here for the same reason.
+            // Announce ACCEPTANCE only after the rejection checks pass -- a crossing POST_ONLY or
+            // under-liquid FOK returns above without inserting or filling, so it must not be
+            // announced at all. The id is taken here for the same reason.
+            // THE CLIENT EVENT ONLY. The note's mirror used to go out here too, and that was
+            // wrong: at this point nobody knows yet whether the order will rest or fill on the
+            // spot. It now goes from `_insertIntoBook`, which is where resting actually happens --
+            // see the note there for what the old placement got wrong. "Accepted" and "resting"
+            // are different facts, and after this they are announced from different places.
             orderId = _nextOrderId++;
             emit InferenceOrderPlaced{dest: address.makeAddrExtern(OfferPlacedEmit, bitCntAddress)}(
                 orderId, e.isBuy, e.price, e.amount, e.owner, e.tokenContract, e.deadline, e.flags);
-            IPrivateNote(e.owner).onInferencePlaced{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
-                _modelHash, e.tokenContract, orderId, e.isBuy, e.price, e.amount);
         }
 
         uint128 inAmount   = firstRun ? e.amount  : e.contRemaining;
         uint128 inEscrow   = firstRun ? e.escrow  : e.contLeftover;
         uint128 resumeFrom = firstRun ? 0 : e.contScanOrder;
         (uint128 remaining, uint128 leftover, bool capped, uint128 nextResume) =
-            _match(orderId, e.isBuy, e.price, isMarket, e.owner, e.tokenContract, e.buyerPubkey, inAmount, inEscrow, resumeFrom, takerFlags);
+            _match(orderId, e.isBuy, e.price, isMarket, e.owner, e.tokenContract, e.buyerPubkey, inAmount, inEscrow, resumeFrom, takerFlags, e.clientOrderId);
 
         if (capped) {
             // Taker crossed > one tx of liquidity -> persist cursor + scan position, resume
@@ -1155,21 +1428,29 @@ contract InferenceOrderBook is AiRegistryModifiers {
             _queue[_queueHead] = e;
             return true;
         }
-        _finalizeTaker(orderId, e.buyerPubkey, e.isBuy, e.price, e.owner, e.tokenContract, remaining, leftover, e.amount, e.flags, e.deadline);
+        _finalizeTaker(orderId, e.buyerPubkey, e.isBuy, e.price, e.owner, e.tokenContract, remaining, leftover, e.amount, e.flags, e.deadline, e.clientOrderId);
         return false;
     }
 
     function _doCancel(address owner, uint128 orderId) private {
         Order o = _orders[orderId];
-        // Give every cancel a terminal, owner-observable outcome rather than a silent no-op:
-        // a missing order(already filled/cancelled) or a foreign owner emits an explicit
-        // rejection the client can match to its request, distinct from the success event below.
+        // Give every cancel a terminal outcome the OWNER'S NOTE can act on, not just an event the
+        // client can read. The event goes to a watcher off-chain; the note's record lives on-chain
+        // and is what refuses a withdrawal. Announcing only to the watcher left the note holding a
+        // resting-order record for an order the book had already forgotten, and nothing else would
+        // ever clear it -- the removal mirror fires from `_removeFromBook`, and neither branch below
+        // reaches it.
+        // BOTH branches send it, and the second is the less obvious one. "Not yours" still means
+        // "not in your books": the caller asked to cancel this id, so its note believes it owns
+        // one, and that belief is exactly what has to go.
         if (o.amount == 0 && o.note == address(0)) {
             emit InferenceOrderCancelRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(orderId, CANCEL_REJ_NOT_FOUND, owner);
+            IPrivateNote(owner).onInferenceOrderRemoved{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(_modelHash, orderId, REMOVED_REJECTED, 0);
             return;
         }
         if (o.note != owner) {
             emit InferenceOrderCancelRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(orderId, CANCEL_REJ_NOT_OWNER, owner);
+            IPrivateNote(owner).onInferenceOrderRemoved{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(_modelHash, orderId, REMOVED_REJECTED, 0);
             return;
         }
         // Limit or subscription: the full remaining escrow returns to the buyer on cancel
@@ -1180,7 +1461,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // BEFORE `_removeFromBook` deletes the order.
         bool    freeTc = !o.isBuy && o.tokenContract != address(0);
         address tc     = o.tokenContract;
-        _removeFromBook(orderId);
+        _removeFromBook(orderId, REMOVED_CANCELLED, refund);
         emit InferenceOrderCancelled{dest: address.makeAddrExtern(OfferCancelledEmit, bitCntAddress)}(orderId, refund, owner);
         _payShell(owner, refund);
         if (freeTc) { ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(); }
@@ -1195,7 +1476,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
             uint128 refund = o.escrow;
             bool    freeTc = !o.isBuy && o.tokenContract != address(0);
             address tc     = o.tokenContract;
-            _removeFromBook(cur);
+            _removeFromBook(cur, REMOVED_CANCELLED, refund);
             emit InferenceOrderCancelled{dest: address.makeAddrExtern(OfferCancelledEmit, bitCntAddress)}(cur, refund, owner);
             if (refund > 0) { _payShell(owner, refund); }
             if (freeTc) { ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(); }
@@ -1237,11 +1518,22 @@ contract InferenceOrderBook is AiRegistryModifiers {
     /// never rests as GTC; an already-past deadline is not a hard error -- the queued-deadline
     /// recheck in `_doPlaceHead` drops it with `onSellClosed`.
     function placeSellOffer(uint128 pricePerTick, uint128 maxTicks, uint8 flags, uint256 sellerPubkey, uint64 nonce, address ownerNote, uint64 deadline) public {
-        ensureBalance();
-        // Auth BEFORE accept: a non-canonical sender is rejected without charging the
-        // contract. A real TC always passes this, so a genuine offer never reverts here.
-        require(msg.sender == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);
+        // ACCEPT FIRST, and only in the two entries the deal calls. Everything before
+        // `tvm.accept()` is charged to the INCOMING message, so whatever ran ahead of it set the
+        // floor on what a caller had to attach. Measured rather than assumed, and the answer was
+        // not the one expected: `ensureBalance()` costs more than deriving an address, and below
+        // the floor a call did not fail its guard -- it ran out of gas before reaching one.
+        // THIS ALSO PUTS ACCEPT ABOVE THE SENDER GUARD, which is a change and not a saving:
+        // an unauthorised call used to be turned away before `accept` and cost this contract
+        // nothing. It now pays the compute for any message that arrives, including one it is
+        // about to reject.
         tvm.accept();
+        ensureBalance();
+        // Auth. This used to sit above `accept` and the comment here used to say so -- that a
+        // non-canonical sender was turned away without charging the contract. That is no longer
+        // true and the sentence had to go with the line: the guard is unchanged, but it now runs
+        // on this contract's gas. A real TC always passes it, so a genuine offer never reverts.
+        require(msg.sender == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);
         // Param / capacity checks AFTER accept: the TC latched `_offerPosted` optimistically
         // and forwarded bounce:false. On ANY non-resting outcome, notify the TC (onSellClosed
         // frees the latch) and return rather than revert, so the TC stays usable (re-list /
@@ -1275,14 +1567,29 @@ contract InferenceOrderBook is AiRegistryModifiers {
             ITokenContractDeal(msg.sender).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
             return;
         }
-        _enqueuePlace(ownerNote, 0, false, flags, pricePerTick, maxTicks, 0, msg.sender, deadline);
+        _enqueuePlace(ownerNote, 0, false, flags, pricePerTick, maxTicks, 0, msg.sender, deadline, 0);
         _processHeadCore();
     }
 
     /// @notice A subscription is this same call with `FLAG_SUBSCRIPTION` set; the term is fixed at
     /// one month(`SUB_WEEKS`), so the order carries no duration of its own.
-    function placeBuyOrder(uint128 maxPricePerTick, uint128 ticks, uint8 flags, uint64 deadline, uint256 buyerPubkey) public {
+    /// @param escrow The buyer's SHELL, as a FIGURE(generation 4.0.33) -- subtracted from the
+    /// calling note's `_balance[CURRENCIES_ID_SHELL]` before it called.
+    /// @param depositHash The caller's `_depositIdentifierHash`, used to DERIVE the address a real
+    /// note with that hash would have. This is not book-keeping: under currency the escrow
+    /// proved itself, because ECC on a message cannot be forged, and this call did not care
+    /// who sent it. A figure proves nothing, so the derivation below replaces the proof the
+    /// currency used to carry. Claiming someone else's hash only derives an address that is
+    /// not the caller, so it buys nothing.
+    /// @dev THE CLIENT NUMBER LEADS THE LIST, and the reason is the bounced window. A bounce
+    /// returns only the leading bits of the body, 256 guaranteed, and the note has to know
+    /// WHICH request came back: function id(32) + `clientOrderId`(64) = 96 bits, with room
+    /// to spare. `escrow` no longer has to travel there at all -- the note recorded the figure
+    /// under this number before sending, so the number alone is enough to undo it. That is
+    /// also why the number is `uint64` and not wider.
+    function placeBuyOrder(uint64 clientOrderId, uint128 escrow, uint128 maxPricePerTick, uint128 ticks, uint8 flags, uint64 deadline, uint256 buyerPubkey, uint256 depositHash) public {
         ensureBalance();
+        require(msg.sender == _noteAddrFromHash(depositHash), ERR_INVALID_SENDER);
         // A deal serves >= 2 ticks(probe + >=1 stream); a 1-tick buy can never fund a
         // deal(fundFromOrderBook rejects < 2), so it is rejected up front.
         require(ticks >= 2, ERR_BAD_PARAM);
@@ -1308,9 +1615,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // Limit price must be a positive whole multiple of 1 SHELL(market buys carry no price).
         require(isMarket || (maxPricePerTick > 0 && maxPricePerTick % PRICE_STEP == 0), ERR_BAD_PARAM);
 
-        mapping(uint32 => varuint32) currencies = msg.currencies;
-        require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
-        uint128 escrow = uint128(currencies[SHELL_ECC_ID]);
+        require(escrow > 0, ERR_NO_SHELL);
         // Compare in uint256: escrow(uint128) must cover the full ticks*(price+fee)
         // product. This also caps the required cost at uint128, so the fill cost
         // never overflows the downstream cast(mirrors the placeSellOffer bound).
@@ -1323,21 +1628,39 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 + (isSub ? 2 * uint256(maxPricePerTick) : 0), ERR_INSUFFICIENT_DEPOSIT);
         }
         tvm.accept();
-        _enqueuePlace(msg.sender, buyerPubkey, true, flags, isMarket ? type(uint256).max : maxPricePerTick, ticks, escrow, address(0), deadline);
+        _enqueuePlace(msg.sender, buyerPubkey, true, flags, isMarket ? type(uint256).max : maxPricePerTick, ticks, escrow, address(0), deadline, clientOrderId);
         _processHeadCore();
     }
 
+    /// @dev A FULL QUEUE IS AN ANSWER, NOT A FAILURE. It used to revert, which reached the note as
+    /// a bounce; a bounce says only "the call did not go through", so the note undid its own
+    /// record -- of an order that is still resting in the book. The record is what refuses a
+    /// withdrawal, so the owner lost the guard on a live order and kept the order.
+    /// Now the book answers with `CANCEL_REJ_QUEUE_FULL` and touches nothing. NO REMOVAL
+    /// MIRROR HERE, deliberately: the other two rejections mean the order is gone and the
+    /// note's record must go with it, this one means the opposite.
     function cancelOrder(uint128 orderId) public {
         ensureBalance();
         tvm.accept();
-        _enqueueCancel(msg.sender, orderId);
+        if (!_enqueueCancel(msg.sender, orderId)) {
+            emit InferenceOrderCancelRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(
+                orderId, CANCEL_REJ_QUEUE_FULL, msg.sender);
+            return;
+        }
         _processHeadCore();
     }
 
+    /// @dev Same soft refusal as `cancelOrder`. The id reported is 0 -- there is no single order
+    /// this request was about, and inventing one would name an order the caller never asked
+    /// for.
     function cancelAllOrders() public {
         ensureBalance();
         tvm.accept();
-        _enqueueCancelAll(msg.sender);
+        if (!_enqueueCancelAll(msg.sender)) {
+            emit InferenceOrderCancelRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(
+                0, CANCEL_REJ_QUEUE_FULL, msg.sender);
+            return;
+        }
         _processHeadCore();
     }
 
@@ -1379,9 +1702,14 @@ contract InferenceOrderBook is AiRegistryModifiers {
     /// bind), so no other account can inject reference-price volume. The TC forwards
     /// bounce:false, so a stale/foreign caller is accept-then-noop, never a revert.
     function reportFinalized(uint256 sellerPubkey, uint64 nonce, uint128 pricePerTick, uint128 cumulativeFinalized) public {
+        // ACCEPT FIRST, and only in the two entries the deal calls. Everything before
+        // `tvm.accept()` is charged to the INCOMING message, so whatever ran ahead of it set the
+        // floor on what a caller had to attach. Measured rather than assumed, and the answer was
+        // not the one expected: `ensureBalance()` costs more than deriving an address, and below
+        // the floor a call did not fail its guard -- it ran out of gas before reaching one.
+        tvm.accept();
         ensureBalance();
         if (msg.sender != _tokenContractAddr(sellerPubkey, nonce)) { return; }
-        tvm.accept();
         uint128 seen = _finalizedSeen[msg.sender];
         if (cumulativeFinalized <= seen) { return; } // monotonic: never below the high-water mark
         _finalizedSeen[msg.sender] = cumulativeFinalized;

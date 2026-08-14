@@ -102,6 +102,7 @@ pub enum SellOfferOutcome {
 pub struct SellOffer {
     pub price_per_tick: Shell,
     pub max_ticks: u64,
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: TokenContract,
     /// Deal-shape flags passed to `PrivateNote.postSellOffer`.
     #[serde(default)]
@@ -113,7 +114,9 @@ pub struct SellOffer {
 /// real chain -- the seller from the `InferenceOrderBook` order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferListing {
+    #[serde(with = "crate::address::serde_canonical")]
     pub seller_id: String,
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: TokenContract,
     pub price_per_tick: Shell,
     pub max_ticks: u64,
@@ -125,7 +128,9 @@ pub struct OfferListing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderBookOrder {
     pub order_id: u128,
+    #[serde(with = "crate::address::serde_canonical")]
     pub owner_note: String,
+    #[serde(with = "crate::address::serde_self_dapp_opt")]
     pub token_contract: Option<TokenContract>,
     pub is_buy: bool,
     pub price_per_tick: u128,
@@ -136,14 +141,81 @@ pub struct OrderBookOrder {
     pub timestamp: u64,
 }
 
+/// Opaque event-stream boundary captured immediately before one exact resting-SELL cancel submit.
+/// Real shellnet uses the newest `InferenceOrderBook` ext-out message id so a later terminal
+/// `InferenceOrderCancelRejected` is accepted only when it appeared after this submit began. Mock
+/// backends need no event stream and use the empty marker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestingSellCancelWatch {
+    event_marker: Option<String>,
+}
+
+impl RestingSellCancelWatch {
+    pub fn from_event_marker(event_marker: Option<String>) -> Self {
+        Self { event_marker }
+    }
+
+    pub fn event_marker(&self) -> Option<&str> {
+        self.event_marker.as_deref()
+    }
+}
+
+/// Stage-aware failure while establishing an exact cancel watch and submitting the cancel.
+#[derive(Debug)]
+pub enum RestingSellCancelStartError {
+    /// No cancel was submitted because its event boundary could not be established.
+    Preparation(ChainError),
+    /// The existing owner-authorized cancel submit returned an error.
+    Submit(ChainError),
+}
+
+/// The one deadline predicate every view that claims an order is live or executable applies.
+/// `now < deadline`, because the book's `_isExpired` is `deadline != 0 && block.timestamp >= deadline`
+/// (`contracts/airegistry/InferenceOrderBook.sol:1115-1117`) -- the deadline second itself is already expired
+/// on chain and must not be offered off it.
+/// `deadline == 0` is side-dependent, and that asymmetry is the contract's, not this client's. The book
+/// reads a zero deadline as "never expires", which is a legitimate GTC bid. A SELL commits no
+/// collateral so it MUST auto-expire, and `PrivateNote.postSellOffer` rejects `ttl == 0`
+/// (`contracts/dex/PrivateNote.sol:41,792`, `ERR_SELL_DEADLINE_TOO_LONG`): a zero-deadline ask cannot
+/// come from a well-formed SELL, so it is treated as malformed rather than as immortal liquidity.
+pub fn order_deadline_is_live(is_buy: bool, deadline: u64, now_unix: u64) -> bool {
+    if deadline == 0 {
+        return is_buy;
+    }
+    now_unix < deadline
+}
+
 impl OrderBookOrder {
+    /// SHAPE only: a SELL row with a deal TokenContract and capacity left. Deliberately says nothing
+    /// about time -- a duplicate-TokenContract safety check is about the shape of the book and needs no
+    /// clock. Any view that reports an ask as live or executable must use
+    /// [`OrderBookOrder::is_live_resting_ask_at`] instead.
     pub fn is_resting_ask(&self) -> bool {
         !self.is_buy && self.token_contract.is_some() && self.ticks > 0
+    }
+
+    /// The right shape AND still valid at `now_unix`. Liveness needs a clock and shape does not, which
+    /// is why the two are separate predicates rather than one that silently assumes a time.
+    pub fn is_live_resting_ask_at(&self, now_unix: u64) -> bool {
+        self.is_resting_ask() && order_deadline_is_live(self.is_buy, self.deadline, now_unix)
     }
 }
 
 /// Fail closed unless the fresh matcher head has the order identity and executable terms rendered
 /// to the buyer.
+/// The frozen row is all SIX fields E2E-ORD-23 names, not four. `deadline` and `flags` are as
+/// load-bearing as the price: `deadline` is the moment the book stops honouring this ask
+/// (`InferenceOrderBook._isExpired`), and `flags` decides what the deal the escrow funds actually IS
+/// -- AON, IOC, subscription, TEE -- forwarded verbatim into the `TokenContract` under `DEAL_FLAGS_MASK`.
+/// A row that agrees on id, TokenContract, price and ticks while disagreeing on either of those is a
+/// different offer than the one the buyer was shown, and it used to be paid for silently.
+/// Both sides of the comparison are read the same way, one after the other, through
+/// `model_buy_preflight_selection_once` -> the raw `getOrder` walk, so widening the comparison
+/// cannot make an unchanged ask look changed: `getOrder` returns the stored `Order`, and neither
+/// field moves for a live order id.
+/// `owner_note`, `escrow` and `timestamp` stay OUT, and deliberately: they are not terms the buyer
+/// executes against, and showed that comparing the whole row makes a benign non-atomic reread
+/// look like a race.
 pub fn ensure_pre_submit_quote_unchanged(
     quoted_order: Option<&OrderBookOrder>,
     selected: &OrderBookOrder,
@@ -153,6 +225,8 @@ pub fn ensure_pre_submit_quote_unchanged(
             && quoted.token_contract == selected.token_contract
             && quoted.price_per_tick == selected.price_per_tick
             && quoted.ticks == selected.ticks
+            && quoted.deadline == selected.deadline
+            && quoted.flags == selected.flags
     }) {
         return Ok(());
     }
@@ -176,6 +250,7 @@ pub struct OrderBookStats {
 pub struct OrderBookSnapshot {
     pub frame_model: String,
     pub model_hash: String,
+    #[serde(with = "crate::address::serde_canonical")]
     pub order_book: String,
     pub stats: Option<OrderBookStats>,
     pub orders: Vec<OrderBookOrder>,
@@ -188,6 +263,14 @@ impl OrderBookSnapshot {
 
     pub fn resting_asks(&self) -> impl Iterator<Item = &OrderBookOrder> {
         self.orders.iter().filter(|o| o.is_resting_ask())
+    }
+
+    /// The resting asks a buy could still reach at `now_unix` -- the set every executable-scope view
+    /// must draw from.
+    pub fn live_resting_asks_at(&self, now_unix: u64) -> impl Iterator<Item = &OrderBookOrder> {
+        self.orders
+            .iter()
+            .filter(move |o| o.is_live_resting_ask_at(now_unix))
     }
 }
 
@@ -441,6 +524,7 @@ pub fn subscription_current_week_headroom(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuoteFill {
     pub order_id: u128,
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: TokenContract,
     pub ticks: u128,
     pub price_per_tick: u128,
@@ -453,6 +537,7 @@ pub struct MatchedFill {
     /// The receiving owner's authoritative order id from `InferenceFilledConfirmed`:
     /// `buyerOrderId` for the buyer event and `sellerOrderId` for the seller event.
     pub order_id: u128,
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: TokenContract,
     pub ticks: u128,
     pub price_per_tick: u128,
@@ -467,6 +552,7 @@ pub struct MatchedFill {
 #[serde(deny_unknown_fields)]
 pub struct InferenceSubscriptionPlacement {
     pub order_id: u128,
+    #[serde(with = "crate::address::serde_canonical")]
     pub buyer_note: String,
     pub max_price_per_tick: u128,
     /// Whole term volume in ticks. Divides evenly by `sub_weeks` -- the book enforces it.
@@ -476,6 +562,61 @@ pub struct InferenceSubscriptionPlacement {
     /// Mandatory order deadline: an unmatched subscription is expirable by anyone afterwards.
     pub deadline: u64,
     pub created_at: i64,
+}
+
+/// One owner-facing `InferenceOrderBook` fact about a BUY order a note submitted.
+/// The book emits a distinct event per outcome, so a durable buyer submit record is resolved by the fact
+/// that actually happened and never by a clock. `Cancelled` and `Rejected` are terminal -- the order is gone
+/// and its money came back. `Expired` is NOT: an order past its deadline can still be matched and settled,
+/// or still hold escrow, so it is reported and the record is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuyerOrderFact {
+    /// Wall-clock `created_at` of the ext-out message that carried the event.
+    pub created_at: i64,
+    /// The note the book named as the order's owner.
+    #[serde(with = "crate::address::serde_canonical")]
+    pub note: String,
+    pub kind: BuyerOrderFactKind,
+}
+
+/// The book event behind a [`BuyerOrderFact`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuyerOrderFactKind {
+    /// `InferenceOrderPlaced` -- the book accepted the buy and assigned it this order id.
+    Placed {
+        order_id: u128,
+        price_per_tick: u128,
+        ticks: u128,
+        deadline: u64,
+    },
+    /// `InferenceOrderCancelled` -- the order left the book and `refunded` returned to the note.
+    Cancelled { order_id: u128, refunded: u128 },
+    /// `InferenceOrderExpired` -- the order's deadline was swept. Reported, never terminal for the record.
+    Expired { order_id: u128 },
+    /// `InferenceRefunded` -- `amount` came back to the note for an order that already carried an id.
+    /// The book emits this ALONGSIDE the reason the order left -- `InferenceOrderBook.sol:387-393`
+    /// states it outright: "An expiring bid emits this alongside `InferenceOrderExpired` -- the
+    /// refund and the reason are separate facts." Keeping them separate here is the point:
+    /// a sweep proves removal, this proves the money came back, and only both together prove an
+    /// order stopped holding a buyer's escrow.
+    Refunded { order_id: u128, amount: u128 },
+    /// `InferenceOrderRejected` -- the book refused the submission, so no order id was ever assigned and
+    /// `refund` returned to the note.
+    Rejected { reason: u8, refund: u128 },
+}
+
+impl BuyerOrderFact {
+    /// The order id this fact names, when the book had already assigned one.
+    pub fn order_id(&self) -> Option<u128> {
+        match self.kind {
+            BuyerOrderFactKind::Placed { order_id, .. }
+            | BuyerOrderFactKind::Cancelled { order_id, .. }
+            | BuyerOrderFactKind::Expired { order_id }
+            | BuyerOrderFactKind::Refunded { order_id, .. } => Some(order_id),
+            BuyerOrderFactKind::Rejected { .. } => None,
+        }
+    }
 }
 
 /// Read-only quote result over current resting asks.
@@ -490,6 +631,7 @@ pub struct ExecutableQuote {
 /// Match result: the seller sees the buyer's recorded pubkey.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Match {
+    #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: TokenContract,
     pub buyer_pubkey: NotePubkey,
     pub price_per_tick: Shell,
@@ -507,7 +649,7 @@ pub struct MatchWatchCursor {
     /// Highest `created_at` timestamp already consumed from the source.
     pub last_seen_created_at: Option<i64>,
     /// TokenContracts consumed at `last_seen_created_at`, for same-second events.
-    #[serde(default)]
+    #[serde(default, with = "crate::address::serde_self_dapp_vec")]
     pub seen_token_contracts_at_last_seen: Vec<TokenContract>,
 }
 
@@ -577,9 +719,15 @@ impl MatchWatchCursor {
 /// Backend errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
-    #[error("no match for token_contract {0}")]
+    #[error(
+        "no match for token_contract {display}",
+        display = crate::address::display_self_dapp(.0)
+    )]
     NoMatch(TokenContract),
-    #[error("no stream open for {0}")]
+    #[error(
+        "no stream open for {display}",
+        display = crate::address::display_self_dapp(.0)
+    )]
     NoStream(TokenContract),
     #[error("endpoints file: {0}")]
     EndpointsFile(String),
@@ -641,12 +789,14 @@ pub struct StreamSnapshot {
 }
 
 /// Exact typed by-fact lifecycle read for a live `TokenContract`.
-/// This mirrors every field of the current 15-field `getState()` ABI so no consumer has to inspect raw JSON
+/// This mirrors every field of the current 13-field `getState()` ABI so no consumer has to inspect raw JSON
 /// or reconstruct a missing claim stage or timeout anchor.
-/// The claim pipeline is three-stage by contract design(`TokenContract.claimTokens`): `tokens_final` is
-/// promoted and irrevocably the seller's, while `tokens_superseded` and `tokens_pending` are the older and
-/// newest contestable cumulative claims. Each pending stage has its own timestamp, so orchestrators must
-/// never collapse either stage or treat `tokens_pending` as earned.
+/// The claim pipeline is two-stage in contracts 4.0.35(`TokenContract.claimTokens`): `tokens_final` is
+/// promoted and irrevocably the seller's, and `tokens_pending` is the single contestable cumulative claim.
+/// Contracts 4.0.34 carried a third slot with its own timestamp(`tokensSuperseded`/`prevClaimTime`); 4.0.35
+/// deleted both, because `CLAIM_PROMOTE_WINDOW` now equals `MIN_CLAIM_INTERVAL`, so the next claim always
+/// arrives with the previous one already ripe and at most one tick can be unpromoted. `tokens_pending` is
+/// still not earned -- only `tokens_final` is money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DealChainState {
     pub funded: bool,
@@ -662,9 +812,7 @@ pub struct DealChainState {
     pub finalized_owed: u128,
     /// Promoted cumulative consumption -- the only figure money is computed from.
     pub tokens_final: u128,
-    /// Older pending cumulative claim, with its own contest window.
-    pub tokens_superseded: u128,
-    /// Newest claimed cumulative consumption, still inside its contest window.
+    /// The one claimed cumulative consumption still inside its contest window.
     pub tokens_pending: u128,
     /// SHELL held as the unaccepted probe. Owed to nobody: it either becomes the seller's on acceptance, or
     /// burns with a mirror slice of the bond if the buyer walks away from the trial, or returns to the escrow
@@ -673,8 +821,6 @@ pub struct DealChainState {
     pub funded_time: Option<u64>,
     /// When the probe was frozen (at `open()`); anchors `PROBE_WINDOW`.
     pub probe_time: u64,
-    /// Landing time of `tokens_superseded`; its contest window is independent of the newest claim.
-    pub prev_claim_time: u64,
     /// Anchor for both claim bounds(`MIN_CLAIM_INTERVAL`) and permissionless promotion
     /// (`CLAIM_PROMOTE_WINDOW`). Set at `open()`, then at every accepted claim.
     pub last_claim_time: u64,
@@ -683,30 +829,30 @@ pub struct DealChainState {
 }
 
 impl DealChainState {
-    /// Strictly decode the exact 15-field `TokenContract.getState()` ABI.
+    /// The exact `TokenContract.getState()` output field list this decoder is written for, in the
+    /// order the compiled ABI declares it. Named once so the shape pin
+    /// (`the_deal_state_decoder_matches_the_compiled_getstate`) can assert this list against
+    /// `TokenContract.abi.json` itself rather than against a second hand-written copy of it.
+    pub(crate) const GET_STATE_FIELDS: &'static [&'static str] = &[
+        "funded",
+        "opened",
+        "probeAccepted",
+        "disputed",
+        "deposit",
+        "probeTick",
+        "finalizedOwed",
+        "tokensFinal",
+        "tokensPending",
+        "probeTime",
+        "lastClaimTime",
+        "disputeTime",
+        "fundedTime",
+    ];
+
+    /// Strictly decode the exact 13-field `TokenContract.getState()` ABI.
     pub fn decode_getter(value: &Value) -> Result<Self, String> {
         const GETTER: &str = "getState()";
-        getter_exact_object(
-            value,
-            GETTER,
-            &[
-                "funded",
-                "opened",
-                "probeAccepted",
-                "disputed",
-                "deposit",
-                "probeTick",
-                "finalizedOwed",
-                "tokensFinal",
-                "tokensSuperseded",
-                "tokensPending",
-                "probeTime",
-                "prevClaimTime",
-                "lastClaimTime",
-                "disputeTime",
-                "fundedTime",
-            ],
-        )?;
+        getter_exact_object(value, GETTER, Self::GET_STATE_FIELDS)?;
 
         let funded_time = getter_u64(value, GETTER, "fundedTime")?;
         let decoded = Self {
@@ -718,22 +864,17 @@ impl DealChainState {
             probe_tick: getter_u128(value, GETTER, "probeTick")?,
             finalized_owed: getter_u128(value, GETTER, "finalizedOwed")?,
             tokens_final: getter_u128(value, GETTER, "tokensFinal")?,
-            tokens_superseded: getter_u128(value, GETTER, "tokensSuperseded")?,
             tokens_pending: getter_u128(value, GETTER, "tokensPending")?,
             probe_time: getter_u64(value, GETTER, "probeTime")?,
-            prev_claim_time: getter_u64(value, GETTER, "prevClaimTime")?,
             last_claim_time: getter_u64(value, GETTER, "lastClaimTime")?,
             dispute_time: getter_u64(value, GETTER, "disputeTime")?,
             funded_time: (funded_time != 0).then_some(funded_time),
         };
 
-        if decoded.tokens_final > decoded.tokens_superseded
-            || decoded.tokens_superseded > decoded.tokens_pending
-        {
+        if decoded.tokens_final > decoded.tokens_pending {
             return Err(format!(
-                "{GETTER} claim pipeline is not monotonic: tokensFinal={} tokensSuperseded={} \
-                 tokensPending={}",
-                decoded.tokens_final, decoded.tokens_superseded, decoded.tokens_pending
+                "{GETTER} claim pipeline is not monotonic: tokensFinal={} tokensPending={}",
+                decoded.tokens_final, decoded.tokens_pending
             ));
         }
         Ok(decoded)
@@ -759,6 +900,82 @@ impl DealChainState {
     /// the two apart.
     pub fn is_stopped(self) -> bool {
         self.funded && !self.opened && !self.disputed && self.deposit == 0 && self.probe_tick == 0
+    }
+
+    /// Why this per-deal `TokenContract` is already USED, if it is.
+    /// A `(sellerPubkey, nonce)` TC is a single-use deal slot, not reusable capacity: once anything
+    /// below is true its `maxTicks` are committed to a buyer and no ask may be posted against them.
+    /// `None` means every field is still at its constructor value, so the TC's whole `getDeal().maxTicks`
+    /// is unsold -- which is what makes it the authoritative remaining capacity for an expiry relist.
+    pub fn used_reason(self) -> Option<String> {
+        let mut used = Vec::new();
+        if self.opened {
+            used.push("opened".to_string());
+        }
+        if self.funded {
+            used.push("funded".to_string());
+        }
+        if self.disputed {
+            used.push("disputed".to_string());
+        }
+        if self.probe_accepted {
+            used.push("probeAccepted".to_string());
+        }
+        for (field, value) in [
+            ("deposit", self.deposit),
+            ("probeTick", self.probe_tick),
+            ("finalizedOwed", self.finalized_owed),
+            ("tokensFinal", self.tokens_final),
+            ("tokensPending", self.tokens_pending),
+        ] {
+            if value > 0 {
+                used.push(format!("{field}={value}"));
+            }
+        }
+        if let Some(funded_time) = self.funded_time {
+            used.push(format!("fundedTime={funded_time}"));
+        }
+        for (field, value) in [
+            ("probeTime", self.probe_time),
+            ("lastClaimTime", self.last_claim_time),
+            ("disputeTime", self.dispute_time),
+        ] {
+            if value > 0 {
+                used.push(format!("{field}={value}"));
+            }
+        }
+        (!used.is_empty()).then(|| used.join(", "))
+    }
+}
+
+/// Strictly decoded `TokenContract.getOffer()` -- the deal's own offer latch.
+/// `offer_posted` is the contract's `_offerPosted`: set when the TC posts its ask
+/// (`contracts/airegistry/TokenContract.sol:713-714`) and cleared only when the book reports the ask
+/// left WITHOUT a fill -- cancel or expiry -- through `onSellClosed`
+/// (`contracts/airegistry/TokenContract.sol:729-736`). While it is set, `postFromNote` returns
+/// without posting anything, so it is the single authoritative fact that says whether a successor
+/// offer can rest at all.
+/// The latch is a single flag. Contracts 4.0.34 carried a second one, `closing`, a seller wind-down
+/// state in which the TC self-destructed inside the next `onSellClosed`; 4.0.35 deleted `_closing`
+/// from the contract's state and from the ABI, because `close()` now refuses outright while an offer
+/// is live instead of latching an intent and reporting success. There is no successor field:
+/// the state it described is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DealOfferLatch {
+    pub offer_posted: bool,
+}
+
+impl DealOfferLatch {
+    /// The exact `TokenContract.getOffer()` output field list, named once so the shape pin can
+    /// assert it against the compiled ABI rather than against a second hand-written copy.
+    pub(crate) const GET_OFFER_FIELDS: &'static [&'static str] = &["offerPosted"];
+
+    pub fn decode_getter(value: &Value) -> Result<Self, String> {
+        const GETTER: &str = "getOffer()";
+        getter_exact_object(value, GETTER, Self::GET_OFFER_FIELDS)?;
+        Ok(Self {
+            offer_posted: getter_bool(value, GETTER, "offerPosted")?,
+        })
     }
 }
 
@@ -819,7 +1036,6 @@ pub struct DealChainSnapshot {
 impl DealChainSnapshot {
     /// Validate only relationships exposed authoritatively by the four getters
     /// in this same account revision.
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     pub(crate) fn validate_cross_getter_invariants(&self) -> Result<(), String> {
         if self.state.funded {
             let minimum_funded_tokens = crate::params::TICK_SIZE * 2;
@@ -861,29 +1077,49 @@ impl DealChainSnapshot {
             }
         }
 
+        // The two bond getters are NOT symmetric, and reading them as if they were is what made this
+        // check refuse a legitimate 4.0.35 deal:
+        // getSellerBond() -> (_sellerBondFunded, _sellerBond, _bondAmount())
+        // getBuyerBond() -> (_buyerBond, _isSubscription() ? _bondAmount(): 0)
+        // So `bondRequired` on the BUYER side is not "how much this deal needs from the buyer" -- it
+        // is zero on an ordinary deal unconditionally and forever, by that ternary, even while the
+        // deal holds a buyer bond. Contracts 4.0.35 posts one on EVERY buy fill: `PrivateNote`
+        // sends `fundBuyerBond(2 * clearingPrice)` gated on `isBuy` with no subscription test, and
+        // `TokenContract.fundBuyerBond` accepts it on any deal. `bondHeld > bondRequired` is
+        // therefore the NORMAL shape of a funded ordinary deal, not an incoherent read.
+        // What is genuinely invariant is that both getters name the same contract quantity,
+        // `_bondAmount()`, and the seller side reports it unconditionally -- so the seller's
+        // `bondRequired` is the deal's bond size whichever kind of deal it is.
         let buyer = self.buyer_bond;
-        if buyer.bond_held > buyer.bond_required {
+        let expected_buyer_required = if self.subscription.is_subscription() {
+            seller.bond_required
+        } else {
+            0
+        };
+        if buyer.bond_required != expected_buyer_required {
             return Err(format!(
-                "getBuyerBond() bondHeld {} exceeds bondRequired {}",
-                buyer.bond_held, buyer.bond_required
+                "getBuyerBond() bondRequired {} is not the shape getBuyerBond() can report for this \
+                 deal: a subscription must mirror getSellerBond().bondRequired {} and an ordinary \
+                 deal must report 0 (subscription={})",
+                buyer.bond_required,
+                seller.bond_required,
+                self.subscription.is_subscription()
+            ));
+        }
+        // `fundBuyerBond` stores exactly `_bondAmount()` and refunds the excess, and no path ever
+        // raises `_buyerBond` again -- the terminal paths only decrement it. So the held figure can
+        // never exceed the deal's bond size as the seller getter reports it, on either kind of deal.
+        // This is the bound that replaces the broken comparison, and it still catches a bond larger
+        // than the contract could have taken.
+        if buyer.bond_held > seller.bond_required {
+            return Err(format!(
+                "getBuyerBond() bondHeld {} exceeds the deal's bond size {} \
+                 (getSellerBond().bondRequired, which is _bondAmount() on both sides)",
+                buyer.bond_held, seller.bond_required
             ));
         }
         if !self.subscription.is_subscription() {
-            if buyer.bond_held != 0 || buyer.bond_required != 0 {
-                return Err(format!(
-                    "getBuyerBond() ordinary-deal shape must be bondHeld=0 and bondRequired=0, got \
-                     bondHeld={} bondRequired={}",
-                    buyer.bond_held, buyer.bond_required
-                ));
-            }
             return Ok(());
-        }
-
-        if buyer.bond_required != seller.bond_required {
-            return Err(format!(
-                "subscription seller/buyer bondRequired mismatch: seller={} buyer={}",
-                seller.bond_required, buyer.bond_required
-            ));
         }
         let live_funded = self.state.funded && !self.state.is_stopped();
         if live_funded && (buyer.bond_required == 0 || buyer.bond_held != buyer.bond_required) {
@@ -1025,8 +1261,6 @@ pub struct SettlementActionBondState {
 pub struct SettlementActionPostState {
     #[serde(rename = "tokensFinal")]
     pub tokens_final: RawUint128,
-    #[serde(rename = "tokensSuperseded")]
-    pub tokens_superseded: RawUint128,
     #[serde(rename = "tokensPending")]
     pub tokens_pending: RawUint128,
     #[serde(rename = "sellerBondHeld")]
@@ -1055,12 +1289,88 @@ pub struct SettlementActionReceipt {
     pub post_state: Option<SettlementActionPostState>,
 }
 
+/// What immutable chain history proves when a buyer STOP path sees a terminal deal but cannot
+/// honestly return an action receipt for its own call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuyerStopTerminalFact {
+    /// The terminal transaction consumed the exact STOP message produced by this invocation.
+    SubmittedStop,
+    /// The terminal receipt existed before this invocation could submit STOP.
+    AlreadyClosed,
+    /// This invocation submitted STOP, but the terminal transaction's inbound call does not prove
+    /// that this STOP, rather than a racing permissionless or counterparty call, closed the deal.
+    UnknownCloser,
+}
+
+impl fmt::Display for BuyerStopTerminalFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SubmittedStop => "submitted_stop",
+            Self::AlreadyClosed => "already_closed",
+            Self::UnknownCloser => "unknown_closer",
+        })
+    }
+}
+
+/// Honest terminal evidence returned by a buyer STOP path. It is populated only from immutable
+/// chain events and exact message identities, never from a client-written receipt or journal row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuyerStopTerminalReceipt {
+    pub token_contract: TokenContract,
+    pub fact: BuyerStopTerminalFact,
+    /// Whether this invocation reached its one STOP POST. This is deliberately independent from
+    /// close attribution: `true` does not mean that STOP won a race.
+    pub stop_submitted: bool,
+    pub message_id: String,
+    pub created_at: u64,
+    #[serde(flatten)]
+    pub event: SettlementActionEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_bonds: Option<SettlementActionBondState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_state: Option<SettlementActionPostState>,
+}
+
+impl BuyerStopTerminalReceipt {
+    pub fn unknown_closer(receipt: SettlementActionReceipt) -> Self {
+        Self {
+            token_contract: receipt.token_contract,
+            fact: BuyerStopTerminalFact::UnknownCloser,
+            stop_submitted: true,
+            message_id: receipt.message_id,
+            created_at: receipt.created_at,
+            event: receipt.event,
+            pre_bonds: Some(receipt.pre_bonds),
+            post_state: receipt.post_state,
+        }
+    }
+}
+
+impl fmt::Display for BuyerStopTerminalReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "token_contract={} fact={} stop_submitted={} message_id={} created_at={} event={:?}",
+            self.token_contract,
+            self.fact,
+            self.stop_submitted,
+            self.message_id,
+            self.created_at,
+            self.event
+        )
+    }
+}
+
 impl fmt::Display for SettlementActionReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "token_contract={} action={} message_id={} created_at={}",
-            self.token_contract, self.action, self.message_id, self.created_at
+            crate::address::display_self_dapp(&self.token_contract),
+            self.action,
+            self.message_id,
+            self.created_at
         )?;
         match &self.event {
             SettlementActionEvent::ProbeBurned {
@@ -1070,8 +1380,9 @@ impl fmt::Display for SettlementActionReceipt {
                 refund_to_buyer,
             } => write!(
                 formatter,
-                " event_kind=probe_burned buyer={buyer} burnedProbe={burned_probe} burnedBond={burned_bond} \
-                 refundToBuyer={refund_to_buyer}"
+                " event_kind=probe_burned buyer={} burnedProbe={burned_probe} burnedBond={burned_bond} \
+                 refundToBuyer={refund_to_buyer}",
+                crate::address::display(buyer)
             )?,
             SettlementActionEvent::StreamStopped {
                 buyer,
@@ -1079,11 +1390,16 @@ impl fmt::Display for SettlementActionReceipt {
                 refund_to_buyer,
             } => write!(
                 formatter,
-                " event_kind=stream_stopped buyer={buyer} toSeller={to_seller} \
-                 refundToBuyer={refund_to_buyer}"
+                " event_kind=stream_stopped buyer={} toSeller={to_seller} \
+                 refundToBuyer={refund_to_buyer}",
+                crate::address::display(buyer)
             )?,
             SettlementActionEvent::StreamDisputed { buyer, at } => {
-                write!(formatter, " event_kind=stream_disputed buyer={buyer} at={at}")?
+                write!(
+                    formatter,
+                    " event_kind=stream_disputed buyer={} at={at}",
+                    crate::address::display(buyer)
+                )?
             }
             SettlementActionEvent::DisputeResolved {
                 to_seller,
@@ -1107,10 +1423,9 @@ impl fmt::Display for SettlementActionReceipt {
         match &self.post_state {
             Some(state) => write!(
                 formatter,
-                " tokensFinal={} tokensSuperseded={} tokensPending={} sellerBondHeld={} \
+                " tokensFinal={} tokensPending={} sellerBondHeld={} \
                  sellerBondRequired={} buyerBondHeld={} buyerBondRequired={} opened={} disputed={}",
                 state.tokens_final,
-                state.tokens_superseded,
                 state.tokens_pending,
                 state.seller_bond_held,
                 state.seller_bond_required,
@@ -1127,13 +1442,219 @@ impl fmt::Display for SettlementActionReceipt {
 #[cfg(test)]
 mod tests {
     use super::{
-        flags, DealBuyerBond, DealChainState, DealSellerBond, DealSubscription, SettlementAction,
+        flags, order_deadline_is_live, DealBuyerBond, DealChainSnapshot, DealChainState,
+        DealOfferLatch,
+        DealSellerBond, DealSubscription, OrderBookOrder, OrderBookSnapshot, SettlementAction,
         SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
         SettlementActionReceipt, SUBSCRIPTION_WEEKS,
     };
     use crate::TICK_SIZE;
     use proptest::prelude::*;
     use serde_json::{json, Value};
+
+    /// The ordered `(name, type)` list a compiled ABI declares for one side of one function.
+    fn params(abi: &str, function: &str, side: &str) -> Vec<(String, String)> {
+        let abi: Value = serde_json::from_str(abi).expect("parse compiled ABI");
+        abi["functions"]
+            .as_array()
+            .expect("compiled ABI functions[]")
+            .iter()
+            .find(|declared| declared["name"] == function)
+            .unwrap_or_else(|| panic!("the compiled ABI declares {function}"))[side]
+            .as_array()
+            .expect("compiled ABI parameter list")
+            .iter()
+            .map(|param| {
+                (
+                    param["name"].as_str().unwrap_or_default().to_string(),
+                    param["type"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The same list, names only -- the shape a strict decoder's field list is compared against.
+    fn names(abi: &str, function: &str, side: &str) -> Vec<String> {
+        params(abi, function, side)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, kind)| ((*name).to_string(), (*kind).to_string()))
+            .collect()
+    }
+
+    /// shape pin: the deal's offer latch and the permissionless sweep, read out of the compiled
+    /// artifacts this workspace ships rather than out of a hand-written signature.
+    /// `getOffer()` is the only authoritative answer to "may a successor ask rest on this deal" --
+    /// while `offerPosted` is set, `postFromNote` returns without posting and the seller gets no error
+    /// -- and `expireOrder(orderId)` is the only way to clear an ask no taker ever crosses. A decoder
+    /// frozen against a proposed shape passes every offline gate while being dead on chain, so the
+    /// field list is asserted against the artifact and the strict decoder against the field list.
+    #[test]
+    fn the_offer_latch_and_the_permissionless_sweep_match_the_compiled_artifacts() {
+        const TOKEN_CONTRACT_ABI: &str =
+            include_str!("../../../../contracts/compiled/airegistry/TokenContract.abi.json");
+        const ORDER_BOOK_ABI: &str =
+            include_str!("../../../../contracts/compiled/airegistry/InferenceOrderBook.abi.json");
+
+        assert_eq!(
+            params(ORDER_BOOK_ABI, "expireOrder", "inputs"),
+            owned(&[("orderId", "uint128")]),
+            "the permissionless sweep takes the order id and nothing else -- no owner argument, which \
+             is what makes it callable by a keeper, the counterparty or the seller itself"
+        );
+        assert_eq!(
+            params(TOKEN_CONTRACT_ABI, "getOffer", "outputs"),
+            owned(&[("offerPosted", "bool")]),
+            "4.0.35 deleted _closing from the contract's state and from the ABI, so the deal's offer \
+             latch is exactly this one flag"
+        );
+        assert_eq!(
+            names(TOKEN_CONTRACT_ABI, "getOffer", "outputs"),
+            DealOfferLatch::GET_OFFER_FIELDS,
+            "the strict decoder's field list is the compiled getter's field list"
+        );
+        assert_eq!(
+            DealOfferLatch::decode_getter(&json!({ "offerPosted": true }))
+                .expect("the exact declared shape decodes"),
+            DealOfferLatch { offer_posted: true }
+        );
+        assert!(
+            DealOfferLatch::decode_getter(&json!({})).is_err(),
+            "a latch read missing a field is not a latch this client may act on"
+        );
+        assert!(
+            DealOfferLatch::decode_getter(&json!({
+                "offerPosted": true,
+                "closing": false,
+            }))
+            .is_err(),
+            "the superseded 4.0.34 shape is not the getter this decoder was written for"
+        );
+    }
+
+    /// The same discipline as the offer latch, for the getter every deal read goes through.
+    /// `getState()` is not compile-coupled to anything: the decoder names its fields in a string
+    /// list, so a shape that has moved on chain fails at RUNTIME, on every read, for buyer, keeper,
+    /// monitor, audit and recover alike -- and nothing offline notices. Contracts 4.0.35 deleted
+    /// `tokensSuperseded` and `prevClaimTime` when the claim pipeline collapsed from three slots to
+    /// two, which took the getter from fifteen fields to thirteen. That is exactly the class this
+    /// pin exists to catch, and there was no pin here when it happened.
+    /// Asserted in both directions on purpose: the ordered `(name, type)` list against the artifact,
+    /// so a renamed or retyped field is caught; and the decoder's own field list against the
+    /// artifact's names, so the strict decoder can never be a generation apart from the ABI this
+    /// workspace embeds.
+    #[test]
+    fn the_deal_state_decoder_matches_the_compiled_getstate() {
+        const TOKEN_CONTRACT_ABI: &str =
+            include_str!("../../../../contracts/compiled/airegistry/TokenContract.abi.json");
+
+        assert_eq!(
+            params(TOKEN_CONTRACT_ABI, "getState", "outputs"),
+            owned(&[
+                ("funded", "bool"),
+                ("opened", "bool"),
+                ("probeAccepted", "bool"),
+                ("disputed", "bool"),
+                ("deposit", "uint128"),
+                ("probeTick", "uint128"),
+                ("finalizedOwed", "uint128"),
+                ("tokensFinal", "uint128"),
+                ("tokensPending", "uint128"),
+                ("probeTime", "uint64"),
+                ("lastClaimTime", "uint64"),
+                ("disputeTime", "uint64"),
+                ("fundedTime", "uint64"),
+            ]),
+            "the deal state getter is exactly these thirteen fields"
+        );
+        assert_eq!(
+            names(TOKEN_CONTRACT_ABI, "getState", "outputs"),
+            DealChainState::GET_STATE_FIELDS,
+            "the strict decoder's field list is the compiled getter's field list"
+        );
+
+        let declared = exact_state();
+        assert!(
+            DealChainState::decode_getter(&declared).is_ok(),
+            "the exact declared shape decodes"
+        );
+        let mut superseded_shape = declared.clone();
+        set_field(&mut superseded_shape, "tokensSuperseded", json!("0"));
+        set_field(&mut superseded_shape, "prevClaimTime", json!("0"));
+        assert!(
+            DealChainState::decode_getter(&superseded_shape).is_err(),
+            "the 4.0.34 fifteen-field shape is not the getter this decoder was written for"
+        );
+    }
+
+    /// The incident, to the second: SELL 11's deadline and the moment it was still being
+    /// offered as executable depth, 779 seconds later.
+    const LAPSED_DEADLINE: u64 = 1_785_678_525;
+    const OBSERVED_AT: u64 = 1_785_679_304;
+
+    fn ask(order_id: u128, deadline: u64) -> OrderBookOrder {
+        OrderBookOrder {
+            order_id,
+            owner_note: "0:seller".to_string(),
+            token_contract: Some("0:tc".to_string()),
+            is_buy: false,
+            price_per_tick: 5_000_000_000,
+            ticks: 956,
+            escrow: 0,
+            deadline,
+            flags: 0,
+            timestamp: 0,
+        }
+    }
+
+    /// one predicate, and it matches the book's own `_isExpired` -- `deadline != 0 &&
+    /// block.timestamp >= deadline`. The deadline second itself is already expired.
+    #[test]
+    fn the_deadline_predicate_matches_the_contract_boundary() {
+        assert!(order_deadline_is_live(false, LAPSED_DEADLINE, LAPSED_DEADLINE - 1));
+        assert!(!order_deadline_is_live(false, LAPSED_DEADLINE, LAPSED_DEADLINE));
+        assert!(!order_deadline_is_live(false, LAPSED_DEADLINE, OBSERVED_AT));
+    }
+
+    /// A zero deadline reads by side: the contract permits a GTC bid, but a SELL commits no
+    /// collateral and `PrivateNote` refuses `ttl == 0`, so a zero-deadline ask is malformed rather
+    /// than immortal liquidity.
+    #[test]
+    fn a_zero_deadline_is_gtc_for_a_bid_and_malformed_for_an_ask() {
+        assert!(order_deadline_is_live(true, 0, OBSERVED_AT));
+        assert!(!order_deadline_is_live(false, 0, OBSERVED_AT));
+    }
+
+    /// Shape and liveness are separate questions: a lapsed row is still a well-formed resting ask,
+    /// which is why a duplicate-TokenContract safety check stays deadline-blind while every view
+    /// that reports executable depth does not.
+    #[test]
+    fn live_resting_asks_exclude_lapsed_rows_that_are_still_well_formed() {
+        let snapshot = OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: vec![ask(11, LAPSED_DEADLINE), ask(12, OBSERVED_AT + 3_600)],
+        };
+
+        assert!(snapshot.orders[0].is_resting_ask());
+        assert!(!snapshot.orders[0].is_live_resting_ask_at(OBSERVED_AT));
+        assert_eq!(snapshot.resting_asks().count(), 2);
+        assert_eq!(
+            snapshot
+                .live_resting_asks_at(OBSERVED_AT)
+                .map(|order| order.order_id)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
 
     /// `deposit` carries the lifecycle distinction now: still-held escrow means the deal is live,
     /// a drained deposit means a terminal path already settled it.
@@ -1146,12 +1667,10 @@ mod tests {
             deposit,
             finalized_owed: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             probe_tick: 0,
             funded_time: None,
             probe_time: 0,
-            prev_claim_time: 0,
             last_claim_time: 0,
             dispute_time: 0,
         }
@@ -1225,10 +1744,8 @@ mod tests {
             "probeTick": "2",
             "finalizedOwed": "3",
             "tokensFinal": "10",
-            "tokensSuperseded": "20",
             "tokensPending": "30",
             "probeTime": "40",
-            "prevClaimTime": "50",
             "lastClaimTime": "60",
             "disputeTime": "0",
             "fundedTime": "70"
@@ -1277,11 +1794,10 @@ mod tests {
     }
 
     /// The claim pipeline is monotonic, so a state that has settled at one cumulative figure carries
-    /// it in all three stages.
+    /// it in both stages.
     fn claimed(cumulative: u128) -> DealChainState {
         let mut state = state(true, true, false, 1_000);
         state.tokens_final = cumulative;
-        state.tokens_superseded = cumulative;
         state.tokens_pending = cumulative;
         state
     }
@@ -1480,14 +1996,120 @@ mod tests {
             .insert(field.to_string(), replacement);
     }
 
+    /// A snapshot that differs from the next only in the four bond figures under test. Deliberately
+    /// NOT funded and NOT opened, so the seller-bond and funded-tokens gates ahead of the buyer-bond
+    /// block cannot be what decides these cases.
+    fn snapshot_for_bonds(
+        subscription: bool,
+        deal_bond: u128,
+        buyer_held: u128,
+        buyer_required: u128,
+    ) -> DealChainSnapshot {
+        DealChainSnapshot {
+            account_code_hash: "code".to_string(),
+            account_boc_hash: "boc".to_string(),
+            state: state(false, false, false, 1_000),
+            subscription: DealSubscription {
+                deal_flags: if subscription { flags::SUBSCRIPTION } else { 0 },
+                sub_weeks: if subscription { SUBSCRIPTION_WEEKS } else { 0 },
+                week_index: 0,
+                tokens_per_week: WEEK,
+                funded_tokens: FUNDED,
+                tokens_paid: TICK_SIZE,
+                period_start: 0,
+                week_base_tokens: 0,
+            },
+            seller_bond: DealSellerBond {
+                bond_funded: false,
+                bond_held: 0,
+                bond_required: deal_bond,
+            },
+            buyer_bond: DealBuyerBond {
+                bond_held: buyer_held,
+                bond_required: buyer_required,
+            },
+        }
+    }
+
+    /// The buyer bond, pinned against the contract sources rather than against a belief about them.
+    /// The belief this replaces was `SUBSCRIPTION_BUYER_BOND_TICKS` prose -- "ordinary BUYs carry no
+    /// buyer bond" -- and the coherence check enforced it as `bondHeld == 0 && bondRequired == 0` on
+    /// every ordinary deal. Contracts 4.0.35 posts a bond on EVERY buy fill, so that refused six
+    /// live proofs with `bondHeld 2000000000 exceeds bondRequired 0` -- a client refusing a chain
+    /// state that was perfectly correct.
+    /// Three facts are read straight out of the `.sol` this workspace ships, so a contract change
+    /// that moves any of them turns this red instead of turning a live campaign red:
+    /// 1. `_bondAmount()` is `2 * _pricePerTick` -- NOT scaled by ticks, and not a different figure
+    /// per side. The measured `bondHeld` of 2e9 and 4e9 across proofs is that doubled price, not
+    /// the tick principal it happened to coincide with.
+    /// 2. `getSellerBond()` reports `_bondAmount()` UNCONDITIONALLY, so it is the deal's bond size
+    /// whichever kind of deal it is.
+    /// 3. `getBuyerBond()` reports it only for a subscription and hard-zero otherwise, which is why
+    /// `bondHeld > bondRequired` is the normal shape of a funded ordinary deal.
+    /// The asymmetry in 2-vs-3 is the whole defect. Asserted here on the sources, because no offline
+    /// fixture can notice a getter that changed shape on chain.
     #[test]
-    fn get_state_decoder_accepts_exact_fifteen_field_abi() {
+    fn the_buyer_bond_getters_are_asymmetric_and_the_source_says_so() {
+        const TOKEN_CONTRACT_SOL: &str =
+            include_str!("../../../../contracts/airegistry/TokenContract.sol");
+        const PRIVATE_NOTE_SOL: &str = include_str!("../../../../contracts/dex/PrivateNote.sol");
+
+        let squashed: String = TOKEN_CONTRACT_SOL.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            squashed.contains("function _bondAmount() private view returns (uint128) { return 2 * _pricePerTick; }"),
+            "the deal's bond is twice the tick price, on both sides and unscaled by ticks"
+        );
+        // Needles are `concat!` of single literals on purpose: a `\`-continued string keeps the
+        // next line's indentation and silently stops matching squashed source.
+        assert!(
+            squashed.contains(concat!(
+                "function getSellerBond() external view returns ",
+                "(bool bondFunded, uint128 bondHeld, uint128 bondRequired) ",
+                "{ return (_sellerBondFunded, _sellerBond, _bondAmount()); }"
+            )),
+            "getSellerBond().bondRequired is _bondAmount() unconditionally"
+        );
+        assert!(
+            squashed.contains(concat!(
+                "function getBuyerBond() external view returns ",
+                "(uint128 bondHeld, uint128 bondRequired) ",
+                "{ return (_buyerBond, _isSubscription() ? _bondAmount() : 0); }"
+            )),
+            "getBuyerBond().bondRequired is hard-zero on an ordinary deal, so it must never be read as an upper bound on bondHeld"
+        );
+        assert!(
+            squashed.contains("_buyerBond = need;")
+                && squashed.contains("uint128 need = _bondAmount();")
+                && squashed.contains("uint128 excess = amount - need;"),
+            "fundBuyerBond stores exactly _bondAmount() and refunds the excess, which is what makes              bondHeld <= getSellerBond().bondRequired an invariant rather than a guess"
+        );
+        assert!(
+            PRIVATE_NOTE_SOL.contains("if (isBuy) {")
+                && PRIVATE_NOTE_SOL.contains("uint128 bond = uint128(2 * clearingPrice);"),
+            "the note posts the bond on every BUY fill, gated on isBuy and on nothing else -- there              is no subscription test here, which is why an ordinary deal now holds one"
+        );
+
+        // And the corrected check admits the shape that broke six live proofs.
+        let ordinary_with_a_bond = snapshot_for_bonds(false, 2_000_000_000, 2_000_000_000, 0);
+        assert_eq!(ordinary_with_a_bond.validate_cross_getter_invariants(), Ok(()));
+        // A bond larger than the deal could ever have taken is still refused.
+        let oversized = snapshot_for_bonds(false, 2_000_000_000, 2_000_000_001, 0);
+        assert!(oversized.validate_cross_getter_invariants().is_err());
+        // An ordinary deal reporting a non-zero requirement is a getter that changed shape.
+        let wrong_required = snapshot_for_bonds(false, 2_000_000_000, 0, 2_000_000_000);
+        assert!(wrong_required.validate_cross_getter_invariants().is_err());
+        // A subscription must still mirror the seller's requirement exactly.
+        let sub_mismatch = snapshot_for_bonds(true, 2_000_000_000, 2_000_000_000, 1);
+        assert!(sub_mismatch.validate_cross_getter_invariants().is_err());
+    }
+
+    #[test]
+    fn get_state_decoder_accepts_exact_thirteen_field_abi() {
         let state = DealChainState::decode_getter(&exact_state()).expect("exact getState ABI");
         assert_eq!(state.finalized_owed, 3);
         assert_eq!(state.tokens_final, 10);
-        assert_eq!(state.tokens_superseded, 20);
         assert_eq!(state.tokens_pending, 30);
-        assert_eq!(state.prev_claim_time, 50);
+        assert_eq!(state.last_claim_time, 60);
         assert_eq!(state.funded_time, Some(70));
     }
 
@@ -1543,10 +2165,8 @@ mod tests {
             "probeTick",
             "finalizedOwed",
             "tokensFinal",
-            "tokensSuperseded",
             "tokensPending",
             "probeTime",
-            "prevClaimTime",
             "lastClaimTime",
             "disputeTime",
             "fundedTime",
@@ -1593,10 +2213,8 @@ mod tests {
             "probeTick",
             "finalizedOwed",
             "tokensFinal",
-            "tokensSuperseded",
             "tokensPending",
             "probeTime",
-            "prevClaimTime",
             "lastClaimTime",
             "disputeTime",
             "fundedTime",
@@ -1616,7 +2234,6 @@ mod tests {
             "probeTick",
             "finalizedOwed",
             "tokensFinal",
-            "tokensSuperseded",
             "tokensPending",
         ] {
             let mut state = exact_state();
@@ -1632,7 +2249,6 @@ mod tests {
         }
         for field in [
             "probeTime",
-            "prevClaimTime",
             "lastClaimTime",
             "disputeTime",
             "fundedTime",
@@ -1652,20 +2268,15 @@ mod tests {
 
     #[test]
     fn get_state_decoder_rejects_non_monotonic_claim_pipeline_boundaries() {
-        for (final_tokens, superseded, pending) in [(11, 10, 30), (10, 31, 30)] {
+        for (final_tokens, pending) in [(31, 30), (11, 10)] {
             let mut state = exact_state();
             set_field(&mut state, "tokensFinal", json!(final_tokens.to_string()));
-            set_field(
-                &mut state,
-                "tokensSuperseded",
-                json!(superseded.to_string()),
-            );
             set_field(&mut state, "tokensPending", json!(pending.to_string()));
             assert!(DealChainState::decode_getter(&state).is_err());
         }
 
         let mut equal = exact_state();
-        for field in ["tokensFinal", "tokensSuperseded", "tokensPending"] {
+        for field in ["tokensFinal", "tokensPending"] {
             set_field(&mut equal, field, json!("10"));
         }
         assert!(DealChainState::decode_getter(&equal).is_ok());
@@ -1675,18 +2286,14 @@ mod tests {
         #[test]
         fn get_state_decoder_preserves_monotonic_claim_pipeline(
             final_tokens in any::<u64>(),
-            first_delta in any::<u32>(),
-            second_delta in any::<u32>(),
+            delta in any::<u32>(),
         ) {
-            let superseded = u128::from(final_tokens) + u128::from(first_delta);
-            let pending = superseded + u128::from(second_delta);
+            let pending = u128::from(final_tokens) + u128::from(delta);
             let mut state = exact_state();
             set_field(&mut state, "tokensFinal", json!(final_tokens.to_string()));
-            set_field(&mut state, "tokensSuperseded", json!(superseded.to_string()));
             set_field(&mut state, "tokensPending", json!(pending.to_string()));
             let decoded = DealChainState::decode_getter(&state).expect("monotonic pipeline");
-            prop_assert!(decoded.tokens_final <= decoded.tokens_superseded);
-            prop_assert!(decoded.tokens_superseded <= decoded.tokens_pending);
+            prop_assert!(decoded.tokens_final <= decoded.tokens_pending);
         }
 
         /// over arbitrary weekly books: the three-phase rule, as inequalities that hold in
@@ -1929,7 +2536,6 @@ mod tests {
             },
             post_state: Some(SettlementActionPostState {
                 tokens_final: 1_000_001u128.into(),
-                tokens_superseded: 2_000_003u128.into(),
                 tokens_pending: u128::MAX.into(),
                 seller_bond_held: 0u128.into(),
                 seller_bond_required: 2_000_000_000u128.into(),
@@ -1957,7 +2563,13 @@ mod tests {
         assert_eq!(round_trip, receipt);
 
         let text = receipt.to_string();
-        assert!(text.contains(&format!("buyer=0:{}", "44".repeat(32))));
+        // the human receipt renders the buyer's PrivateNote canonically - a system contract of
+        // the shared dexdo DApp. The machine `encoded["buyer"]` above stays on the legacy form.
+        assert!(text.contains(&format!(
+            "buyer={}::{}",
+            crate::address::DEXDO_DAPP_ID,
+            "44".repeat(32)
+        )));
         assert!(text.contains(&format!("toSeller={}", u128::MAX)));
         assert!(text.contains("tokensFinal=1000001"));
         assert!(!text.contains("ticks="));
@@ -1982,7 +2594,6 @@ mod tests {
             },
             post_state: Some(SettlementActionPostState {
                 tokens_final: 1u128.into(),
-                tokens_superseded: 0u128.into(),
                 tokens_pending: 1u128.into(),
                 seller_bond_held: 2_000_000_000u128.into(),
                 seller_bond_required: 2_000_000_000u128.into(),

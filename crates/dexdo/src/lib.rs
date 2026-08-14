@@ -6,5 +6,6 @@ mod test_refusing_endpoint;
 
 pub mod buyer;
 pub mod registry;
+pub mod runtime_events;
 pub mod seller;
 pub mod wallet_seed;

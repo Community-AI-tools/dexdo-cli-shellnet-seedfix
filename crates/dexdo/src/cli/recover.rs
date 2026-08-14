@@ -10,7 +10,9 @@ use anyhow::Result;
 #[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     persist_pool_recovery_record, resolve_persistable_pool_recovery_inputs,
-    resolve_pool_recovery_inputs, resolve_pool_recovery_plan, PoolRecoveryPlan, PoolRecoveryTarget,
+    resolve_persistable_pool_recovery_inputs_for_deal, resolve_pool_recovery_inputs,
+    resolve_pool_recovery_inputs_for_deal, resolve_pool_recovery_plan, AmbiguousRecoveryDeals,
+    PoolRecoveryPlan, PoolRecoveryTarget,
 };
 #[cfg(feature = "shellnet")]
 use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
@@ -18,6 +20,16 @@ use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
 use anyhow::bail;
 #[cfg(feature = "shellnet")]
 use serde_json::Value;
+
+#[cfg(feature = "shellnet")]
+fn display_token_contract(value: &dyn std::fmt::Display) -> String {
+    dexdo_core::address::display_self_dapp(&value.to_string())
+}
+
+#[cfg(feature = "shellnet")]
+fn display_dexdo_address(value: &dyn std::fmt::Display) -> String {
+    dexdo_core::address::display(&value.to_string())
+}
 
 /// recover an orphaned OPEN deal. The buyer process died mid-stream but the buyer note/key are intact,
 /// so no one sent STOP and the deal hangs OPEN(the seller cannot `destroy` an `_opened` deal). `recover`
@@ -134,8 +146,10 @@ pub(crate) fn exact_prior_stop_receipt(
         .map_err(|error| anyhow::anyhow!("local buyer note: {error}"))?;
     if observed != expected {
         anyhow::bail!(
-            "prior terminal receipt beneficiary {observed} does not match local buyer note {expected}; \
-             refusing local reconciliation"
+            "prior terminal receipt beneficiary {} does not match local buyer note {}; refusing \
+             local reconciliation",
+            display_dexdo_address(&observed),
+            display_dexdo_address(&expected)
         );
     }
     Ok(Some((*stops[0]).clone()))
@@ -146,6 +160,13 @@ pub(crate) fn prior_stop_receipt_json(
     tc: &dexdo_core::Address,
     receipt: &dexdo_core::TokenContractSettlementReceipt,
 ) -> serde_json::Value {
+    // This object becomes the `tx` of the versioned machine schema `dexdo.close.v1`, and it is the
+    // SECOND producer of that field: `close::confirmed_seller_stop_response` fills the same `tx` by
+    // serializing `SettlementActionReceipt`, whose canonical serde attributes were deliberately
+    // removed so the schema keeps the legacy `0:<account_id>` spelling until a coordinated version
+    // bump. One unversioned machine field must mean one thing, so this producer spells addresses the
+    // same way rather than canonically. The HUMAN rendering is unaffected and stays canonical - see
+    // `prior_stop_confirmation` just below.
     let mut value = serde_json::json!({
         "token_contract": tc.with_workchain(),
         "action": "terminal_stop_reconciliation",
@@ -172,6 +193,8 @@ pub(crate) fn prior_stop_receipt_json(
             refund_to_buyer,
         } => serde_json::json!({
             "event_kind": "stream_stopped",
+            "closer": "unknown",
+            "possible_closers": ["buyer_stop", "seller_stop", "finalize"],
             "action_attribution": "unknown_buyer_stop_or_seller_stop",
             "buyer": buyer,
             "toSeller": to_seller.to_string(),
@@ -198,14 +221,16 @@ pub(crate) fn prior_stop_confirmation(
             "action=buyer_stop (ProbeBurned-specific)"
         }
         dexdo_core::TokenContractSettlementEvent::StreamStopped { .. } => {
-            "action=unknown (StreamStopped records the buyer beneficiary, not whether buyer stop or sellerStop submitted it)"
+            "action=unknown (StreamStopped records the buyer beneficiary, not whether buyer stop or sellerStop or permissionless finalize submitted it)"
         }
         _ => unreachable!("prior_stop_confirmation receives only exact STOP receipts"),
     };
     format!(
-        "{command} noop: TokenContract {tc} is already terminal by immutable receipt \
-         message_id={} created_at={} event={:?}; {attribution}; buyer note {note}; no second STOP was submitted",
+        "{command} noop: TokenContract {} is already terminal by immutable receipt \
+         message_id={} created_at={} event={:?}; {attribution}; buyer note {}; no second STOP was submitted",
+        display_token_contract(tc),
         receipt.message_id, receipt.created_at, receipt.event,
+        display_dexdo_address(note),
     )
 }
 
@@ -215,10 +240,12 @@ fn recover_confirmation(
     note: &dexdo_core::Address,
     receipt: &dexdo_core::SettlementActionReceipt,
 ) -> String {
+    let tc_display = display_token_contract(tc);
     format!(
-        "recover confirmed -> streamStop(TokenContract {tc}) from buyer note {note}; \
-         receipt={receipt}; the deal STOPs. Next: the seller runs `dexdo destroy` to close \
-         (selfdestruct) the TokenContract."
+        "recover confirmed -> streamStop(TokenContract {tc_display}) from buyer note {}; \
+         receipt={receipt}; the deal STOPs. Next: {}.",
+        display_dexdo_address(note),
+        crate::cli::support::destroy_guidance(&tc_display, None)
     )
 }
 
@@ -233,6 +260,128 @@ fn apply_recover_terminal_marker(
              was rendered: {error:#}"
         )
     })
+}
+
+/// one recorded deal, and what the chain says about acting on it in this invocation.
+#[cfg(feature = "shellnet")]
+struct RecordedDealVerdict {
+    note_addr: String,
+    token_contract: String,
+    /// `None` -- the chain proves this recorded deal is one the command can act on right now.
+    /// `Some(reason)` -- the chain proves it is not, with the decoded reason.
+    refused: Option<String>,
+}
+
+/// The chain's verdict on one recorded deal, decided from exactly the facts `check_recoverable` and
+/// `check_disputable` share: the deal is OPEN, not disputed, and its recorded buyer note is this note.
+/// Both preflights re-decode the full gate -- including the buyer key -- on the deal that is actually
+/// selected, so this is strictly weaker than the money gate and can only make the selection refuse more
+/// often, never act more often.
+#[cfg(feature = "shellnet")]
+fn recorded_deal_verdict(
+    note_addr: &str,
+    token_contract: &str,
+    state: Option<dexdo_core::DealChainState>,
+    buyer_note: Option<&str>,
+) -> RecordedDealVerdict {
+    let refused = match state {
+        None => Some("TokenContract is not active (undeployed/closed)".to_string()),
+        Some(state) if !state.opened => {
+            Some("deal is not OPEN (already closed, or never matched)".to_string())
+        }
+        Some(state) if state.disputed => Some("deal is already DISPUTED".to_string()),
+        Some(_) => match buyer_note {
+            None => Some("deal records no buyer note (not matched)".to_string()),
+            Some(buyer) if buyer != note_addr => Some(format!(
+                "deal records buyer note {}, not the note this entry was recorded for",
+                display_dexdo_address(&buyer)
+            )),
+            Some(_) => None,
+        },
+    };
+    RecordedDealVerdict {
+        note_addr: note_addr.to_string(),
+        token_contract: token_contract.to_string(),
+        refused,
+    }
+}
+
+/// which recorded deal a one-deal recovery acts on when the pool records several.
+/// The choice is made from the chain's verdict on **every** recorded deal -- never from the pool's own row
+/// order or recorded timestamps, which say nothing about which deal is still live. Acting is allowed only
+/// where the chain proves exactly one recorded deal is in the state this command acts on **and** proves
+/// every other one is not.
+/// Every direction of doubt errs towards refusing. A chain read that fails for any recorded deal has
+/// already aborted the invocation before this is reached, so a deal whose state could not be read is
+/// never silently dropped from the set; a deal the chain cannot place is not a candidate; two candidates
+/// refuse and name both. A refusal leaves every recorded deal exactly where it was. That is the safe side
+/// for money because a wrong pick is irreversible: a `recover` STOP pays a seller for a deal the operator
+/// never meant to end, and a `dispute` freezes the contested amount and the seller bond and starts an
+/// arbitration clock on a deal that was fine. A refusal costs the operator one flag.
+#[cfg(feature = "shellnet")]
+fn select_recorded_deal(
+    command: &str,
+    ambiguous: &AmbiguousRecoveryDeals,
+    verdicts: Vec<RecordedDealVerdict>,
+) -> Result<(String, String)> {
+    let recorded = verdicts.len();
+    let (mut actionable, refused): (Vec<_>, Vec<_>) = verdicts
+        .into_iter()
+        .partition(|verdict| verdict.refused.is_none());
+    let render = |entries: &[RecordedDealVerdict]| {
+        entries
+            .iter()
+            .map(|verdict| {
+                let detail = verdict
+                    .refused
+                    .as_ref()
+                    .map_or_else(String::new, |reason| format!(": {reason}"));
+                format!(
+                    "\n  --note-addr {} --token-contract {}{detail}",
+                    display_dexdo_address(&verdict.note_addr),
+                    display_token_contract(&verdict.token_contract)
+                )
+            })
+            .collect::<String>()
+    };
+    if actionable.len() == 1 {
+        let chosen = actionable.pop().expect("exactly one actionable deal");
+        // The deals this invocation is NOT acting on are still the operator's money. Naming them, with
+        // the chain's reason, is the only report they get: this command is about to act on a different
+        // deal and would otherwise look like a plain success.
+        for verdict in &refused {
+            eprintln!(
+                "{command}: skipped recorded deal note={} token_contract={}: {}; nothing was submitted for it",
+                display_dexdo_address(&verdict.note_addr),
+                display_token_contract(&verdict.token_contract),
+                verdict.refused.as_deref().unwrap_or("")
+            );
+        }
+        eprintln!(
+            "{command}: DEXDO_PN_POOL {} records {recorded} recoverable deals and the chain places \
+             exactly one of them in the state {command} acts on: note {} TokenContract {}.",
+            ambiguous.pool.display(),
+            display_dexdo_address(&chosen.note_addr),
+            display_token_contract(&chosen.token_contract)
+        );
+        return Ok((chosen.note_addr, chosen.token_contract));
+    }
+    if actionable.is_empty() {
+        anyhow::bail!(
+            "{command}: DEXDO_PN_POOL {} records {recorded} recoverable deals and the chain places none \
+             of them in the state {command} acts on; nothing was submitted:{}",
+            ambiguous.pool.display(),
+            render(&refused)
+        );
+    }
+    anyhow::bail!(
+        "{command}: DEXDO_PN_POOL {} records {recorded} recoverable deals and the chain places {} of \
+         them in the state {command} acts on; {command} acts on one, so pass --note-addr and/or \
+         --token-contract naming exactly one of:{}",
+        ambiguous.pool.display(),
+        actionable.len(),
+        render(&actionable)
+    );
 }
 
 #[cfg(feature = "shellnet")]
@@ -252,12 +401,44 @@ async fn run_recover_with_chain_and_marker(
     marker: &(dyn Fn(&str, &str) -> Result<()> + Sync),
 ) -> Result<()> {
     use dexdo_core::{check_recoverable, keypair_ed_pubkey, Address, KeyPair};
-    let resolved = resolve_persistable_pool_recovery_inputs(
+    let resolved = match resolve_persistable_pool_recovery_inputs(
         &args.identity,
         args.market.as_deref(),
         args.token_contract.as_deref(),
         args.pool.as_deref(),
-    )?;
+    ) {
+        Ok(resolved) => resolved,
+        // several recorded deals, so the chain decides which one this invocation acts on.
+        Err(error) => match error.downcast::<AmbiguousRecoveryDeals>() {
+            Ok(ambiguous) => {
+                let mut verdicts = Vec::with_capacity(ambiguous.deals.len());
+                for (note_addr, tc_str) in &ambiguous.deals {
+                    let tc = Address::parse(tc_str).map_err(|e| {
+                        anyhow::anyhow!("recover: recorded token_contract {tc_str}: {e}")
+                    })?;
+                    // A chain that cannot answer for ONE recorded deal cannot rule that deal out, so
+                    // the whole invocation refuses rather than acting on a sibling.
+                    let state = chain.state(&tc).await?;
+                    let buyer_note = chain.buyer_note(&tc).await?;
+                    verdicts.push(recorded_deal_verdict(
+                        note_addr,
+                        tc_str,
+                        state,
+                        buyer_note.as_ref().map(|note| note.with_workchain()).as_deref(),
+                    ));
+                }
+                let deal = select_recorded_deal("recover", &ambiguous, verdicts)?;
+                resolve_persistable_pool_recovery_inputs_for_deal(
+                    &args.identity,
+                    args.market.as_deref(),
+                    args.token_contract.as_deref(),
+                    args.pool.as_deref(),
+                    &deal,
+                )?
+            }
+            Err(other) => return Err(other),
+        },
+    };
     let pool_record = resolved.pool_record;
     let note_addr = resolved.note_addr;
     let tc_str = resolved.token_contract;
@@ -268,6 +449,7 @@ async fn run_recover_with_chain_and_marker(
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let tc_display = display_token_contract(&tc);
 
     let prior_receipts = chain.settlement_receipts(&tc).await?;
     if let Some(receipt) = exact_prior_stop_receipt(&prior_receipts, &note.with_workchain())? {
@@ -286,7 +468,7 @@ async fn run_recover_with_chain_and_marker(
     }
 
     let state = chain.state(&tc).await?.ok_or_else(|| {
-        anyhow::anyhow!("recover: TokenContract {tc} is not active (undeployed/closed)")
+        anyhow::anyhow!("recover: TokenContract {tc_display} is not active (undeployed/closed)")
     })?;
     let buyer_note = chain.buyer_note(&tc).await?;
     let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
@@ -304,8 +486,9 @@ async fn run_recover_with_chain_and_marker(
     .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "recover {tc}: buyer-signed STOP of an OPEN deal (streamStop -> TokenContract.stop(), standard \
-         split). No new buy is placed. After this, the seller closes it: `dexdo destroy --token-contract {tc}`."
+        "recover {tc_display}: buyer-signed STOP of an OPEN deal (streamStop -> TokenContract.stop(), standard \
+         split). No new buy is placed. After this, {}.",
+        crate::cli::support::destroy_guidance(&tc_display, Some(&args.contracts))
     );
     let receipt = chain.stop(&note, &keys, &tc).await?;
     let confirmation = recover_confirmation(&tc, &note, &receipt);
@@ -338,42 +521,122 @@ pub(crate) async fn run_recover(_args: RecoverArgs) -> Result<()> {
     bail!("recover unavailable: build with `--features shellnet`")
 }
 
+/// The chain surface `dispute` uses, mirroring [`RecoverChain`] so the buyer-side dispute has the same
+/// offline seam its sibling recovery already has.
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+trait DisputeChain: Sync {
+    async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
+    async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>>;
+    async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> Result<Option<[u8; 32]>>;
+    async fn dispute(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<dexdo_core::SettlementActionReceipt>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait]
+impl DisputeChain for dexdo_core::RealChainBackend {
+    async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>> {
+        Ok(self
+            .token_contract_deal_snapshot(tc)
+            .await?
+            .map(|snapshot| snapshot.state))
+    }
+
+    async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>> {
+        Ok(self.token_contract_buyer_note(tc).await?)
+    }
+
+    async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> Result<Option<[u8; 32]>> {
+        Ok(self.token_contract_buyer_pubkey(tc).await?)
+    }
+
+    async fn dispute(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<dexdo_core::SettlementActionReceipt> {
+        Ok(self.stream_dispute(note, keys, tc).await?)
+    }
+}
+
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
-    use dexdo_core::{check_disputable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend};
+    use dexdo_core::RealChainBackend;
     let manifest = args
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    let resolved = resolve_pool_recovery_inputs(
+    let chain = RealChainBackend::connect(manifest)?;
+    run_dispute_with_chain(args, &chain).await
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_dispute_with_chain(args: DisputeArgs, chain: &dyn DisputeChain) -> Result<()> {
+    use dexdo_core::{check_disputable, keypair_ed_pubkey, Address, KeyPair};
+    let resolved = match resolve_pool_recovery_inputs(
         &args.identity,
         args.market.as_deref(),
         args.token_contract.as_deref(),
         args.pool.as_deref(),
-    )?;
+    ) {
+        Ok(resolved) => resolved,
+        // several recorded deals, so the chain decides which one this invocation acts on.
+        Err(error) => match error.downcast::<AmbiguousRecoveryDeals>() {
+            Ok(ambiguous) => {
+                let mut verdicts = Vec::with_capacity(ambiguous.deals.len());
+                for (note_addr, tc_str) in &ambiguous.deals {
+                    let tc = Address::parse(tc_str).map_err(|e| {
+                        anyhow::anyhow!("dispute: recorded token_contract {tc_str}: {e}")
+                    })?;
+                    // A chain that cannot answer for ONE recorded deal cannot rule that deal out, so
+                    // the whole invocation refuses rather than acting on a sibling.
+                    let state = chain.state(&tc).await?;
+                    let buyer_note = chain.buyer_note(&tc).await?;
+                    verdicts.push(recorded_deal_verdict(
+                        note_addr,
+                        tc_str,
+                        state,
+                        buyer_note.as_ref().map(|note| note.with_workchain()).as_deref(),
+                    ));
+                }
+                let deal = select_recorded_deal("dispute", &ambiguous, verdicts)?;
+                resolve_pool_recovery_inputs_for_deal(
+                    &args.identity,
+                    args.market.as_deref(),
+                    args.token_contract.as_deref(),
+                    args.pool.as_deref(),
+                    &deal,
+                )?
+            }
+            Err(other) => return Err(other),
+        },
+    };
     let note_addr = resolved.note_addr;
     let tc_str = resolved.token_contract;
     let seed = resolved.note_secret_hex;
-    let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note = dexdo_core::address::parse_chain_address(&note_addr)
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let tc_display = display_token_contract(&tc);
+    let note_display = display_dexdo_address(&note);
 
     // Fail-loud pre-flight: only an OPEN, undisputed deal owned by THIS buyer note/key can be disputed.
-    let state = chain
-        .token_contract_deal_snapshot(&tc)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("dispute: TokenContract {tc} is not active (undeployed/closed)")
-        })?
-        .state;
-    let buyer_note = chain.token_contract_buyer_note(&tc).await?;
+    let state = chain.state(&tc).await?.ok_or_else(|| {
+        anyhow::anyhow!("dispute: TokenContract {tc_display} is not active (undeployed/closed)")
+    })?;
+    let buyer_note = chain.buyer_note(&tc).await?;
     let buyer_note_s = buyer_note.as_ref().map(|a| a.with_workchain());
     let note_s = note.with_workchain();
-    let buyer_pubkey = chain.token_contract_buyer_pubkey(&tc).await?;
+    let buyer_pubkey = chain.buyer_pubkey(&tc).await?;
     let note_ed = keypair_ed_pubkey(&keys)?;
     check_disputable(
         state.opened,
@@ -386,13 +649,13 @@ pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
     .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "dispute {tc}: buyer-signed streamDispute -> TokenContract.dispute() () -- freezes this TC's \
+        "dispute {tc_display}: buyer-signed streamDispute -> TokenContract.dispute() () -- freezes this TC's \
          contested amount and seller bond until resolution. Stronger than `recover` (which still pays the \
          seller for delivered ticks); both whole notes remain usable for independent deals."
     );
-    let receipt = chain.stream_dispute(&note, &keys, &tc).await?;
+    let receipt = chain.dispute(&note, &keys, &tc).await?;
     println!(
-        "dispute_opened -> streamDispute(TokenContract {tc}) from buyer note {note}; receipt={receipt}; \
+        "dispute_opened -> streamDispute(TokenContract {tc_display}) from buyer note {note_display}; receipt={receipt}; \
          no terminal payment/refund split exists yet"
     );
     Ok(())
@@ -544,12 +807,14 @@ async fn reclaim_one(
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc = Address::parse(tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
     let note_s = note.with_workchain();
+    let note_display = display_dexdo_address(&note);
+    let tc_display = display_token_contract(&tc);
 
     // This command owns only the strictly decoded never-opened cleanup. An OPEN deal is stopped
     // explicitly through `dexdo close` or `dexdo recover`, never rewritten from this legacy name.
     let Some(state) = chain.state(&tc).await? else {
         return terminal_entry(
-            format!("reclaim: TokenContract {tc} is not active (undeployed/closed)"),
+            format!("reclaim: TokenContract {tc_display} is not active (undeployed/closed)"),
             &note_s,
             &tc,
             marker,
@@ -566,9 +831,10 @@ async fn reclaim_one(
     // decides how severe a mismatch is, not whether the cleanup may be submitted.
     if let Some(buyer) = buyer_note_s.as_deref() {
         if buyer != note_s {
+            let buyer_display = display_dexdo_address(&buyer);
             anyhow::bail!(
-                "reclaim: the recovery record claims note {note_s} owns TokenContract {tc}, but the \
-                 deal's buyer note is {buyer}; refusing to treat a contradicted recovery record as a \
+                "reclaim: the recovery record claims note {note_display} owns TokenContract {tc_display}, but the \
+                 deal's buyer note is {buyer_display}; refusing to treat a contradicted recovery record as a \
                  decided no-op (nothing was submitted)"
             );
         }
@@ -576,15 +842,15 @@ async fn reclaim_one(
     if let Some(buyer_pubkey) = buyer_pubkey.as_ref() {
         if buyer_pubkey != &note_ed {
             anyhow::bail!(
-                "reclaim: the owner key recorded for note {note_s} is not the buyer key of \
-                 TokenContract {tc}; refusing to treat a contradicted recovery record as a decided \
+                "reclaim: the owner key recorded for note {note_display} is not the buyer key of \
+                 TokenContract {tc_display}; refusing to treat a contradicted recovery record as a decided \
                  no-op (nothing was submitted)"
             );
         }
     }
     if state.opened {
         return Ok(ReclaimEntryOutcome::NotActionable(format!(
-            "reclaim: OPEN deal {tc} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
+            "reclaim: OPEN deal {tc_display} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
         )));
     }
     if state.probe_accepted {
@@ -614,7 +880,7 @@ async fn reclaim_one(
         .funded_time
         .expect("successful never-opened preflight requires fundedTime");
     eprintln!(
-        "reclaim {tc}: buyer-signed streamCleanup -> TokenContract.cleanupUnopened() (never-opened refund). \
+        "reclaim {tc_display}: buyer-signed streamCleanup -> TokenContract.cleanupUnopened() (never-opened refund). \
          MATCH_OPEN_TIMEOUT met: fundedTime {funded_time} + matchOpenTimeout {MATCH_OPEN_TIMEOUT_SECS} <= \
          now {now}."
     );
@@ -630,7 +896,7 @@ async fn reclaim_one(
             Ok(()) => {
                 let marked = marker(&note_s, &tc.with_workchain())?;
                 println!(
-                    "reclaim confirmed -> streamCleanup(TokenContract {tc}) after an outcome-ambiguous \
+                    "reclaim confirmed -> streamCleanup(TokenContract {tc_display}) after an outcome-ambiguous \
                      submit ({submit}); bounded on-chain observation found the TokenContract absent or no \
                      longer funded, so the cleanup landed; this run drove no further cleanup for it, and \
                      the destroyed deal cannot be paid out twice; subscription_marked={marked}"
@@ -638,7 +904,7 @@ async fn reclaim_one(
                 Ok(ReclaimEntryOutcome::Reclaimed)
             }
             Err(observation) => Err(anyhow::anyhow!(
-                "reclaim: streamCleanup(TokenContract {tc}) submit failed and its outcome is \
+                "reclaim: streamCleanup(TokenContract {tc_display}) submit failed and its outcome is \
                  unresolved: {submit}; the bounded observation did not find the TokenContract absent \
                  or unfunded either: {observation}; this run drove no further cleanup for it -- re-run \
                  to re-decide this deal from the chain, which cannot pay it out twice because \
@@ -648,13 +914,13 @@ async fn reclaim_one(
     }
     chain.confirm_cleanup(&tc).await.map_err(|error| {
         anyhow::anyhow!(
-            "reclaim submitted -> streamCleanup(TokenContract {tc}); bounded cleanup \
+            "reclaim submitted -> streamCleanup(TokenContract {tc_display}); bounded cleanup \
                  confirmation failed: {error}; settlement is not confirmed"
         )
     })?;
     let marked = marker(&note_s, &tc.with_workchain())?;
     println!(
-        "reclaim confirmed -> streamCleanup(TokenContract {tc}); bounded on-chain observation \
+        "reclaim confirmed -> streamCleanup(TokenContract {tc_display}); bounded on-chain observation \
          found the TokenContract absent or no longer funded; subscription_marked={marked}"
     );
     Ok(ReclaimEntryOutcome::Reclaimed)
@@ -695,7 +961,9 @@ async fn drive_reclaim_plan(
     for refusal in &plan.refused {
         println!(
             "reclaim refused note={} token_contract={}: {}; no money was moved for it",
-            refusal.note_addr, refusal.token_contract, refusal.reason
+            display_dexdo_address(&refusal.note_addr),
+            display_token_contract(&refusal.token_contract),
+            refusal.reason
         );
     }
     let planned = plan.targets.len();
@@ -706,35 +974,37 @@ async fn drive_reclaim_plan(
         let position = index + 1;
         let note_addr = &target.note_addr;
         let token_contract = &target.token_contract;
+        let note_display = display_dexdo_address(note_addr);
+        let token_contract_display = display_token_contract(token_contract);
         let recorded_at = target
             .recorded_at_unix
             .map_or_else(|| "unrecorded".to_string(), |at| at.to_string());
         eprintln!(
-            "reclaim entry {position}/{planned}: note {note_addr} TokenContract {token_contract} \
+            "reclaim entry {position}/{planned}: note {note_display} TokenContract {token_contract_display} \
              recorded_at_unix={recorded_at}; each recorded deal is decided on its own chain state."
         );
         match reclaim_one(chain, target, now, marker).await {
             Ok(ReclaimEntryOutcome::Reclaimed) => {
                 reclaimed += 1;
                 println!(
-                    "reclaim entry {position}/{planned} reclaimed note={note_addr} \
-                     token_contract={token_contract}"
+                    "reclaim entry {position}/{planned} reclaimed note={note_display} \
+                     token_contract={token_contract_display}"
                 );
             }
             Ok(ReclaimEntryOutcome::NotActionable(reason)) => {
                 noop += 1;
                 println!(
-                    "reclaim entry {position}/{planned} noop note={note_addr} \
-                     token_contract={token_contract}: {reason}; no money was moved for it"
+                    "reclaim entry {position}/{planned} noop note={note_display} \
+                     token_contract={token_contract_display}: {reason}; no money was moved for it"
                 );
             }
             Err(error) => {
                 println!(
-                    "reclaim entry {position}/{planned} failed note={note_addr} \
-                     token_contract={token_contract}: {error:#}"
+                    "reclaim entry {position}/{planned} failed note={note_display} \
+                     token_contract={token_contract_display}: {error:#}"
                 );
                 failed.push(format!(
-                    "note={note_addr} token_contract={token_contract}: {error:#}"
+                    "note={note_display} token_contract={token_contract_display}: {error:#}"
                 ));
             }
         }
@@ -758,7 +1028,9 @@ async fn drive_reclaim_plan(
                 .iter()
                 .map(|refusal| format!(
                     "note={} token_contract={}: {}",
-                    refusal.note_addr, refusal.token_contract, refusal.reason
+                    display_dexdo_address(&refusal.note_addr),
+                    display_token_contract(&refusal.token_contract),
+                    refusal.reason
                 ))
                 .collect::<Vec<_>>()
                 .join("; "),
@@ -779,12 +1051,12 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
         check_release_disputable, check_seller_pubkey, Address, KeyPair, RealChainBackend,
     };
     let note_addr =
-        args.identity.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!("release-dispute: --note-addr (seller note) is required")
-        })?;
-    let note_key = args.identity.note_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("release-dispute: --note-key (seller owner key) is required")
-    })?;
+        crate::cli::support::require_note_addr(&args.identity, "release-dispute", "seller note")?;
+    let note_key = crate::cli::support::require_note_key(
+        &args.identity,
+        "release-dispute",
+        "seller owner key",
+    )?;
     let manifest = args
         .contracts
         .to_str()
@@ -799,12 +1071,16 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let tc_display = display_token_contract(&tc);
+    let note_display = display_dexdo_address(&note);
 
     let state = chain
         .token_contract_deal_snapshot(&tc)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!("release-dispute: TokenContract {tc} is not active (undeployed/closed)")
+            anyhow::anyhow!(
+                "release-dispute: TokenContract {tc_display} is not active (undeployed/closed)"
+            )
         })?
         .state;
     check_release_disputable(state.disputed).map_err(anyhow::Error::msg)?;
@@ -813,11 +1089,11 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
         .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "release-dispute {tc}: seller-signed TokenContract.releaseDispute() from note {note}; \
+        "release-dispute {tc_display}: seller-signed TokenContract.releaseDispute() from note {note_display}; \
          exact burns, returns and seller payout will be reported only by DisputeResolved and strict getters."
     );
     let receipt = chain.release_dispute(&tc, &keys).await?;
-    println!("release-dispute confirmed -> TokenContract {tc}; receipt={receipt}");
+    println!("release-dispute confirmed -> TokenContract {tc_display}; receipt={receipt}");
     Ok(())
 }
 
@@ -884,6 +1160,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
         resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
+    let tc_display = display_token_contract(&tc);
     let deployed = Deployed::load(&args.contracts)?;
     let expected_hash = deployed
         .contract_hashes
@@ -897,7 +1174,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
         let seller = chain
             .token_contract_seller_pubkey(&tc)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("TokenContract {tc} getSeller unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("TokenContract {tc_display} getSeller unavailable"))?;
         let seller = serde_json::json!(format!("0x{seller:0>64}"));
         let root = dexdo_core::address::parse_chain_address(&market.root_model)?;
         identity_ok &= chain.token_contract_model_hash(&tc).await?.as_deref()
@@ -918,12 +1195,12 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "resolve-dispute-timeout: TokenContract {tc} is not active (undeployed/closed)"
+                "resolve-dispute-timeout: TokenContract {tc_display} is not active (undeployed/closed)"
             )
         })?
         .state;
     let config = chain.token_contract_config(&tc).await?.ok_or_else(|| {
-        anyhow::anyhow!("resolve-dispute-timeout: TokenContract {tc} getConfig unavailable")
+        anyhow::anyhow!("resolve-dispute-timeout: TokenContract {tc_display} getConfig unavailable")
     })?;
     let preflight = if identity_ok {
         validate_dispute_timeout(before, &config, now)
@@ -936,7 +1213,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
         submit_dispute_timeout_after_validation(preflight, chain.resolve_dispute_timeout(&tc))
             .await?;
     println!(
-        "resolve-dispute-timeout confirmed token_contract={tc} deadline={deadline} receipt={receipt}"
+        "resolve-dispute-timeout confirmed token_contract={tc_display} deadline={deadline} receipt={receipt}"
     );
     Ok(())
 }
@@ -950,19 +1227,24 @@ pub(crate) async fn run_resolve_dispute_timeout(_args: ResolveDisputeTimeoutArgs
 const WITHDRAW_SHELL_GUIDANCE: &str =
     "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active.";
 
+/// `withdrawShell(uint128 amount)` pays the `_sellerNote` the deal stored at construction.
+#[cfg(any(feature = "shellnet", test))]
+const WITHDRAW_SHELL_PAYEE: &str =
+    "The deal pays the seller note it stored at construction; withdrawShell accepts only amount.";
+
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
     use dexdo_core::{
         check_seller_pubkey, check_withdrawable_shell, Address, KeyPair, RealChainBackend,
     };
     let note_addr =
-        args.identity.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!("withdraw-shell: --note-addr (seller note) is required")
-        })?;
-    let note_key = args.identity.note_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("withdraw-shell: --note-key (seller owner key) is required")
-    })?;
-    let recipient_addr = args.recipient.clone().unwrap_or_else(|| note_addr.clone());
+        crate::cli::support::require_note_addr(&args.identity, "withdraw-shell", "seller note")?;
+    let note_key = crate::cli::support::require_note_key(
+        &args.identity,
+        "withdraw-shell",
+        "seller owner key",
+    )?;
+    Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let manifest = args
         .contracts
         .to_str()
@@ -975,14 +1257,15 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
-    let recipient = Address::parse(&recipient_addr)
-        .map_err(|e| anyhow::anyhow!("--recipient/--note-addr {recipient_addr}: {e}"))?;
+    let tc_display = display_token_contract(&tc);
 
     let state = chain
         .token_contract_deal_snapshot(&tc)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!("withdraw-shell: TokenContract {tc} is not active (undeployed/closed)")
+            anyhow::anyhow!(
+                "withdraw-shell: TokenContract {tc_display} is not active (undeployed/closed)"
+            )
         })?
         .state;
     let amount =
@@ -992,12 +1275,13 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "withdraw-shell {tc}: seller-signed TokenContract.withdrawShell(amount={amount}, recipient={recipient}). \
-         {WITHDRAW_SHELL_GUIDANCE}"
+        "withdraw-shell {tc_display}: seller-signed TokenContract.withdrawShell(amount={amount}). \
+         {WITHDRAW_SHELL_PAYEE} {WITHDRAW_SHELL_GUIDANCE}"
     );
-    chain.withdraw_shell(&tc, amount, &recipient, &keys).await?;
+    chain.withdraw_shell(&tc, amount, &keys).await?;
     println!(
-        "withdraw-shell submitted -> {amount} finalized SHELL from TokenContract {tc} to {recipient}"
+        "withdraw-shell submitted -> {amount} finalized SHELL from TokenContract {tc_display} to the seller note it \
+         stored at construction"
     );
     Ok(())
 }
@@ -1026,8 +1310,10 @@ mod tests {
             "recover must use the shared explicit STOP path"
         );
         assert!(!production.contains(".stream_stop("));
+        // renamed the interpolated binding to the canonically rendered `{tc_display}`; the
+        // sentence itself, and the path it names, are unchanged.
         assert!(production.contains(
-            "OPEN deal {tc} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
+            "OPEN deal {tc_display} must use the explicit buyer STOP path (`dexdo close` or `dexdo recover`)"
         ));
     }
 
@@ -1046,12 +1332,10 @@ mod tests {
             deposit,
             finalized_owed: 0,
             tokens_final: 0,
-            tokens_superseded: 0,
             tokens_pending: 0,
             probe_tick: 0,
             funded_time: Some(1),
             probe_time: 0,
-            prev_claim_time: 1,
             last_claim_time: 1,
             dispute_time: if disputed { 100 } else { 0 },
         }
@@ -1107,7 +1391,6 @@ mod tests {
         let me = [7u8; 32];
         let mut state = chain_state(true, false, false, false, 100);
         state.funded_time = Some(1);
-        state.prev_claim_time = 1;
         state.last_claim_time = 1;
         let cleanup = super::check_reclaimable_state(
             state,
@@ -1174,7 +1457,6 @@ mod tests {
             },
             post_state: Some(dexdo_core::SettlementActionPostState {
                 tokens_final: 3u128.into(),
-                tokens_superseded: 4u128.into(),
                 tokens_pending: 5u128.into(),
                 seller_bond_held: 0u128.into(),
                 seller_bond_required: 2u128.into(),
@@ -1196,11 +1478,12 @@ mod tests {
             "action=buyer_stop",
             "message_id=test-stop-message",
             "created_at=1",
-            "buyer=0:1111111111111111111111111111111111111111111111111111111111111111",
+            // the human confirmation names the buyer's PrivateNote canonically; a note is a
+            // contract of the shared dexdo DApp.
+            "buyer=0000000000000000000000000000000000000000000000000000000000000004::1111111111111111111111111111111111111111111111111111111111111111",
             "toSeller=1",
             "refundToBuyer=2",
             "tokensFinal=3",
-            "tokensSuperseded=4",
             "tokensPending=5",
         ] {
             assert!(rendered.contains(fact), "missing {fact:?} in {rendered}");
@@ -1722,6 +2005,42 @@ mod tests {
         );
     }
 
+    /// The operator-facing line must name the payee the compiled ABI allows: the deal's stored
+    /// seller note, with no caller-selected recipient input.
+    #[test]
+    fn withdraw_shell_run_line_states_the_payee_the_abi_allows() {
+        let abi: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/compiled/airegistry/TokenContract.abi.json"
+        ))
+        .expect("compiled TokenContract ABI parses");
+        let inputs: Vec<&str> = abi["functions"]
+            .as_array()
+            .expect("compiled ABI declares functions")
+            .iter()
+            .find(|function| function["name"] == "withdrawShell")
+            .expect("compiled ABI declares withdrawShell")["inputs"]
+            .as_array()
+            .expect("declared inputs")
+            .iter()
+            .map(|input| input["name"].as_str().expect("declared input name"))
+            .collect();
+        assert_eq!(
+            inputs,
+            vec!["amount"],
+            "withdrawShell gained or lost an input; the operator-facing line must move with it"
+        );
+
+        let payee = super::WITHDRAW_SHELL_PAYEE;
+        assert!(
+            payee.contains("accepts only amount"),
+            "the run line must match the contract input: {payee}"
+        );
+        assert!(
+            payee.contains("seller note it stored at construction"),
+            "the run line must name the payee the contract uses: {payee}"
+        );
+    }
+
     // ----: pool-only reclaim drives every recorded deal, exactly once each ----
 
     /// One fake never-opened deal: the chain facts `reclaim` decodes, plus the submission outcomes a
@@ -2002,7 +2321,7 @@ mod tests {
         pool_path
     }
 
-    /// The production entry point of `dexdo reclaim --pool <file>`: the real plan resolver over the real
+    /// The production entry point of `dexdo reclaim` given a pool file: the real plan resolver over the real
     /// pool file, then the real driver. Only the chain and the durable subscription marker are faked.
     #[cfg(feature = "shellnet")]
     async fn run_pool_only_reclaim(
@@ -2366,12 +2685,12 @@ mod tests {
             .await
             .expect_err("a single unreclaimable entry stays a loud failure")
             .to_string();
+        // the refusal names the TokenContract canonically, and a TokenContract is a self-DApp
+        // account, so its DApp half is its own account id.
+        let tc_a_account = tc_a.strip_prefix("0:").expect("fixture is the chain form");
         assert_eq!(
             error,
-            format!(
-                "reclaim: TokenContract {} is not active (undeployed/closed)",
-                dexdo_core::Address::parse(&tc_a).unwrap()
-            )
+            format!("reclaim: TokenContract {tc_a_account}::{tc_a_account} is not active (undeployed/closed)")
         );
         assert!(gone.cleanups().is_empty());
 
@@ -3301,6 +3620,456 @@ mod tests {
                 dexdo_core::Address::parse(&tc_3).unwrap().with_workchain(),
             ],
             "both bought deals are reclaimed, in recorded order"
+        );
+    }
+
+    // ----: `recover`/`dispute` on a pool holding more than one recovery entry ----
+
+    #[cfg(feature = "shellnet")]
+    use crate::cli::args::DisputeArgs;
+
+    /// A chain that answers per TokenContract, so a pool recording several deals can be put in the state
+    /// a real one is in: one deal still OPEN and its siblings already over. A TokenContract absent from
+    /// `deals` is inactive, which is what a destroyed deal looks like; one listed in `unreadable` fails
+    /// the read, which is what an unreachable node looks like.
+    #[cfg(feature = "shellnet")]
+    struct RecordedDeal {
+        opened: bool,
+        buyer_note: String,
+        buyer_pubkey: [u8; 32],
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Default)]
+    struct RecordedDealsChain {
+        deals: std::collections::BTreeMap<String, RecordedDeal>,
+        unreadable: std::collections::BTreeSet<String>,
+        stopped: std::sync::Mutex<Vec<String>>,
+        disputed: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl RecordedDealsChain {
+        fn with_deal(mut self, tc: &str, opened: bool, buyer_note: &str, buyer_secret: &str) -> Self {
+            let keys = dexdo_core::KeyPair::from_secret_hex(buyer_secret).unwrap();
+            self.deals.insert(
+                dexdo_core::Address::parse(tc).unwrap().with_workchain(),
+                RecordedDeal {
+                    opened,
+                    buyer_note: dexdo_core::Address::parse(buyer_note)
+                        .unwrap()
+                        .with_workchain(),
+                    buyer_pubkey: dexdo_core::keypair_ed_pubkey(&keys).unwrap(),
+                },
+            );
+            self
+        }
+
+        fn with_unreadable_deal(mut self, tc: &str) -> Self {
+            self.unreadable
+                .insert(dexdo_core::Address::parse(tc).unwrap().with_workchain());
+            self
+        }
+
+        fn deal(&self, tc: &dexdo_core::Address) -> anyhow::Result<Option<&RecordedDeal>> {
+            let tc = tc.with_workchain();
+            if self.unreadable.contains(&tc) {
+                anyhow::bail!("chain read failed for TokenContract {tc}");
+            }
+            Ok(self.deals.get(&tc))
+        }
+
+        fn stopped(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
+        }
+
+        fn disputed(&self) -> Vec<String> {
+            self.disputed.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl super::RecoverChain for RecordedDealsChain {
+        async fn state(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::DealChainState>> {
+            Ok(self
+                .deal(tc)?
+                .map(|deal| chain_state(true, deal.opened, true, false, 100)))
+        }
+
+        async fn buyer_note(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::Address>> {
+            Ok(self
+                .deal(tc)?
+                .map(|deal| dexdo_core::Address::parse(&deal.buyer_note).unwrap()))
+        }
+
+        async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> anyhow::Result<Option<[u8; 32]>> {
+            Ok(self.deal(tc)?.map(|deal| deal.buyer_pubkey))
+        }
+
+        async fn stop(
+            &self,
+            note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<dexdo_core::SettlementActionReceipt> {
+            let deal = self.deal(tc)?.expect("STOP on an inactive TokenContract");
+            assert_eq!(
+                note.with_workchain(),
+                deal.buyer_note,
+                "the STOP must be signed by the deal's own buyer note"
+            );
+            self.stopped.lock().unwrap().push(tc.with_workchain());
+            Ok(test_stop_receipt(tc))
+        }
+
+        async fn settlement_receipts(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<dexdo_core::TokenContractSettlementReceipts> {
+            let tc_s = tc.with_workchain();
+            if !self.stopped.lock().unwrap().contains(&tc_s) {
+                return Ok(dexdo_core::TokenContractSettlementReceipts::default());
+            }
+            let deal = self.deal(tc)?.expect("a stopped deal is a known deal");
+            Ok(dexdo_core::TokenContractSettlementReceipts {
+                events: vec![dexdo_core::TokenContractSettlementReceipt {
+                    message_id: "test-stop-message".to_string(),
+                    created_at: 1,
+                    cursor: "test-stop-cursor".to_string(),
+                    event: dexdo_core::TokenContractSettlementEvent::StreamStopped {
+                        buyer: deal.buyer_note.clone(),
+                        to_seller: 1,
+                        refund_to_buyer: 2,
+                    },
+                }],
+            })
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl super::DisputeChain for RecordedDealsChain {
+        async fn state(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::DealChainState>> {
+            super::RecoverChain::state(self, tc).await
+        }
+
+        async fn buyer_note(
+            &self,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<dexdo_core::Address>> {
+            super::RecoverChain::buyer_note(self, tc).await
+        }
+
+        async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> anyhow::Result<Option<[u8; 32]>> {
+            super::RecoverChain::buyer_pubkey(self, tc).await
+        }
+
+        async fn dispute(
+            &self,
+            note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            tc: &dexdo_core::Address,
+        ) -> anyhow::Result<dexdo_core::SettlementActionReceipt> {
+            let deal = self.deal(tc)?.expect("dispute on an inactive TokenContract");
+            assert_eq!(
+                note.with_workchain(),
+                deal.buyer_note,
+                "the dispute must be signed by the deal's own buyer note"
+            );
+            self.disputed.lock().unwrap().push(tc.with_workchain());
+            Ok(dexdo_core::SettlementActionReceipt {
+                action: dexdo_core::SettlementAction::Dispute,
+                event: dexdo_core::SettlementActionEvent::StreamDisputed {
+                    buyer: deal.buyer_note.clone(),
+                    at: 1,
+                },
+                ..test_stop_receipt(tc)
+            })
+        }
+    }
+
+    /// The ordinary two-deal pool found live: two notes, one recorded deal each. The later-recorded
+    /// deal is the one the chain still holds OPEN, so "the first recorded entry" and "the deal to act on"
+    /// are different entries.
+    #[cfg(feature = "shellnet")]
+    fn two_recorded_deals_pool(dir: &std::path::Path) -> std::path::PathBuf {
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        write_reclaim_pool(
+            dir,
+            serde_json::json!([
+                recorded_row(&note_a, &secret_a, &tc_a, 10),
+                recorded_row(&note_b, &secret_b, &tc_b, 20),
+            ]),
+        )
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn pool_only_recovery_identity() -> RecoveryIdentityArgs {
+        RecoveryIdentityArgs {
+            note_key: None,
+            note_addr: None,
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn recorded_row_updated_at(pool_path: &std::path::Path, token_contract: &str) -> u64 {
+        // Identify the row by its ACCOUNT ID, not by one spelling of the address: a pool the command
+        // rewrote records the canonical `<account_id>::<account_id>` while a pool a refusal
+        // left untouched still holds the hand-built `0:<account_id>`, and this helper reads both.
+        let account_of = |value: &str| {
+            value
+                .rsplit_once("::")
+                .map(|(_, account)| account)
+                .unwrap_or_else(|| value.strip_prefix("0:").unwrap_or(value))
+                .to_string()
+        };
+        let account = account_of(token_contract);
+        let pool = crate::cli::commands::load_pool_json(pool_path).unwrap();
+        pool["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|note| {
+                note["token_contract"].as_str().map(account_of) == Some(account.clone())
+            })
+            .unwrap_or_else(|| panic!("pool must still record {token_contract}"))
+            ["token_contract_updated_at_unix"]
+            .as_u64()
+            .expect("a recorded row keeps its recorded time")
+    }
+
+    /// primary regression, through `dexdo recover --pool <file>` itself: a pool recording TWO
+    /// recoverable deals no longer refuses. The chain places exactly one of them in the state `recover`
+    /// acts on, that one is STOPped, and the other recorded deal is not touched at all.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn recover_acts_on_the_one_recorded_deal_the_chain_places_open() {
+        let dir = reclaim_test_dir("recover-two-recorded-deals");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = two_recorded_deals_pool(&dir);
+        let chain = RecordedDealsChain::default()
+            // recorded first, but the chain says this deal is over
+            .with_deal(&tc_a, false, &note_a, &secret_a)
+            // recorded second, and still the OPEN deal an orphaned buyer left behind
+            .with_deal(&tc_b, true, &note_b, &secret_b);
+
+        super::run_recover_with_chain(
+            RecoverArgs {
+                identity: pool_only_recovery_identity(),
+                token_contract: None,
+                market: None,
+                pool: Some(pool_path.clone()),
+                contracts: dir.join("unused-contracts.json"),
+            },
+            &chain,
+        )
+        .await
+        .expect("two recorded deals with exactly one OPEN must not refuse");
+
+        assert_eq!(
+            chain.stopped(),
+            vec![dexdo_core::Address::parse(&tc_b).unwrap().with_workchain()],
+            "exactly one STOP, and it is the deal the chain placed OPEN"
+        );
+        assert_eq!(
+            recorded_row_updated_at(&pool_path, &tc_a),
+            10,
+            "the deal that was not acted on must be left exactly as recorded"
+        );
+        assert!(
+            recorded_row_updated_at(&pool_path, &tc_b) > 20,
+            "the acted-on deal's own row is the one that is written back"
+        );
+    }
+
+    /// The other half of the same rule: when the chain cannot tell the recorded deals apart -- both are
+    /// still OPEN and owned by their recorded notes -- `recover` still refuses and moves nothing. This is
+    /// the side the change errs on.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn recover_refuses_when_the_chain_places_two_recorded_deals_open() {
+        let dir = reclaim_test_dir("recover-two-open-recorded-deals");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = two_recorded_deals_pool(&dir);
+        let chain = RecordedDealsChain::default()
+            .with_deal(&tc_a, true, &note_a, &secret_a)
+            .with_deal(&tc_b, true, &note_b, &secret_b);
+
+        let error = super::run_recover_with_chain(
+            RecoverArgs {
+                identity: pool_only_recovery_identity(),
+                token_contract: None,
+                market: None,
+                pool: Some(pool_path.clone()),
+                contracts: dir.join("unused-contracts.json"),
+            },
+            &chain,
+        )
+        .await
+        .expect_err("two OPEN recorded deals cannot be told apart and must refuse")
+        .to_string();
+
+        // Specific to the chain-decoded refusal, so reverting the fix cannot satisfy it with the old
+        // "pass --note-addr or --token-contract to disambiguate" message.
+        assert!(
+            error.contains("the chain places 2 of them in the state recover acts on"),
+            "{error}"
+        );
+        // the refusal names each deal's TokenContract canonically, and a TokenContract is a
+        // self-DApp account, so its DApp half is its own account id.
+        let named = |tc: &str| {
+            let account = tc.strip_prefix("0:").expect("fixture is the chain form");
+            format!("{account}::{account}")
+        };
+        assert!(
+            error.contains(&named(&tc_a)),
+            "the first deal is unnamed: {error}"
+        );
+        assert!(
+            error.contains(&named(&tc_b)),
+            "the second deal is unnamed: {error}"
+        );
+        assert!(!error.contains(&secret_a), "refusal leaked an owner key");
+        assert!(!error.contains(&secret_b), "refusal leaked an owner key");
+        assert!(chain.stopped().is_empty(), "a refusal must move no money");
+        assert_eq!(recorded_row_updated_at(&pool_path, &tc_a), 10);
+        assert_eq!(recorded_row_updated_at(&pool_path, &tc_b), 20);
+    }
+
+    /// A chain that cannot answer for ONE recorded deal has not ruled that deal out, so the whole
+    /// invocation refuses rather than acting on the sibling it happened to read successfully.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn recover_refuses_when_one_recorded_deal_cannot_be_read() {
+        let dir = reclaim_test_dir("recover-unreadable-recorded-deal");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_b, secret_b, tc_b) = note_b();
+        let (_, _, tc_a) = note_a();
+        let pool_path = two_recorded_deals_pool(&dir);
+        let chain = RecordedDealsChain::default()
+            .with_unreadable_deal(&tc_a)
+            .with_deal(&tc_b, true, &note_b, &secret_b);
+
+        let error = super::run_recover_with_chain(
+            RecoverArgs {
+                identity: pool_only_recovery_identity(),
+                token_contract: None,
+                market: None,
+                pool: Some(pool_path.clone()),
+                contracts: dir.join("unused-contracts.json"),
+            },
+            &chain,
+        )
+        .await
+        .expect_err("an unreadable recorded deal must refuse the whole invocation")
+        .to_string();
+
+        assert!(error.contains("chain read failed"), "{error}");
+        assert!(chain.stopped().is_empty(), "a refusal must move no money");
+    }
+
+    /// the `dispute` half: the same selection, for the action that also freezes the seller bond and
+    /// starts the arbitration clock.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn dispute_acts_on_the_one_recorded_deal_the_chain_places_open() {
+        let dir = reclaim_test_dir("dispute-two-recorded-deals");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = two_recorded_deals_pool(&dir);
+        let chain = RecordedDealsChain::default()
+            .with_deal(&tc_a, false, &note_a, &secret_a)
+            .with_deal(&tc_b, true, &note_b, &secret_b);
+
+        super::run_dispute_with_chain(
+            DisputeArgs {
+                identity: pool_only_recovery_identity(),
+                token_contract: None,
+                market: None,
+                pool: Some(pool_path.clone()),
+                contracts: dir.join("unused-contracts.json"),
+            },
+            &chain,
+        )
+        .await
+        .expect("two recorded deals with exactly one OPEN must not refuse");
+
+        assert_eq!(
+            chain.disputed(),
+            vec![dexdo_core::Address::parse(&tc_b).unwrap().with_workchain()],
+            "exactly one bond is locked, and it is the deal the chain placed OPEN"
+        );
+        assert_eq!(
+            recorded_row_updated_at(&pool_path, &tc_a),
+            10,
+            "dispute persists nothing, so both rows are exactly as recorded"
+        );
+        assert_eq!(recorded_row_updated_at(&pool_path, &tc_b), 20);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn dispute_refuses_when_the_chain_places_two_recorded_deals_open() {
+        let dir = reclaim_test_dir("dispute-two-open-recorded-deals");
+        let _cleanup = TempDirCleanup(dir.clone());
+        let (note_a, secret_a, tc_a) = note_a();
+        let (note_b, secret_b, tc_b) = note_b();
+        let pool_path = two_recorded_deals_pool(&dir);
+        let chain = RecordedDealsChain::default()
+            .with_deal(&tc_a, true, &note_a, &secret_a)
+            .with_deal(&tc_b, true, &note_b, &secret_b);
+
+        let error = super::run_dispute_with_chain(
+            DisputeArgs {
+                identity: pool_only_recovery_identity(),
+                token_contract: None,
+                market: None,
+                pool: Some(pool_path.clone()),
+                contracts: dir.join("unused-contracts.json"),
+            },
+            &chain,
+        )
+        .await
+        .expect_err("two OPEN recorded deals cannot be told apart and must refuse")
+        .to_string();
+
+        assert!(
+            error.contains("the chain places 2 of them in the state dispute acts on"),
+            "{error}"
+        );
+        // the refusal names each deal's TokenContract canonically, and a TokenContract is a
+        // self-DApp account, so its DApp half is its own account id.
+        let named = |tc: &str| {
+            let account = tc.strip_prefix("0:").expect("fixture is the chain form");
+            format!("{account}::{account}")
+        };
+        assert!(
+            error.contains(&named(&tc_a)),
+            "the first deal is unnamed: {error}"
+        );
+        assert!(
+            error.contains(&named(&tc_b)),
+            "the second deal is unnamed: {error}"
+        );
+        assert!(
+            chain.disputed().is_empty(),
+            "a refusal must lock no bond and start no clock"
         );
     }
 }

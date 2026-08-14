@@ -1,12 +1,14 @@
 //! Canonical dexdo funding wallet artifact.
-//! Source: `gosh-sh/ackinacki-kit` v5.0.0
-//! `28f3434ed34d285c55e2e9b3ec50432a3f3adfbd`.
+//! Source: `gosh-sh/acki-nacki`
+//! `44fe02ea01e4bb31d431ed57d1f9b3dc3dd88a18`.
 
 use serde_json::{Map, Value};
 
-pub const CONTRACT_NAME: &str = "UpdateCustodianMultisigWallet_v2";
-pub const VERSION: &str = "2.2.0";
-pub const CODE_HASH: &str = "09f596d5bb4f63d7f2b18020ee0b7c9e88114dc90010389cc594c67954655ded";
+pub use crate::canonical_multisig_allowlist::{
+    is_supported_spending_code_hash, CODE_HASH, CONTRACT_NAME, LEGACY_SPENDING_CODE_HASH,
+    SUPPORTED_SPENDING_CODE_HASHES, VERSION,
+};
+
 pub const ROOT_PN_DAPP_ID: &str = "4";
 
 pub const MULTISIG_ABI_JSON: &str =
@@ -41,6 +43,26 @@ pub fn submit_transaction_params(
     flag: u8,
     payload: String,
 ) -> Value {
+    submit_transaction_params_in_dapp(dest, value, cc, bounce, flag, payload, ROOT_PN_DAPP_ID)
+}
+
+/// `submitTransaction` params for a recipient that does NOT live in the RootPN DApp.
+/// The wallet's `dapp_id` argument is reported, not routed: the contract passes only
+/// `(value, bounce, flags, payload, cc)` to `dest.transfer(...)` and its own comment records that
+/// "network-level dest_dapp_id addressing is not wired yet, dapp_id is used only for reading account
+/// state on the client"(`UpdateCustodianMultisigWallet_v2.sol`). So this argument cannot misroute
+/// money and cannot make a transfer fail -- but it IS emitted in `TransactionSent`, and an event
+/// that names DApp 4 for a recipient living in DApp 1 tells every off-chain subscriber something
+/// untrue. Callers outside DApp 4 pass the recipient's real DApp id so the receipt is honest.
+pub fn submit_transaction_params_in_dapp(
+    dest: String,
+    value: u128,
+    cc: Map<String, Value>,
+    bounce: bool,
+    flag: u8,
+    payload: String,
+    dapp_id: &str,
+) -> Value {
     serde_json::json!({
         "dest": dest,
         "value": value.to_string(),
@@ -48,7 +70,7 @@ pub fn submit_transaction_params(
         "bounce": bounce,
         "flag": flag,
         "payload": payload,
-        "dapp_id": ROOT_PN_DAPP_ID,
+        "dapp_id": dapp_id,
     })
 }
 
@@ -58,8 +80,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tvm_block::Deserializable;
 
-    const ABI_SHA256: &str = "28312c9773b1231623998a2d09d6285a8afc272e10af6b595bfabcddb320e45e";
-    const TVC_SHA256: &str = "535e180e85ee019c23631c6046449fa2a5536d88f55b26d64e026d671e82d520";
+    const ABI_SHA256: &str = "e7573b233667cf50d8edc9ab0ce235f8ac88674ae9610c77d426bec22070f581";
+    const TVC_SHA256: &str = "b0d72acbbdc6af309823e74b96b0b3ffb0f871a5b98316b6e89affdfb56c5c9d";
 
     fn sha256_hex(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
@@ -78,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v2_artifacts_match_ackinacki_kit_v5_release() {
+    fn canonical_v2_4_0_artifacts_match_acki_nacki_source() {
         assert_eq!(sha256_hex(MULTISIG_ABI_JSON.as_bytes()), ABI_SHA256);
         assert_eq!(sha256_hex(MULTISIG_TVC), TVC_SHA256);
 

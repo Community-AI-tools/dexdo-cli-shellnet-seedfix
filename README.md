@@ -91,6 +91,10 @@ canonical form or the older `0:<account_id>` form, so an address copied from an
 earlier run still works. Files written by an earlier version keep loading
 unchanged and are rewritten canonically the next time dexdo saves them.
 
+The single exception is `dexdo note withdraw --to`, which requires the
+DApp-qualified form: the destination DApp is evidence in `TokensWithdrawn`, and
+account-only input cannot supply it.
+
 ## Commands
 
 | Command | What it does |

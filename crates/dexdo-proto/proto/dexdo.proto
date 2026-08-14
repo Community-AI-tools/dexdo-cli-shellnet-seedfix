@@ -63,46 +63,31 @@ message SamplingParams {
   bool greedy = 4;
 }
 
-// One top-k alternative in a token's distribution. The token is as
-// the upstream returns it(OpenAI/Groq logprobs are strings; the upstream SSE does not return token-ids, R4).
-message TopLogprob {
-  string token = 1;
-  double logprob = 2;
-}
-
-// Per-token logprobs: the logprob of the chosen token + top-k alternatives for checking
-// the distribution shape. The index matches token_ids.
-message TokenLogprobs {
-  // Logprob of the chosen token.
-  double logprob = 1;
-  // Top-k alternatives(for the distribution shape; may be empty).
-  repeated TopLogprob top = 2;
-}
-
 // Declaration of the available subset of verification signals: the gateway EXPLICITLY states what
 // it returns and does NOT fabricate what is missing(R3/R4). The buyer degrades by fact.
 message SignalManifest {
+  // Retired: `has_logprobs`. Log probabilities are not a verification layer -- most models do not
+  // support them at all, so the number is never reused.
+  reserved 3;
   // Tokenizer family, e.g. "llama"/"qwen"/"gpt".
   string tokenizer_family = 1;
   // The gateway returns token_ids.
   bool has_token_ids = 2;
-  // The gateway returns logprobs.
-  bool has_logprobs = 3;
   // The claimed model -- NOT trusted blindly.
   string claimed_model = 4;
 }
 
 // One stream increment to the buyer. In it carries fake tokens.
 message CanonChunk {
+  // Retired: `logprobs`. Log probabilities are not carried by the canon -- most models do not
+  // support them at all, so the number is never reused.
+  reserved 4;
   // Text delta.
   string text = 1;
   // token-ids for the tokenizer check; in they are fake.
   repeated uint32 token_ids = 2;
   // Sequence number(incrementality, R6).
   uint64 seq = 3;
-  // Per-token logprobs. Preserved
-  // by lossless normalization(R2); the index matches token_ids.
-  repeated TokenLogprobs logprobs = 4;
   // Signal declaration -- the gateway states it on the FIRST chunk(seq=0); not repeated afterwards.
   SignalManifest manifest = 5;
   // Reasoning/thinking delta from providers that separate it from user-visible content(for verification only).
