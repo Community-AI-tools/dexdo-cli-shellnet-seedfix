@@ -31,6 +31,14 @@ pub const AGENT_WALLETS_RESPONSE_TYPE: &str = "agent_wallets_response";
 pub const AGENT_WALLETS_BODY_VERSION: u8 = 1;
 const DEXDO_CLI_BEE_APP_ID: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000078";
+/// The onboarding intent this CLI declares on its connect deeplink, verbatim as the wallet reads it.
+/// An EXTERNAL query parameter on the final link, deliberately not a `ConnectPayload` field: the
+/// payload is the bee-authenticated part of the invitation and its shape belongs to bee, while this
+/// is a routing hint the wallet reads straight off the URL it was opened with. On seeing it the
+/// arrives. It authorises nothing and starts no deployment.
+/// `DEXDO_CLI_BEE_APP_ID` stays exactly as it was: it still identifies DEXDO CLI and names it in the
+/// wallet, it just no longer decides which onboarding flow the wallet opens.
+pub const AGENT_ONBOARD_INTENT_QUERY: &str = "intent=agent_onboard";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionLimits {
@@ -201,7 +209,7 @@ impl OnboardingSession {
             .map_err(|error| anyhow!("wallet onboarding Vault public key: {error}"))?;
         validate_nonce_hex(nonce)?;
         let ttl_secs = limits.session_ttl.as_secs();
-        let invitation = ConnectClient::new()
+        let mut invitation = ConnectClient::new()
             .create_shared_key_session(ParamsOfCreateSharedKeySession {
                 app_id: DEXDO_CLI_BEE_APP_ID.to_string(),
                 ttl_secs: Some(ttl_secs),
@@ -213,6 +221,9 @@ impl OnboardingSession {
                     describe_bee_failure("create bee wallet onboarding session", &error, &[])
                 )
             })?;
+        // Declare the intent on the FINAL link, so the one string that is printed, stored, and
+        // handed to the QR renderer is the one the wallet is opened with.
+        invitation.deep_link = with_agent_onboard_intent(&invitation.deep_link);
         if invitation.deep_link.contains(&hot_pubkey)
             || vault_pubkey
                 .as_ref()
@@ -1153,6 +1164,23 @@ fn is_hex64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Append [`AGENT_ONBOARD_INTENT_QUERY`] to a connect deeplink, exactly once.
+/// Idempotent on purpose: the final link is what gets persisted in the durable session state, so a
+/// resumed onboarding reads back a link that already declares the intent and must not grow a second
+/// copy of it. Compared parameter-wise rather than by substring, so a payload that happens to spell
+/// the same bytes cannot be mistaken for the query parameter.
+fn with_agent_onboard_intent(deep_link: &str) -> String {
+    if deep_link
+        .split(['?', '&'])
+        .skip(1)
+        .any(|parameter| parameter == AGENT_ONBOARD_INTENT_QUERY)
+    {
+        return deep_link.to_string();
+    }
+    let separator = if deep_link.contains('?') { '&' } else { '?' };
+    format!("{deep_link}{separator}{AGENT_ONBOARD_INTENT_QUERY}")
+}
+
 pub fn now_unix_secs() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1174,6 +1202,9 @@ fn placeholder_response() -> AgentWalletsResponse {
         hot: address,
     }
 }
+
+#[cfg(test)]
+mod agent_onboard_intent_tests;
 
 #[cfg(test)]
 mod endpoint_and_diagnostics_tests;
@@ -1230,7 +1261,7 @@ mod tests {
         let session = OnboardingSession::create(
             "test-agent",
             "shellnet",
-            "shellnet.ackinacki.org",
+            "dd-shellnet.ackinacki.org",
             &hot_public,
             None,
             &nonce,
@@ -1275,7 +1306,7 @@ mod tests {
         let session = OnboardingSession::create(
             "test-agent",
             "shellnet",
-            "shellnet.ackinacki.org",
+            "dd-shellnet.ackinacki.org",
             &hot_public,
             distinct_vault.then_some(vault_public.as_str()),
             &nonce,
@@ -1467,7 +1498,7 @@ mod tests {
             file_version: SESSION_FILE_VERSION,
             agent_name: "test-agent".to_string(),
             network: "shellnet".to_string(),
-            endpoint: "shellnet.ackinacki.org".to_string(),
+            endpoint: "dd-shellnet.ackinacki.org".to_string(),
             hot_pubkey: fixture.hot_public.clone(),
             vault_pubkey: distinct_vault.then_some(fixture.vault_public.clone()),
             phase: SessionPhase::RequestPrepared {

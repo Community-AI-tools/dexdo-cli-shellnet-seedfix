@@ -73,7 +73,7 @@ fn state_with_phase(phase: serde_json::Value) -> String {
         "file_version": SESSION_FILE_VERSION,
         "agent_name": "fixture-agent",
         "network": "shellnet",
-        "endpoint": "https://shellnet.ackinacki.org",
+        "endpoint": "https://dd-shellnet.ackinacki.org",
         "hot_pubkey": filler('a'),
         "phase": phase,
     })

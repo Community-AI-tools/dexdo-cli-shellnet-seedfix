@@ -1,0 +1,14 @@
+# Line endings are LF in the working tree on every platform.
+#
+# Without this file a Windows checkout gets CRLF (the hosted runner image sets
+# `core.autocrlf=true`), and this tree has 167 places where a test reads its own source with
+# `include_str!` and then locates a marker in it. Sixty-three of those markers contain a newline,
+# so on Windows they simply are not found and the test fails on a difference that has nothing to do
+# with the behaviour under test:
+#
+#     registry.rs:1177           reader impl end marker present
+#     seller/upstream/mod.rs:511 upstream unit-test module boundary
+#
+# `text=auto` leaves files git detects as binary alone, so contract artifacts and images are
+# untouched.
+* text=auto eol=lf

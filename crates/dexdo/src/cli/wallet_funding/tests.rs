@@ -6,6 +6,15 @@
 
 use std::cell::{Cell, RefCell};
 
+#[cfg(feature = "shellnet")]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+#[cfg(feature = "shellnet")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use super::*;
 
 const SHELL: u32 = 2;
@@ -68,7 +77,10 @@ impl FakeChain {
     fn always(balance: u128) -> Self {
         Self {
             answers: RefCell::new(Vec::new()),
-            last: RefCell::new(Ok(HotBalances::new([(SHELL, balance)]))),
+            last: RefCell::new(Ok(HotBalances::new(
+                vault_to_hot_native_value(),
+                [(SHELL, balance)],
+            ))),
             reads: Cell::new(0),
         }
     }
@@ -79,10 +91,18 @@ impl FakeChain {
             answers: RefCell::new(
                 answers
                     .into_iter()
-                    .map(|balance| Ok(HotBalances::new([(SHELL, balance)])))
+                    .map(|balance| {
+                        Ok(HotBalances::new(
+                            vault_to_hot_native_value(),
+                            [(SHELL, balance)],
+                        ))
+                    })
                     .collect(),
             ),
-            last: RefCell::new(Ok(HotBalances::new([(SHELL, last)]))),
+            last: RefCell::new(Ok(HotBalances::new(
+                vault_to_hot_native_value(),
+                [(SHELL, last)],
+            ))),
             reads: Cell::new(0),
         }
     }
@@ -192,6 +212,63 @@ fn record(dir: &Path) -> Option<FundingJournalRecord> {
 
 fn temp() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp data dir")
+}
+
+#[cfg(feature = "shellnet")]
+fn account_response(native: u128, shell: u128) -> String {
+    format!(
+        r#"{{"data":{{"blockchain":{{"account":{{"info":{{"acc_type_name":"Active","boc":null,"code_hash":"abc","balance":"0x{native:x}","balance_other":[{{"currency":2.0,"value":"0x{shell:x}"}}]}}}}}}}}}}"#
+    )
+}
+
+#[cfg(feature = "shellnet")]
+async fn serve_account_responses(
+    responses: Vec<(&'static str, String)>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind account fixture");
+    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let task_reads = Arc::clone(&reads);
+    let task = tokio::spawn(async move {
+        for (status, body) in responses {
+            let (mut socket, _) = listener.accept().await.expect("accept account POST");
+            task_reads.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read account POST");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write account response");
+        }
+    });
+    (endpoint, reads, task)
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_with_real_reader(
+    dir: &Path,
+    client: &dexdo_core::ChainClient,
+    provider: &FakeProvider,
+) -> Result<FundedHot> {
+    ensure_hot_funded(
+        &HotFundingContext {
+            binding: &binding(WalletProvider::AckinackiWallet),
+            requirements: &requirements(),
+            operation: "note deploy",
+            creator_pubkey: "creator-pubkey",
+            data_dir: dir,
+            bounds: tight_bounds(),
+        },
+        client,
+        provider,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -417,6 +494,68 @@ async fn an_unreadable_queue_is_not_absence_and_forbids_a_second_request() {
 }
 
 #[tokio::test]
+async fn an_executed_record_followed_by_contradictory_absence_never_submits() {
+    let dir = temp();
+    let chain = FakeChain::always(0);
+    let provider = FakeProvider::ackinacki(RequestPresence::Absent).with_submit(vec![
+        SubmitOutcome::Accepted {
+            transaction_hash: Some("tx-7".to_string()),
+            // A malformed id exercises the conservative execution fallback: it can forbid a
+            // submit, but cannot authorize retirement of this generation.
+            pending_transaction_id: Some("not-a-queue-id".to_string()),
+        },
+    ]);
+
+    let _ = run(
+        dir.path(),
+        &binding(WalletProvider::AckinackiWallet),
+        &chain,
+        &provider,
+        tight_bounds(),
+    )
+    .await;
+    assert_eq!(provider.submits.get(), 1);
+
+    provider
+        .probe
+        .borrow_mut()
+        .push(RequestPresence::Executed {
+            evidence: FundingEvidence {
+                verdict: "executed".to_string(),
+                source: "history fallback".to_string(),
+                observed_at_unix: Some(7),
+                detail: "a generation-invariant sent event".to_string(),
+                delivery_message_id: None,
+            },
+        });
+    let _ = run(
+        dir.path(),
+        &binding(WalletProvider::AckinackiWallet),
+        &chain,
+        &provider,
+        tight_bounds(),
+    )
+    .await;
+    assert_eq!(record(dir.path()).expect("record").state, FundingState::Executed);
+
+    provider.probe.borrow_mut().push(RequestPresence::Absent);
+    let _ = run(
+        dir.path(),
+        &binding(WalletProvider::AckinackiWallet),
+        &chain,
+        &provider,
+        tight_bounds(),
+    )
+    .await;
+    assert_eq!(
+        provider.submits.get(),
+        1,
+        "an erroneous Absent verdict must not overwrite an Executed generation and submit again"
+    );
+    assert_eq!(record(dir.path()).expect("record").state, FundingState::Executed);
+}
+
+#[tokio::test]
 async fn a_repeat_cannot_resume_down_a_different_providers_flow() {
     let dir = temp();
 
@@ -526,6 +665,7 @@ async fn a_timeout_leaves_a_state_that_a_rerun_re_checks() {
             source: "finalized TransactionSent".to_string(),
             observed_at_unix: Some(1),
             detail: "the timed-out request executed".to_string(),
+            delivery_message_id: None,
         },
     });
     let funded = run(dir.path(), &binding, &chain2, &provider2, patient_bounds())
@@ -592,6 +732,7 @@ async fn the_journal_closes_only_on_an_observed_balance_that_meets_the_requireme
             source: "finalized TransactionSent".to_string(),
             observed_at_unix: Some(1),
             detail: "the accepted request executed".to_string(),
+            delivery_message_id: None,
         },
     })
     .with_submit(vec![SubmitOutcome::Accepted {
@@ -670,6 +811,85 @@ async fn a_chain_read_error_neither_closes_the_record_nor_counts_as_a_balance() 
     assert_eq!(provider.submits.get(), 0);
 }
 
+#[cfg(feature = "shellnet")]
+#[tokio::test]
+async fn the_production_hot_reader_retries_one_transient_account_failure() {
+    let body = account_response(vault_to_hot_native_value(), 1_000);
+    let (endpoint, reads, server) = serve_account_responses(vec![
+        ("503 Service Unavailable", r#"{"error":"try again"}"#.to_string()),
+        ("200 OK", body),
+    ])
+    .await;
+    let client = dexdo_core::ChainClient::connect(&endpoint).expect("connect fixture client");
+    let hot = CanonicalAddress::parse(&self_dapp_hot()).expect("canonical Hot");
+
+    let balances = HotBalanceReader::hot_balances(&client, &hot)
+        .await
+        .expect("one transient read failure must be retried by the production Hot reader");
+
+    server.await.expect("account fixture task");
+    assert_eq!(balances.get(SHELL), 1_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the first transient response must not abort the funding read"
+    );
+}
+
+#[cfg(feature = "shellnet")]
+#[tokio::test]
+async fn an_ecc_funded_hot_requests_only_its_exact_native_shortfall() {
+    let native_shortfall = 123;
+    let observed_native = vault_to_hot_native_value() - native_shortfall;
+    let (endpoint, reads, server) = serve_account_responses(vec![(
+        "200 OK",
+        account_response(observed_native, 1_000),
+    )])
+    .await;
+    let client = dexdo_core::ChainClient::connect(&endpoint).expect("connect fixture client");
+    let dir = temp();
+    let provider = FakeProvider::ackinacki(RequestPresence::Absent);
+
+    let _ = run_with_real_reader(dir.path(), &client, &provider).await;
+
+    server.await.expect("account fixture task");
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.submits.get(),
+        1,
+        "sufficient ECC does not hide a native vmshell shortfall"
+    );
+    let submitted = record(dir.path()).expect("native shortfall request");
+    assert_eq!(submitted.fingerprint.value, native_shortfall);
+    assert!(
+        submitted.fingerprint.cc.is_empty(),
+        "the native balance is not ECC[2] and must not invent a currency entry"
+    );
+}
+
+#[cfg(feature = "shellnet")]
+#[tokio::test]
+async fn a_native_funded_hot_requests_only_its_exact_ecc_shortfall() {
+    let (endpoint, _, server) = serve_account_responses(vec![(
+        "200 OK",
+        account_response(vault_to_hot_native_value(), 400),
+    )])
+    .await;
+    let client = dexdo_core::ChainClient::connect(&endpoint).expect("connect fixture client");
+    let dir = temp();
+    let provider = FakeProvider::ackinacki(RequestPresence::Absent);
+
+    let _ = run_with_real_reader(dir.path(), &client, &provider).await;
+
+    server.await.expect("account fixture task");
+    let submitted = record(dir.path()).expect("ECC shortfall request");
+    assert_eq!(
+        submitted.fingerprint.value, 0,
+        "an already-satisfied native floor must not be transferred again"
+    );
+    assert_eq!(submitted.fingerprint.cc.get(&SHELL), Some(&600));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Providers with no request to create
 // ---------------------------------------------------------------------------------------------
@@ -739,12 +959,15 @@ async fn the_request_carries_the_hots_own_dapp_and_not_the_dexdo_constant() {
 #[test]
 fn shortfall_is_per_currency_and_saturates() {
     let requirements = FundingRequirements::new([(SHELL, 1_000u128), (7, 5u128)]);
-    let balances = HotBalances::new([(SHELL, 1_200u128)]);
+    let balances = HotBalances::new(vault_to_hot_native_value(), [(SHELL, 1_200u128)]);
     let shortfall = requirements.shortfall(&balances);
     assert_eq!(shortfall.get(&SHELL), None, "an over-funded currency is not a shortfall");
     assert_eq!(shortfall.get(&7), Some(&5), "an absent currency reads as zero, not as met");
     assert!(!requirements.met_by(&balances));
-    assert!(requirements.met_by(&HotBalances::new([(SHELL, 1_000u128), (7, 5u128)])));
+    assert!(requirements.met_by(&HotBalances::new(
+        vault_to_hot_native_value(),
+        [(SHELL, 1_000u128), (7, 5u128)],
+    )));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -877,7 +1100,9 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
         hot_dapp_id: hex64(0xa1),
         creator_pubkey: "pubkey".to_string(),
         required: [(SHELL, 1_000u128)].into_iter().collect(),
+        required_native: vault_to_hot_native_value(),
         shortfall: [(SHELL, 400u128)].into_iter().collect(),
+        native_shortfall: 40,
     };
     let mut written = FundingJournalRecord::open(&request, 1_700_000_000);
     written.state = FundingState::Submitted;
@@ -894,7 +1119,9 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
     assert_eq!(read.hot_address, self_dapp_hot());
     assert_eq!(read.creator_pubkey, "pubkey");
     assert_eq!(read.required.get(&SHELL), Some(&1_000));
+    assert_eq!(read.required_native, vault_to_hot_native_value());
     assert_eq!(read.shortfall.get(&SHELL), Some(&400));
+    assert_eq!(read.native_shortfall, 40);
     assert_eq!(read.created_at_unix, 1_700_000_000);
 
     let raw = std::fs::read_to_string(funding_journal_path(
@@ -938,3 +1165,4 @@ fn a_record_this_client_cannot_read_is_refused_rather_than_acted_on() {
 }
 
 mod pr1332_retirement_regressions;
+mod issue_334_explicit_hot_regressions;

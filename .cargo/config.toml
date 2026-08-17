@@ -1,0 +1,21 @@
+# Windows gives a process's main thread a 1 MiB stack reserve; Linux and macOS give 8 MiB. The
+# seller binary overflows the smaller one and the process dies before it can print anything:
+#
+#     seller exited before becoming ready: Some(ExitStatus(ExitStatus(3221225725)))
+#
+# 3221225725 is 0xC00000FD, STATUS_STACK_OVERFLOW. There is no message because the fault happens
+# below the level that could format one, which is exactly why this went unseen - the Windows leg of
+# `ci` reported an exit code and nothing else.
+#
+# This is not a test-only setting. A published Windows binary carries the same reserve, so a Windows
+# operator running `dexdo seller` hits the same fault. Eight MiB is the value the two other
+# platforms already use, so this makes the three agree rather than inventing a number.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# The GNU toolchain takes the same request in ld's own spelling.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

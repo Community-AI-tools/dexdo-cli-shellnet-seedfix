@@ -345,9 +345,25 @@ mod tests {
         .unwrap();
         let port = seller.listen_addr.port();
 
-        connect_pinned(&format!("https://127.1:{port}"), &seller.tls_fingerprint)
-            .await
-            .expect("a short-form IPv4 endpoint must complete the pinned dial");
+        // The contract this row states is "a spelling the SYSTEM RESOLVER accepts and
+        // `IpAddr::from_str` rejects", so the spelling has to come from what the running system
+        // actually accepts. Measured on `windows-latest`: `getaddrinfo("127.1")` fails with 11001,
+        // as do `127.0.1`, `127.000.000.001` and `0x7f000001` -- Windows takes no abbreviated IPv4
+        // at all. `localhost` satisfies both halves of the contract on every platform, and `127.1`
+        // is kept everywhere it resolves because it is the exact spelling that hard-failed before
+        // the fix.
+        let spellings: &[&str] = if cfg!(windows) {
+            &["localhost"]
+        } else {
+            &["127.1", "localhost"]
+        };
+        for host in spellings {
+            connect_pinned(&format!("https://{host}:{port}"), &seller.tls_fingerprint)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("the endpoint spelling `{host}` must complete the pinned dial: {error:?}")
+                });
+        }
 
         seller.server_task.abort();
     }

@@ -18,6 +18,91 @@ pub(crate) const NOTE_DEPLOY_SCHEMA: &str = "dexdo.note_deploy.v1";
 pub(crate) const SUBSCRIPTION_SCHEMA: &str = "dexdo.subscription.v1";
 pub(crate) const ERROR_SCHEMA: &str = "dexdo.error.v1";
 
+/// The structured form of the Hot-funding outcome carried inside a command's ONE success object.
+/// It deliberately carries only the stable lifecycle fact. Provider responses and local paths can
+/// contain sensitive material, while an orchestrator only needs to know which funding state the
+/// command observed. Keeping this type in `machine.rs` makes it part of the same explicit machine
+/// contract as the neighbouring response/event types.
+#[cfg(any(feature = "shellnet", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub(crate) enum MachineFundingNotice {
+    AlreadyFunded,
+    RequestSubmitted,
+    RequestAlreadyPending,
+    RequestExecuted,
+    RequestIndeterminate,
+    ManualTopUpRequested,
+}
+
+#[cfg(any(feature = "shellnet", test))]
+impl MachineFundingNotice {
+    /// The same stable name `serde` writes into the `event` field, for the human-facing rendering.
+    /// Kept beside the enum so the two spellings live in one file, and pinned to the serialized
+    /// form by a regression rather than by convention.
+    pub(crate) fn event(self) -> &'static str {
+        match self {
+            Self::AlreadyFunded => "already_funded",
+            Self::RequestSubmitted => "request_submitted",
+            Self::RequestAlreadyPending => "request_already_pending",
+            Self::RequestExecuted => "request_executed",
+            Self::RequestIndeterminate => "request_indeterminate",
+            Self::ManualTopUpRequested => "manual_top_up_requested",
+        }
+    }
+}
+
+/// The funding state a money command had already reached when it failed.
+/// A `note deploy` that creates a Vault -> Hot request and then times out waiting for the balance
+/// leaves an orchestrator with the one question it cannot answer from an exit code: has money
+/// already left the Vault? The success object answers it with `funding_notice`; before this, the
+/// failure answered it only in `stderr` prose.
+/// Carried as a typed cause rather than as wording, so the envelope is built by matching a type -
+/// the same way `classify_error` reads every other machine-relevant fact - and the operator-facing
+/// message above it is free to change without changing the machine contract.
+/// It holds ONLY the stable event. No address, no provider response, no local path, no key.
+#[cfg(any(feature = "shellnet", test))]
+#[derive(Debug)]
+pub(crate) struct FundingContext {
+    notice: MachineFundingNotice,
+    source: anyhow::Error,
+}
+
+#[cfg(any(feature = "shellnet", test))]
+impl FundingContext {
+    /// Carry `notice` alongside `source` without changing what `source` says or loses.
+    pub(crate) fn wrap(notice: MachineFundingNotice, source: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self { notice, source })
+    }
+
+    pub(crate) fn notice(&self) -> MachineFundingNotice {
+        self.notice
+    }
+
+    /// The failure the state was attached to, for a renderer that would otherwise repeat it.
+    pub(crate) fn source_error(&self) -> &anyhow::Error {
+        &self.source
+    }
+}
+
+#[cfg(any(feature = "shellnet", test))]
+impl std::fmt::Display for FundingContext {
+    /// The source's FIRST line, and deliberately not `{source:#}`.
+    /// Written through a plain `{}` rather than by forwarding `f`, so this holds however the
+    /// wrapper itself is formatted: forwarding would let a `{context:#}` render the source's whole
+    /// flattened chain here, and that chain is already rendered below this node.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+#[cfg(any(feature = "shellnet", test))]
+impl std::error::Error for FundingContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 pub(crate) const OP_MARKETS: &str = "markets";
 pub(crate) const OP_QUOTE: &str = "quote";
 pub(crate) const OP_BUYER_START: &str = "buyer_start";
@@ -37,22 +122,14 @@ pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE: &str =
      no wallet transaction was signed or submitted, no voucher was generated, and no funds were spent";
 
 /// the stable machine-readable name for "this instance has no funding wallet bound".
-pub(crate) const WALLET_NOT_CONFIGURED_CODE: &str = "WALLET_NOT_CONFIGURED";
+pub(crate) const WALLET_NOT_CONFIGURED_CODE: &str = "wallet_not_configured";
 
 /// The remediation, carried on `message` rather than only inside `cause`.
-/// `message` is the field an orchestrator surfaces to a human, and the whole point of this code is
-/// that the next move is a setup command the operator runs once. It names the command and every
-/// provider it accepts, because a provider is never chosen for the operator: it is recorded at bind
-/// time and is not recoverable from an address or a code hash afterwards.
-/// The providers are spelled out instead of a placeholder for a mechanical reason as well as a
-/// readable one -- `no_command_line_in_these_sources_is_rejected_by_the_parser` rejects a printed
-/// command line the shipped parser cannot run, and an unquoted placeholder after the subcommand is
-/// a shell redirect, not an argument. This is the same wording `E_WALLET_NOT_CONFIGURED.fix()`
-/// already uses, so the two say one thing.
+/// `message` is the field an orchestrator surfaces to a human, so it carries one directly
+/// executable setup command. The general onboarding command still lets the operator choose another
+/// provider; the remediation itself contains no placeholder or prose-only provider list.
 pub(crate) const WALLET_NOT_CONFIGURED_MESSAGE: &str =
-    "no funding wallet is bound to this instance; bind one with `dexdo wallet onboard` followed by \
-     a provider -- `ackinacki-wallet`, `gosh-ai` or `manual` -- which is never chosen for you. \
-     Nothing was submitted and no funds were spent";
+    "wallet is not configured; run `dexdo wallet onboard gosh-ai` first";
 
 #[derive(Debug)]
 pub(crate) struct MachineErrorPrinted;
@@ -377,6 +454,14 @@ pub(crate) struct MachineError {
     pub(crate) failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) retryable_after_unix: Option<u64>,
+    /// re-audit item 8: the funding state the command had already reached when it failed.
+    /// Present only when this run created a Vault -> Hot request or found one of its own still
+    /// pending - the states in which a failure cannot tell an orchestrator whether money has left
+    /// the Vault. Absent means no funding request of this run exists, which is itself the answer.
+    /// It carries the same stable event the success object carries, and nothing else.
+    #[cfg(any(feature = "shellnet", test))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) funding_notice: Option<MachineFundingNotice>,
 }
 
 impl MachineError {
@@ -395,6 +480,8 @@ impl MachineError {
             deal_handle: None,
             failure_class: None,
             retryable_after_unix: None,
+            #[cfg(any(feature = "shellnet", test))]
+            funding_notice: None,
         }
     }
 
@@ -442,7 +529,47 @@ pub(crate) fn print_error(
     code: ErrorCode,
     err: &anyhow::Error,
 ) -> Result<()> {
-    print_json(&MachineError::new(operation, code).with_cause(error_cause(err)))
+    print_json(&machine_error(operation, code, err))
+}
+
+/// The exact envelope [`print_error`] writes, built rather than printed.
+/// Separated so a regression can assert the FIELDS a machine consumer reads instead of scraping the
+/// process's stdout, and so the one place that decides what a failure carries stays one place.
+pub(crate) fn machine_error(
+    operation: &'static str,
+    code: ErrorCode,
+    err: &anyhow::Error,
+) -> MachineError {
+    #[allow(unused_mut)]
+    let mut error = MachineError::new(operation, code).with_cause(error_cause(err));
+    // re-audit item 8: a failed money command carries the funding state it had already
+    // reached. Read from the typed cause the funding wait attaches, so the fact survives any
+    // rewording of the message it travels under.
+    // `Error::downcast_ref` and NOT a `chain()` scan: the state is attached with `.context(..)`, so
+    // that the original error keeps being an error and its own typed causes stay downcastable for
+    // `classify_error`. A `chain()` element for a context layer is anyhow's `ContextError<C, E>`,
+    // never the `C` inside it, so a chain scan cannot see it - measured, not assumed.
+    // `Error::downcast_ref` walks the context chain itself and does find it.
+    #[cfg(any(feature = "shellnet", test))]
+    {
+        error.funding_notice = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<FundingContext>())
+            .map(FundingContext::notice);
+        // The state wrapper renders as its own source's first line, so rendering the whole error
+        // would print that line twice. When it is the outermost node, render from underneath it
+        // instead: every layer below is still rendered, so nothing is dropped but the repeat.
+        // Deliberately only when it IS outermost - skipping it from deeper down would drop
+        // whatever wrapped it.
+        if let Some(context) = err
+            .chain()
+            .next()
+            .and_then(|cause| cause.downcast_ref::<FundingContext>())
+        {
+            error.cause = Some(error_cause(context.source_error()));
+        }
+    }
+    error
 }
 
 fn error_cause(err: &anyhow::Error) -> String {
@@ -1204,7 +1331,7 @@ mod tests {
     #[test]
     fn transport_failure_is_chain_transport() {
         let err = anyhow::Error::new(dexdo_core::ChainError::Transport(
-            "connect timed out at https://shellnet.ackinacki.org/graphql".to_string(),
+            "connect timed out at https://dd-shellnet.ackinacki.org/graphql".to_string(),
         ));
         assert_eq!(
             classify_error(OP_BUYER_START, &err),
@@ -1217,7 +1344,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered["cause"],
-            "shellnet transport: connect timed out at https://shellnet.ackinacki.org/graphql"
+            "shellnet transport: connect timed out at https://dd-shellnet.ackinacki.org/graphql"
         );
 
         let wrapped = anyhow::Error::new(dexdo_core::ChainError::Transport(
@@ -1312,7 +1439,7 @@ mod tests {
 
     #[test]
     fn machine_error_path_redaction_preserves_public_urls_and_relative_paths() {
-        let cause = "request https://shellnet.ackinacki.org/graphql failed in cache/state.json";
+        let cause = "request https://dd-shellnet.ackinacki.org/graphql failed in cache/state.json";
         assert_eq!(sanitize_error_cause(cause), cause);
         assert!(forbidden_machine_fragment(cause).is_none());
     }

@@ -140,6 +140,25 @@ fn status_next_for(
     }
 }
 
+/// render an address the way the versioned machine schemas are pinned to carry it.
+/// `runtime-machine-contract.md` fixes `dexdo.status.v2` and the `dexdo.*.event.v1` payloads to the
+/// legacy `0:<account_id>` shape until a coordinated version bump, because every parent process
+/// parses that form. Human output and files keep the canonical `<dapp_id>::<account_id>`; only this
+/// boundary converts.
+/// An address that does not parse is passed through unchanged. This function's job is the SHAPE of
+/// a well-formed address, and swallowing an unparseable one into an empty string or a panic would
+/// replace a visible oddity with an invisible one; the reader downstream still sees exactly what
+/// the command was given.
+/// The conversion is `address::to_chain_param`, the crate's own seam for exactly this direction, and
+/// not `parse_chain_address`: the latter is `#[cfg(feature = "shellnet")]`, so calling it from here
+/// broke the default-feature build of the whole workspace -- the shape this boundary converts is
+/// decided by the schema, not by whether the chain client is compiled in. That is also why there is
+/// ONE function here and not a pair split by the feature: a default build that passed the address
+/// through would answer `dexdo.status.v2` in the unpinned shape, which is the defect reports.
+fn pinned_schema_address(address: &str) -> String {
+    dexdo_core::address::to_chain_param(address).unwrap_or_else(|_| address.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn status_response_from_summary(
     network: &str,
@@ -157,7 +176,17 @@ fn status_response_from_summary(
         generated_at_unix: machine::now_unix()?,
         handle,
         role: role.clone(),
-        token_contract,
+        // `dexdo.status.v2` is pinned to `0:<account_id>` by `runtime-machine-contract.md`,
+        // and this field used to be whatever reached the command -- the argv string, or the
+        // spelling the deal handle happens to store. Both can be canonical, and then a schema the
+        // whole parent process reads answers in a form it does not accept.
+        // Measured, not deduced: the two-runner release gate refused with
+        // asked about 97256735...::97256735..., status answered '97256735...::97256735...'
+        // -- the SAME account, so the identity half of the check passed and the shape half did not.
+        // That gate had been red since 2026-08-10 and v0.0.22 shipped over it.
+        // Normalising here, at the one place the machine schema is built, rather than at each of
+        // the callers: a caller that forgets is exactly how this arrived.
+        token_contract: pinned_schema_address(&token_contract),
         frame_model,
         state: state.to_string(),
         active,
@@ -621,5 +650,90 @@ mod tests {
 
         assert_eq!(next.action, "none");
         assert_eq!(next.command, "none");
+    }
+}
+
+/// the versioned machine schemas answer in the shape they are pinned to.
+/// Ungated on purpose. The conversion it exercises has no feature of its own, so these rows run in
+/// the default build too -- which is the build whose regression would otherwise be checked by
+/// nothing at all.
+#[cfg(test)]
+mod pinned_schema_address_1419 {
+    use super::pinned_schema_address;
+
+    /// The shape that shipped the defect. `market.json` stores the canonical form, a deal handle
+    /// stores whatever it was written with, and either can reach the schema builder; before this,
+    /// whatever arrived was printed verbatim.
+    /// Measured on the two-runner release gate, which had been red since 2026-08-10:
+    /// ```text
+    /// asked about 97256735...::97256735..., status answered '97256735...::97256735...'
+    /// ```
+    /// The same account -- so the check's identity half passed and its shape half did not.
+    /// Asserted through `status_response_from_summary`, the place that BUILDS the schema, not
+    /// through the helper alone: a helper that exists but is not wired in leaves the defect exactly
+    /// where it was, and a test of the helper alone passes either way. (It did, on the first
+    /// draft of this module.)
+    #[test]
+    fn the_status_schema_answers_in_the_pinned_legacy_shape_1419() {
+        let account = "97256735ac843277affcb10bb22c5d3dbb415e7f2d7c199825c9d584b34aef85";
+        let canonical = format!("{account}::{account}");
+        let response = super::status_response_from_summary(
+            "mainnet",
+            None,
+            Some("seller".to_string()),
+            canonical,
+            None,
+            "closed",
+            false,
+            &crate::cli::deals::DealStateSummary {
+                kind: crate::cli::deals::DealStateKind::Stopped,
+                funded: false,
+                opened: false,
+                disputed: false,
+                probe_accepted: false,
+                deposit: 0,
+                probe_tick: 0,
+                buyer_bond: 0,
+                buyer_bond_required: 0,
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_pending: 0,
+                funded_time: None,
+                probe_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            },
+        )
+        .expect("the schema is built");
+        assert_eq!(
+            response.token_contract,
+            format!("0:{account}"),
+            "`dexdo.status.v2` must answer in `0:<account_id>`, whatever form reached the command"
+        );
+    }
+
+    /// Already pinned: unchanged, and in particular not double-prefixed.
+    #[test]
+    fn the_pinned_shape_survives_unchanged_1419() {
+        let legacy = format!("0:{}", "a".repeat(64));
+        assert_eq!(pinned_schema_address(&legacy), legacy);
+    }
+
+    /// The accepted forms are the two the canonical parser takes, and a bare account id is not one
+    /// of them: it names no workchain and no DApp. Every production call site feeds
+    /// `target.token_contract`, written canonical or legacy, so a bare id cannot reach this
+    /// boundary -- and if one ever does, it stays visible rather than being coerced into an address
+    /// that would name a different account than the caller meant.
+    #[test]
+    fn a_bare_account_id_is_not_an_accepted_form_1419() {
+        let account = "b".repeat(64);
+        assert_eq!(pinned_schema_address(&account), account);
+    }
+
+    /// Not an address at all: passed through, because replacing a visible oddity with an empty
+    /// field or a panic hides it from the reader who has to diagnose it.
+    #[test]
+    fn an_unparseable_value_is_passed_through_1419() {
+        assert_eq!(pinned_schema_address("not-an-address"), "not-an-address");
     }
 }

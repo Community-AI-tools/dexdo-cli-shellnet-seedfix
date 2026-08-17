@@ -16,9 +16,10 @@ use std::{cell::RefCell, collections::BTreeMap};
 use anyhow::{bail, Result};
 
 use super::{
-    payload_hash, vault_to_hot_native_value, FundingEvidence, FundingFingerprint, FundingRequest,
-    HotFundingProvider, RecordedRequest, RequestPresence, SubmitOutcome, WalletProvider,
-    VAULT_TO_HOT_BOUNCE, VAULT_TO_HOT_PAYLOAD, VAULT_TO_HOT_SEND_FLAGS,
+    payload_hash, render_native_and_ecc_amounts, vault_to_hot_native_value, FundingEvidence,
+    FundingFingerprint, FundingRequest, HotFundingProvider, RecordedRequest, RequestPresence,
+    SubmitOutcome, WalletProvider, VAULT_TO_HOT_BOUNCE, VAULT_TO_HOT_PAYLOAD,
+    VAULT_TO_HOT_SEND_FLAGS,
 };
 
 /// The base64 of an empty BOC cell, which is how a multisig queue reports the empty payload every
@@ -79,7 +80,7 @@ impl HotFundingProvider for DirectTopUpProvider {
     }
 
     fn manual_instruction(&self, request: &FundingRequest) -> String {
-        let shortfall = render_shortfall(&request.shortfall);
+        let shortfall = render_native_and_ecc_amounts(request.native_shortfall, &request.shortfall);
         match self.provider {
             // The same placeholder the Gosh.ai onboarding flow prints, and deliberately the same
             // constant: when the real sub-wallet screen exists there must be one link to replace.
@@ -96,23 +97,6 @@ impl HotFundingProvider for DirectTopUpProvider {
             ),
         }
     }
-}
-
-fn render_shortfall(shortfall: &BTreeMap<u32, u128>) -> String {
-    if shortfall.is_empty() {
-        return "nothing".to_string();
-    }
-    shortfall
-        .iter()
-        .map(|(currency, amount)| {
-            if *currency == dexdo_core::params::SHELL_CURRENCY_ID {
-                format!("{amount} raw ECC[2] SHELL")
-            } else {
-                format!("{amount} raw ECC[{currency}]")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" and ")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -166,6 +150,23 @@ pub(crate) trait VaultChain {
 
     /// Every queue event in the Vault's finalized ext-out history, in chain order.
     async fn history(&self) -> Result<Vec<VaultQueueEvent>>;
+
+    /// The INTERNAL message that carried an executed queue transfer to `destination`, proven by the
+    /// destination's own finalized receipt.
+    /// `sent_event_message_id` is a `TransactionSent` message id, and that message is an EVENT: the
+    /// wallet emits it on a hardcoded event channel, so its own destination is that channel and
+    /// never the transfer's. What binds them is the queued path executing `txn.dest.transfer(...)`
+    /// and then `emit TransactionSent(...)` in ONE Vault transaction - so the event anchors that
+    /// transaction and the delivery is its sibling out-message addressed to `destination`.
+    /// `Ok(None)` is "cannot be established from chain fact", which every caller must read as
+    /// unknown: no sibling, more than one, or no finalized receipt for it. It is never "no
+    /// delivery", and it never authorizes anything.
+    async fn delivery_message_id(
+        &self,
+        sent_event_message_id: &str,
+        destination: &str,
+        destination_dapp_id: &str,
+    ) -> Result<Option<String>>;
 
     /// `getParameters.expirationTime` - how long a queued request stays confirmable.
     async fn expiration_window_secs(&self) -> Result<u64>;
@@ -248,7 +249,9 @@ pub(crate) fn describe_recorded_request(
     format!(
         "generation {} - {} to {} in DApp {}, created by custodian key {} ({queue_id})",
         recorded.generation,
-        render_shortfall(&expected.cc),
+        // The fingerprint's own native `value` is the native half of THIS transfer, so the
+        // description names the whole of what was queued rather than only its currency map.
+        render_native_and_ecc_amounts(expected.value, &expected.cc),
         expected.dest,
         expected.dapp_id,
         expected.creator,
@@ -409,6 +412,34 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                 .iter()
                 .find(|event| event.kind == VaultQueueEventKind::Sent && event.transaction_id == id)
             {
+                // The event proves the money left the VAULT. Which internal message carried it to
+                // the Hot is a separate question, and it is the one that later decides whether a
+                // replacement generation may be sized: a chain read failure there must not be
+                // allowed to look like "no delivery", so it fails closed as `Unknown`.
+                let delivery_message_id = match self
+                    .chain
+                    .delivery_message_id(&sent.message_id, &expected.dest, &expected.dapp_id)
+                    .await
+                {
+                    Ok(delivery_message_id) => delivery_message_id,
+                    Err(error) => {
+                        return Ok(RequestPresence::Unknown {
+                            reason: format!(
+                                "the Vault emitted TransactionSent for queue transaction {id}, so \
+                                 the money left the Vault, but the internal message that carried it \
+                                 to {} could not be read: {error}",
+                                expected.dest
+                            ),
+                        })
+                    }
+                };
+                let delivery = match delivery_message_id.as_deref() {
+                    Some(delivery) => format!(
+                        ", delivered to the Hot by internal message {delivery}, whose destination \
+                         receipt is finalized"
+                    ),
+                    None => String::new(),
+                };
                 return Ok(RequestPresence::Executed {
                     evidence: FundingEvidence {
                         verdict: "executed".to_string(),
@@ -416,9 +447,10 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                         observed_at_unix: Some(sent.created_at),
                         detail: format!(
                             "the Vault emitted TransactionSent for queue transaction {id} to {} at \
-                             chain time {}",
+                             chain time {}{delivery}",
                             sent.dest, sent.created_at
                         ),
+                        delivery_message_id,
                     },
                 });
             }
@@ -513,6 +545,8 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                          longer be confirmed",
                         recorded.generation
                     ),
+                    // Nothing was delivered, so there is no delivery to name.
+                    delivery_message_id: None,
                 },
             });
         }
@@ -536,7 +570,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             "Hot wallet {} is short {}. Confirm the pending Vault -> Hot transaction in Acki Nacki \
              Wallet.",
             request.hot_address,
-            render_shortfall(&request.shortfall)
+            render_native_and_ecc_amounts(request.native_shortfall, &request.shortfall)
         )
     }
 }
@@ -564,3 +598,7 @@ pub(crate) use chain::RealVaultChain;
 
 #[cfg(test)]
 mod tests;
+
+/// the native half of a shortfall is part of the instruction, and "nothing" is never it.
+#[cfg(test)]
+mod issue_1387_regressions;

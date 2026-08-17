@@ -894,6 +894,16 @@ fn buyer_submit_reconciliation(
 
 #[cfg(feature = "shellnet")]
 fn buyer_submit_state_dir() -> Result<std::path::PathBuf> {
+    // The test journal root lives beside the test binary, INSIDE the cargo target
+    // directory, and never in the system temp dir. `PATH` is a `static`, so it is never
+    // dropped: neither a `Drop` guard nor a `tempfile::TempDir` can remove this directory
+    // when the process exits, which is why every invocation of a test binary used to leave
+    // one `dexdo-buyer-submits-tests-*` directory in `/tmp` for good. The target directory
+    // is the one place the build already discards wholesale - `cargo clean`, a fresh CI
+    // checkout, an agent deleting its own CARGO_TARGET_DIR - so putting the directory there
+    // hands the lifetime to a mechanism that already exists instead of inventing one.
+    // The pid and nanosecond suffix stays: concurrent test binaries share one target
+    // directory, and they must not share one journal.
     #[cfg(test)]
     let path = {
         static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -902,10 +912,14 @@ fn buyer_submit_state_dir() -> Result<std::path::PathBuf> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("test process clock must be after the Unix epoch")
                 .as_nanos();
-            std::env::temp_dir().join(format!(
-                "dexdo-buyer-submits-tests-{}-{started_at}",
-                std::process::id()
-            ))
+            let test_binary = std::env::current_exe()
+                .expect("test binary path must be readable to place the buyer submit journal");
+            test_binary
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("test binary must live under the cargo target directory")
+                .join("dexdo-buyer-submits-tests")
+                .join(format!("{}-{started_at}", std::process::id()))
         })
         .clone()
     };
@@ -3735,6 +3749,109 @@ fn ensure_pending_buyer_submit_matches_invocation(
     ))))
 }
 
+/// what the probe tick costs the buyer, in tokens, BEFORE any money leaves the note.
+/// `TokenContract::_recordDelivered` bills the probe as a WHOLE tick no matter how little it
+/// actually delivered:
+/// ```solidity
+/// uint128 delivered = _tokensFinal;
+/// if(_probeAccepted && delivered < TICK_SIZE) { delivered = TICK_SIZE; }
+/// ```
+/// Measured live on mainnet on 2026-08-17: the probe delivered 143 465 tokens and billed
+/// 1 000 000, so every one of the twelve claims carried the same 856 535-token gap between
+/// delivered and counted. A two-tick deal paid for 2 000 000 tokens and received 1 159 177 -- the
+/// buyer got **58%** of the volume he paid for, and the deal then ended on "delivery capacity is
+/// exhausted", counting the tokens it had billed rather than the ones it had sent.
+/// None of that was knowable from the preflight line: `probe_tick` appeared only in the accounting
+/// printed AFTER the escrow was committed. The economics themselves are the contract's and are not
+/// this function's business -- being told the number in time is.
+/// The share shrinks with deal size(2 ticks -> 50% of ticks, 100 ticks -> 1%), so the sentence is
+/// added only where it changes a decision: a deal small enough for the probe to take a quarter or
+/// more of it. That is exactly the size a first-time buyer picks.
+#[cfg(feature = "shellnet")]
+fn probe_share_clause(ticks: u128) -> String {
+    let tick_size = dexdo_core::params::TICK_SIZE;
+    let streaming_ticks = ticks.saturating_sub(1);
+    let clause = format!(
+        "probe_tick_charged_tokens={tick_size} billable_ticks={ticks} \
+         streaming_ticks_after_probe={streaming_ticks} \
+         streaming_tokens_after_probe={}",
+        streaming_ticks.saturating_mul(tick_size)
+    );
+    if ticks > 0 && ticks <= 4 {
+        return format!(
+            "{clause} note=one of the {ticks} ticks you pay for is the probe, billed whole even if \
+             it delivers less; {streaming_ticks} tick(s) remain for streaming"
+        );
+    }
+    clause
+}
+
+/// the preflight must name the probe's cost before the escrow is committed.
+#[cfg(all(test, feature = "shellnet"))]
+mod probe_share_clause_1425 {
+    use super::probe_share_clause;
+
+    /// The live two-tick mainnet deal of 2026-08-17: half the ticks bought were the probe. The
+    /// buyer saw none of that before paying, so the numbers he needed are asserted by value.
+    #[test]
+    fn a_two_tick_deal_states_the_probe_takes_one_of_them() {
+        let clause = probe_share_clause(2);
+        assert!(
+            clause.contains("probe_tick_charged_tokens=1000000"),
+            "the probe's whole-tick billing is not stated: {clause}"
+        );
+        assert!(
+            clause.contains("billable_ticks=2"),
+            "the paid tick count is not stated: {clause}"
+        );
+        assert!(
+            clause.contains("streaming_ticks_after_probe=1"),
+            "what is left for streaming is not stated: {clause}"
+        );
+        assert!(
+            clause.contains("streaming_tokens_after_probe=1000000"),
+            "what is left for streaming is not stated in tokens: {clause}"
+        );
+        assert!(
+            clause.contains("note=one of the 2 ticks you pay for is the probe"),
+            "a deal this small does not spell the share out: {clause}"
+        );
+    }
+
+    /// The share is 1% here, so the sentence would be noise; the numbers still have to be there,
+    /// because a reader who wants them must not have to know the deal size to get them.
+    #[test]
+    fn a_hundred_tick_deal_keeps_the_numbers_and_drops_the_sentence() {
+        let clause = probe_share_clause(100);
+        assert!(
+            clause.contains("probe_tick_charged_tokens=1000000")
+                && clause.contains("streaming_ticks_after_probe=99")
+                && clause.contains("streaming_tokens_after_probe=99000000"),
+            "the numbers vanished on a large deal: {clause}"
+        );
+        assert!(
+            !clause.contains("note="),
+            "the small-deal sentence leaked onto a deal where the probe is 1%: {clause}"
+        );
+    }
+
+    /// A resting buy renders the same clause with whatever tick count was asked for, and zero must
+    /// not panic or claim a negative remainder.
+    #[test]
+    fn zero_ticks_neither_panics_nor_promises_streaming() {
+        let clause = probe_share_clause(0);
+        assert!(
+            clause.contains("streaming_ticks_after_probe=0")
+                && clause.contains("streaming_tokens_after_probe=0"),
+            "zero ticks did not saturate: {clause}"
+        );
+        assert!(
+            !clause.contains("note="),
+            "the sentence claimed a probe on a deal of no ticks: {clause}"
+        );
+    }
+}
+
 #[cfg(feature = "shellnet")]
 fn render_buyer_human_preflight(
     frame_model: &str,
@@ -3744,12 +3861,13 @@ fn render_buyer_human_preflight(
     escrow: u128,
     note_shell_balance: u128,
 ) -> String {
+    let probe = probe_share_clause(ticks);
     if selection.resting_buy {
         return format!(
             "BUYER_PREFLIGHT model={frame_model} requested_ticks={ticks} minimum_ticks={} \
              best_ask=<waiting> max_price_per_tick={max_price_per_tick} escrow={escrow} \
              note_shell_balance={note_shell_balance} order_id=<pending> token_contract=<pending> \
-             matchable=wait_for_seller balance_sufficient={}",
+             matchable=wait_for_seller balance_sufficient={} {probe}",
             dexdo_core::params::MIN_STREAM_BUY_TICKS,
             note_shell_balance >= escrow
         );
@@ -3783,7 +3901,7 @@ fn render_buyer_human_preflight(
          minimum_ticks={} best_ask={} \
          max_price_per_tick={max_price_per_tick} escrow={escrow} fee={fee} \
          note_shell_balance={note_shell_balance} matched_ask_order_id={} \
-         matched_ask_token_contract={} balance_sufficient={}",
+         matched_ask_token_contract={} balance_sufficient={} {probe}",
         dexdo_core::params::MIN_STREAM_BUY_TICKS,
         fill.price_per_tick,
         fill.order_id,
@@ -13764,7 +13882,7 @@ mod tests {
             let secret = format!("{seed_byte:02x}").repeat(32);
             let public = crate::cli::note::derive_owner_pubkey_from_secret_hex(&secret).unwrap();
             crate::cli::note::OnboardPnState {
-                endpoint: "shellnet.ackinacki.org".into(),
+                endpoint: "dd-shellnet.ackinacki.org".into(),
                 nominal: "N100".into(),
                 token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
@@ -14696,12 +14814,12 @@ mod tests {
     #[test]
     fn note_endpoint_url_accepts_bare_host_or_url() {
         assert_eq!(
-            super::note_endpoint_url("shellnet.ackinacki.org").unwrap(),
-            "https://shellnet.ackinacki.org"
+            super::note_endpoint_url("dd-shellnet.ackinacki.org").unwrap(),
+            "https://dd-shellnet.ackinacki.org"
         );
         assert_eq!(
-            super::note_endpoint_url("https://shellnet.ackinacki.org/").unwrap(),
-            "https://shellnet.ackinacki.org"
+            super::note_endpoint_url("https://dd-shellnet.ackinacki.org/").unwrap(),
+            "https://dd-shellnet.ackinacki.org"
         );
         assert!(super::note_endpoint_url("  ").is_err());
     }
@@ -14718,9 +14836,9 @@ mod tests {
             multisig_seed_file,
             nominal: "N100".into(),
             token_type: "shell".into(),
-            endpoint: "shellnet.ackinacki.org".into(),
+            endpoint: "dd-shellnet.ackinacki.org".into(),
             contracts: std::path::PathBuf::from("contracts/deployed.shellnet.json"),
-            pool: std::path::PathBuf::from("pn_pool.json"),
+            pool: Some(std::path::PathBuf::from("pn_pool.json")),
             recovery: None,
             simulate_interrupt_after_spend_before_pool: false,
             simulate_interrupt_after_deposit_voucher_submit: false,
@@ -21948,10 +22066,16 @@ mod tests {
         assert_eq!(
             line,
             format!(
+                // the line now closes with what the probe tick costs, and this pin carries
+                // it so the disclosure cannot be dropped without a red test.
                 "BUYER_PREFLIGHT model=qwen--qwen3--32b requested_ticks=2 minimum_ticks={} \
                  best_ask={} max_price_per_tick={} escrow={} fee={fee} \
                  note_shell_balance={note_shell_balance} matched_ask_order_id={} \
-                 matched_ask_token_contract={matched_tc} balance_sufficient=true",
+                 matched_ask_token_contract={matched_tc} balance_sufficient=true \
+                 probe_tick_charged_tokens=1000000 billable_ticks=2 \
+                 streaming_ticks_after_probe=1 streaming_tokens_after_probe=1000000 \
+                 note=one of the 2 ticks you pay for is the probe, billed whole even if it \
+                 delivers less; 1 tick(s) remain for streaming",
                 dexdo_core::params::MIN_STREAM_BUY_TICKS,
                 order.price_per_tick,
                 order.price_per_tick,
@@ -22069,7 +22193,10 @@ mod tests {
                  minimum_ticks={} best_ask=3000000000 max_price_per_tick=3000000000 \
                  escrow=6000000000 fee=150000000 note_shell_balance=6000000000 \
                  matched_ask_order_id=11 matched_ask_token_contract={ask_token_contract_rendered} \
-                 balance_sufficient=true",
+                 balance_sufficient=true probe_tick_charged_tokens=1000000 billable_ticks=2 \
+                 streaming_ticks_after_probe=1 streaming_tokens_after_probe=1000000 \
+                 note=one of the 2 ticks you pay for is the probe, billed whole even if it \
+                 delivers less; 1 tick(s) remain for streaming",
                 dexdo_core::params::MIN_STREAM_BUY_TICKS,
             )
         );
@@ -22273,6 +22400,33 @@ mod tests {
         frame_model: &str,
         token_contract: Option<&str>,
     ) -> super::BuyerArgs {
+        // The refusal under test is a book-state refusal, so this buyer must own the policy it
+        // runs on: with no `--policy` the command reads one from outside the tree
+        // (`XDG_CONFIG_HOME`, else `$HOME/.config`), and on a machine without that file it
+        // refuses on the unreadable policy long before it ever reaches the book.
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "buyer": {
+                    "on": {
+                        "no_handover_after_match": "fail_closed",
+                        "malformed_handover": "fail_closed",
+                        "dead_gateway": "fail_closed",
+                        "empty_stream": "fail_closed",
+                        "seller_stalls_mid_stream": "accept_delivered_then_reclaim",
+                        "bad_output_scam": "stop"
+                    },
+                    "failover": {
+                        "max_sellers_to_try": 1,
+                        "total_spend_cap_shells": 1000000000
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         super::BuyerArgs {
             mock: super::MockFlags {
                 mock_model: false,
@@ -22308,7 +22462,7 @@ mod tests {
             max_price_per_tick: dexdo_core::PRICE_STEP,
             escrow: None,
             contracts: dir.join("offline-contracts.json"),
-            policy: None,
+            policy: Some(policy_path),
         }
     }
 
@@ -28158,6 +28312,102 @@ mod tests {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
             }
+        }
+    }
+
+    /// Regression: a finished test process must leave NOTHING behind in the system temp
+    /// directory.
+    /// `buyer_submit_state_dir` memoises its test-side answer in a `static`, and a `static`
+    /// is never dropped, so nothing inside the process - not a `Drop` guard, not a
+    /// `tempfile::TempDir` - can remove that directory when the process exits. For as long
+    /// as the path was built from `std::env::temp_dir()`, every single invocation of a test
+    /// binary therefore left one `dexdo-buyer-submits-tests-<pid>-<nanos>` directory in
+    /// `/tmp` forever, and they accumulated into thousands on a developer machine.
+    /// Asserting that the helper returns a path would not have caught that: the leaked
+    /// directory only becomes observable once its owning process is gone. So the proof has
+    /// to outlive a process. This re-execs the running test binary with its temp directory
+    /// pointed at an empty sandbox, waits for that child to exit, and then requires the
+    /// sandbox to still be empty.
+    #[cfg(feature = "shellnet")]
+    mod buyer_submit_state_dir_leaves_no_litter {
+        /// Set by the parent on the re-exec, and only there: it is what turns the probe
+        /// below from a no-op into the child half of the test.
+        const CHILD_MARKER: &str = "DEXDO_BUYER_SUBMIT_STATE_DIR_CHILD_PROBE";
+
+        /// The child half. An ordinary suite run reaches this with the marker unset and
+        /// does nothing at all; only the re-exec makes it build a state directory.
+        #[test]
+        fn buyer_submit_state_dir_child_probe() {
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                return;
+            }
+            let dir = super::super::buyer_submit_state_dir()
+                .expect("the child must be able to create its buyer submit state dir");
+            assert!(
+                dir.is_dir(),
+                "child state dir {} was not created",
+                dir.display()
+            );
+            println!("CHILD_STATE_DIR={}", dir.display());
+        }
+
+        #[test]
+        fn a_finished_test_process_leaves_the_system_temp_dir_empty() {
+            let sandbox =
+                tempfile::tempdir().expect("sandbox standing in for the system temp dir");
+            let exe = std::env::current_exe().expect("path of the running test binary");
+
+            // libtest matches its filter as a substring, so naming the probe is enough to
+            // select exactly it - this test never has to hard-code a module path.
+            let output = std::process::Command::new(&exe)
+                .arg("buyer_submit_state_dir_child_probe")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_MARKER, "1")
+                // std::env::temp_dir() reads TMPDIR on unix, TMP/TEMP on windows.
+                .env("TMPDIR", sandbox.path())
+                .env("TMP", sandbox.path())
+                .env("TEMP", sandbox.path())
+                .output()
+                .expect("re-exec the test binary as the child probe");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child probe exited {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            // `0 passed; N filtered out` is a filter that matched nothing, not a pass.
+            assert!(
+                stdout.contains("1 passed"),
+                "the filter selected no probe, so nothing was proved\nstdout:\n{stdout}"
+            );
+            // libtest writes `test <name>... ` without a newline, so the probe's own line
+            // is appended to it rather than starting the line - match the marker anywhere.
+            let child_state_dir = stdout
+                .lines()
+                .find_map(|line| line.split("CHILD_STATE_DIR=").nth(1))
+                .map(str::trim)
+                .map(std::path::PathBuf::from)
+                .expect("the child probe did not report its state dir");
+
+            let leftovers: Vec<_> = std::fs::read_dir(sandbox.path())
+                .expect("read the sandbox temp dir")
+                .map(|entry| entry.expect("sandbox entry").file_name())
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "the finished child left {leftovers:?} in the temp dir it was given. The buyer \
+                 submit journal is memoised in a `static` that is never dropped, so it must not \
+                 be created under std::env::temp_dir() at all; the child reported {}",
+                child_state_dir.display()
+            );
+            assert!(
+                !child_state_dir.starts_with(sandbox.path()),
+                "the child built its state dir {} inside the system temp dir",
+                child_state_dir.display()
+            );
         }
     }
 }

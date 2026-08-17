@@ -145,6 +145,30 @@ fn queued_transfer_from(entry: &Value) -> Result<QueuedTransfer> {
     })
 }
 
+fn vault_to_hot_submit_transaction_params(fingerprint: &FundingFingerprint) -> Result<Value> {
+    let mut cc = serde_json::Map::new();
+    for (currency, amount) in &fingerprint.cc {
+        cc.insert(currency.to_string(), serde_json::json!(amount.to_string()));
+    }
+    // The canonical builder hard-codes `dapp_id = ROOT_PN_DAPP_ID`("4"), which is right for
+    // every dexdo destination and wrong for this one: a Hot is a self-DApp multisig, so the
+    // transfer has to be addressed into the Hot's OWN DApp. Forwarding it into DApp 4 would burn
+    // the attached vmshell without the money ever reaching the Hot, and the wait would then sit
+    // on a balance that is never going to move.
+    let mut params = dexdo_core::canonical_multisig::submit_transaction_params(
+        dexdo_core::address::to_chain_param(&fingerprint.dest).map_err(anyhow::Error::msg)?,
+        fingerprint.value,
+        cc,
+        bounce_argument(),
+        send_flag_argument()?,
+        fingerprint.payload_for_wire()?.to_string(),
+    );
+    params["dapp_id"] = serde_json::json!(dexdo_core::address::to_dapp_id_param(
+        &fingerprint.dapp_id
+    ));
+    Ok(params)
+}
+
 #[async_trait::async_trait(?Send)]
 impl VaultChain for RealVaultChain<'_> {
     async fn queue(&self) -> Result<Vec<QueuedTransfer>> {
@@ -211,6 +235,36 @@ impl VaultChain for RealVaultChain<'_> {
             .collect())
     }
 
+    async fn delivery_message_id(
+        &self,
+        sent_event_message_id: &str,
+        destination: &str,
+        destination_dapp_id: &str,
+    ) -> Result<Option<String>> {
+        // The frozen fingerprint's own destination, parsed by the one address parser this client
+        // has. A destination that does not parse is not a destination a receipt can be proven at.
+        let destination = CanonicalAddress::parse(destination)
+            .map_err(|e| anyhow!("funding destination {destination} is not a chain address: {e}"))?;
+        let http = dexdo_core::shellnet_http_client()?;
+        dexdo_core::shellnet::prove_multisig_delivery_message(
+            &http,
+            &self.endpoint,
+            sent_event_message_id,
+            destination.account_id(),
+            // The DApp the RECORD froze, not the one the address happens to render, so a receipt is
+            // only ever accepted in the DApp this generation's transfer was addressed into.
+            destination_dapp_id,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "prove the Vault {} -> {destination} delivery behind TransactionSent message \
+                 {sent_event_message_id}: {e}",
+                self.vault
+            )
+        })
+    }
+
     async fn expiration_window_secs(&self) -> Result<u64> {
         let output = self.getter("getParameters").await?;
         as_u64(&output["expirationTime"], "expirationTime")
@@ -225,24 +279,7 @@ impl VaultChain for RealVaultChain<'_> {
         use dexdo_core::airegistry::{calls::encode_external_call, deploy::local_context};
 
         let ctx = local_context()?;
-        let mut cc = serde_json::Map::new();
-        for (currency, amount) in &fingerprint.cc {
-            cc.insert(currency.to_string(), serde_json::json!(amount.to_string()));
-        }
-        // The canonical builder hard-codes `dapp_id = ROOT_PN_DAPP_ID`("4"), which is right for
-        // every dexdo destination and wrong for this one: a Hot is a self-DApp multisig, so the
-        // transfer has to be addressed into the Hot's OWN DApp. Forwarding it into DApp 4 would burn
-        // the attached vmshell without the money ever reaching the Hot, and the wait would then sit
-        // on a balance that is never going to move.
-        let mut params = dexdo_core::canonical_multisig::submit_transaction_params(
-            fingerprint.dest.clone(),
-            fingerprint.value,
-            cc,
-            bounce_argument(),
-            send_flag_argument()?,
-            fingerprint.payload_for_wire()?.to_string(),
-        );
-        params["dapp_id"] = serde_json::json!(fingerprint.dapp_id.clone());
+        let params = vault_to_hot_submit_transaction_params(fingerprint)?;
 
         let boc = encode_external_call(
             &ctx,
@@ -328,5 +365,38 @@ impl VaultChain for RealVaultChain<'_> {
             transaction_hash: Some(receipt.transaction_hash),
             pending_transaction_id,
         })
+    }
+}
+
+/// item 1: the same parameters, through the SDK encoder that decides whether they can be sent.
+#[cfg(test)]
+mod abi_encoding_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::wallet_funding::{payload_hash, VAULT_TO_HOT_PAYLOAD};
+
+    #[test]
+    fn vault_submit_params_use_chain_dest_and_keep_hot_dapp() {
+        let hot_dapp_id = "a1".repeat(32);
+        let hot_account_id = "b2".repeat(32);
+        let fingerprint = FundingFingerprint {
+            creator: "c3".repeat(32),
+            dest: format!("{hot_dapp_id}::{hot_account_id}"),
+            dapp_id: hot_dapp_id.clone(),
+            value: 10,
+            cc: [(2u32, 1_000u128)].into_iter().collect(),
+            send_flags: 1,
+            bounce: true,
+            payload_hash: payload_hash(VAULT_TO_HOT_PAYLOAD),
+        };
+
+        let params = vault_to_hot_submit_transaction_params(&fingerprint).unwrap();
+
+        assert_eq!(params["dest"], format!("0:{hot_account_id}"));
+        // `0x`-prefixed because the ABI declares `dapp_id` a `uint256` and the SDK reads an
+        // unprefixed string as decimal; `abi_encoding_tests` is what proves that through the encoder.
+        assert_eq!(params["dapp_id"], format!("0x{hot_dapp_id}"));
     }
 }

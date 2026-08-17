@@ -796,7 +796,7 @@ async fn live_giver_funds_fresh_wallet() {
     use gosh_ackinacki::wallet::giver::GiverClient;
 
     let cfg = AiRegistryConfig::shellnet();
-    let endpoint = "https://shellnet.ackinacki.org";
+    let endpoint = "https://dd-shellnet.ackinacki.org";
     let ctx = local_context().expect("client context");
     // A write(`/v2/messages`) behind Cloudflare: the default reqwest UA is blocked -> browser UA
     // (per the access-notes from the coordinator's comment on 82dbe51).
@@ -1507,7 +1507,7 @@ async fn live_multisig_send_transaction_generates_rootpn_voucher() {
         loop {
             let resp: serde_json::Value = be
                 .http
-                .post("https://shellnet.ackinacki.org/graphql")
+                .post("https://dd-shellnet.ackinacki.org/graphql")
                 .json(&json!({
                     "query": query,
                     "variables": {

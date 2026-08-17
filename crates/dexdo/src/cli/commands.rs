@@ -47,8 +47,8 @@ use dexdo::registry::{
 };
 #[cfg(feature = "shellnet")]
 use dexdo_core::params::{
-    DEFAULT_CONTRACTS_PATH, EXECUTABLE_READ_BACKOFF, POOL_LOCK_POLL_INTERVAL,
-    POOL_LOCK_TIMEOUT_SECS,
+    DEFAULT_CONTRACTS_PATH, DEFAULT_PN_POOL_PATH, EXECUTABLE_READ_BACKOFF,
+    POOL_LOCK_POLL_INTERVAL, POOL_LOCK_TIMEOUT_SECS,
 };
 #[cfg(feature = "shellnet")]
 use dexdo_core::shellnet::LiveBookOrder;
@@ -716,7 +716,7 @@ pub(crate) fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::
         return Some(path.to_path_buf());
     }
     if let Some(root) = crate::cli::data_dir::explicit() {
-        return Some(root.join("pn_pool.json"));
+        return Some(root.join(DEFAULT_PN_POOL_PATH));
     }
     match std::env::var_os("DEXDO_PN_POOL") {
         Some(raw) if !raw.is_empty() => Some(std::path::PathBuf::from(raw)),
@@ -1922,11 +1922,7 @@ pub(crate) fn deal_contracts_path(
                 (!h.contracts.trim().is_empty()).then(|| std::path::PathBuf::from(&h.contracts))
             })
         })
-        .unwrap_or_else(|| {
-            crate::cli::data_dir::explicit()
-                .map(|root| root.join(DEFAULT_CONTRACTS_PATH))
-                .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONTRACTS_PATH))
-        })
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONTRACTS_PATH))
 }
 
 #[cfg(feature = "shellnet")]
@@ -2123,13 +2119,12 @@ pub(crate) async fn shellnet_doctor_preflight_with_endpoint(
     let deployed = dexdo_core::Deployed::load(contracts)
         .with_context(|| format!("load --contracts {}", contracts.display()))?;
     let endpoint = manifest_preflight_endpoint(&deployed, endpoint)?;
-    let report = shellnet_doctor_report(
-        dexdo_core::params::DEFAULT_DOCTOR_NETWORK,
-        Some(&endpoint),
-        contracts,
-        market,
-    )
-    .await?;
+    // the network named here is the manifest's own, never a default constant. It is inert on
+    // this path -- `shellnet_doctor_report` only consults it when no endpoint was resolved, and one
+    // always is here -- but a preflight that reads mainnet while naming `shellnet` is the same
+    // wrong answer the report itself used to print.
+    let report =
+        shellnet_doctor_report(&deployed.network, Some(&endpoint), contracts, market).await?;
     if !report.is_ok() {
         bail!("{}", render_shellnet_doctor_report(&report));
     }

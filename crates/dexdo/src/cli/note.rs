@@ -294,6 +294,52 @@ pub(crate) fn unknown_note_getter_balance_maps(reason: impl Into<String>) -> Not
     }
 }
 
+/// The note's `_busy` latch as `PrivateNote.getDetails()` renders it: an `optional(address)` that is
+/// null while the note holds no latch and carries the counterparty's address while it does.
+/// `dex::ERR_NOTE_BUSY(121)` tells the operator to check what the note is busy with on
+/// `dexdo note balance`, and that command printed no such line -- a latched note rendered exactly
+/// like a free one, `status: Active` included. The latch is not a wait-and-retry state: the contract
+/// clears it only on the acknowledgement of the operation that set it, or when that message bounces
+/// (`contracts/dex/PrivateNote.sol`), so a missing line was not something the operator could sit out.
+/// `Unknown` is a third answer on purpose. `getDetails` not being readable, or answering without the
+/// field at all, is not evidence that the note is free, and rendering it as "not busy" would be the
+/// same defect one level down.
+#[derive(Debug, PartialEq)]
+pub(crate) enum NoteBusyLatch {
+    /// `getDetails` answered and the note holds no latch.
+    Free,
+    /// `getDetails` answered and the note is latched to this counterparty.
+    BusyWith(String),
+    /// The latch was not read, so neither answer may be reported.
+    Unknown(String),
+}
+
+/// Read the latch off the same `getDetails()` response the balance maps are read from -- no second
+/// chain read: `run_note_balance` calls `private_note_details` once and both parsers see that value.
+pub(crate) fn note_busy_latch(details: Option<&Value>) -> NoteBusyLatch {
+    let Some(details) = details else {
+        return NoteBusyLatch::Unknown("getDetails returned no data".to_string());
+    };
+    // Both spellings, to match `client.rs::field`, which is what `busy_with` reads this same field
+    // through when it builds the 121 error. The pinned decoder emits the ABI's camelCase and I have
+    // not observed the snake_case form on the wire; it is accepted so that the reader the operator is
+    // sent to and the reader that sends them cannot disagree about which spellings count.
+    match details
+        .get("busyAddress")
+        .or_else(|| details.get("busy_address"))
+    {
+        None => NoteBusyLatch::Unknown("busyAddress field unavailable".to_string()),
+        Some(Value::Null) => NoteBusyLatch::Free,
+        Some(Value::String(address)) if address.trim().is_empty() => {
+            // `optional(address)` decodes to null or to an address, never to "". An empty string is a
+            // decoding fault, and a fault is not evidence that the note is free.
+            NoteBusyLatch::Unknown("busyAddress decoded as an empty string".to_string())
+        }
+        Some(Value::String(address)) => NoteBusyLatch::BusyWith(address.trim().to_string()),
+        Some(_) => NoteBusyLatch::Unknown("busyAddress is not an address".to_string()),
+    }
+}
+
 pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     let mut out = String::new();
     let account = &view.account;
@@ -340,6 +386,34 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     );
     out
 }
+
+/// The `_busy` latch section of `dexdo note balance`, in the shape the getter sections above use: a
+/// titled line and one indented line that is always emitted, so no state is reported by silence.
+pub(crate) fn render_note_busy_latch(latch: &NoteBusyLatch) -> String {
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "PrivateNote.getDetails busyAddress (in-flight operation latch):"
+    )
+    .unwrap();
+    match latch {
+        NoteBusyLatch::Free => writeln!(&mut out, "  not busy").unwrap(),
+        // `_busy` holds a PMP, an order book, or the destination note of an outbound transfer -- all
+        // shared-DApp accounts, which is the address form `display` renders.
+        NoteBusyLatch::BusyWith(address) => writeln!(
+            &mut out,
+            "  busy with {}",
+            dexdo_core::address::display(address)
+        )
+        .unwrap(),
+        NoteBusyLatch::Unknown(reason) => writeln!(&mut out, "  unknown ({reason})").unwrap(),
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "note_busy_1391_tests.rs"]
+mod note_busy_1391_tests;
 
 impl NoteAccountSnapshot {
     fn ecc_value(&self, id: u32) -> u128 {
@@ -1997,7 +2071,7 @@ mod note_deploy_tests {
         let secret = fixture_secret_hex();
         let public = derive_owner_pubkey_from_secret_hex(&secret).expect("fixture key derives");
         OnboardPnState {
-            endpoint: "shellnet.ackinacki.org".into(),
+            endpoint: "dd-shellnet.ackinacki.org".into(),
             nominal: "N100".into(),
             token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
@@ -2380,7 +2454,7 @@ mod note_deploy_tests {
         let onboard_debug = format!("{onboard:?}");
         assert!(!onboard_debug.contains("onboard-secret-sentinel"));
         assert!(onboard_debug.contains("owner_secret_key_hex: \"<redacted>\""));
-        assert!(onboard_debug.contains("shellnet.ackinacki.org"));
+        assert!(onboard_debug.contains("dd-shellnet.ackinacki.org"));
 
         let proof = NoteDeployVoucherProof {
             proof: "public-proof".into(),
@@ -3471,7 +3545,7 @@ mod note_deploy_tests {
         let path = dir.join("pn_pool.json.recovery.json");
         let state = NoteDeployRecoveryState::new(
             recovery_request(
-                "https://shellnet.ackinacki.org",
+                "https://dd-shellnet.ackinacki.org",
                 &format!("0:{}", "a".repeat(64)),
             ),
             &derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap(),
@@ -3929,7 +4003,7 @@ mod note_deploy_tests {
             panic!("note recover command");
         };
         assert_eq!(args.recovery, recovery);
-        assert_eq!(args.pool, pool);
+        assert_eq!(args.pool.as_deref(), Some(pool));
     }
 
     /// A maximal run of hex digits at least `len` long: the shape a note owner secret has in a
@@ -4207,7 +4281,7 @@ mod pool_address_form_tests {
         let secret = secret_seed.repeat(32);
         let public = derive_owner_pubkey_from_secret_hex(&secret).expect("fixture key derives");
         OnboardPnState {
-            endpoint: "shellnet.ackinacki.org".into(),
+            endpoint: "dd-shellnet.ackinacki.org".into(),
             nominal: "N100".into(),
             token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,

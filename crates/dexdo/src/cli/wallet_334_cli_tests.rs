@@ -11,6 +11,7 @@ fn provider_of(cli: Cli) -> Option<&'static str> {
     };
     let bind = match wallet.command {
         WalletCommand::Onboard(bind) | WalletCommand::Rebind(bind) => bind,
+        WalletCommand::RemoveArchived(_) => return None,
     };
     bind.provider.as_ref().map(|provider| match provider {
         WalletProviderCommand::AckinackiWallet(_) => "ackinacki-wallet",

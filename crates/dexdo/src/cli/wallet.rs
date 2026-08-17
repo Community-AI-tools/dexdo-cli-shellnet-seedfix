@@ -14,7 +14,9 @@
 //! **A wallet-dependent command with no binding fails fast**, before any chain write, with
 //! [`dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED`] and a remediation naming the providers.
 
-use crate::cli::args::{WalletArgs, WalletCommand, WalletProviderCommand};
+use crate::cli::args::{
+    WalletArgs, WalletCommand, WalletProviderCommand, WalletRemoveArchivedArgs,
+};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -111,6 +113,16 @@ impl WalletNetwork {
         }
     }
 
+    /// The endpoint a wallet command reads through when `--endpoint` is not given. One table for
+    /// every wallet flow: onboarding proves a Hot through it and removal proves one empty through
+    /// it, and two tables are how the two answers start to differ.
+    pub(crate) const fn default_endpoint(self) -> &'static str {
+        match self {
+            Self::Shellnet => dexdo_core::params::WALLET_ONBOARD_SHELLNET_ENDPOINT,
+            Self::Mainnet => dexdo_core::params::WALLET_ONBOARD_MAINNET_ENDPOINT,
+        }
+    }
+
     /// The network a money command is running on, read from the `network` field of the deployed
     /// contracts manifest it was pointed at.
     /// This is the SAME field `note deploy` and `note topup` already read to key the funding-wallet
@@ -190,9 +202,16 @@ pub(crate) struct WalletBinding {
 
 /// The one entry point behind `dexdo wallet`.
 pub(crate) async fn run_wallet(args: WalletArgs) -> Result<()> {
+    if matches!(&args.command, WalletCommand::RemoveArchived(_)) {
+        let WalletCommand::RemoveArchived(remove) = args.command else {
+            unreachable!("matched remove-archived")
+        };
+        return run_remove_archived(remove).await;
+    }
     let (action, explicit) = match &args.command {
         WalletCommand::Onboard(onboard) => (WalletAction::Onboard, onboard.provider.as_ref()),
         WalletCommand::Rebind(rebind) => (WalletAction::Rebind, rebind.provider.as_ref()),
+        WalletCommand::RemoveArchived(_) => unreachable!("handled above"),
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -205,6 +224,189 @@ pub(crate) async fn run_wallet(args: WalletArgs) -> Result<()> {
         &mut stdout.lock(),
     )?;
     run_selected(action, provider, explicit).await
+}
+
+/// The endpoint every wallet command reads through: `--endpoint` when given, the network's default
+/// otherwise, and in BOTH cases normalized to a URL.
+/// A `--endpoint` given as a bare host is the form every other command on this CLI takes, and the
+/// form the acceptance suite passes everywhere. Connected unnormalized it posts to
+/// `dd-shellnet.ackinacki.org/graphql` with no scheme, and every read through it fails: removal is
+/// refused with "read every balance... nothing was removed" -- the very refusal an EMPTY Hot would
+/// get -- and onboarding spends its whole activation timeout on "the chain read failed; retrying",
+/// measured at 600 s on the stand. One function for all three so a flow cannot be added that
+/// connects raw.
+/// The gate is the caller's: `dexdo_core::normalize_endpoint` is re-exported only under `shellnet`,
+/// so a wider gate compiles this function in a build where the symbol it calls does not exist --
+/// `cargo check -p dexdo --tests` on default features stops at E0425.
+#[cfg(feature = "shellnet")]
+pub(crate) fn wallet_read_endpoint(
+    explicit: Option<&str>,
+    network: WalletNetwork,
+) -> Result<String> {
+    let raw = explicit.map_or_else(|| network.default_endpoint().to_string(), str::to_string);
+    // The refusal names `--endpoint` only when the operator passed it. Naming a flag that was never
+    // typed sends them looking for their own mistake in a value the CLI chose itself.
+    dexdo_core::normalize_endpoint(&raw).map_err(|error| {
+        if explicit.is_some() {
+            anyhow::anyhow!("--endpoint {raw}: {error}")
+        } else {
+            anyhow::anyhow!("default {network} balance endpoint {raw}: {error}")
+        }
+    })
+}
+
+/// Permanently forget one OLD binding after its Hot is proven empty by a read-only chain call.
+#[cfg(feature = "shellnet")]
+async fn run_remove_archived(args: WalletRemoveArchivedArgs) -> Result<()> {
+    let store = WalletStore::open()?;
+    let target = store.archived_binding(&args.binding_id)?;
+    // (rymkapro, 2026-08-17): this command deletes the ONLY local keys to a Hot, and it used
+    // to decide from two reads it did not own. The journal check and the balance check are two
+    // separate observations, and a money command running beside them fits entirely into the gap:
+    // 1. `note deploy`/`note topup` loads the active binding and its keys into memory;
+    // 2. a parallel rebind archives that binding;
+    // 3. `remove-archived` reads a journal that is still empty and a Hot that is still zero;
+    // 4. the money command writes `prepared` and sends its Vault -> Hot request;
+    // 5. `remove-archived` deletes the keys;
+    // 6. the confirmed request later credits a Hot nobody can spend from.
+    // The cure is the turn the spenders already take, not a second mechanism: the SAME lock, under
+    // the SAME key, held across BOTH observations and the deletion. `funding_wallet_lock_path`
+    // canonicalises the address before hashing, so the Hot recorded in the binding and the wallet a
+    // money command resolves hash to one lock file even when their spellings differ.
+    // The network keying that lock is the archived binding's own, recorded when it was written and
+    // never edited afterwards. It used to come from a deployed-contracts manifest the operator
+    // pointed at, checked here for equality with this same field: the check could only ever fail by
+    // the operator naming the wrong file, and it passed by restating what the binding already said.
+    // Everything that observes state still happens under the lock.
+    let _funding_lock = crate::cli::note_cmd::acquire_funding_wallet_lock(
+        target.binding.network.as_str(),
+        &target.binding.hot_address,
+    )?;
+    refuse_removal_while_funding_may_still_arrive(&target.binding)?;
+    let endpoint = wallet_read_endpoint(args.endpoint.as_deref(), target.binding.network)?;
+    let client = dexdo_core::ChainClient::connect(&endpoint)
+        .map_err(|error| anyhow::anyhow!("connect read-only balance endpoint {endpoint}: {error}"))?;
+    let removed =
+        remove_archived_binding_after_balance_check(&store, &target, &client).await?;
+    println!(
+        "removed archived wallet binding {} and its secrets directory after Hot {} on {} was \
+         proven to hold zero native and zero ECC balances",
+        removed.id, removed.hot_address, removed.network
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+async fn run_remove_archived(_args: WalletRemoveArchivedArgs) -> Result<()> {
+    bail!("wallet remove-archived unavailable: build with `--features shellnet`")
+}
+
+/// The money-safety boundary: no local removal is reachable before a successful all-zero read.
+#[cfg(any(feature = "shellnet", test))]
+async fn remove_archived_binding_after_balance_check<R>(
+    store: &WalletStore,
+    target: &store::ArchivedBinding,
+    reader: &R,
+) -> Result<WalletBinding>
+where
+    R: crate::cli::wallet_funding::HotBalanceReader,
+{
+    let hot = dexdo_core::CanonicalAddress::parse(&target.binding.hot_address).map_err(|error| {
+        anyhow::anyhow!(
+            "archived binding {} records unusable Hot address {:?}: {error}; nothing was removed",
+            target.binding.id,
+            target.binding.hot_address
+        )
+    })?;
+    let balances = reader.hot_balances(&hot).await.map_err(|error| {
+        anyhow::anyhow!(
+            "read every balance of archived binding {} Hot {}: {error}; nothing was removed",
+            target.binding.id,
+            target.binding.hot_address
+        )
+    })?;
+    let nonzero_ecc = balances
+        .balances
+        .iter()
+        .filter(|(_, balance)| **balance != 0)
+        .map(|(currency, balance)| format!("ECC[{currency}]={balance}"))
+        .collect::<Vec<_>>();
+    if balances.native != 0 || !nonzero_ecc.is_empty() {
+        bail!(
+            "archived binding {} Hot {} still holds native={} and {}; refusing permanent removal",
+            target.binding.id,
+            target.binding.hot_address,
+            balances.native,
+            if nonzero_ecc.is_empty() {
+                "no non-zero ECC balances".to_string()
+            } else {
+                nonzero_ecc.join(", ")
+            }
+        );
+    }
+    let removed = target.binding.clone();
+    store.remove_archived_binding(target)?;
+    Ok(removed)
+}
+
+/// Refuse permanent removal while the funding journal still records a generation that can move
+/// money INTO this archived Hot.
+/// The balance proof answers "how much is on that Hot now". This answers "can more still arrive
+/// there", and the two are different questions. A Vault -> Hot request the operator has not yet
+/// confirmed sits in the Vault's queue addressed at the OLD Hot; that Hot reads zero for as long as
+/// the request is unconfirmed. Removing the binding inside that window deletes the only local key
+/// to the account the money is on its way to, and confirming the request afterwards pays into an
+/// account nobody can spend from - which is the whole loss this command exists to prevent.
+/// Nothing new is recorded for this. The durable funding journal is already keyed by the same
+/// (network, Hot) pair the funding mechanism writes it under, and
+/// [`crate::cli::wallet_funding::FundingJournalRecord::generation_may_still_execute`] is the
+/// predicate that mechanism itself uses for "this generation may still move money". A generation
+/// carrying a finalized verdict - `expired`(it never left the Vault) or `satisfied` (closed
+/// against an observed balance, reachable only once every recorded queue id has a verdict) - is not
+/// one of those, so the removal goes through. This refuses the window it has to refuse and nothing
+/// wider: a Hot with no journal record has nothing pending and is removable as before.
+/// An unreadable or unknown-version journal is an error rather than a pass. That record may be the
+/// only local trace of a request that is already on chain, and `load_funding_journal` says so in
+/// its own words.
+#[cfg(feature = "shellnet")]
+fn refuse_removal_while_funding_may_still_arrive(binding: &WalletBinding) -> Result<()> {
+    use crate::cli::wallet_funding::{
+        funding_journal_path, load_funding_journal, FundingJournalRecord,
+    };
+
+    let hot = dexdo_core::CanonicalAddress::parse(&binding.hot_address).map_err(|error| {
+        anyhow::anyhow!(
+            "archived binding {} records unusable Hot address {:?}: {error}; nothing was removed",
+            binding.id,
+            binding.hot_address
+        )
+    })?;
+    // Exactly the key `fund_hot_for_money_command` writes under: the binding's own network label
+    // and the canonical round-trip of its Hot. A different rendering here would read a file that
+    // does not exist and report "nothing pending" about a request that is.
+    let hot_address = hot.to_string();
+    let network = binding.network.as_str();
+    let data_dir = crate::cli::data_dir::effective()?;
+    let Some(record) = load_funding_journal(&data_dir, network, &hot_address)?
+        .filter(FundingJournalRecord::generation_may_still_execute)
+    else {
+        return Ok(());
+    };
+    bail!(
+        "archived binding {} cannot be removed: its funding journal {} records generation {} in \
+         state {:?} for Hot {hot_address}, so that request may still move money into a Hot whose \
+         only local key this removal would destroy. {} Settle it from the Vault pending list, or \
+         let it expire, then re-run the money command that created it so the journal records the \
+         finalized verdict - after that this removal is allowed. Nothing was removed.",
+        binding.id,
+        funding_journal_path(&data_dir, network, &hot_address).display(),
+        record.generation,
+        record.state,
+        record.pending_transaction_id.as_deref().map_or_else(
+            || "No Vault queue transaction id was ever observed for it.".to_string(),
+            |pending| format!("Its Vault queue transaction is {pending}."),
+        ),
+    );
 }
 
 /// Pick the provider: the subcommand when one was given, the terminal menu when there is a terminal
@@ -666,7 +868,6 @@ async fn manual_flow(
             multisig_seed_file: args.multisig_seed_file.clone(),
             network: args.network,
             endpoint: args.endpoint.clone(),
-            contracts: args.contracts.clone(),
         },
         _ => crate::cli::args::WalletOnboardManualArgs {
             multisig_address: None,
@@ -674,7 +875,6 @@ async fn manual_flow(
             multisig_seed_file: None,
             network: crate::cli::args::WalletNetworkArg::Shellnet,
             endpoint: None,
-            contracts: std::path::PathBuf::from(dexdo_core::params::DEFAULT_CONTRACTS_PATH),
         },
     };
     crate::cli::wallet_manual::run_wallet_onboard_manual(args, draft.id()).await
@@ -723,15 +923,10 @@ async fn goshai_flow(
     let network = args
         .as_ref()
         .map_or(crate::cli::args::WalletNetworkArg::Shellnet, |a| a.network);
-    let contracts = args.as_ref().map_or_else(
-        || std::path::PathBuf::from(dexdo_core::params::DEFAULT_CONTRACTS_PATH),
-        |a| a.contracts.clone(),
-    );
     run_wallet_onboard_goshai(GoshAiOnboardOptions {
         network: WalletNetwork::from(network),
         binding_id: draft.id().to_string(),
         endpoint: args.as_ref().and_then(|a| a.endpoint.clone()),
-        contracts,
         activation_timeout: args
             .as_ref()
             .and_then(|a| a.activation_timeout)
@@ -774,3 +969,12 @@ mod binding_load_validation_tests;
 /// resolves -- and never spends -- a wallet bound on another.
 #[cfg(test)]
 mod per_network_binding_tests;
+
+/// re-audit item 8: permanent removal is all-zero-only and preserves every byte on refusal.
+#[cfg(test)]
+mod item8_removal_tests;
+
+/// The balance proof behind that removal is read from a URL, whatever form `--endpoint` arrived in.
+/// Gated with the code it covers: the function under test exists only under `shellnet`.
+#[cfg(all(test, feature = "shellnet"))]
+mod endpoint_tests;

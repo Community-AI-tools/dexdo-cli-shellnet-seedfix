@@ -80,6 +80,14 @@ pub(crate) struct WalletStore {
     root: PathBuf,
 }
 
+/// One uniquely resolved OLD archive record and the exact local state its removal targets.
+pub(crate) struct ArchivedBinding {
+    pub(super) path: PathBuf,
+    pub(super) bytes: Vec<u8>,
+    pub(super) binding: WalletBinding,
+    pub(super) secrets_dir: PathBuf,
+}
+
 impl WalletStore {
     /// The store under the effective instance data directory. `--data-dir` already redirects it;
     /// the operator never has to know the platform path.
@@ -124,6 +132,284 @@ impl WalletStore {
 
     pub(crate) fn archive_dir(&self) -> PathBuf {
         self.root.join("archive")
+    }
+
+    /// Resolve one archived id without changing local state.
+    /// Every archive record is parsed so duplicate copies of the same id cannot be missed. Any
+    /// unreadable entry makes the answer unknown and therefore refuses a destructive operation.
+    pub(crate) fn archived_binding(&self, id: &str) -> Result<ArchivedBinding> {
+        if !is_minted_binding_id(id) {
+            anyhow::bail!(
+                "archived binding id {id:?} is not an id this store mints ({BINDING_ID_LEN} \
+                 lowercase hex characters); nothing was removed"
+            );
+        }
+        self.ensure_not_active(id)?;
+
+        let entries = std::fs::read_dir(self.archive_dir()).map_err(|error| {
+            anyhow::anyhow!(
+                "read wallet archive {} while looking for binding {id}: {error}; nothing was \
+                 removed",
+                self.archive_dir().display()
+            )
+        })?;
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                anyhow::anyhow!(
+                    "read wallet archive entry for binding {id}: {error}; nothing was removed"
+                )
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                anyhow::anyhow!(
+                    "inspect wallet archive entry {}: {error}; nothing was removed",
+                    path.display()
+                )
+            })?;
+            if !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "wallet archive entry {} is not a regular file, so the archive is ambiguous; \
+                     nothing was removed",
+                    path.display()
+                );
+            }
+            let bytes = std::fs::read(&path).map_err(|error| {
+                anyhow::anyhow!(
+                    "read wallet archive entry {}: {error}; nothing was removed",
+                    path.display()
+                )
+            })?;
+            let binding: WalletBinding = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "parse wallet archive entry {}; the archive is ambiguous and nothing was removed",
+                    path.display()
+                )
+            })?;
+            if binding.version != BINDING_VERSION {
+                anyhow::bail!(
+                    "wallet archive entry {} is version {}, and this build reads version \
+                     {BINDING_VERSION}; nothing was removed",
+                    path.display(),
+                    binding.version
+                );
+            }
+            if binding.id == id {
+                matches.push((path, bytes, binding));
+            }
+        }
+        let [(path, bytes, binding)] = matches.as_slice() else {
+            anyhow::bail!(
+                "archived binding id {id} resolved to {} records; exactly one is required and \
+                 nothing was removed",
+                matches.len()
+            );
+        };
+        let secrets_dir = self.bindings_dir().join(id);
+        let metadata = std::fs::symlink_metadata(&secrets_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "inspect archived binding {id} secrets directory {}: {error}; nothing was removed",
+                secrets_dir.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            anyhow::bail!(
+                "archived binding {id} secrets path {} is not a real directory; nothing was removed",
+                secrets_dir.display()
+            );
+        }
+        Ok(ArchivedBinding {
+            path: path.clone(),
+            bytes: bytes.clone(),
+            binding: binding.clone(),
+            secrets_dir,
+        })
+    }
+
+    /// Delete exactly the archive record and per-binding directory resolved above.
+    /// Both the active-reference check and the archive bytes are repeated at the mutation boundary
+    /// so a local change between the chain read and deletion fails closed. Each target is first
+    /// renamed inside its parent. If moving the secrets fails, the archive rename is rolled back;
+    /// the recursive secrets deletion is not reachable while the live archive path still exists.
+    pub(crate) fn remove_archived_binding(&self, target: &ArchivedBinding) -> Result<()> {
+        self.remove_archived_binding_with_move(target, |source, destination| {
+            std::fs::rename(source, destination)
+        })
+    }
+
+    pub(super) fn remove_archived_binding_with_move<F>(
+        &self,
+        target: &ArchivedBinding,
+        move_secrets: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    {
+        self.ensure_not_active(&target.binding.id)?;
+        let current = self.archived_binding(&target.binding.id)?;
+        if current.path != target.path || current.bytes != target.bytes {
+            anyhow::bail!(
+                "archived binding {} changed while its Hot balance was being checked; nothing was \
+                 removed",
+                target.binding.id
+            );
+        }
+        let archive_tombstone = self
+            .archive_dir()
+            .join(format!(".remove-archived-{}.json", target.binding.id));
+        let secrets_tombstone = self
+            .bindings_dir()
+            .join(format!(".remove-archived-{}", target.binding.id));
+        for tombstone in [&archive_tombstone, &secrets_tombstone] {
+            match std::fs::symlink_metadata(tombstone) {
+                Ok(_) => anyhow::bail!(
+                    "permanent-removal staging path {} already exists; nothing was removed",
+                    tombstone.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => anyhow::bail!(
+                    "inspect permanent-removal staging path {}: {error}; nothing was removed",
+                    tombstone.display()
+                ),
+            }
+        }
+        std::fs::rename(&target.path, &archive_tombstone).map_err(|error| {
+            anyhow::anyhow!(
+                "stage archived binding {} record {} for removal: {error}; secrets were not touched",
+                target.binding.id,
+                target.path.display()
+            )
+        })?;
+        if let Err(move_error) = move_secrets(&target.secrets_dir, &secrets_tombstone) {
+            return match std::fs::rename(&archive_tombstone, &target.path) {
+                Ok(()) => Err(anyhow::anyhow!(
+                    "stage archived binding {} secrets directory {} for removal: {move_error}; \
+                     the archive record was restored and secrets were not touched",
+                    target.binding.id,
+                    target.secrets_dir.display()
+                )),
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "stage archived binding {} secrets directory {} for removal: {move_error}; \
+                     restoring its archive record from {} also failed: {rollback_error}; secrets \
+                     remain at their original path",
+                    target.binding.id,
+                    target.secrets_dir.display(),
+                    archive_tombstone.display()
+                )),
+            };
+        }
+        if let Err(remove_error) = std::fs::remove_file(&archive_tombstone) {
+            let secrets_rollback = std::fs::rename(&secrets_tombstone, &target.secrets_dir);
+            let archive_rollback = std::fs::rename(&archive_tombstone, &target.path);
+            anyhow::bail!(
+                "remove staged archived binding {} record {}: {remove_error}; rollback of secrets: \
+                 {}; rollback of archive: {}",
+                target.binding.id,
+                archive_tombstone.display(),
+                rollback_result(&secrets_rollback),
+                rollback_result(&archive_rollback)
+            );
+        }
+        std::fs::remove_dir_all(&secrets_tombstone).map_err(|error| {
+            anyhow::anyhow!(
+                "archived binding {} record was removed after its Hot was proven empty, but \
+                 cleanup of staged secrets directory {} was incomplete: {error}",
+                target.binding.id,
+                secrets_tombstone.display()
+            )
+        })
+    }
+
+    /// Refuse an archived-id deletion if any active/legacy record still names that id.
+    fn ensure_not_active(&self, id: &str) -> Result<()> {
+        let mut paths = vec![self.legacy_binding_path()];
+        match std::fs::read_dir(self.active_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    paths.push(
+                        entry
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "read active wallet binding directory while checking archived \
+                                     binding {id}: {error}; nothing was removed"
+                                )
+                            })?
+                            .path(),
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                anyhow::bail!(
+                    "read active wallet binding directory while checking archived binding {id}: \
+                     {error}; nothing was removed"
+                )
+            }
+        }
+        for path in paths {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    anyhow::bail!(
+                        "read active wallet binding {} while checking archived binding {id}: \
+                         {error}; nothing was removed",
+                        path.display()
+                    )
+                }
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "parse active wallet binding {} while checking archived binding {id}; nothing was removed",
+                    path.display()
+                )
+            })?;
+            if value.get("id").and_then(serde_json::Value::as_str) == Some(id) {
+                anyhow::bail!(
+                    "binding {id} is still referenced by active wallet record {}; active bindings \
+                     are never removed and nothing was changed",
+                    path.display()
+                );
+            }
+            for field in ["hot_key_file", "vault_key_file", "hot_seed_file"] {
+                let Some(reference) = value.get(field) else {
+                    continue;
+                };
+                if reference.is_null() {
+                    continue;
+                }
+                let reference = reference.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "active wallet binding {} has unusable {field}; whether it references \
+                         archived binding {id} is unknown, so nothing was removed",
+                        path.display()
+                    )
+                })?;
+                let reference = std::fs::canonicalize(reference).map_err(|error| {
+                    anyhow::anyhow!(
+                        "resolve active wallet binding {} {field} {reference:?}: {error}; whether \
+                         it references archived binding {id} is unknown, so nothing was removed",
+                        path.display()
+                    )
+                })?;
+                let secrets_dir =
+                    std::fs::canonicalize(self.bindings_dir().join(id)).map_err(|error| {
+                        anyhow::anyhow!(
+                            "resolve archived binding {id} secrets directory while checking active \
+                             references: {error}; nothing was removed"
+                        )
+                    })?;
+                if reference.starts_with(&secrets_dir) {
+                    anyhow::bail!(
+                        "binding {id} secrets directory is still referenced by active wallet \
+                         record {} field {field}; active binding secrets are never removed and \
+                         nothing was changed",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The active record as it is ON DISK: read, parsed and version-checked, with its id NOT
@@ -446,6 +732,13 @@ impl WalletStore {
         json.push(b'\n');
         crate::cli::note::write_private_atomic(&path, &json)?;
         Ok(path)
+    }
+}
+
+fn rollback_result(result: &std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => "restored".to_string(),
+        Err(error) => format!("failed ({error})"),
     }
 }
 

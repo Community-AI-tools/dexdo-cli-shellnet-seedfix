@@ -40,6 +40,14 @@ mod client_issue_1120_tests;
 #[path = "client_issue_1348_tests.rs"]
 mod client_issue_1348_tests;
 
+#[cfg(test)]
+#[path = "client_issue_1386_tests.rs"]
+mod client_issue_1386_tests;
+
+#[cfg(test)]
+#[path = "client_issue_1386_doctor_tests.rs"]
+mod client_issue_1386_doctor_tests;
+
 const MIN_PMP_INITIAL_STAKE: u128 = 10_000_000;
 /// Pinned `tvm_client` default signed-message lifetime(`message_expiration_timeout`).
 const SDK_MESSAGE_EXPIRY_SECS: u64 = 40;
@@ -637,6 +645,11 @@ fn seller_note_withdrawn_check(note: &Address, actual: Option<bool>) -> Shellnet
     }
 }
 
+/// these verdicts named `shellnet` on every network, and `doctor` prints one of them thirteen
+/// times over on a mainnet run. The pinned hashes are GENERATION pins -- one 4.0.35 build, matched
+/// on both chains -- so naming a network here asserted something the comparison never established,
+/// and on mainnet it was simply false. The chain the run is actually on is named once, by
+/// `endpoint_reachable_check` and the report header, both sourced from the deployment manifest.
 pub(super) fn code_hash_check(
     name: &str,
     address: Option<&Address>,
@@ -648,12 +661,12 @@ pub(super) fn code_hash_check(
     let (status, message) = match actual.as_deref() {
         Some(a) if a == expected => (
             ShellnetDoctorStatus::Pass,
-            "binary pin matches live shellnet".to_string(),
+            "binary pin matches the live chain".to_string(),
         ),
         Some(a) => (
             ShellnetDoctorStatus::Fail,
             format!(
-                "dexdo build is STALE vs live shellnet - binary pins {expected}, live is {a}; rebuild from dev HEAD"
+                "dexdo build is STALE vs the live chain - binary pins {expected}, live is {a}; rebuild from dev HEAD"
             ),
         ),
         None => (
@@ -1920,10 +1933,37 @@ pub struct Deployed {
     pub contract_hashes: BTreeMap<String, String>,
 }
 
+/// The deployed-contracts manifest compiled into this binary.
+/// The default `--contracts` value is a RELATIVE path, so on its own it resolves against whatever
+/// directory the operator happens to stand in, and there is nowhere stable for it to point: the
+/// published installer copies the executable alone into `~/.local/bin` (`release/public/install.sh`
+/// extracts the archive to a temporary directory and installs only `dexdo`), so an installed
+/// machine has no `contracts/deployed.shellnet.json` anywhere -- not next to the binary, not in the
+/// data directory. The manifest is versioned in this repository and packaged into the same release
+/// archive as the binary, so the honest built-in default is the same bytes, carried inside the
+/// executable.
+pub const EMBEDDED_DEPLOYED_SHELLNET_MANIFEST: &str =
+    include_str!("../../../../contracts/deployed.shellnet.json");
+
 impl Deployed {
     /// Read the manifest from a file(`contracts/deployed.shellnet.json`).
+    /// A path that names a file is read from that file, always: `--contracts PATH` stays exact and
+    /// an explicit path that cannot be read is still an error. Only the built-in default -- the
+    /// relative `contracts/deployed.shellnet.json` nobody asked for -- falls back to
+    /// [`EMBEDDED_DEPLOYED_SHELLNET_MANIFEST`] when no such file exists here, which is what makes
+    /// the command work from a directory other than a repository checkout.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path.as_ref())?;
+        let path = path.as_ref();
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && path == Path::new(crate::params::DEFAULT_CONTRACTS_PATH) =>
+            {
+                return Ok(serde_json::from_str(EMBEDDED_DEPLOYED_SHELLNET_MANIFEST)?);
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -2094,9 +2134,20 @@ fn connect_client_from_manifest_with<T>(
     endpoint_override: Option<&str>,
     connect: impl FnOnce(&str, AiRegistryConfig) -> anyhow::Result<T>,
 ) -> anyhow::Result<(Deployed, T)> {
+    let manifest_path = manifest_path.as_ref();
     let deployed = Deployed::load(manifest_path)?;
     let config = ai_registry_config_from_manifest(&deployed)?;
     let endpoint = resolve_endpoint(endpoint_override, &deployed)?;
+    // the declared `network` is only a string until it is checked against the chain actually
+    // being dialled. This is the one place both are known -- every `RealChainBackend::connect*` goes
+    // through here -- and it is ahead of the connector, so a contradiction costs no chain traffic and
+    // no spending path ever sees a label it could not prove.
+    crate::params::verify_declared_network_matches_endpoint(
+        &deployed.network,
+        &endpoint,
+        &manifest_path.display().to_string(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let client = connect(&endpoint, config)?;
     Ok((deployed, client))
 }
@@ -4565,6 +4616,245 @@ pub async fn read_multisig_queue_history(
     .await
 }
 
+/// The transaction that emitted one ext-out message, and every message that transaction produced.
+/// `out_msgs` is a list of message ids. The richer `out_messages { id dst }` projection is NOT
+/// reachable: the dexdo read surface rejects it, so each sibling's destination is resolved by its
+/// own exact-hash lookup below.
+const SOURCE_TRANSACTION_OUT_MESSAGES_QUERY: &str = r#"
+    query($hash: String!) {
+      blockchain {
+        message(hash: $hash) {
+          id
+          src_transaction { id out_msgs }
+        }
+      }
+    }
+"#;
+
+/// One message's destination, by exact hash.
+const MESSAGE_DESTINATION_QUERY: &str = r#"
+    query($hash: String!) {
+      blockchain {
+        message(hash: $hash) { id dst }
+      }
+    }
+"#;
+
+/// The ids of every message emitted by the transaction that emitted `expected_message_id`.
+/// `None` means the anchor itself is not readable yet - the message is unknown to the index, or its
+/// emitting transaction is not attached to it. That is absence of evidence, never evidence that the
+/// transaction produced nothing.
+pub fn parse_source_transaction_out_messages(
+    response: &Value,
+    expected_message_id: &str,
+) -> Result<Option<Vec<String>>> {
+    let message = response
+        .pointer("/data/blockchain/message")
+        .ok_or_else(|| anyhow!("multisig delivery anchor GraphQL response shape changed"))?;
+    if message.is_null() {
+        return Ok(None);
+    }
+    let observed = message["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("multisig delivery anchor message has no id"))?;
+    if bare_hex(observed) != bare_hex(expected_message_id) {
+        return Err(anyhow!(
+            "multisig delivery anchor exact-hash lookup returned mismatched message id"
+        ));
+    }
+    let transaction = &message["src_transaction"];
+    if transaction.is_null() {
+        return Ok(None);
+    }
+    let out_messages = transaction["out_msgs"].as_array().ok_or_else(|| {
+        anyhow!("multisig delivery anchor source transaction has no out_msgs")
+    })?;
+    out_messages
+        .iter()
+        .map(|id| {
+            let id = id.as_str().filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+                anyhow!("multisig delivery anchor source transaction has a malformed out_msg id")
+            })?;
+            Ok(id.to_string())
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// One message's destination account, by exact hash. `None` when the index does not know it.
+pub fn parse_message_destination(
+    response: &Value,
+    expected_message_id: &str,
+) -> Result<Option<String>> {
+    let message = response
+        .pointer("/data/blockchain/message")
+        .ok_or_else(|| anyhow!("multisig delivery sibling GraphQL response shape changed"))?;
+    if message.is_null() {
+        return Ok(None);
+    }
+    let observed = message["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("multisig delivery sibling message has no id"))?;
+    if bare_hex(observed) != bare_hex(expected_message_id) {
+        return Err(anyhow!(
+            "multisig delivery sibling exact-hash lookup returned mismatched message id"
+        ));
+    }
+    match message["dst"].as_str() {
+        Some(destination) if !destination.trim().is_empty() => Ok(Some(destination.to_string())),
+        _ => Ok(None),
+    }
+}
+
+/// Which of an emitting transaction's sibling messages carried the transfer to `destination`.
+/// Exactly one, or nothing. Two siblings to the same destination in one transaction do not identify
+/// a delivery, and neither does none.
+pub fn sole_delivery_sibling(
+    siblings: &[(String, Option<String>)],
+    anchor_message_id: &str,
+    destination_account_id: &str,
+) -> Option<String> {
+    let expected = bare_hex(destination_account_id);
+    let mut matched = siblings.iter().filter(|(id, destination)| {
+        bare_hex(id) != bare_hex(anchor_message_id)
+            && destination
+                .as_deref()
+                .is_some_and(|destination| bare_hex(destination) == expected)
+    });
+    let first = matched.next()?;
+    match matched.next() {
+        Some(_) => None,
+        None => Some(first.0.clone()),
+    }
+}
+
+/// The internal message that carried an EXECUTED multisig queue transfer to its destination, proven
+/// by the destination's own finalized receipt.
+/// # Why the event's own message id is not that proof
+/// `TransactionSent` is an ext-out EVENT message. The wallet emits it on a hardcoded event channel,
+/// so the event message's own `dst` is that channel and never the transfer's destination. What binds
+/// the two is that the queued path performs `txn.dest.transfer(...)` and then
+/// `emit TransactionSent(...)` inside ONE Vault transaction: the transfer and the event are two
+/// out-messages of the same transaction. So the event is an anchor to that transaction, and the
+/// delivery is the sibling out-message addressed to the destination.
+/// # What `None` means
+/// Not "no delivery". It means this client cannot yet name the delivery from chain fact: the anchor
+/// is not indexed, its transaction is not attached, no sibling is addressed to the destination, more
+/// than one is, or the destination's receipt is not finalized. A caller must treat every one of
+/// those as unknown. An aggregated balance that grew by the expected amount can establish that funds
+/// are sufficient to spend; it can never establish that THIS transfer is what delivered them,
+/// because an unrelated incoming transfer produces exactly the same growth.
+pub async fn prove_multisig_delivery_message(
+    http: &reqwest::Client,
+    endpoint: &str,
+    sent_event_message_id: &str,
+    destination_account_id: &str,
+    destination_dapp_id: &str,
+) -> Result<Option<String>> {
+    let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+    let anchor = post_message_query(
+        http,
+        &gql,
+        SOURCE_TRANSACTION_OUT_MESSAGES_QUERY,
+        sent_event_message_id,
+        "multisig delivery anchor",
+    )
+    .await?;
+    let Some(out_messages) =
+        parse_source_transaction_out_messages(&anchor, sent_event_message_id)?
+    else {
+        return Ok(None);
+    };
+
+    let mut siblings = Vec::with_capacity(out_messages.len());
+    for id in out_messages {
+        if bare_hex(&id) == bare_hex(sent_event_message_id) {
+            siblings.push((id, None));
+            continue;
+        }
+        let response = post_message_query(
+            http,
+            &gql,
+            MESSAGE_DESTINATION_QUERY,
+            &id,
+            "multisig delivery sibling",
+        )
+        .await?;
+        let destination = parse_message_destination(&response, &id)?;
+        siblings.push((id, destination));
+    }
+    let Some(delivery) = sole_delivery_sibling(
+        &siblings,
+        sent_event_message_id,
+        destination_account_id,
+    ) else {
+        return Ok(None);
+    };
+
+    // The exact-hash destination receipt reader this client already has, and the only one: it binds
+    // the message to a FINALIZED destination transaction at the expected account and DApp, and
+    // refuses a receipt whose destination, transaction account or DApp is anything else.
+    let response = query_exact_destination_receipt(
+        http,
+        endpoint,
+        destination_account_id,
+        destination_dapp_id,
+        &delivery,
+    )
+    .await?;
+    if let Some(errors) = response.get("errors") {
+        return Err(anyhow!(
+            "multisig delivery receipt GraphQL errors for message {delivery}: {errors}"
+        ));
+    }
+    let receipt = parse_exact_destination_receipt(
+        &response,
+        destination_account_id,
+        destination_dapp_id,
+        &delivery,
+    )
+    .map_err(|error| {
+        error.context(format!(
+            "prove the multisig delivery {delivery} landed on {destination_account_id}"
+        ))
+    })?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    // An aborted destination transaction delivered nothing. Reported as unproven rather than as an
+    // error: the caller's only safe response to both is the same, and a bounced transfer is a fact
+    // about this chain rather than about this client.
+    if receipt.aborted != Some(false) {
+        return Ok(None);
+    }
+    Ok(Some(delivery))
+}
+
+async fn post_message_query(
+    http: &reqwest::Client,
+    gql: &str,
+    query: &'static str,
+    message_id: &str,
+    what: &str,
+) -> Result<Value> {
+    let response = http
+        .post(gql)
+        .json(&json!({
+            "query": query,
+            "variables": { "hash": bare_hex(message_id) },
+        }))
+        .send()
+        .await?;
+    let response: Value = shellnet_response_for_status(response)
+        .await?
+        .json()
+        .await?;
+    if let Some(errors) = response.get("errors") {
+        return Err(anyhow!("{what} GraphQL errors for {message_id}: {errors}"));
+    }
+    Ok(response)
+}
+
 /// The chain's own clock, in unix seconds.
 /// Exposed because an expiry verdict has to be taken against chain time. A local clock is not chain
 /// evidence: a machine whose clock runs fast would conclude that a request it can still confirm has
@@ -5792,12 +6082,22 @@ impl RealChainBackend {
         })
     }
 
+    /// The endpoint-reachability line `doctor` prints, split out so it can be read without a chain.
+    /// this line said `shellnet endpoint` on every network, so a mainnet run reported a chain
+    /// it had never dialled. `doctor` is what an operator runs to answer "am I where I think I am",
+    /// and on mainnet a wrong answer to that precedes spending real money. The name is taken from
+    /// the manifest this client was built from -- the same value the report header carries -- so it
+    /// cannot disagree with the endpoint the connect-time cross-check already proved.
+    fn endpoint_reachable_check(&self) -> ShellnetDoctorCheck {
+        pass_check(&format!("{} endpoint", self.network()), "reachable")
+    }
+
     /// Read-only shellnet readiness report: compare this binary's embedded/pinned contract images against
     /// live shellnet and, when supplied, verify that a market manifest still points at active IOB/TC accounts.
     pub async fn doctor(&self, market: Option<&MarketManifest>) -> Result<ShellnetDoctorReport> {
         let mut checks = Vec::new();
         self.liveness().await?;
-        checks.push(pass_check("shellnet endpoint", "reachable"));
+        checks.push(self.endpoint_reachable_check());
         checks.push(clock_skew_check(
             local_unix_secs()?,
             retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
@@ -8683,7 +8983,7 @@ impl RealChainBackend {
         dest_wallet: &Address,
         destination_dapp_id: &str,
     ) -> Value {
-        let dapp_id = format!("0x{}", destination_dapp_id.trim_start_matches("0x"));
+        let dapp_id = crate::address::to_dapp_id_param(destination_dapp_id);
         withdraw_note_tokens_payload(dest_wallet, &dapp_id)
     }
 
@@ -12933,8 +13233,8 @@ mod tests {
         assert_eq!(
             endpoint_urls(&endpoint).unwrap(),
             (
-                "https://shellnet.ackinacki.org/graphql".into(),
-                "https://shellnet.ackinacki.org/v2/account".into(),
+                "https://dd-shellnet.ackinacki.org/graphql".into(),
+                "https://dd-shellnet.ackinacki.org/v2/account".into(),
             )
         );
     }

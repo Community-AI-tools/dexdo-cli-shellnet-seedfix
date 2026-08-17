@@ -29,7 +29,13 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dexdo-wallet-onboarding = { path = "wallet-onboarding", optional = true }
+# `svg`(PR1362): the opt-in `--qr-file` export of the same invitation QR.
 qrcode = { version = "0.14", default-features = false, features = ["svg"], optional = true }
+# QR-as-image(terminal graphics): base64 feeds the kitty/iTerm2 escape payloads (already in the
+# shellnet graph via dexdo-core), png encodes the iTerm2 inline image. Both stay out of the default
+# (mock) build; the unicode fallback needs neither.
+base64 = { version = "0.22", optional = true }
+png = { version = "0.17", optional = true }
 # Gosh.ai onboarding: the pasted Hot address + recovery phrase are read through ONE non-echoing
 # terminal input. Neither std nor any crate already in this graph can disable terminal echo, and a
 # hand-rolled termios/console toggle on a secret path is exactly the wrong place to be original --
@@ -71,6 +77,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    # QR terminal-graphics probe: raw console mode + VT input for the DA1/kitty capability query.
+    "Win32_System_Console",
     "Win32_System_SystemServices",
     "Win32_System_WindowsProgramming",
 ] }
@@ -83,6 +91,8 @@ shellnet = [
     "dexdo-core/shellnet",
     "dep:dexdo-wallet-onboarding",
     "dep:qrcode",
+    "dep:base64",
+    "dep:png",
     "dep:rpassword",
     "dep:tvm_client",
 ]
@@ -93,5 +103,9 @@ test-giver = ["shellnet", "dexdo-core/test-giver"]
 [dev-dependencies]
 # invariant property tests for routing/frame.
 proptest.workspace = true
+# qr_display's pure halves compile under `any(shellnet, test)`(the wallet_manual pattern), so the
+# default-features test build needs the encoder crates the shellnet build gets optionally.
+base64 = "0.22"
+png = "0.17"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

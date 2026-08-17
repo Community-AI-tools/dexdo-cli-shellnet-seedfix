@@ -48,7 +48,7 @@ fn the_wallet_fail_fast_classifies_as_its_own_code_and_never_as_internal() {
             "{operation}: an unbound wallet is a configuration state, not a client fault: {error:#}"
         );
         assert_eq!(code.as_str(), WALLET_NOT_CONFIGURED_CODE);
-        assert_eq!(code.as_str(), "WALLET_NOT_CONFIGURED");
+        assert_eq!(code.as_str(), "wallet_not_configured");
         assert_ne!(code, ErrorCode::Internal, "{operation}");
         assert_ne!(code.as_str(), "INTERNAL", "{operation}");
     }
@@ -70,7 +70,7 @@ fn the_emitted_envelope_names_the_code_and_the_remediation() {
             serde_json::from_str(&rendered).expect("the envelope is json");
 
         assert_eq!(value["schema"], ERROR_SCHEMA, "{operation}");
-        assert_eq!(value["code"], "WALLET_NOT_CONFIGURED", "{operation}");
+        assert_eq!(value["code"], "wallet_not_configured", "{operation}");
         assert_ne!(value["code"], "INTERNAL", "{operation}");
         assert_eq!(
             value["retryable"], false,
@@ -79,19 +79,11 @@ fn the_emitted_envelope_names_the_code_and_the_remediation() {
 
         let message = value["message"].as_str().expect("a message");
         assert_ne!(message, "internal invariant failed", "{operation}");
-        assert!(
-            message.contains("dexdo wallet onboard"),
-            "{operation}: the remediation must be on `message`, not only in `cause`: {message}"
+        assert_eq!(
+            message,
+            "wallet is not configured; run `dexdo wallet onboard gosh-ai` first",
+            "{operation}: the remediation must be directly executable"
         );
-        // Every provider by name rather than a placeholder: the operator has to type one of them,
-        // and `no_command_line_in_these_sources_is_rejected_by_the_parser` forbids printing a
-        // command line the shipped parser cannot run, which an unquoted placeholder would be.
-        for provider in ["ackinacki-wallet", "gosh-ai", "manual"] {
-            assert!(
-                message.contains(provider),
-                "{operation}: the remediation must name `{provider}`: {message}"
-            );
-        }
 
         let cause = value["cause"].as_str().expect("a cause");
         assert!(
@@ -112,7 +104,7 @@ fn the_emitted_envelope_names_the_code_and_the_remediation() {
 /// The fix is a TYPED match on one code, so it must not have moved anything else onto it.
 /// The two neighbours in the same downcast block, a chain error and the fall-through that legitimately
 /// stays `INTERNAL` are all checked here: if the new arm had been placed so that it swallowed them,
-/// or written as another text rule, one of these would come back `WALLET_NOT_CONFIGURED`.
+/// or written as another text rule, one of these would come back `wallet_not_configured`.
 #[test]
 fn no_other_error_was_moved_onto_the_wallet_code() {
     let unreachable = anyhow::Error::new(

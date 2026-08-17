@@ -539,7 +539,7 @@ mod tests {
         let wallet = format!("0:{}", "a".repeat(64));
         let state = note::NoteDeployRecoveryState::new(
             note::NoteDeployRecoveryRequest {
-                endpoint: "https://shellnet.ackinacki.org",
+                endpoint: "https://dd-shellnet.ackinacki.org",
                 nominal: "N100",
                 token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,

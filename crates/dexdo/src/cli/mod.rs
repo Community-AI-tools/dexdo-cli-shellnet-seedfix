@@ -32,6 +32,11 @@ pub(crate) mod orders;
 pub(crate) mod policy;
 // shared provenance vocabulary for chain-backed book views and indexer depth.
 pub(crate) mod provenance;
+// QR-as-image: the probe-reply parsing, the protocol decision and the encoders are pure and
+// compile under every test build(the `wallet_manual` pattern); the terminal I/O and the `qrcode`
+// entry point sit behind `shellnet` inside the module, next to its only callers.
+#[cfg(any(feature = "shellnet", test))]
+pub(crate) mod qr_display;
 pub(crate) mod recover;
 pub(crate) mod reports;
 pub(crate) mod seller;
@@ -45,6 +50,12 @@ pub(crate) mod wallet;
 // module exists there and under test - the same boundary `note` uses.
 #[cfg(any(feature = "shellnet", test))]
 pub(crate) mod wallet_funding;
+// re-audit items 4 and 8: how the funding wait treats a read that got no answer, and what its
+// failure hands a machine consumer. Declared beside the two modules it drives - `wallet_funding`
+// and `machine` - rather than inside either, so reverting one of them leaves the regression
+// compiled and failing instead of silently uncollected.
+#[cfg(test)]
+mod wallet_funding_wait_failures_334;
 // Gosh.ai onboarding, reached from `wallet onboard gosh-ai` through `wallet::provider_flow`.
 // The `allow(dead_code)` that used to sit here is gone with the wiring it was waiting for.
 #[cfg(any(feature = "shellnet", test))]
@@ -59,6 +70,20 @@ pub(crate) mod wallet_goshai;
 #[allow(dead_code)]
 #[cfg(any(feature = "shellnet", test))]
 pub(crate) mod wallet_manual;
+// (rymkapro, 2026-08-17): `wallet remove-archived` deletes the only local keys to a Hot, so it
+// must hold the funding wallet's turn across BOTH observations the deletion rests on. Declared here
+// rather than inside `wallet`, because it pins a property shared by `wallet` and `note_cmd` - the
+// lock's key - and a regression living in one of them would go uncollected the moment that module
+// was reverted.
+#[cfg(test)]
+mod wallet_remove_archived_lock_334;
+// the gas floor a funding wallet's own outgoing messages need, and the rule that the client
+// states it before it commits a spend. Declared here rather than inside one of the modules it pins
+// because it pins THREE - `wallet_funding`'s floor, `accumulator`'s sell and `note_cmd`'s top-up
+// preflight - and a regression living in any one of them would be uncollected the moment that
+// module was reverted.
+#[cfg(test)]
+mod wallet_gas_floor_1392;
 // (PR715): the authenticated bee-session onboarding the `ackinacki-wallet` provider runs.
 pub(crate) mod wallet_onboarding;
 #[cfg(windows)]

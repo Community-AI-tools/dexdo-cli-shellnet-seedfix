@@ -265,10 +265,10 @@ pub(crate) struct SellerArgs {
     /// selected, otherwise to `models.json` in the working directory.
     #[arg(long, default_value = DEFAULT_MODELS_PATH)]
     pub(crate) models: PathBuf,
-    /// **Real shellnet:** manifest of the deployed contracts(SuperRoot/DappConfig addresses). The release
-    /// places it next to the binary; default -- `<data-dir>/contracts/deployed.shellnet.json` when selected,
-    /// otherwise the same relative path in the working directory. The exact seller bond `2P` is posted by the
-    /// note itself -- no operator wallet.
+    /// **Real shellnet:** application/distribution manifest of the deployed contracts
+    /// (SuperRoot/DappConfig addresses). Default: `contracts/deployed.shellnet.json`, independent
+    /// of `--data-dir`; an explicit `--contracts` remains exact. The exact seller bond `2P` is
+    /// posted by the note itself -- no operator wallet.
     #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
     /// Persistent failure policy JSON. Defaults to `<data-dir>/policy.json` when selected, otherwise
@@ -1278,6 +1278,19 @@ pub(crate) enum WalletCommand {
     /// Replace the active binding with one from an explicit provider. The binding it replaces is
     /// ARCHIVED, never deleted -- funds can still sit in the old Hot.
     Rebind(WalletBindArgs),
+    /// Permanently remove one OLD archived binding and its per-binding secrets directory, but only
+    /// after read-only chain balances prove that Hot holds zero native and zero of every ECC.
+    RemoveArchived(WalletRemoveArchivedArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct WalletRemoveArchivedArgs {
+    /// Exact id recorded by the archived binding. Active bindings are always refused.
+    #[arg(long, value_name = "ID")]
+    pub(crate) binding_id: String,
+    /// Read-only chain endpoint used to prove the old Hot is empty.
+    #[arg(long)]
+    pub(crate) endpoint: Option<String>,
 }
 
 /// The provider is a SUBCOMMAND, not a flag, and it has no default.
@@ -1333,9 +1346,6 @@ pub(crate) struct WalletOnboardManualArgs {
     /// Chain endpoint used for the verification reads. Defaults from the selected network.
     #[arg(long)]
     pub(crate) endpoint: Option<String>,
-    /// Deployed contracts manifest the verification reads connect through.
-    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
-    pub(crate) contracts: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1353,11 +1363,12 @@ impl WalletNetworkArg {
         }
     }
 
-    pub(crate) const fn default_endpoint(self) -> &'static str {
-        match self {
-            Self::Shellnet => dexdo_core::params::WALLET_ONBOARD_SHELLNET_ENDPOINT,
-            Self::Mainnet => dexdo_core::params::WALLET_ONBOARD_MAINNET_ENDPOINT,
-        }
+    /// The default endpoint of the selected network. One table for every wallet flow, kept in
+    /// [`crate::cli::wallet::WalletNetwork`]: this enum is the command-line spelling of that one,
+    /// and a second table here is how the flag and the binding start answering differently.
+    #[cfg(any(feature = "shellnet", test))]
+    pub(crate) fn default_endpoint(self) -> &'static str {
+        crate::cli::wallet::WalletNetwork::from(self).default_endpoint()
     }
 }
 
@@ -1376,9 +1387,6 @@ pub(crate) struct WalletGoshAiArgs {
     /// Block Manager endpoint. Defaults from the selected network.
     #[arg(long)]
     pub(crate) endpoint: Option<String>,
-    /// Deployed-contracts manifest.
-    #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
-    pub(crate) contracts: PathBuf,
     /// How long to wait for the Hot to appear and go Active, e.g. `20m`. The specification fixes the
     /// default at ten minutes and makes this the only way to change it.
     #[arg(long, value_parser = crate::cli::args::parse_activation_timeout)]
@@ -1662,15 +1670,16 @@ pub(crate) struct NoteDeployArgs {
     /// Emit one machine-readable JSON result on stdout.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Deployed multisig WALLET address that funds the note(no giver). Omit it to spend from the
-    /// active wallet binding; passing it still wins and is used exactly as given.
-    #[arg(long, requires = "deploy_funding_key")]
+    /// Deployed multisig WALLET address that funds the note(no giver). Env fallback:
+    /// DEXDO_MULTISIG_ADDRESS. Omit both to spend from the active wallet binding; passing
+    /// the flag still wins and is used exactly as given.
+    #[arg(long)]
     pub(crate) multisig_address: Option<String>,
-    /// File with the multisig wallet's 32-byte secret hex(the funding key); the secret is never logged.
+    /// File with the multisig wallet's 32-byte secret hex(the funding key). Env fallback:
+    /// DEXDO_MULTISIG_KEY. The secret is never logged.
     #[arg(
         long,
         value_name = "PATH",
-        requires = "multisig_address",
         conflicts_with = "multisig_seed_file"
     )]
     pub(crate) multisig_key: Option<PathBuf>,
@@ -1678,7 +1687,6 @@ pub(crate) struct NoteDeployArgs {
     #[arg(
         long,
         value_name = "PATH",
-        requires = "multisig_address",
         conflicts_with = "multisig_key"
     )]
     pub(crate) multisig_seed_file: Option<PathBuf>,
@@ -1700,9 +1708,10 @@ pub(crate) struct NoteDeployArgs {
     /// Deployed shellnet contracts manifest used for the pre-spend generation check.
     #[arg(long, default_value = DEFAULT_CONTRACTS_PATH)]
     pub(crate) contracts: PathBuf,
-    /// The `DEXDO_PN_POOL` JSON to append the deployed note to(created if absent).
-    #[arg(long)]
-    pub(crate) pool: PathBuf,
+    /// The `DEXDO_PN_POOL` JSON to append the deployed note to(created if absent). Defaults to the
+    /// canonical per-instance pool under the effective `--data-dir`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) pool: Option<PathBuf>,
     /// Crash-safe deploy recovery state. Defaults to `<pool>.recovery.json`; carries the note owner secret.
     #[arg(long, value_name = "PATH")]
     pub(crate) recovery: Option<PathBuf>,
@@ -1738,9 +1747,51 @@ pub(crate) struct NoteRecoverArgs {
     /// Crash-safe recovery state written by `dexdo note deploy`.
     #[arg(long, value_name = "PATH")]
     pub(crate) recovery: PathBuf,
-    /// The `DEXDO_PN_POOL` JSON to append the recovered note to(created if absent).
-    #[arg(long)]
-    pub(crate) pool: PathBuf,
+    /// The `DEXDO_PN_POOL` JSON to append the recovered note to(created if absent). Defaults to the
+    /// canonical per-instance pool under the effective `--data-dir`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) pool: Option<PathBuf>,
+}
+
+pub(crate) const DEXDO_MULTISIG_ADDRESS_ENV: &str = "DEXDO_MULTISIG_ADDRESS";
+pub(crate) const DEXDO_MULTISIG_KEY_ENV: &str = "DEXDO_MULTISIG_KEY";
+
+impl NoteDeployArgs {
+    /// Apply the established explicit-first/env-fallback convention without enabling clap's env
+    /// feature. The two environment variables are one BYO-Hot pair; a seed-file flag remains an
+    /// explicit alternative and therefore suppresses the key fallback.
+    pub(crate) fn apply_multisig_env_fallbacks(&mut self) -> Result<()> {
+        if self.multisig_address.is_none() {
+            self.multisig_address = match std::env::var_os(DEXDO_MULTISIG_ADDRESS_ENV) {
+                Some(raw) if !raw.is_empty() => Some(raw.into_string().map_err(|_| {
+                    anyhow::anyhow!("{DEXDO_MULTISIG_ADDRESS_ENV} is not valid UTF-8")
+                })?),
+                _ => None,
+            };
+        }
+        if self.multisig_key.is_none() && self.multisig_seed_file.is_none() {
+            self.multisig_key = std::env::var_os(DEXDO_MULTISIG_KEY_ENV)
+                .filter(|raw| !raw.is_empty())
+                .map(PathBuf::from);
+        }
+
+        self.validate_multisig_pair()
+    }
+
+    pub(crate) fn validate_multisig_pair(&self) -> Result<()> {
+        let has_address = self.multisig_address.is_some();
+        let has_secret = self.multisig_key.is_some() || self.multisig_seed_file.is_some();
+        match (has_address, has_secret) {
+            (true, false) => bail!(
+                "a BYO Hot address requires --multisig-key/--multisig-seed-file or \
+                 {DEXDO_MULTISIG_KEY_ENV}"
+            ),
+            (false, true) => bail!(
+                "a BYO Hot key requires --multisig-address or {DEXDO_MULTISIG_ADDRESS_ENV}"
+            ),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Oracle/OracleEventList/PMP discovery and reads, plus the existing range-market lifecycle.

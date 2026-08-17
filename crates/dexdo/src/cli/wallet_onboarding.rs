@@ -16,7 +16,7 @@ mod shellnet {
     use dexdo_wallet_onboarding::{
         AgentWalletsResponse, CanonicalBeeSessionIo, OnboardingSession, SessionLimits,
     };
-    use qrcode::render::{svg, unicode};
+    use qrcode::render::svg;
     use qrcode::QrCode;
     use serde_json::Value;
     use zeroize::Zeroizing;
@@ -50,7 +50,7 @@ mod shellnet {
     /// bee `ClientContext`, the `AuthProfile` write, the `ConnectClient` poll, the chain read and
     /// the durable state all receive.
     /// Normalise ONCE, here, and let every later use take this value.
-    /// The defaults are bare hosts(`shellnet.ackinacki.org`). Reads survive that, but the WRITE
+    /// The defaults are bare hosts(`dd-shellnet.ackinacki.org`). Reads survive that, but the WRITE
     /// that publishes `agent_onboard_request` through `AuthProfile.add_context_text` goes out on
     /// the wrong scheme and fails as a bare `Send message` -- observed live on mainnet, with the
     /// request already prepared and durably stored. `wallet_validation_endpoint` normalised too
@@ -500,9 +500,12 @@ mod shellnet {
             let qr = qr
                 .as_ref()
                 .ok_or_else(|| anyhow!("terminal QR requested without a rendered QR code"))?;
-            let rendered = qr.render::<unicode::Dense1x2>().quiet_zone(true).build();
             writeln!(output, "Or scan this QR code in the released wallet:")?;
-            writeln!(output, "{rendered}")?;
+            // PR1362 owns everything around this line -- the link first, the opt-in flag, the
+            // injected writer. Only the rendering inside the flag changes: an image where the
+            // terminal proved it can show one, and PR1362's unicode rendering everywhere else.
+            crate::cli::qr_display::write_qr(output, qr)
+                .context("render the ordinary bee connection QR code")?;
         }
         writeln!(output, "waiting for the wallet's signed hello...")?;
         output.flush().context("flush wallet onboarding invitation")?;
@@ -940,7 +943,7 @@ mod shellnet {
         fn default_shellnet_chain_validation_endpoint_is_absolute() {
             assert_eq!(
                 wallet_validation_endpoint(WalletNetworkArg::Shellnet.default_endpoint()).unwrap(),
-                "https://shellnet.ackinacki.org"
+                "https://dd-shellnet.ackinacki.org"
             );
         }
 
@@ -1137,7 +1140,9 @@ mod shellnet {
             let link = session.deep_link().unwrap();
             assert!(!link.contains(keys.hot.public_hex()));
             assert!(!link.contains(keys.vault.as_ref().unwrap().public_hex()));
-            assert!(!link.contains("agent_onboard"));
+            // The onboarding intent is a public routing hint, not a secret: the wallet needs it to
+            assert!(link.ends_with("&intent=agent_onboard"), "{link}");
+            assert_eq!(link.matches("intent=agent_onboard").count(), 1, "{link}");
         }
 
         #[test]

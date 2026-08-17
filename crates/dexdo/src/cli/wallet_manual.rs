@@ -726,7 +726,7 @@ mod shellnet {
     /// Render the address the way the binding will store it: the DApp id comes from the chain, not
     /// from an assumption, because a wallet does not have to live in the dexdo DApp.
     async fn canonical_hot_address(
-        chain: &dexdo_core::RealChainBackend,
+        chain: &dexdo_core::ChainClient,
         address: &dexdo_core::Address,
         supplied: &str,
     ) -> Result<String> {
@@ -763,17 +763,16 @@ mod shellnet {
         let keys = dexdo_core::KeyPair::from_secret_hex(secret_hex.trim())
             .map_err(|error| anyhow::anyhow!("{}: {error:?}", secret.kind.flag()))?;
 
-        let manifest = args
-            .contracts
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-        let endpoint = args
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| args.network.default_endpoint().to_string());
-        let chain = dexdo_core::RealChainBackend::connect_with_endpoint(manifest, Some(&endpoint))?;
+        // Verification is three read-only account queries against the selected network, and the
+        // deployed-contracts manifest names none of the accounts they read: the Hot's address comes
+        // from the operator and its DApp id from the chain. So the endpoint is the whole input, the
+        // same one `wallet onboard ackinacki-wallet` connects with.
+        let endpoint =
+            crate::cli::wallet::wallet_read_endpoint(args.endpoint.as_deref(), args.network.into())?;
+        let chain = dexdo_core::ChainClient::connect(&endpoint)
+            .map_err(|error| anyhow::anyhow!("connect verification endpoint {endpoint}: {error}"))?;
         let address = dexdo_core::address::parse_chain_address(&supplied_address)?;
-        let observed = observe_hot_wallet(chain.client(), &address).await?;
+        let observed = observe_hot_wallet(&chain, &address).await?;
         let hot_address = canonical_hot_address(&chain, &address, &supplied_address).await?;
 
         let secret_path = crate::cli::note::resolve_private_file_path(&secret.path, "secret file")?;

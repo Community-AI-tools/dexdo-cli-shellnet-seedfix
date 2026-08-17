@@ -34,7 +34,7 @@ fn a_scheme_less_endpoint_cannot_reach_the_authprofile_write() {
     // So the constructor refuses one instead of carrying it to the write.
     for bare in [
         "dd-mainnet.ackinacki.org",
-        "shellnet.ackinacki.org",
+        "dd-shellnet.ackinacki.org",
         "  dd-mainnet.ackinacki.org  ",
         "dd-mainnet.ackinacki.org/graphql",
     ] {

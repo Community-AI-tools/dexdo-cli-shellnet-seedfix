@@ -297,144 +297,59 @@ impl Command {
         }
     }
 
-    fn apply_data_dir_defaults(&mut self) {
+    fn apply_data_dir_defaults(&mut self) -> Result<()> {
         use dexdo_core::params::{
-            DEFAULT_CONTRACTS_PATH, DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH,
-            DEFAULT_ORACLE_MARKET_OUTPUT_PATH,
+            DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH,
+            DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_PN_POOL_PATH,
         };
 
-        let contracts = |path: &mut std::path::PathBuf| {
-            cli::data_dir::rebase_default(path, DEFAULT_CONTRACTS_PATH)
-        };
         let models = |path: &mut std::path::PathBuf| {
             cli::data_dir::rebase_default(path, DEFAULT_MODELS_PATH)
         };
         match self {
-            Command::Seller(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Buyer(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Monitor(args) => contracts(&mut args.contracts),
-            Command::Doctor(args) => contracts(&mut args.contracts),
-            // Takes no `--contracts`/`--models` path: its whole input is the decrypted
-            // endpoint and fingerprint, so there is nothing to rebase onto the data dir.
-            Command::GatewayCheck(_) => {}
+            Command::Seller(args) => models(&mut args.models),
+            Command::Buyer(args) => models(&mut args.models),
             Command::Provision(args) => {
-                contracts(&mut args.contracts);
                 cli::data_dir::rebase_default(
                     &mut args.output,
                     DEFAULT_MARKET_MANIFEST_OUTPUT_PATH,
                 );
             }
-            Command::DeployMarket(args) => contracts(&mut args.contracts),
-            Command::Destroy(args) => contracts(&mut args.contracts),
-            Command::Recover(args) => contracts(&mut args.contracts),
-            Command::Dispute(args) => contracts(&mut args.contracts),
-            Command::Reclaim(args) => contracts(&mut args.contracts),
-            Command::ReleaseDispute(args) => contracts(&mut args.contracts),
-            Command::ResolveDisputeTimeout(args) => contracts(&mut args.contracts),
-            Command::WithdrawShell(args) => contracts(&mut args.contracts),
-            Command::SettlementReceipt(args) => contracts(&mut args.contracts),
-            Command::Markets(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Market(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::ExecutableBook(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Quote(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::MarketData(_) => {}
-            Command::Orders(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Subscription(args) => {
-                models(&mut args.models);
-                contracts(&mut args.contracts);
-            }
-            Command::Deals(_)
-            | Command::History(_)
-            | Command::Dashboard(_)
-            | Command::Policy(_) => {}
-// onboarding state/key paths are explicit arguments, not data-dir defaults. The two
-            // providers that read the chain take the shared contracts manifest, so those are rebased.
-            Command::Wallet(args) => {
-                let provider = match &mut args.command {
-                    WalletCommand::Onboard(bind) | WalletCommand::Rebind(bind) => {
-                        bind.provider.as_mut()
-                    }
-                };
-                match provider {
-                    Some(WalletProviderCommand::Manual(manual)) => contracts(&mut manual.contracts),
-                    Some(WalletProviderCommand::GoshAi(goshai)) => contracts(&mut goshai.contracts),
-                    Some(WalletProviderCommand::AckinackiWallet(_)) | None => {}
-                }
-            }
-            Command::Status(_) | Command::Close(_) | Command::Export(_) => {
-                // Optional explicit manifests remain exact overrides. Their no-handle fallback goes
-                // through `deal_contracts_path`, which uses the configured data root.
-            }
+            Command::Markets(args) => models(&mut args.models),
+            Command::Market(args) => models(&mut args.models),
+            Command::ExecutableBook(args) => models(&mut args.models),
+            Command::Quote(args) => models(&mut args.models),
+            Command::Orders(args) => models(&mut args.models),
+            Command::Subscription(args) => models(&mut args.models),
             Command::Note(args) => match &mut args.command {
-                NoteCommand::Wallet(args) => contracts(&mut args.contracts),
-                NoteCommand::Balance(args) => contracts(&mut args.contracts),
-                NoteCommand::Outstanding(args) => contracts(&mut args.contracts),
-                NoteCommand::Deploy(args) => contracts(&mut args.contracts),
-                NoteCommand::Recover(_) => {}
-                NoteCommand::Topup(args) => contracts(&mut args.contracts),
-                NoteCommand::Transfer(args) => contracts(&mut args.contracts),
-                NoteCommand::Withdraw(args) => contracts(&mut args.contracts),
+                NoteCommand::Deploy(args) => {
+                    args.apply_multisig_env_fallbacks()?;
+                    if args.pool.is_none() {
+                        args.pool = Some(cli::data_dir::automatic_private_file(
+                            DEFAULT_PN_POOL_PATH,
+                        )?);
+                    }
+                }
+                NoteCommand::Recover(args) => {
+                    if args.pool.is_none() {
+                        args.pool = Some(cli::data_dir::automatic_private_file(
+                            DEFAULT_PN_POOL_PATH,
+                        )?);
+                    }
+                }
+                _ => {}
             },
-            Command::Accumulator(args) => match &mut args.command {
-                AccumulatorCommand::Status(args) => contracts(&mut args.contracts),
-                AccumulatorCommand::Sell(args) => contracts(&mut args.contracts),
-                AccumulatorCommand::Buy(args) => contracts(&mut args.contracts),
-                AccumulatorCommand::Lots(args) => contracts(&mut args.contracts),
-                AccumulatorCommand::Claim(args) => contracts(&mut args.contracts),
-            },
-            Command::Oracle(args) => match &mut args.command {
-                OracleCommand::Address(args) => contracts(&mut args.contracts),
-                OracleCommand::EventList(args) => match &mut args.command {
-                    OracleEventListCommand::Address(args) => contracts(&mut args.contracts),
-                    OracleEventListCommand::Events(args) => contracts(&mut args.contracts),
-                },
-                OracleCommand::Pmp(args) => match &mut args.command {
-                    OraclePmpCommand::Address(args) => contracts(&mut args.contracts),
-                    OraclePmpCommand::Status(args) => contracts(&mut args.contracts),
-                },
-                OracleCommand::Book(args) => match &mut args.command {
-                    OracleBookCommand::Status(args) => contracts(&mut args.contracts),
-                    OracleBookCommand::Order(args) => contracts(&mut args.contracts),
-                    OracleBookCommand::Orders(args) => contracts(&mut args.contracts),
-                },
-                OracleCommand::Provision(args) => {
-                    contracts(&mut args.contracts);
+            Command::Oracle(args) => {
+                if let OracleCommand::Provision(args) = &mut args.command {
                     cli::data_dir::rebase_default(
                         &mut args.output,
                         DEFAULT_ORACLE_MARKET_OUTPUT_PATH,
                     );
                 }
-                OracleCommand::State(args) => contracts(&mut args.contracts),
-                OracleCommand::Resolve(args)
-                | OracleCommand::Cancel(args)
-                | OracleCommand::Delete(args) => contracts(&mut args.contracts),
-                OracleCommand::CancelStake(args) | OracleCommand::Claim(args) => {
-                    contracts(&mut args.contracts)
-                }
-                OracleCommand::WithdrawFees(args) => contracts(&mut args.contracts),
-            },
+            }
+            _ => {}
         }
+        Ok(())
     }
 
     fn instance_lock_request(&self) -> Option<(cli::data_dir::InstanceRole, bool)> {
@@ -561,7 +476,7 @@ async fn main() -> Result<()> {
     }
 
     let instance_lock = cli::data_dir::configure(cli.data_dir.take()).and_then(|()| {
-        cli.command.apply_data_dir_defaults();
+        cli.command.apply_data_dir_defaults()?;
         cli.command
             .instance_lock_request()
             .map(|(role, legacy_uses_shared_defaults)| {
@@ -815,7 +730,7 @@ mod note_cli_tests {
         };
         assert_eq!(d.nominal, "N100");
         assert_eq!(d.token_type, "shell");
-        assert_eq!(d.endpoint, "shellnet.ackinacki.org");
+        assert_eq!(d.endpoint, "dd-shellnet.ackinacki.org");
         assert_eq!(
             d.contracts,
             PathBuf::from("contracts/deployed.shellnet.json")
@@ -823,7 +738,7 @@ mod note_cli_tests {
         assert_eq!(d.multisig_address, Some("0:wallet".to_string()));
         assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
-        assert_eq!(d.pool, PathBuf::from("pn_pool.json"));
+        assert_eq!(d.pool, Some(PathBuf::from("pn_pool.json")));
         assert_eq!(d.recovery, None);
         assert!(d.json);
         assert!(!d.simulate_interrupt_after_spend_before_pool);
@@ -860,10 +775,9 @@ mod note_cli_tests {
             Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
         assert!(!d.json);
-        // The passed-in wallet address and one key input remain independently required. Each of
-        // these supplies `--nominal` so the rejection is provably the flag under test, not the
-        // newly required nominal.
-        assert!(Cli::try_parse_from([
+        // Clap accepts either half so the missing half can come from its env equivalent; after
+        // fallbacks, the pair validator still refuses a genuinely partial BYO Hot.
+        let c = Cli::try_parse_from([
             "dexdo",
             "note",
             "deploy",
@@ -874,8 +788,16 @@ mod note_cli_tests {
             "--pool",
             "p.json",
         ])
-        .is_err());
-        assert!(Cli::try_parse_from([
+        .expect("a key may be paired with an env address");
+        let Command::Note(n) = c.command else {
+            panic!("expected Command::Note");
+        };
+        let NoteCommand::Deploy(d) = n.command else {
+            panic!("expected NoteCommand::Deploy");
+        };
+        assert!(d.validate_multisig_pair().is_err());
+
+        let c = Cli::try_parse_from([
             "dexdo",
             "note",
             "deploy",
@@ -886,7 +808,14 @@ mod note_cli_tests {
             "--pool",
             "p.json",
         ])
-        .is_err());
+        .expect("an address may be paired with an env key");
+        let Command::Note(n) = c.command else {
+            panic!("expected Command::Note");
+        };
+        let NoteCommand::Deploy(d) = n.command else {
+            panic!("expected NoteCommand::Deploy");
+        };
+        assert!(d.validate_multisig_pair().is_err());
         assert!(Cli::try_parse_from([
             "dexdo",
             "note",
@@ -921,6 +850,78 @@ mod note_cli_tests {
         .is_err());
     }
 
+    /// audit item 5: the pool belongs to the client instance, so both commands parse without
+    /// making an operator spell the path the effective data directory already determines.
+    #[test]
+    fn note_deploy_and_recover_do_not_require_pool_flags() {
+        Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "deploy",
+            "--multisig-address",
+            "0:wallet",
+            "--multisig-key",
+            "wallet.key",
+            "--nominal",
+            "N100",
+        ])
+        .expect("note deploy must accept the per-instance pool default");
+
+        Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "recover",
+            "--recovery",
+            "pn_pool.json.recovery.json",
+        ])
+        .expect("note recover must accept the per-instance pool default");
+    }
+
+    /// audit item 5: contracts are application resources, not instance state. This guards
+    /// both defaulting paths: ordinary command arguments and handle-less status/close/report.
+    #[test]
+    fn data_dir_defaulting_never_rebases_the_contracts_manifest() {
+        fn body_after<'a>(source: &'a str, marker: &str) -> &'a str {
+            let tail = source
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("missing source marker {marker}"))
+                .1;
+            let end = tail
+                .find("\n    fn ")
+                .unwrap_or_else(|| panic!("missing end after source marker {marker}"));
+            &tail[..end]
+        }
+
+        let defaults = body_after(
+            include_str!("main.rs"),
+            "fn apply_data_dir_defaults(&mut self)",
+        );
+        assert!(
+            !defaults.contains("DEFAULT_CONTRACTS_PATH")
+                && !defaults.contains("contracts(&mut"),
+            "--data-dir still rebases an application contracts manifest:\n{defaults}"
+        );
+
+        let deal_fallback = body_after(
+            include_str!("cli/commands.rs"),
+            "pub(crate) fn deal_contracts_path(",
+        );
+        assert!(
+            !deal_fallback.contains("data_dir::explicit"),
+            "handle-less deal commands still rebase contracts into --data-dir:\n{deal_fallback}"
+        );
+
+        let pool_fallback = body_after(
+            include_str!("cli/commands.rs"),
+            "pub(crate) fn note_pool_path(",
+        );
+        assert!(
+            pool_fallback.contains("DEFAULT_PN_POOL_PATH")
+                && !pool_fallback.contains("\"pn_pool.json\""),
+            "a note pool consumer duplicates the canonical default:\n{pool_fallback}"
+        );
+    }
+
     /// `dexdo note recover` finalizes from the crash-safe state without wallet credentials.
     #[test]
     fn note_recover_subcommand_parses() {
@@ -941,11 +942,10 @@ mod note_cli_tests {
             panic!("expected NoteCommand::Recover");
         };
         assert_eq!(r.recovery, PathBuf::from("pn_pool.json.recovery.json"));
-        assert_eq!(r.pool, PathBuf::from("pn_pool.json"));
+        assert_eq!(r.pool, Some(PathBuf::from("pn_pool.json")));
         assert!(Cli::try_parse_from(["dexdo", "note", "recover", "--pool", "p.json"]).is_err());
-        assert!(
-            Cli::try_parse_from(["dexdo", "note", "recover", "--recovery", "state.json"]).is_err()
-        );
+        Cli::try_parse_from(["dexdo", "note", "recover", "--recovery", "state.json"])
+            .expect("note recover uses the per-instance pool default");
     }
 
     /// `dexdo note withdraw` is owner-signed money movement, so the parser surface and destination

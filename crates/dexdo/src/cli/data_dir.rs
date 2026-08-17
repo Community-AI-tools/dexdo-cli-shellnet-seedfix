@@ -44,6 +44,32 @@ pub(crate) fn automatic(relative: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(effective()?.join(relative))
 }
 
+/// Resolve an automatic private-file path and ensure its instance root exists owner-only.
+/// This is deliberately separate from [`automatic`]: only a path the CLI selected may create its
+/// parent. An explicit file flag remains an exact path and gets no implicit directory creation.
+pub(crate) fn automatic_private_file(relative: impl AsRef<Path>) -> Result<PathBuf> {
+    let root = effective()?;
+    std::fs::create_dir_all(&root).map_err(|error| {
+        anyhow::anyhow!(
+            "create private instance data directory {}: {error}",
+            root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "set owner-only permissions on instance data directory {}: {error}",
+                    root.display()
+                )
+            },
+        )?;
+    }
+    Ok(root.join(relative))
+}
+
 /// Rebase a clap-provided canonical default only when the operator selected `--data-dir`.
 /// Custom path flags remain exact overrides.
 pub(crate) fn rebase_default(path: &mut PathBuf, canonical_default: &str) {

@@ -1703,11 +1703,25 @@ where
     Ok(pool)
 }
 
+/// what the startup admission decided, both halves of it.
+/// The refusals used to be a `tracing::error!` and nothing else, so the run carried on and spent
+/// the very capacity it had just told the operator it did not have. On mainnet (2026-08-16,
+/// contracts 4.0.35) the seller declined the `TokenContract` `provision` had deployed and funded
+/// one command earlier and then deployed and funded a replacement for a settled deal instead: two
+/// 16-SHELL deposits out of one note for one deal. A refusal is a fact the spending path has to
+/// know, so it is carried rather than logged and dropped.
+struct SellerStartupAdmission {
+    /// The deals this startup retained and will supervise.
+    admitted: Vec<SellerPoolDeal>,
+    /// Rendered `TokenContract`s refused for lack of `seller.max_open_deals` capacity.
+    refused: Vec<String>,
+}
+
 async fn admit_seller_startup_deals(
     deals: Vec<SellerPoolDeal>,
     context: &SellerPoolContext<'_>,
     seller_policy: &policy::SellerRuntimePolicy,
-) -> Result<Vec<SellerPoolDeal>> {
+) -> Result<SellerStartupAdmission> {
     let max_open_deals = usize::try_from(seller_policy.max_open_deals).unwrap_or(usize::MAX);
     let mut incumbents = Vec::new();
     let mut new_deals = Vec::new();
@@ -1731,6 +1745,7 @@ async fn admit_seller_startup_deals(
     }
 
     let mut current_open_deals = incumbents.len();
+    let mut refused = Vec::new();
     for deal in new_deals {
         if current_open_deals < max_open_deals {
             current_open_deals += 1;
@@ -1749,8 +1764,15 @@ async fn admit_seller_startup_deals(
             max_open_deals,
             "seller startup did not take deal at max_open_deals"
         );
+        // the refusal used to end at that log line. It is kept so the one path that can
+        // spend -- residual provisioning in `run_seller_pool` -- can refuse to buy a successor with
+        // capacity this startup has just denied.
+        refused.push(display_token_contract(&deal.cfg.token_contract));
     }
-    Ok(incumbents)
+    Ok(SellerStartupAdmission {
+        admitted: incumbents,
+        refused,
+    })
 }
 
 /// `shutdown_requested` is the seller's RECORD that the operator's stop has been observed;
@@ -2051,6 +2073,13 @@ trait SellerPoolPolicyView {
     fn startup_max_open_deals(&self) -> u64 {
         self.runtime_policy().max_open_deals
     }
+
+    /// the startup candidates this run refused for lack of `seller.max_open_deals` capacity.
+    /// Empty for a bare runtime policy: a refusal is a fact about a startup, and only the startup
+    /// view carries one.
+    fn refused_startup_deals(&self) -> &[String] {
+        &[]
+    }
 }
 
 impl SellerPoolPolicyView for policy::SellerRuntimePolicy {
@@ -2062,6 +2091,7 @@ impl SellerPoolPolicyView for policy::SellerRuntimePolicy {
 struct SellerStartupPolicy<'a> {
     runtime: &'a policy::SellerRuntimePolicy,
     retained_deals: usize,
+    refused_startup_deals: Vec<String>,
 }
 
 impl SellerPoolPolicyView for SellerStartupPolicy<'_> {
@@ -2073,6 +2103,10 @@ impl SellerPoolPolicyView for SellerStartupPolicy<'_> {
         self.runtime
             .max_open_deals
             .max(u64::try_from(self.retained_deals).unwrap_or(u64::MAX))
+    }
+
+    fn refused_startup_deals(&self) -> &[String] {
+        &self.refused_startup_deals
     }
 }
 
@@ -2098,6 +2132,10 @@ where
 {
     let startup_max_open_deals =
         usize::try_from(seller_policy.startup_max_open_deals()).unwrap_or(usize::MAX);
+    // read before the view is narrowed to its runtime half. The provisioning gate below is
+    // the only place in this function that spends, and it is the place that has to know a candidate
+    // was already turned away for lack of capacity.
+    let refused_startup_deals = seller_policy.refused_startup_deals();
     let seller_policy = seller_policy.runtime_policy();
     let max_open_deals = usize::try_from(seller_policy.max_open_deals).unwrap_or(usize::MAX);
     if max_open_deals == 0 {
@@ -2316,6 +2354,34 @@ where
         while watched.len() + active.len() < max_open_deals {
             if pending.is_empty() {
                 break;
+            }
+            // this run has ALREADY told the operator it cannot take a deal -- on mainnet the
+            // very TokenContract `provision` had deployed and funded one command earlier, named in
+            // the `market.json` the buyer is handed. Deploying and funding a successor for some
+            // OTHER deal spends exactly the capacity that refusal denied: the note paid two
+            // 16-SHELL deposits for one deal, and the manifest kept pointing at the contract nobody
+            // serves. A refusal must not spend.
+            // Fail closed here rather than at the refusal itself: a refusal that costs nothing is
+            // ordinary and correct (an at-limit seller keeps serving its live incumbent and simply
+            // leaves the new candidate alone), and only the step that would buy a contract is the
+            // step that must stop. That is the shape `assert_token_contract_fresh`
+            // (`crates/core/src/chain/mod.rs`) already uses: refuse with an action the operator can
+            // take, never deploy around the refusal. `break 'pool` rather than a bare return so the
+            // exit path below still cancels every ask this run rests.
+            if !refused_startup_deals.is_empty() {
+                let queued = pending
+                    .front()
+                    .map(|deal| display_token_contract(&deal.cfg.token_contract))
+                    .unwrap_or_else(|| "a queued residual".to_string());
+                stop_error = Some(anyhow::anyhow!(
+                    "seller refused {} at seller.max_open_deals={max_open_deals} and will not fund \
+                     a replacement TokenContract for {queued} instead: a refusal must not spend. \
+                     Free capacity first -- finish or retire the deal still holding the slot, or \
+                     raise seller.max_open_deals above {max_open_deals} -- then restart. The \
+                     refused TokenContract was not touched and is still serviceable.",
+                    refused_startup_deals.join(", ")
+                ));
+                break 'pool;
             }
             // provisioning deploys and funds a fresh TokenContract. Honor the recorded
             // shutdown or observe a newly-ready signal before taking the residual from `pending`
@@ -3670,7 +3736,8 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         },
     )
     .await?;
-    let pool = admit_seller_startup_deals(pool, &context, &seller_policy).await?;
+    let admission = admit_seller_startup_deals(pool, &context, &seller_policy).await?;
+    let pool = admission.admitted;
     let args_ref = &args;
     let provision_endpoints = mock_endpoints_file.clone();
     let provision_seller = seller_owner.clone();
@@ -3718,6 +3785,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     let startup_policy = SellerStartupPolicy {
         runtime: &seller_policy,
         retained_deals: pool.len(),
+        refused_startup_deals: admission.refused,
     };
     let result = run_seller_pool(
         &seller,
@@ -3753,6 +3821,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     include!("seller_1056_restart_tests.rs");
+    include!("seller_1402_refusal_tests.rs");
 
     #[tokio::test]
     async fn persisted_gateway_tls_survives_restart_and_pinned_reconnects() {
@@ -7289,7 +7358,8 @@ mod tests {
                 .await
                 .unwrap();
             let buyer_client = dexdo::buyer::Buyer::from_note(buyer.clone());
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            // Same bound, same reason as the sibling row below: sized for the slowest runner.
+            tokio::time::timeout(std::time::Duration::from_secs(120), async {
                 loop {
                     if let Ok(handover) =
                         buyer_client.resolve_endpoint(&chain, &token_contract).await
@@ -7478,7 +7548,12 @@ mod tests {
                 .unwrap();
             let buyer_client = dexdo::buyer::Buyer::from_note(buyer.clone());
             // Reached only from the serving pool, i.e. strictly after the loader that used to abort.
-            let handover = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            // The bound has to hold on the SLOWEST runner this suite runs on, not on the fastest.
+            // `macos-latest` timed this loop out at 30 s while Linux completes it in well under a
+            // second; the loop itself polls every 10 ms and returns the moment the endpoint
+            // resolves, so a larger bound costs nothing when the handover works and only changes
+            // how long a genuine hang is allowed to look like a hang.
+            let handover = tokio::time::timeout(std::time::Duration::from_secs(120), async {
                 loop {
                     if let Ok(handover) =
                         buyer_client.resolve_endpoint(&chain, &token_contract).await

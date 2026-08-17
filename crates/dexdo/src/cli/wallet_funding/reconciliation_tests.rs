@@ -70,12 +70,12 @@ fn patient_bounds() -> FundingWaitBounds {
 }
 
 /// The transfer the first run creates, as the Vault's queue would report it back.
-fn queued(id: u64, shortfall: u128) -> QueuedTransfer {
+fn queued(id: u64, native: u128, shortfall: u128) -> QueuedTransfer {
     QueuedTransfer {
         id,
         creator_pubkey: Some(creator()),
         dest: hot_address(),
-        value: vault_to_hot_native_value(),
+        value: native,
         cc: [(SHELL, shortfall)].into_iter().collect(),
         send_flags: VAULT_TO_HOT_SEND_FLAGS,
         bounce: VAULT_TO_HOT_BOUNCE,
@@ -84,24 +84,24 @@ fn queued(id: u64, shortfall: u128) -> QueuedTransfer {
     }
 }
 
-fn submitted_event(id: u64, at: u64) -> VaultQueueEvent {
+fn submitted_event(id: u64, native: u128, at: u64) -> VaultQueueEvent {
     VaultQueueEvent {
         kind: VaultQueueEventKind::Submitted,
         transaction_id: id,
         dest: hot_address(),
-        value: vault_to_hot_native_value(),
+        value: native,
         dapp_id: hex64(0xa1),
         message_id: format!("msg-submitted-{id}"),
         created_at: at,
     }
 }
 
-fn sent_event(id: u64, at: u64) -> VaultQueueEvent {
+fn sent_event(id: u64, native: u128, at: u64) -> VaultQueueEvent {
     VaultQueueEvent {
         kind: VaultQueueEventKind::Sent,
         transaction_id: id,
         dest: hot_address(),
-        value: vault_to_hot_native_value(),
+        value: native,
         dapp_id: hex64(0xa1),
         message_id: format!("msg-sent-{id}"),
         created_at: at,
@@ -159,6 +159,18 @@ impl VaultChain for &FakeVault {
         Ok(self.history.borrow().clone())
     }
 
+    /// A real Vault's executing transaction emits the `TransactionSent` event and the internal
+    /// transfer together, so a chain that has the event can also name the sibling that carried the
+    /// money. Every execution scripted in this file is one of those, so this fake names it too.
+    async fn delivery_message_id(
+        &self,
+        sent_event_message_id: &str,
+        _destination: &str,
+        _destination_dapp_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(Some(format!("delivery-of-{sent_event_message_id}")))
+    }
+
     async fn expiration_window_secs(&self) -> Result<u64> {
         Ok(self.window)
     }
@@ -179,10 +191,12 @@ impl VaultChain for &FakeVault {
         self.next_id.set(id + 1);
         // A real Vault takes the request into its queue and records that it did.
         let shortfall = fingerprint.cc.get(&SHELL).copied().unwrap_or_default();
-        self.queue.borrow_mut().push(queued(id, shortfall));
+        self.queue
+            .borrow_mut()
+            .push(queued(id, fingerprint.value, shortfall));
         self.history
             .borrow_mut()
-            .push(submitted_event(id, self.now.get()));
+            .push(submitted_event(id, fingerprint.value, self.now.get()));
         Ok(SubmitOutcome::Accepted {
             transaction_hash: Some(format!("tx-{id}")),
             pending_transaction_id: Some(
@@ -199,6 +213,7 @@ impl VaultChain for &FakeVault {
 struct FakeHot {
     balances: RefCell<Vec<u128>>,
     last: Cell<u128>,
+    native: Cell<u128>,
     reads: Cell<usize>,
 }
 
@@ -207,6 +222,7 @@ impl FakeHot {
         Self {
             balances: RefCell::new(Vec::new()),
             last: Cell::new(balance),
+            native: Cell::new(vault_to_hot_native_value()),
             reads: Cell::new(0),
         }
     }
@@ -216,6 +232,16 @@ impl FakeHot {
         Self {
             balances: RefCell::new(first),
             last: Cell::new(last),
+            native: Cell::new(vault_to_hot_native_value()),
+            reads: Cell::new(0),
+        }
+    }
+
+    fn with_balances(native: u128, shell: u128) -> Self {
+        Self {
+            balances: RefCell::new(Vec::new()),
+            last: Cell::new(shell),
+            native: Cell::new(native),
             reads: Cell::new(0),
         }
     }
@@ -226,7 +252,10 @@ impl HotBalanceReader for FakeHot {
     async fn hot_balances(&self, _hot: &CanonicalAddress) -> Result<HotBalances> {
         self.reads.set(self.reads.get() + 1);
         let balance = self.balances.borrow_mut().pop().unwrap_or_else(|| self.last.get());
-        Ok(HotBalances::new([(SHELL, balance)]))
+        Ok(HotBalances::new(
+            self.native.get(),
+            [(SHELL, balance)],
+        ))
     }
 }
 
@@ -246,6 +275,16 @@ async fn money_command_run_with(
     hot: &FakeHot,
     bounds: FundingWaitBounds,
 ) -> Result<FundedHot> {
+    money_command_run_with_requirements(dir, vault, hot, &requirements(), bounds).await
+}
+
+async fn money_command_run_with_requirements(
+    dir: &Path,
+    vault: &FakeVault,
+    hot: &FakeHot,
+    requirements: &FundingRequirements,
+    bounds: FundingWaitBounds,
+) -> Result<FundedHot> {
     let recorded = record_of(dir)
         .filter(FundingJournalRecord::is_open)
         .map(|record| record.recorded_request());
@@ -254,7 +293,7 @@ async fn money_command_run_with(
     ensure_hot_funded_with_turn(
         &HotFundingContext {
             binding: &binding,
-            requirements: &requirements(),
+            requirements,
             operation: "note deploy",
             creator_pubkey: &creator(),
             data_dir: dir,
@@ -275,59 +314,73 @@ fn temp() -> tempfile::TempDir {
 // The rule: queue disappearance alone never authorizes another submit
 // ---------------------------------------------------------------------------------------------
 
-/// THE money-safety property. The request executed - the human confirmed it and the transfer left
-/// the Vault - so the queue no longer holds it. A client that read that emptiness as "my request is
-/// not there, so I never made one" would transfer a second time out of a cold wallet.
+/// A finalized execution retires exactly the generation identified by its recorded queue id. If
+/// that transfer satisfied an earlier, smaller need but the current command needs more, the old
+/// request cannot execute again and a new generation must carry only the remaining shortfall.
 #[tokio::test]
-async fn a_request_the_chain_shows_executed_is_never_submitted_again() {
+async fn an_executed_underfill_opens_a_new_generation_for_the_exact_remaining_shortfall() {
     let dir = temp();
     let vault = FakeVault::empty();
 
-    // Run 1: nothing queued yet, so the request is created.
+    // Run 1 creates a real generation through the production-composed entry point for the smaller
+    // need. No journal end state is fabricated by the test.
+    let first_requirements = FundingRequirements::new([(SHELL, 400)]);
     let hot = FakeHot::always(0);
-    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    let _ = money_command_run_with_requirements(
+        dir.path(),
+        &vault,
+        &hot,
+        &first_requirements,
+        bounds(),
+    )
+    .await;
     assert_eq!(vault.submits.get(), 1, "the first run creates the request");
     let after_first = record_of(dir.path()).expect("run 1 left a record");
     assert_eq!(after_first.state, FundingState::Submitted);
     assert_eq!(after_first.generation, 1);
     assert_eq!(after_first.pending_transaction_id.as_deref(), Some("7"));
 
-    // The human confirms it in the wallet app: it leaves the queue AND the wallet emits the
-    // execution event. The Hot's balance has not caught up yet - which is precisely the window in
-    // which a naive client resubmits.
+    // The wallet's real queue/history surface now proves that exact id executed, and the observed
+    // Hot balance includes the 400 it delivered. The next command needs 1,000, however.
     vault.queue.borrow_mut().clear();
     vault
         .history
         .borrow_mut()
-        .push(sent_event(7, QUEUED_AT + 60));
+        .push(sent_event(7, 0, QUEUED_AT + 60));
 
-    // Run 2: the same command again.
-    let hot = FakeHot::always(0);
-    let second = money_command_run(dir.path(), &vault, &hot).await;
-    assert!(second.is_err(), "the balance has not arrived, so the wait still fails");
+    let current_requirements = FundingRequirements::new([(SHELL, REQUIRED)]);
+    let hot = FakeHot::always(400);
+    let _ = money_command_run_with_requirements(
+        dir.path(),
+        &vault,
+        &hot,
+        &current_requirements,
+        bounds(),
+    )
+    .await;
 
     assert_eq!(
         vault.submits.get(),
-        1,
-        "a request proven to have EXECUTED must never be submitted a second time: that is the \
-         double transfer out of the cold Vault"
+        2,
+        "a finalized executed generation cannot move money again, so an unmet current need must \
+         open one replacement generation"
     );
-    let after_second = record_of(dir.path()).expect("run 2 kept the record");
+    let after_second = record_of(dir.path()).expect("run 2 opened a replacement record");
     assert_eq!(
         after_second.state,
-        FundingState::Executed,
-        "the record must carry the verdict the chain gave, not merely stay `submitted`"
+        FundingState::Submitted,
+        "the replacement generation was submitted through the provider"
     );
     assert_eq!(
-        after_second.generation, 1,
-        "an executed request does not retire its generation: the money it moved is this generation's"
+        after_second.generation, 2,
+        "the finalized execution retires generation 1 before the replacement is opened"
     );
-    let evidence = after_second.evidence.expect("the verdict must retain its evidence");
-    assert_eq!(evidence.verdict, "executed");
-    assert!(
-        evidence.source.contains("msg-sent-7"),
-        "the evidence must name the finalized message it was read from: {evidence:?}"
+    assert_eq!(
+        after_second.fingerprint.cc.get(&SHELL),
+        Some(&600),
+        "generation 2 carries the exact current shortfall, not the original amount"
     );
+    assert_eq!(after_second.pending_transaction_id.as_deref(), Some("8"));
 }
 
 /// The opposite reading of the SAME observable. The request was never confirmed and the wallet's own
@@ -450,8 +503,14 @@ async fn an_unobserved_submit_is_recovered_from_the_wallets_own_submitted_event(
 
     // On chain it DID land, and then it executed. The client never learned either.
     vault.indeterminate.set(false);
-    vault.history.borrow_mut().push(submitted_event(42, QUEUED_AT));
-    vault.history.borrow_mut().push(sent_event(42, QUEUED_AT + 30));
+    vault
+        .history
+        .borrow_mut()
+        .push(submitted_event(42, 0, QUEUED_AT));
+    vault
+        .history
+        .borrow_mut()
+        .push(sent_event(42, 0, QUEUED_AT + 30));
 
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
@@ -515,7 +574,8 @@ async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_ret
     );
     assert_eq!(
         after.generation, 1,
-        "a generation is retired only by PROVEN expiry, and nothing here proved one"
+        "a generation is retired only by finalized expiry or execution of its recorded queue id, \
+         and nothing here proved either"
     );
     assert!(after.evidence.is_none(), "there was no evidence to record");
 }
@@ -590,7 +650,7 @@ async fn the_money_command_continues_once_the_balance_arrives() {
         vault
             .history
             .borrow_mut()
-            .push(sent_event(7, QUEUED_AT + 60));
+            .push(sent_event(7, 0, QUEUED_AT + 60));
     };
     let (funded, ()) = tokio::join!(funding, confirmation);
     let funded = funded.expect("the balance arrives and the command continues");
@@ -625,6 +685,35 @@ async fn the_money_command_continues_once_the_balance_arrives() {
 // The record carries what reconciliation needs
 // ---------------------------------------------------------------------------------------------
 
+/// The production provider derives its wire fingerprint from the same native shortfall the journal
+/// records. This catches a fixed `value` surviving in the provider while the state machine appears
+/// correct through a request-only fake.
+#[tokio::test]
+async fn the_provider_wire_carries_the_exact_native_shortfall() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let native_shortfall = 123;
+    let hot = FakeHot::with_balances(
+        vault_to_hot_native_value() - native_shortfall,
+        REQUIRED,
+    );
+
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let submitted = vault.submitted.borrow();
+    let on_wire = submitted.first().expect("the provider submitted a fingerprint");
+    assert_eq!(on_wire.value, native_shortfall);
+    assert!(
+        on_wire.cc.is_empty(),
+        "an ECC-funded Hot sends no invented ECC entry for native vmshell"
+    );
+    assert_eq!(
+        record_of(dir.path()).expect("journal").fingerprint,
+        on_wire.clone(),
+        "the wire transfer and durable identity must remain identical"
+    );
+}
+
 /// Every field the specification names for the fingerprint, on the record, frozen for the
 /// generation - and the same fingerprint on the wire, because both come from one derivation.
 #[tokio::test]
@@ -644,7 +733,10 @@ async fn the_record_freezes_the_full_fingerprint_the_submit_used() {
         "a Vault -> Hot transfer is addressed into the Hot's OWN self-DApp, never the dexdo one"
     );
     assert_ne!(fingerprint.dapp_id, "4");
-    assert_eq!(fingerprint.value, vault_to_hot_native_value());
+    assert_eq!(
+        fingerprint.value, 0,
+        "the already-funded native floor has zero shortfall"
+    );
     assert_eq!(fingerprint.cc.get(&SHELL), Some(&REQUIRED));
     assert_eq!(fingerprint.send_flags, VAULT_TO_HOT_SEND_FLAGS);
     assert_eq!(fingerprint.bounce, VAULT_TO_HOT_BOUNCE);

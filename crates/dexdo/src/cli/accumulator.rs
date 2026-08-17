@@ -954,7 +954,25 @@ async fn run_sell(args: AccumulatorSellArgs) -> Result<()> {
         println!("  queue {denom} eccUSDC: this run's lots start at order id {next_id}");
     }
 
-    require_native_gas(spender.native_balance().await?, plan.lot_count())?;
+    let native_raw = spender.native_balance().await?;
+    require_native_gas(native_raw, plan.lot_count())?;
+    // `require_native_gas` above answers "can this run's lots be sent", from
+    // `ACCUMULATOR_WALLET_MESSAGE_GAS_RAW` -- one observed message. It does NOT answer "will this
+    // wallet still be able to act afterwards", and that is the question a sell has to ask, because
+    // a sell is the command that converts a wallet's spendable SHELL away. A wallet that ends this
+    // run below the floor holds eccUSDC and SHELL it cannot move, and the message that would
+    // convert SHELL back into gas is one of the messages it can no longer pay for. Stated here, at
+    // the last point before anything irreversible is written, and stated with the numbers.
+    if let Some(notice) =
+        dexdo_core::params::funding_wallet_native_floor_notice(native_raw, available_raw)
+    {
+        anyhow::bail!(
+            "funding wallet {} is below the gas floor its own outgoing messages need: {notice}. \
+             No lot was submitted. This is a statement of what messages cost, \
+             not a limit on what you may convert -- top the wallet up and re-run the same command.",
+            spender.display
+        );
+    }
     spender.persist_pending(&PendingOperation::Sell {
         floors: first_unseen.clone(),
         denoms: plan.lots.iter().map(|lot| lot.denom).collect(),

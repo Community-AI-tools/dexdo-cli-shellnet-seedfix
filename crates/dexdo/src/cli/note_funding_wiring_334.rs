@@ -94,12 +94,12 @@ fn note_topup_arranges_funding_before_it_refuses_on_a_short_balance_334() {
     );
 }
 
-/// A wallet passed on the command line has no provider, and one is never inferred.
-/// Three providers hand out the same canonical multisig contract, so an address, a code hash and
-/// every on-chain parameter are all incapable of telling them apart. Both commands therefore read
-/// the binding for the funding decision only when the binding is what chose the wallet.
+/// An explicit wallet skips the durable binding and reaches the shared entrypoint with its facts.
+/// `None` here means only that no durable provider binding selected the Hot. The shared entrypoint
+/// receives the already-resolved Hot and the manifest network, and the explicit path there selects
+/// the ephemeral Manual flow without persisting a binding or inferring a provider from the address.
 #[test]
-fn an_explicitly_passed_wallet_selects_no_funding_provider_334() {
+fn an_explicit_wallet_skips_durable_binding_but_reaches_manual_route_334() {
     for entry in ["run_note_deploy", "run_note_topup"] {
         let body = body_of(entry);
         let end = body
@@ -112,7 +112,14 @@ fn an_explicitly_passed_wallet_selects_no_funding_provider_334() {
         );
         assert!(
             head.contains("Some(_) => None,"),
-            "{entry} must select NO provider when the wallet came from the command line"
+            "{entry} must not load a durable binding when the explicit wallet won"
+        );
+        assert!(
+            body[end..].contains(
+                "funding_binding.as_ref(),\n        &funding_wallet.address,\n        &funding_network,"
+            ),
+            "{entry} must pass the resolved explicit Hot and manifest network to the shared \
+             entrypoint that selects the ephemeral Manual flow"
         );
     }
 }

@@ -24,6 +24,8 @@
 //! provider this module invented for itself would be a funding flow the operator never bound.
 
 use std::collections::BTreeMap;
+#[cfg(any(feature = "shellnet", test))]
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -145,17 +147,32 @@ impl WalletProvider {
 /// These are required FINAL balances, not deltas: the specification asks the caller to compute "the
 /// exact need per currency", and a final balance is the only form of that which stays correct while
 /// the balance is moving underneath the wait.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FundingRequirements {
+    /// Required final native vmshell balance. Native is not an ECC currency and must never be
+    /// represented by an invented currency id.
+    pub(crate) required_native: u128,
     /// Currency id -> required total balance.
     pub(crate) required: BTreeMap<u32, u128>,
+}
+
+impl Default for FundingRequirements {
+    fn default() -> Self {
+        Self::new(std::iter::empty())
+    }
 }
 
 impl FundingRequirements {
     pub(crate) fn new(required: impl IntoIterator<Item = (u32, u128)>) -> Self {
         Self {
+            required_native: vault_to_hot_native_value(),
             required: required.into_iter().collect(),
         }
+    }
+
+    /// Native vmshell shortfall against the final floor required by this money path.
+    pub(crate) fn native_shortfall(&self, balances: &HotBalances) -> u128 {
+        self.required_native.saturating_sub(balances.native)
     }
 
     /// Per-currency shortfall against `balances`. Empty means the requirement is met.
@@ -171,19 +188,21 @@ impl FundingRequirements {
 
     /// Whether `balances` satisfies every requirement.
     pub(crate) fn met_by(&self, balances: &HotBalances) -> bool {
-        self.shortfall(balances).is_empty()
+        self.native_shortfall(balances) == 0 && self.shortfall(balances).is_empty()
     }
 }
 
-/// A Hot's observed on-chain balances, per currency.
+/// A Hot's observed balances. Native vmshell is disjoint from every ECC currency.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HotBalances {
+    pub(crate) native: u128,
     pub(crate) balances: BTreeMap<u32, u128>,
 }
 
 impl HotBalances {
-    pub(crate) fn new(balances: impl IntoIterator<Item = (u32, u128)>) -> Self {
+    pub(crate) fn new(native: u128, balances: impl IntoIterator<Item = (u32, u128)>) -> Self {
         Self {
+            native,
             balances: balances.into_iter().collect(),
         }
     }
@@ -230,8 +249,12 @@ pub(crate) struct FundingRequest {
     pub(crate) creator_pubkey: String,
     /// The required final balances this request is meant to reach.
     pub(crate) required: BTreeMap<u32, u128>,
+    /// Required final native vmshell balance, kept separate from ECC currencies.
+    pub(crate) required_native: u128,
     /// The shortfall computed when the request was prepared.
     pub(crate) shortfall: BTreeMap<u32, u128>,
+    /// Exact native vmshell shortfall computed when the request was prepared.
+    pub(crate) native_shortfall: u128,
 }
 
 /// The immutable identity of ONE Vault -> Hot transfer.
@@ -266,12 +289,16 @@ pub(crate) struct FundingFingerprint {
 
 impl FundingFingerprint {
     /// The fingerprint of the transfer `request` describes.
-    pub(crate) fn of(request: &FundingRequest, native_value: u128) -> Self {
+    pub(crate) fn of(request: &FundingRequest, native_floor: u128) -> Self {
+        // The second argument is the canonical target/cap, not a fixed transfer amount. The
+        // request freezes the observed shortfall; capping it at that target keeps a corrupt request
+        // from asking for more native than the path's entire final floor.
+        let native_shortfall = request.native_shortfall.min(native_floor);
         Self {
             creator: request.creator_pubkey.clone(),
             dest: request.hot_address.clone(),
             dapp_id: request.hot_dapp_id.clone(),
-            value: native_value,
+            value: native_shortfall,
             cc: request.shortfall.clone(),
             send_flags: VAULT_TO_HOT_SEND_FLAGS,
             bounce: VAULT_TO_HOT_BOUNCE,
@@ -319,6 +346,14 @@ pub(crate) struct FundingEvidence {
     pub(crate) observed_at_unix: Option<u64>,
     /// A human-readable rendering of the fact itself.
     pub(crate) detail: String,
+    /// The INTERNAL message that carried this transfer to the Hot, once the Hot's own finalized
+    /// receipt for it has been read.
+    /// Structural rather than a phrase inside `source`, because a decision is taken from it: it is
+    /// the only fact that says the credit which landed on the Hot is THIS generation's delivery and
+    /// not an unrelated incoming transfer of the same size. `None` is "not established", which is
+    /// where a fresh generation is refused - never "no delivery".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_message_id: Option<String>,
 }
 
 /// Whether a funding request matching [`FundingRequest`] is on chain.
@@ -335,13 +370,14 @@ pub(crate) enum RequestPresence {
         pending_transaction_id: Option<String>,
     },
     /// Gone from the queue, and finalized history proves it EXECUTED. The money left the Vault.
-    /// Never permits a submit: a second one here is the double transfer.
+    /// A verdict bound to this generation's parseable queue id retires that generation; an
+    /// id-less history fallback remains conservative and never permits another submit.
     Executed { evidence: FundingEvidence },
     /// Gone from the queue, and finalized history proves it expired WITHOUT executing. The money
     /// never left the Vault, so a fresh request is the only way the Hot is ever funded.
     ExpiredUnexecuted { evidence: FundingEvidence },
-    /// Proven absent, with nothing of ours ever having been in the queue. This and
-    /// [`RequestPresence::ExpiredUnexecuted`] are the only answers that permit a submit.
+    /// Proven absent, with nothing of ours ever having been in the queue. This permits an initial
+    /// submit; it never overrides a journal record that says a generation may still execute.
     Absent,
     /// Could not be established. Never permits a submit.
     Unknown { reason: String },
@@ -420,10 +456,11 @@ pub(crate) struct RecordedRequest {
 /// it degenerates to "an open funding need for this Hot", which is a superset of the same meaning
 /// and keeps one state machine instead of two.
 /// `Executed` and `Expired` are the two ways a request leaves the Vault's queue, and they are
-/// opposite in money terms: `Executed` means the transfer left the Vault and a second one would be
-/// a double transfer; `Expired` means it never left, so the Hot will not be funded unless a fresh
-/// request is made. Neither is ever concluded from the request's absence - only from finalized
-/// chain evidence, which is retained on the record as [`FundingEvidence`].
+/// opposite in money terms: `Executed` means the transfer left the Vault, so only any remaining
+/// shortfall may be requested after that exact generation is retired; `Expired` means it never left,
+/// so the full current shortfall is still needed. Neither is ever concluded from the request's
+/// absence - only from finalized chain evidence, which is retained on the record as
+/// [`FundingEvidence`].
 /// `Satisfied` is reached from any of the others and only ever by an observed Hot balance that
 /// meets the requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,10 +480,11 @@ pub(crate) struct FundingJournalRecord {
     pub(crate) version: u32,
     /// Which attempt at funding this Hot the record describes.
     /// A generation is the unit over which the shortfall and the fingerprint are frozen. It is
-    /// incremented in exactly one circumstance: the previous generation was PROVEN to have expired
-    /// without executing. It is never incremented because the shortfall was recomputed, because a
-    /// wait timed out, or because the request is no longer visible - each of those would let a
-    /// recomputed amount create a second live request while the first is still confirmable.
+    /// incremented only after finalized evidence proves the previous generation can no longer move
+    /// money: it either expired unexecuted, or its recorded queue id executed. It is never
+    /// incremented because the shortfall was merely recomputed, because a wait timed out, or because
+    /// the request is no longer visible - each of those would let a recomputed amount create a
+    /// second live request while the first is still confirmable.
     pub(crate) generation: u32,
     pub(crate) provider: WalletProvider,
     pub(crate) network: String,
@@ -454,7 +492,11 @@ pub(crate) struct FundingJournalRecord {
     pub(crate) hot_address: String,
     pub(crate) creator_pubkey: String,
     pub(crate) required: BTreeMap<u32, u128>,
+    #[serde(default)]
+    pub(crate) required_native: u128,
     pub(crate) shortfall: BTreeMap<u32, u128>,
+    #[serde(default)]
+    pub(crate) native_shortfall: u128,
     /// The frozen identity of this generation's transfer.
     pub(crate) fingerprint: FundingFingerprint,
     pub(crate) state: FundingState,
@@ -470,6 +512,8 @@ pub(crate) struct FundingJournalRecord {
     /// The balances that closed the record. Present only in `Satisfied`, and only ever the
     /// balances that were actually read.
     pub(crate) satisfied_balances: Option<BTreeMap<u32, u128>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) satisfied_native_balance: Option<u128>,
 }
 
 impl FundingJournalRecord {
@@ -487,7 +531,9 @@ impl FundingJournalRecord {
             hot_address: request.hot_address.clone(),
             creator_pubkey: request.creator_pubkey.clone(),
             required: request.required.clone(),
+            required_native: request.required_native,
             shortfall: request.shortfall.clone(),
+            native_shortfall: request.native_shortfall,
             fingerprint: FundingFingerprint::of(request, vault_to_hot_native_value()),
             state: FundingState::Prepared,
             transaction_hash: None,
@@ -496,6 +542,7 @@ impl FundingJournalRecord {
             created_at_unix: now,
             last_checked_at_unix: None,
             satisfied_balances: None,
+            satisfied_native_balance: None,
         }
     }
 
@@ -526,10 +573,67 @@ impl FundingJournalRecord {
         }
     }
 
+    /// The generation a finalized execution retires, when the verdict can be bound to it.
+    /// Only a parseable recorded queue id binds a `TransactionSent` to THIS generation; a
+    /// generation-invariant history fallback may forbid a submit, but can never say which
+    /// generation executed.
+    fn retirable_generation(&self) -> Option<u32> {
+        self.pending_transaction_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .map(|_| self.generation)
+    }
+
+    /// Whether `observed` was read AFTER this generation's executed transfer reached the Hot.
+    /// `Executed` is a fact about the VAULT: the message left it. The credit lands on the Hot in a
+    /// later transaction, and until it does the Hot's balance is still the balance this generation
+    /// was sized against - so a shortfall computed from it is the OLD shortfall, and a request for
+    /// it asks the Vault for the same money a second time.
+    /// Two facts, and both are needed, because they answer two different questions.
+    /// IDENTITY comes first: the chain must have named the internal message that carried THIS
+    /// generation's transfer to the Hot and shown the Hot's own finalized receipt for it. A balance
+    /// that grew by the expected amount does not say which transfer grew it - an unrelated incoming
+    /// transfer of the same size produces exactly the same reading - and it is identity, not size,
+    /// that says the executed generation can be retired. Without it the credit is unproven and the
+    /// window is still open.
+    /// SUFFICIENCY comes second, and it is about the READING rather than the chain: the next
+    /// generation is sized from the balance this run already observed, and that observation may
+    /// pre-date the credit even when the credit is proven. The record carries both halves needed to
+    /// tell: the balance the shortfall was computed from(`required` minus `shortfall`) and the
+    /// amount the frozen transfer carries. A reading showing at least their sum is a reading the
+    /// credit has reached; anything less is the window.
+    fn executed_delivery_is_credited(&self, observed: &HotBalances) -> bool {
+        let delivered = self
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.delivery_message_id.is_some());
+        if !delivered {
+            return false;
+        }
+        let native_before = self.required_native.saturating_sub(self.native_shortfall);
+        if observed.native < native_before.saturating_add(self.fingerprint.value) {
+            return false;
+        }
+        self.fingerprint.cc.iter().all(|(currency, carried)| {
+            let required = self.required.get(currency).copied().unwrap_or_default();
+            let shortfall = self.shortfall.get(currency).copied().unwrap_or_default();
+            observed.get(*currency) >= required.saturating_sub(shortfall).saturating_add(*carried)
+        })
+    }
+
+    /// Whether this record is parked on a transfer the chain proved EXECUTED whose credit the Hot
+    /// has not shown yet. In that window there is no balance a residual can be sized from.
+    fn awaits_executed_credit(&self, observed: &HotBalances) -> bool {
+        matches!(self.state, FundingState::Executed)
+            && self.retirable_generation().is_some()
+            && !self.executed_delivery_is_credited(observed)
+    }
+
     /// Whether this record still describes a request that may yet move money.
     /// `Prepared` and `Submitted` both do - a prepared record is the trace of a submit whose result
-    /// was never observed, which is precisely the request that may be sitting in the queue. Only a
-    /// proven expiry retires a generation.
+    /// was never observed, which is precisely the request that may be sitting in the queue.
+    /// `Executed` is retired only while handling that exact finalized verdict; a later contradictory
+    /// `Absent` answer must still fail closed rather than overwrite the recorded generation.
     pub(crate) fn generation_may_still_execute(&self) -> bool {
         matches!(
             self.state,
@@ -562,19 +666,47 @@ impl FundingJournalRecord {
             hot_dapp_id,
             creator_pubkey: self.creator_pubkey.clone(),
             required: self.required.clone(),
+            required_native: self.required_native,
             shortfall: self.shortfall.clone(),
+            native_shortfall: self.native_shortfall,
         }
     }
 }
 
-/// The native value one Vault -> Hot transfer carries.
+/// The final native vmshell floor this money path requires the Hot to hold.
 /// The specification fixes that a single `submitTransaction` carries both halves of the shortfall -
-/// native in `value`, SHELL in `cc[2]`. The commands this module serves compute their need in
-/// ECC[2] only, so the native leg is not a shortfall figure but the transfer's own gas: the same
-/// `NOTE_DEPLOY_SUBMIT_NATIVE_VALUE` every other multisig transfer in this client attaches, which
-/// arrives in the Hot's native balance and is what the Hot then spends to act.
+/// the exact native vmshell shortfall in `value`, SHELL in `cc[2]`. The floor is what the money path
+/// can ATTACH out of the Hot before it next reads a balance, and an already-held native balance is
+/// subtracted rather than transferred again.
+/// It is built from three canonical facts, and it is the whole of what the two submits take:
+/// > [`dexdo_core::params::NOTE_DEPLOY_WALLET_SUBMITS`] submits x ([`dexdo_core::params::NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`] attached +
+/// > [`dexdo_core::params::WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW`] fee)
+/// A fresh `note deploy` submits twice - the deposit voucher and the SHELL gas voucher - and EACH of
+/// those submits takes two separate amounts out of the Hot: the value it attaches, which never
+/// returns(`RootPN.generateVoucher` accepts the message and sends no change back), and the fee its
+/// own transaction charges, which `flag: 1` pays from the wallet's balance rather than out of the
+/// amount being sent. A floor counting either half alone leaves the Hot able to start the deploy and
+/// unable to finish it: it stops after the first voucher with the deposit already spent and a halo2
+/// proof already made.
+/// Two deliberate choices, so that neither is quietly optimized back later.
+/// **Over-funding is preferred to under-funding.** The fee half is an upper bound rather than the
+/// fee itself, and the floor is sized to the LARGEST of the paths sharing this mechanism rather than
+/// to each separately - the funding step runs before either command reads its recovery file, so it
+/// cannot know whether this is a fresh deploy with two submits left or a resumed one with one. What
+/// it can know is the most the path can spend. Every raw unit of the difference moves the operator's
+/// own money into the operator's own Hot, which is not a loss; being short stops a money path that
+/// has already paid for its first leg, which is.
+/// **It never exceeds the recipe the operator was already told to send.** The figure is exactly the
+/// "sends" half of [`dexdo_core::params::OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]'s own budget - that budget is one
+/// wallet deploy plus these same two submits - so asking a Hot to reach this floor can never ask for
+/// more native than `note wallet` already funds a fresh wallet with.
+/// moved the arithmetic itself to [`dexdo_core::params::FUNDING_WALLET_NATIVE_FLOOR_RAW`],
+/// where the same three constants now produce it once. The two were always the same figure for the
+/// same reason -- what a funding wallet's own outgoing messages cost it -- and the other commands
+/// that spend a funding wallet need to state it too. Restating the product here would let the floor
+/// this gate waits for and the floor those commands report drift apart.
 pub(crate) fn vault_to_hot_native_value() -> u128 {
-    dexdo_core::params::NOTE_DEPLOY_SUBMIT_NATIVE_VALUE
+    dexdo_core::params::FUNDING_WALLET_NATIVE_FLOOR_RAW
 }
 
 /// The journal file name for one Hot: `sha256(network, hot_address)` in hex.
@@ -789,6 +921,42 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a read failed because the chain never answered, as opposed to answering something.
+/// The single shared reader([`dexdo_core::shellnet::retry_transient_read`]) is the thing that
+/// decides which transport failures are worth repeating; when its own budget for ONE read runs out
+/// it marks the error with [`dexdo_core::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX`]. That marker is the
+/// whole discrimination, and it is deliberately the shared helper's verdict rather than a second
+/// opinion formed here: "no answer yet" is the only failure a longer wait can change.
+/// Everything without the marker is an answer and stays final - a parameter encoding fault, an
+/// account that is not Active, a malformed address. Waiting ten minutes to be told the same thing
+/// is the failure mode this predicate exists to avoid.
+fn read_got_no_answer(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(dexdo_core::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX)
+}
+
+/// Leave the wait carrying the funding state, so the machine error envelope can name it.
+/// Wrapped so the failure keeps BOTH things a failed money command is judged on.
+/// The first shape of this rendered the error to a string and rebuilt around it
+/// (`anyhow::Error::new(state).context(format!("{error:#}"))`). That was a defect: `classify_error`
+/// picks the machine code by downcasting the causes - `DexdoError` for `E_GATEWAY_UNREACHABLE` /
+/// `E_GATEWAY_WRONG_ENDPOINT`, `DealHandleSchemaTooNew`, `ChainError` - and flattening threw every
+/// one of them away. Adding a field to the envelope while silently moving `code` is not a fix.
+/// The obvious repair, `error.context(state)`, restores the causes but makes the STATE the error's
+/// `Display`, and four accepted tests read the operator's message through `to_string()`. So the
+/// state travels in a wrapper that renders as its own source and keeps that source as a real cause:
+/// `to_string()` is still the operator's message, and every typed cause is still downcastable.
+/// Only the stable event travels - no address, no provider response, no local path, no key
+/// material.
+/// `notice` is `None` when this run has not arranged anything yet, and then nothing is attached:
+/// an absent `funding_notice` means "no funding request of this run exists", which is an answer in
+/// its own right and must not be confused with `already_funded`.
+fn carrying_funding_state(error: anyhow::Error, notice: Option<&FundingNotice>) -> anyhow::Error {
+    let Some(notice) = notice else {
+        return error;
+    };
+    crate::cli::machine::FundingContext::wrap(notice.machine_notice(), error)
+}
+
 // ---------------------------------------------------------------------------------------------
 // ensure_hot_funded
 // ---------------------------------------------------------------------------------------------
@@ -812,6 +980,48 @@ pub(crate) enum FundingNotice {
     RequestIndeterminate { reason: String },
     /// This provider has no request to create; the operator tops the Hot up themselves.
     ManualTopUpRequested,
+}
+
+impl FundingNotice {
+    /// Stable, secret-free machine form. Free-form provider reasons/evidence stay out of stdout.
+    pub(crate) fn machine_notice(&self) -> crate::cli::machine::MachineFundingNotice {
+        use crate::cli::machine::MachineFundingNotice;
+        match self {
+            Self::AlreadyFunded => MachineFundingNotice::AlreadyFunded,
+            Self::RequestSubmitted => MachineFundingNotice::RequestSubmitted,
+            Self::RequestAlreadyPending => MachineFundingNotice::RequestAlreadyPending,
+            Self::RequestExecuted { .. } => MachineFundingNotice::RequestExecuted,
+            Self::RequestIndeterminate { .. } => MachineFundingNotice::RequestIndeterminate,
+            Self::ManualTopUpRequested => MachineFundingNotice::ManualTopUpRequested,
+        }
+    }
+}
+
+/// Render the Acki confirmation notice under the already accepted ANSI policy.
+/// `stderr_is_terminal` names the stream this line is written to. Passing the two facts in keeps
+/// all three policy outcomes functional-testable without mutating process-wide environment state.
+fn render_ackinacki_funding_notice(
+    message: &str,
+    stderr_is_terminal: bool,
+    no_color: bool,
+) -> String {
+    if stderr_is_terminal && !no_color {
+        format!("\x1b[33m{message}\x1b[0m")
+    } else {
+        message.to_string()
+    }
+}
+
+#[cfg(any(feature = "shellnet", test))]
+fn print_ackinacki_funding_notice(message: &str) {
+    eprintln!(
+        "{}",
+        render_ackinacki_funding_notice(
+            message,
+            std::io::stderr().is_terminal(),
+            crate::cli::no_color_requested(),
+        )
+    );
 }
 
 /// Bounds for the wait. Separate from the call so a test can drive Tokio's monotonic clock.
@@ -916,9 +1126,10 @@ where
 /// 1. the `prepared` record is written and flushed BEFORE the submit, so a spend that lands while
 /// this client never learns it did always leaves a record at least as advanced as `prepared` -
 /// there is no window in which money moved and the journal is silent;
-/// 2. from any open record, a submit needs [`RequestPresence::Absent`] or
-/// [`RequestPresence::ExpiredUnexecuted`], both of which are positive facts read off the chain.
-/// `Unknown` - any read failure - is neither, and forbids the submit;
+/// 2. from any open record, a submit needs [`RequestPresence::Absent`],
+/// [`RequestPresence::ExpiredUnexecuted`], or finalized execution tied to that generation's
+/// parseable recorded queue id. Each is a positive chain fact that the old generation cannot
+/// move money again. `Unknown` - any read failure - is not, and forbids the submit;
 /// 3. a request that has LEFT the Vault's queue is never read as absence. The specification is
 /// explicit that queue disappearance alone must never authorize another submit, because
 /// "executed" and "expired" look identical from the queue and are opposite in money terms. Only
@@ -972,6 +1183,11 @@ where
     let started = tokio::time::Instant::now();
     let mut arranged = false;
     let mut notice = FundingNotice::AlreadyFunded;
+    // the last balance this run actually read. The timeout message names what is still
+    // missing, and that figure has to come from a reading that happened - so when the operator's
+    // window runs out INSIDE a read, the wait reports the last real one rather than inventing a
+    // fresh number or degrading into a transient chain error.
+    let mut last_observed: Option<HotBalances> = None;
 
     loop {
         // Everything that reads the balance for a decision, and everything that writes the journal,
@@ -988,7 +1204,50 @@ where
             HotTurn::AlreadyHeldByCaller => None,
         };
 
-        let observed = reader.hot_balances(&hot).await?;
+        // (rymkapro, 2026-08-17): `--funding-timeout` is the operator's whole window, so no
+        // single read may outlive what is left of it. The budget used to be consulted only AFTER a
+        // read returned, and `hot_balances` carries its own retry budget of up to forty-five
+        // seconds; a read begun just before the deadline therefore ran past it, and when its inner
+        // retry ran out it produced a transient read error that took the arm below instead of the
+        // documented timeout. Two different wrongs from one missing bound: a wait longer than
+        // asked for, and the wrong verdict at the end of it.
+        // The first pass is deliberately unbounded. The budget check further down is placed after a
+        // full check-and-arrange pass precisely so that `--funding-timeout 0` still performs one
+        // check and an already-funded Hot never fails on a timeout; bounding the first read to a
+        // zero remainder would take that away.
+        let remaining = bounds.timeout.saturating_sub(started.elapsed());
+        let read = if last_observed.is_none() {
+            reader.hot_balances(&hot).await
+        } else {
+            match tokio::time::timeout(remaining, reader.hot_balances(&hot)).await {
+                Ok(answer) => answer,
+                // The window ran out inside the read. That is the operator's timeout, not a chain
+                // fault, so it must not be reported as one -- fall through to the documented
+                // timeout with the last reading this run actually took.
+                Err(_elapsed) => {
+                    drop(lock);
+                    break;
+                }
+            }
+        };
+        let observed = match read {
+            Ok(observed) => observed,
+            // A read that never got an answer is not a verdict about the balance, and the operator
+            // asked to wait for that balance for `bounds.timeout`. The shared per-read retry has
+            // its own, much smaller budget - it is sized for ONE read and is right for every other
+            // caller - so letting its exhaustion end the wait capped a ten-minute
+            // `--funding-timeout` at forty-five seconds. Keep reading on the cadence the wait
+            // already polls at, and stop the moment the operator's window is actually spent.
+            Err(error) if read_got_no_answer(&error) && started.elapsed() < bounds.timeout => {
+                drop(lock);
+                tokio::time::sleep(bounds.poll).await;
+                continue;
+            }
+            // Everything else is an answer: an encoding fault, an account that is not Active, a
+            // rejected request. It will read the same in ten minutes, so it leaves now.
+            Err(error) => return Err(carrying_funding_state(error, arranged.then_some(&notice))),
+        };
+        last_observed = Some(observed.clone());
         if requirements.met_by(&observed) {
             // A sufficient balance proves the command can spend; it says nothing about a Vault
             // request that is still confirmable. Probe a recorded queue id before retiring it. If
@@ -1048,7 +1307,14 @@ where
                 provider,
             )
             .await?;
-            arranged = true;
+            // A generation the chain proved EXECUTED whose credit the Hot has not shown yet leaves
+            // this pass with no balance it could size a residual from, so it is not the one
+            // arrangement this run is allowed. The credit - or this wait's own budget running out -
+            // is what ends that window, and only a pass that reads a balance after it may size
+            // anything.
+            arranged = !load_funding_journal(data_dir, &network, &hot_address)?
+                .filter(FundingJournalRecord::is_open)
+                .is_some_and(|record| record.awaits_executed_credit(&observed));
         }
 
         drop(lock);
@@ -1056,19 +1322,49 @@ where
         // Checked AFTER a full check-and-arrange pass, so a zero budget still performs one check
         // and an already-funded Hot never fails on a timeout.
         if started.elapsed() >= bounds.timeout {
-            let shortfall = requirements.shortfall(&observed);
-            bail!(
-                "{operation}: timed out after {}s waiting for Hot {hot_address} to reach the \
-                 required balance (still missing {}). Nothing was cancelled: any Vault transfer you \
-                 have already confirmed stays on chain, the wallet binding, its keys and every \
-                 recovery file are untouched, and the funding journal keeps what is pending. Top the \
-                 Hot up and re-run the same command - it re-checks the balance and continues.",
-                bounds.timeout.as_secs(),
-                render_currency_amounts(&shortfall)
-            );
+            break;
         }
         tokio::time::sleep(bounds.poll).await;
     }
+
+    // Reached two ways, and both are the operator's window running out: the budget check above, and
+    // a read that was still running when the window closed. One exit means one verdict -- before
+    // the second way produced a transient chain error instead, which named the wrong culprit
+    // for the same event.
+    // `last_observed` is `Some` here: the first pass reads unbounded and records its answer, and the
+    // bounded arm only breaks once a reading exists. The fallback keeps that reasoning honest
+    // rather than resting on it - if it were ever wrong, the message says so instead of panicking.
+    let Some(observed) = last_observed else {
+        return Err(carrying_funding_state(
+            anyhow!(
+                "{operation}: timed out after {}s waiting for Hot {hot_address}, and this run never \
+                 completed a single balance read, so it cannot say what is still missing. Nothing \
+                 was cancelled: any Vault transfer you have already confirmed stays on chain, the \
+                 wallet binding, its keys and every recovery file are untouched, and the funding \
+                 journal keeps what is pending.",
+                bounds.timeout.as_secs()
+            ),
+            arranged.then_some(&notice),
+        ));
+    };
+    let shortfall = requirements.shortfall(&observed);
+    let native_shortfall = requirements.native_shortfall(&observed);
+    // `arranged` is true on every path that reaches here: a met requirement returns above,
+    // and an unmet one arranges before the budget is ever checked. So the timeout always
+    // carries the funding state, which is the whole point of naming it here.
+    Err(carrying_funding_state(
+        anyhow!(
+            "{operation}: timed out after {}s waiting for Hot {hot_address} to reach the \
+             required balance (still missing {}). Nothing was cancelled: any Vault \
+             transfer you have already confirmed stays on chain, the wallet binding, its \
+             keys and every recovery file are untouched, and the funding journal keeps \
+             what is pending. Top the Hot up and re-run the same command - it re-checks \
+             the balance and continues.",
+            bounds.timeout.as_secs(),
+            render_native_and_ecc_amounts(native_shortfall, &shortfall)
+        ),
+        arranged.then_some(&notice),
+    ))
 }
 
 /// Close an open record, and only ever with the balances that were actually read.
@@ -1104,6 +1400,7 @@ fn close_journal_if_open(
     record.state = FundingState::Satisfied;
     record.last_checked_at_unix = Some(unix_now_secs());
     record.satisfied_balances = Some(observed.balances.clone());
+    record.satisfied_native_balance = Some(observed.native);
     store_funding_journal(data_dir, &record)
 }
 
@@ -1124,6 +1421,7 @@ where
 {
     let hot_address = hot.to_string();
     let shortfall = requirements.shortfall(observed);
+    let native_shortfall = requirements.native_shortfall(observed);
     let today = FundingRequest {
         provider: binding.provider,
         network: binding.network.clone(),
@@ -1133,7 +1431,9 @@ where
         hot_dapp_id: hot.dapp_id().to_string(),
         creator_pubkey: creator_pubkey.to_string(),
         required: requirements.required.clone(),
+        required_native: requirements.required_native,
         shortfall: shortfall.clone(),
+        native_shortfall,
     };
 
     let existing = load_funding_journal(data_dir, &binding.network, &hot_address)?;
@@ -1185,16 +1485,21 @@ where
             record.pending_transaction_id = pending_transaction_id.or(record.pending_transaction_id);
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
-            eprintln!(
+            print_ackinacki_funding_notice(
                 "Hot wallet funding request is pending. Confirm the pending Vault -> Hot \
-                 transaction in your wallet application."
+                 transaction in your wallet application.",
             );
             Ok(FundingNotice::RequestAlreadyPending)
         }
         RequestPresence::Executed { evidence } => {
-            // The transfer LEFT the Vault. A second request here is the double transfer the whole
-            // journal exists to prevent, so nothing is submitted: the money is on its way and the
-            // wait is what observes it arriving.
+            // Finalized execution bound to this generation's recorded queue id proves that request
+            // can never execute again. If its delivered amount is insufficient for today's need,
+            // retire it before opening the next generation for today's exact shortfall. An id-less
+            // or malformed-id history fallback remains conservative: it may forbid a submit, but
+            // cannot prove which generation executed.
+            let retired_generation = open
+                .as_ref()
+                .and_then(FundingJournalRecord::retirable_generation);
             let mut record =
                 open.unwrap_or_else(|| FundingJournalRecord::open(&probe_for, unix_now_secs()));
             record.state = FundingState::Executed;
@@ -1209,21 +1514,71 @@ where
                     evidence.detail
                 );
             } else {
+                if let Some(retired) = retired_generation {
+                    // Execution proves the message left the VAULT, not that the Hot has been
+                    // credited. Between the two the Hot still holds what this generation was sized
+                    // against, so a residual computed here would be the whole old shortfall over
+                    // again - and the Hot would end up holding both transfers. The Hot's balance is
+                    // the destination receipt: wait for it to show the credit, and let a later pass
+                    // size whatever is still missing from a reading taken after it.
+                    if !record.executed_delivery_is_credited(observed) {
+                        // Two different facts can be the missing one, and they read very differently
+                        // to whoever is watching a Hot whose balance HAS moved. Naming the one that
+                        // is actually missing is the difference between a wait an operator can
+                        // follow and a refusal that looks like it is ignoring the chain.
+                        let missing = if record
+                            .evidence
+                            .as_ref()
+                            .is_some_and(|evidence| evidence.delivery_message_id.is_some())
+                        {
+                            "the Hot has not shown that credit yet, so the only balance this run \
+                             has read is the one that generation was already sized against"
+                        } else {
+                            "the internal message that carried it to the Hot cannot be named from \
+                             chain fact yet, so nothing says the Hot's balance holds THIS transfer \
+                             rather than an unrelated one of the same size"
+                        };
+                        eprintln!(
+                            "{operation}: the earlier Vault -> Hot funding request for \
+                             {hot_address} EXECUTED ({}), but {missing}. Sizing a second request \
+                             from it would ask the Vault for the same shortfall twice. Nothing was \
+                             submitted; the wait continues against the Hot's own balance.",
+                            evidence.detail
+                        );
+                        return Ok(FundingNotice::RequestExecuted { evidence });
+                    }
+                    eprintln!(
+                        "{operation}: the earlier Vault -> Hot funding request for {hot_address} \
+                         EXECUTED ({}), the Hot has been credited with it, and the current \
+                         requirement is still unmet. That finalized generation cannot execute \
+                         again, so a fresh request is being created.",
+                        evidence.detail
+                    );
+                    return submit_new_request(
+                        data_dir,
+                        &today,
+                        operation,
+                        &hot_address,
+                        retired + 1,
+                        provider,
+                    )
+                    .await;
+                }
                 eprintln!(
-                    "{operation}: the earlier Vault -> Hot funding request for {hot_address} is no \
-                     longer queued because it EXECUTED ({}). No second request was created. Waiting \
-                     for the transferred balance to appear on the Hot.",
+                    "{operation}: finalized history shows an earlier Vault -> Hot transfer for \
+                     {hot_address} executed ({}), but no parseable recorded queue id binds that \
+                     fallback to this generation. No second request was created.",
                     evidence.detail
                 );
             }
             Ok(FundingNotice::RequestExecuted { evidence })
         }
         RequestPresence::ExpiredUnexecuted { evidence } => {
-            // Proven to have left the queue WITHOUT moving money. This is the one circumstance in
-            // which a new generation may be opened: the previous one can no longer execute, so a
-            // fresh request cannot be a second transfer. The retired generation's verdict is kept
-            // on the way past, then the new generation is written `prepared` and flushed before the
-            // submit, exactly as the first one was.
+            // Proven to have left the queue WITHOUT moving money. Like finalized execution of the
+            // recorded id, this retires the previous generation: it can no longer execute, so a
+            // fresh request cannot be a second live transfer. The retired generation's verdict is
+            // kept on the way past, then the new generation is written `prepared` and flushed
+            // before the submit, exactly as the first one was.
             let retired = open.as_ref().map_or(1, |record| record.generation);
             if let Some(record) = &open {
                 let mut closing = record.clone();
@@ -1323,9 +1678,9 @@ where
             record.pending_transaction_id = pending_transaction_id;
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
-            eprintln!(
+            print_ackinacki_funding_notice(
                 "Hot wallet funding request submitted. Confirm the pending Vault -> Hot \
-                 transaction in Acki Nacki Wallet."
+                 transaction in Acki Nacki Wallet.",
             );
             Ok(FundingNotice::RequestSubmitted)
         }
@@ -1342,15 +1697,48 @@ where
     }
 }
 
-fn render_currency_amounts(amounts: &BTreeMap<u32, u128>) -> String {
-    if amounts.is_empty() {
-        return "nothing".to_string();
+/// A native vmshell amount and an ECC currency map, rendered with each half named as its own unit.
+/// Both halves, always, because they are disjoint balances and every gate that reads them blocks on
+/// BOTH([`FundingRequirements::met_by`]). Native is never folded into an `ECC[N]` label: an
+/// invented currency id would be a second way to say the same thing wrongly.
+/// # Why there is exactly one of these
+/// There were two. This module's wait-loop timeout and the provider instructions in [`providers`]
+/// each rendered the same pair of values through their own implementation, and the copies drifted
+/// until they disagreed about money: a live mainnet `note deploy` printed "Hot wallet... is short
+/// nothing" from the provider copy, which read only the currency map, and then failed with "still
+/// missing 492980000 native vmshell" from this one, which had known the figure the whole time
+/// . A wallet rich in ECC[2] and low on gas is exactly the state in which that map is empty,
+/// so the operator was told the sum of a missing balance was "nothing" by one renderer and told the
+/// truth by the other, in one incident.
+/// # Why it is not named for shortfalls
+/// [`providers::describe_recorded_request`] renders a queued transfer's own amount through it,
+/// which is not a shortfall at all. One name covering two meanings is how the last divergence
+/// started.
+fn render_native_and_ecc_amounts(native: u128, amounts: &BTreeMap<u32, u128>) -> String {
+    let mut parts = Vec::new();
+    if native > 0 {
+        parts.push(format!("{native} raw native vmshell"));
     }
-    amounts
-        .iter()
-        .map(|(currency, amount)| format!("{amount} of currency {currency}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    parts.extend(amounts.iter().map(|(currency, amount)| {
+        if *currency == dexdo_core::params::SHELL_CURRENCY_ID {
+            format!("{amount} raw ECC[2] SHELL")
+        } else {
+            format!("{amount} raw ECC[{currency}]")
+        }
+    }));
+    if parts.is_empty() {
+        // Unreachable from every caller. `met_by` is exactly "no native shortfall AND an empty
+        // currency map", so neither a provider instruction nor the timeout below - both of which
+        // run only on its negation - can hold a request with nothing missing, and a recorded
+        // transfer that moves nothing was never queued. It is named as the client bug it would be
+        // rather than as "nothing", which is the one reading an operator can act on and be wrong.
+        // Refusing here instead would turn a rendering fault into a failed money command, and a
+        // panic is not allowed on a runtime path - so this stays a total function with no new
+        // branch in any caller.
+        return "an amount this client failed to record (client bug: the request carries no amount)"
+            .to_string();
+    }
+    parts.join(" and ")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1363,15 +1751,14 @@ impl HotBalanceReader for dexdo_core::ChainClient {
     async fn hot_balances(&self, hot: &CanonicalAddress) -> Result<HotBalances> {
         let address = dexdo_core::Address::parse(&hot.legacy())
             .map_err(|e| anyhow!("Hot {hot} is not a chain address: {e:?}"))?;
-        let account = self
-            .get_account(&address)
+        let account = dexdo_core::shellnet::retry_transient_read(|| self.get_account(&address))
             .await
             .map_err(|e| anyhow!("read Hot {hot} balances: {e}"))?
             .ok_or_else(|| anyhow!("Hot {hot} not found on chain"))?;
         if !account.is_active() {
             bail!("Hot {hot} is not Active (acc_type={})", account.status);
         }
-        Ok(HotBalances::new(account.ecc))
+        Ok(HotBalances::new(account.balance, account.ecc))
     }
 }
 
@@ -1384,11 +1771,10 @@ pub(crate) mod providers;
 
 /// Ensure the bound Hot can pay for `operation`, arranging a top-up through its provider if not.
 /// This is what `note deploy` and `note topup` call. Three things about its shape are deliberate.
-/// **It is a no-op without a binding.** `--multisig-address` wins over the binding and is used
-/// exactly as given(`resolve_funding_wallet`), so a wallet passed on the command line has no
-/// recorded provider - and the specification forbids inferring one, because different providers hand
-/// out the same canonical contract. With nothing to infer from there is no funding flow to choose,
-/// so the command keeps the insufficient-balance refusal it has always had. `Ok(None)` is that case.
+/// **An explicit Hot is manual for this command.** `--multisig-address` wins over the binding and
+/// is used exactly as resolved(`resolve_funding_wallet`). It does not create a durable binding and
+/// no provider is inferred from its address: the explicit BYO path itself selects the agreed manual
+/// instruction plus bounded on-chain balance wait.
 /// **The Hot's turn is already held.** Both callers take the funding-wallet lock they have shared
 /// since before they read anything, so the check and the spend are already serialized under
 /// one key. Taking a second lock here would serialize nothing the first does not.
@@ -1401,16 +1787,23 @@ pub(crate) async fn fund_hot_for_money_command(
     client: &dexdo_core::ChainClient,
     endpoint: &str,
     binding: Option<&crate::cli::wallet::WalletBinding>,
+    resolved_hot_address: &str,
+    network: &str,
     requirements: FundingRequirements,
     operation: &str,
     funding_timeout: Option<Duration>,
-) -> Result<Option<FundingNotice>> {
+) -> Result<FundingNotice> {
     use providers::{AckinackiVaultProvider, DirectTopUpProvider, RealVaultChain};
 
-    let Some(active) = binding else {
-        return Ok(None);
-    };
-    let view = HotFundingBinding::from_active(active);
+    let view = binding.map_or_else(
+        || HotFundingBinding {
+            provider: WalletProvider::Manual,
+            network: network.to_string(),
+            hot_address: dexdo_core::address::display_self_dapp(resolved_hot_address),
+            vault_address: None,
+        },
+        HotFundingBinding::from_active,
+    );
     let hot_address = view.hot()?.to_string();
     let data_dir = crate::cli::data_dir::effective()?;
     let bounds = FundingWaitBounds {
@@ -1424,11 +1817,11 @@ pub(crate) async fn fund_hot_for_money_command(
         .filter(FundingJournalRecord::is_open)
         .map(|record| record.recorded_request());
 
-    if !active.provider.creates_vault_request() {
+    if !view.provider.creates_vault_request() {
         // No Vault, so no request and no creator: the operator tops the Hot up and the wait
         // observes it. The journal still records the open need, which is what keeps one shortfall
         // and one reconciliation timestamp across a repeat of the command.
-        let provider = DirectTopUpProvider::new(active.provider)?;
+        let provider = DirectTopUpProvider::new(view.provider)?;
         let funded = ensure_hot_funded_with_turn(
             &HotFundingContext {
                 binding: &view,
@@ -1443,9 +1836,12 @@ pub(crate) async fn fund_hot_for_money_command(
             &provider,
         )
         .await?;
-        return Ok(Some(funded.notice));
+        return Ok(funded.notice);
     }
 
+    let active = binding.ok_or_else(|| {
+        anyhow!("internal: a Vault funding view cannot come from an explicit manual Hot")
+    })?;
     let vault = view.vault()?.ok_or_else(|| {
         anyhow!(
             "wallet binding {} names provider `{}` but records no Vault address, so there is \
@@ -1495,7 +1891,7 @@ pub(crate) async fn fund_hot_for_money_command(
         &provider,
     )
     .await?;
-    Ok(Some(funded.notice))
+    Ok(funded.notice)
 }
 
 #[cfg(test)]
@@ -1504,3 +1900,18 @@ mod tests;
 /// the states a request leaves the Vault queue through, and what may follow each.
 #[cfg(test)]
 mod reconciliation_tests;
+
+/// re-audit item 8: terminal colour policy and the secret-free machine notice mapping.
+#[cfg(test)]
+#[path = "wallet_funding/item8_output_tests.rs"]
+mod item8_output_tests;
+
+/// re-audit items 2 and 3: the window an executed transfer has not been credited in, and the
+/// native floor of a money path that attaches it more than once.
+#[cfg(test)]
+mod issue_334_reaudit_regressions;
+
+/// re-audit item 2, second reading: which transfer credited the Hot is an identity the
+/// aggregated balance cannot carry.
+#[cfg(test)]
+mod issue_334_delivery_identity;

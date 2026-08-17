@@ -1184,7 +1184,6 @@ mod shellnet {
     use dexdo_core::params::{GOSHAI_HOT_ACTIVATION_POLL_INTERVAL, GOSHAI_HOT_ACTIVATION_TIMEOUT};
     use dexdo_core::shellnet::RetryingReads as _;
     use dexdo_core::{Address, CanonicalAddress};
-    use qrcode::render::unicode;
     use qrcode::QrCode;
     use zeroize::Zeroizing;
 
@@ -1205,7 +1204,6 @@ mod shellnet {
         /// does not know about.
         pub(crate) binding_id: String,
         pub(crate) endpoint: Option<String>,
-        pub(crate) contracts: PathBuf,
         /// `--activation-timeout`, defaulting to
         /// [`GoshAiOnboardOptions::DEFAULT_ACTIVATION_TIMEOUT`].
         pub(crate) activation_timeout: Duration,
@@ -1272,21 +1270,22 @@ mod shellnet {
 
     /// Step 1 of the spec, and a placeholder. See [`GOSHAI_PLACEHOLDER_URL`].
     fn print_placeholder_invitation() -> Result<()> {
-        let qr = QrCode::new(GOSHAI_PLACEHOLDER_URL.as_bytes())
-            .context("render the Gosh.ai placeholder link as a QR code")?
-            .render::<unicode::Dense1x2>()
-            .quiet_zone(true)
-            .build();
-        println!("Open Gosh.ai and copy the one-line wallet string for your sub-wallet.");
-        println!("{qr}");
-        println!("{GOSHAI_PLACEHOLDER_URL}");
-        println!(
+        let code = QrCode::new(GOSHAI_PLACEHOLDER_URL.as_bytes())
+            .context("render the Gosh.ai placeholder link as a QR code")?;
+        let mut stdout = std::io::stdout();
+        writeln!(
+            stdout,
+            "Open Gosh.ai and copy the one-line wallet string for your sub-wallet."
+        )?;
+        crate::cli::qr_display::write_qr(&mut stdout, &code)
+            .context("render the Gosh.ai placeholder QR code")?;
+        writeln!(stdout, "{GOSHAI_PLACEHOLDER_URL}")?;
+        writeln!(
+            stdout,
             "This link is a placeholder for the direct sub-wallet screen and will change before \
              release."
-        );
-        std::io::stdout()
-            .flush()
-            .context("flush the Gosh.ai invitation")
+        )?;
+        stdout.flush().context("flush the Gosh.ai invitation")
     }
 
     async fn poll_hot(client: &dexdo_core::ChainClient, address: &Address) -> HotPoll {
@@ -1460,18 +1459,20 @@ mod shellnet {
             }
         };
 
-        let manifest = options
-            .contracts
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-        let chain = dexdo_core::RealChainBackend::connect_with_endpoint(
-            manifest,
+        // Proving the Hot is three read-only account queries on the selected network, and the
+        // deployed-contracts manifest names none of the accounts they read: the address arrives in
+        // the Gosh.ai string. So the endpoint is the whole input here, exactly as it is for
+        // `wallet onboard ackinacki-wallet`.
+        let endpoint = crate::cli::wallet::wallet_read_endpoint(
             options.endpoint.as_deref(),
+            options.network,
         )?;
+        let chain = dexdo_core::ChainClient::connect(&endpoint)
+            .map_err(|error| anyhow::anyhow!("connect verification endpoint {endpoint}: {error}"))?;
         let address = chain_address(&prepared.hot_address)?;
-        await_active_hot(chain.client(), &address, options.activation_timeout).await?;
+        await_active_hot(&chain, &address, options.activation_timeout).await?;
 
-        let facts = read_active_hot_facts(chain.client(), &address).await?;
+        let facts = read_active_hot_facts(&chain, &address).await?;
         if let Err(refusal) =
             verify_active_hot(&prepared.hot_address, &facts, &prepared.derived_public_key)
         {

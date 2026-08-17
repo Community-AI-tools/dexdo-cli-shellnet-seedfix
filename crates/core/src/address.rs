@@ -107,6 +107,18 @@ pub fn to_chain_param(s: &str) -> Result<String, String> {
     Ok(CanonicalAddress::parse(s)?.legacy())
 }
 
+/// Render a DApp id as the `uint256` argument the contract ABIs declare it to be.
+/// `dapp_id` is a `uint256` input of `UpdateCustodianMultisigWallet_v2.submitTransaction` and of
+/// `PrivateNote.withdrawTokens`, and the SDK's tokenizer reads a STRING argument as decimal unless it
+/// carries the `0x` prefix. A DApp id is 64 hex characters, so handing it over bare either fails to
+/// encode at all - `can not parse number from string`, raised before anything reaches the chain - or,
+/// for the DApp id whose characters all happen to be decimal digits, silently encodes a different
+/// number. The prefix is what makes the argument name the DApp it was read from.
+/// An already-prefixed id passes through unchanged, so this is safe to apply at any boundary.
+pub fn to_dapp_id_param(dapp_id: &str) -> String {
+    format!("0x{}", dapp_id.trim_start_matches("0x"))
+}
+
 /// Render an address for output in the canonical public form.
 /// This is the display seam: it upgrades a stored/legacy `0:<account_id>` to `<dapp_id>::<account_id>`
 /// and leaves an already-canonical address alone. A value that is not an address at all (a placeholder,

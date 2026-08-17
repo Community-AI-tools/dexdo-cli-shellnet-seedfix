@@ -205,12 +205,12 @@ fn a_seed_file_binding_resolves_to_the_seed_input() {
     assert_eq!(resolved.seed_file, Some(PathBuf::from("/secrets/hot.seed")));
 }
 
-/// The parser half of the same change: omitting the wallet is now a RUN-TIME question for the
-/// binding to answer, so it has to reach the command instead of being rejected by clap. The pairing
-/// rules that were there before are unchanged, which is why the existing parse test keeps all four
-/// of its rejections.
+/// The parser half of the same change: omitting the wallet is a run-time question for the binding,
+/// and either `note deploy` flag half may be completed by its env equivalent. Those shapes must
+/// reach the post-fallback pair validator instead of being rejected by clap. `note topup` has no
+/// such env contract, so its existing pair rejections stay at the parser.
 #[test]
-fn omitting_the_wallet_parses_while_every_previous_pairing_rule_still_rejects() {
+fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects() {
     for command in [
         vec![
             "dexdo", "note", "deploy", "--nominal", "N100", "--pool", "p.json",
@@ -218,12 +218,6 @@ fn omitting_the_wallet_parses_while_every_previous_pairing_rule_still_rejects() 
         vec![
             "dexdo", "note", "topup", "--note-addr", "0:note", "--to-raw", "1",
         ],
-    ] {
-        Cli::try_parse_from(command.clone())
-            .unwrap_or_else(|error| panic!("{command:?} must reach the binding: {error}"));
-    }
-    for command in [
-        // A key with no wallet to spend from names no wallet at all.
         vec![
             "dexdo",
             "note",
@@ -235,7 +229,6 @@ fn omitting_the_wallet_parses_while_every_previous_pairing_rule_still_rejects() 
             "--pool",
             "p.json",
         ],
-        // A wallet with no key cannot sign.
         vec![
             "dexdo",
             "note",
@@ -247,6 +240,12 @@ fn omitting_the_wallet_parses_while_every_previous_pairing_rule_still_rejects() 
             "--pool",
             "p.json",
         ],
+    ] {
+        Cli::try_parse_from(command.clone()).unwrap_or_else(|error| {
+            panic!("{command:?} must reach binding/env fallback: {error}")
+        });
+    }
+    for command in [
         vec![
             "dexdo",
             "note",

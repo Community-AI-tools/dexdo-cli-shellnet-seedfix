@@ -95,11 +95,11 @@ mod endpoint_and_resume_tests {
                 None,
                 "https://dd-mainnet.ackinacki.org",
             ),
-            (WalletNetworkArg::Shellnet, None, "https://shellnet.ackinacki.org"),
+            (WalletNetworkArg::Shellnet, None, "https://dd-shellnet.ackinacki.org"),
             (
                 WalletNetworkArg::Shellnet,
-                Some("shellnet.ackinacki.org".to_string()),
-                "https://shellnet.ackinacki.org",
+                Some("dd-shellnet.ackinacki.org".to_string()),
+                "https://dd-shellnet.ackinacki.org",
             ),
             (
                 WalletNetworkArg::Mainnet,
@@ -174,7 +174,7 @@ mod endpoint_and_resume_tests {
 
         // Accepting a scheme difference must not become accepting a host or a downgrade.
         for other in [
-            "https://shellnet.ackinacki.org",
+            "https://dd-shellnet.ackinacki.org",
             "https://mainnet.example.invalid",
             "http://dd-mainnet.ackinacki.org",
         ] {

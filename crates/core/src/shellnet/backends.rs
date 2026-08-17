@@ -10194,16 +10194,16 @@ mod codecell_tests {
         // The exact reqwest error `fetch_dapp_id` produces on a funded-uninit deploy target -> uninit.
         assert!(is_uninit_account_404(
             "HTTP status client error (404 Not Found) for url \
-             (https://shellnet.ackinacki.org/v2/account?account_id=6606&dapp_id=6606)"
+             (https://dd-shellnet.ackinacki.org/v2/account?account_id=6606&dapp_id=6606)"
         ));
         // A 404 from a DIFFERENT endpoint is NOT the uninit-account case -> must propagate.
         assert!(!is_uninit_account_404(
-            "HTTP status client error (404 Not Found) for url (https://shellnet.ackinacki.org/v2/messages)"
+            "HTTP status client error (404 Not Found) for url (https://dd-shellnet.ackinacki.org/v2/messages)"
         ));
         // A non-404 error on `/v2/account`(transport/5xx) is NOT uninit -> must propagate.
         assert!(!is_uninit_account_404(
             "HTTP status server error (502 Bad Gateway) for url \
-             (https://shellnet.ackinacki.org/v2/account?account_id=x&dapp_id=x)"
+             (https://dd-shellnet.ackinacki.org/v2/account?account_id=x&dapp_id=x)"
         ));
         assert!(!is_uninit_account_404(
             "transport error: connection refused"

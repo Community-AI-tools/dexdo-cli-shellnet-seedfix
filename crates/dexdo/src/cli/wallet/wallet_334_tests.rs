@@ -50,7 +50,6 @@ fn goshai_args() -> crate::cli::args::WalletGoshAiArgs {
     crate::cli::args::WalletGoshAiArgs {
         network: crate::cli::args::WalletNetworkArg::Shellnet,
         endpoint: None,
-        contracts: std::path::PathBuf::from(dexdo_core::params::DEFAULT_CONTRACTS_PATH),
         activation_timeout: None,
     }
 }
@@ -63,7 +62,6 @@ fn manual_args() -> crate::cli::args::WalletOnboardManualArgs {
         multisig_seed_file: None,
         network: crate::cli::args::WalletNetworkArg::Shellnet,
         endpoint: None,
-        contracts: std::path::PathBuf::from(dexdo_core::params::DEFAULT_CONTRACTS_PATH),
     }
 }
 

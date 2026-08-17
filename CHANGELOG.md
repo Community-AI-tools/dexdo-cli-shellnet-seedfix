@@ -1,3 +1,25 @@
+## v0.0.23
+
+- fix(release): the release regression must carry every path the allow-list requires
+- fix(release): two files that change the published binary were not being published
+- fix(test): the last two platform rows -- a bound sized for the fast runner, and a stop Windows cannot make
+- merge PR1435: an executed Vault transfer is credited by identity, not by a grown balance
+- fix(windows): the shipped binary overflows the 1 MiB main-thread stack
+- fix(test): isolate the data directory with the flag, not a Linux-only env var
+- fix(test): the probe budget must outlast the platform refusal it waits for
+- fix(ci): the Linux leg was killing the linker, not failing a test
+- fix(ci): the campaign harness must run on the mac runner too
+- fix(ci): the Windows leg, all three causes, measured on the runner
+- merge PR1411: drop --contracts from the wallet commands, one endpoint seam, dd-shellnet
+- chore(ci): throwaway windows loopback probe (delete after reading)
+- fix(test): the gateway-check row holds its dead port the portable way too
+- fix(test): the dead-address primitive must refuse on BSD too, not only on Linux
+- fix(ci): the pinned-schema seam must not need the shellnet feature
+- dev 92a2de8a. , :
+- Promotes 717 commits of dev work. main held no unique non-merge commits -- its
+- release: merge dev into main for v0.0.19
+- Shellnet 4.0.29 client alignment, canonical multisig v2, recovered-buyer price safety, seller policy preflight, probe guidance, and release hardening.
+
 ## v0.0.22
 
 - Fix wallet invitation output in terminals

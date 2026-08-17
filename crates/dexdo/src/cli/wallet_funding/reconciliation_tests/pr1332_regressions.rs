@@ -62,7 +62,7 @@ async fn an_older_submitted_event_cannot_date_an_indeterminate_generation() {
     vault
         .history
         .borrow_mut()
-        .push(submitted_event(101, QUEUED_AT));
+        .push(submitted_event(101, 0, QUEUED_AT));
     vault.indeterminate.set(true);
 
     let hot = FakeHot::always(0);
@@ -159,7 +159,10 @@ async fn a_fallback_sent_event_never_retires_an_indeterminate_generation() {
     vault
         .history
         .borrow_mut()
-        .extend([submitted_event(101, QUEUED_AT), sent_event(101, QUEUED_AT + 1)]);
+        .extend([
+            submitted_event(101, 0, QUEUED_AT),
+            sent_event(101, 0, QUEUED_AT + 1),
+        ]);
     vault.indeterminate.set(true);
 
     let hot = FakeHot::always(0);
@@ -190,7 +193,7 @@ async fn a_fallback_sent_event_never_retires_an_indeterminate_generation() {
 
     // The current generation becomes visible after the fallback read. `Present` is authoritative
     // about its liveness and must erase the unrelated execution evidence before close is attempted.
-    vault.queue.borrow_mut().push(queued(7, REQUIRED));
+    vault.queue.borrow_mut().push(queued(7, 0, REQUIRED));
     let hot = FakeHot::always(REQUIRED);
     let error = money_command_run(dir.path(), &vault, &hot)
         .await
@@ -235,7 +238,7 @@ async fn a_malformed_pending_transaction_id_is_refused_rather_than_retired() {
     vault
         .history
         .borrow_mut()
-        .push(sent_event(7, QUEUED_AT + 1));
+        .push(sent_event(7, 0, QUEUED_AT + 1));
 
     let hot = FakeHot::always(REQUIRED);
     let error = money_command_run(dir.path(), &vault, &hot)

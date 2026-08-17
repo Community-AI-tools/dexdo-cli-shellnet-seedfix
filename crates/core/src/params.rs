@@ -515,7 +515,11 @@ pub const ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL: u128 = 10_000_000_000;
 pub const SHELLNET_CLOCK_SKEW_SAFETY_MARGIN_SECS: u64 = 10;
 
 /// Default shellnet GraphQL endpoint used when the operator supplies none.
-pub const DEFAULT_SHELLNET_ENDPOINT: &str = "https://shellnet.ackinacki.org";
+/// `dd-shellnet` is the surface that serves this client: account lookups, message submission and
+/// the GraphQL fields every command reads. The other shellnet host, the one without the `dd-`
+/// prefix, is no longer named anywhere in this tree, so a command that supplies no endpoint cannot
+/// end up on it.
+pub const DEFAULT_SHELLNET_ENDPOINT: &str = "https://dd-shellnet.ackinacki.org";
 
 /// Maximum reads used to locate one finalized destination receipt.
 pub const FINALIZED_DESTINATION_RECEIPT_MAX_ATTEMPTS: u32 = 12;
@@ -668,6 +672,9 @@ pub const DEFAULT_SELLER_MOCK_TOKEN_COUNT: u64 = 8;
 /// Default models-registry configuration path.
 pub const DEFAULT_MODELS_PATH: &str = "models.json";
 
+/// Default per-instance private-note pool filename.
+pub const DEFAULT_PN_POOL_PATH: &str = "pn_pool.json";
+
 /// Default deployed shellnet contracts-manifest path.
 pub const DEFAULT_CONTRACTS_PATH: &str = "contracts/deployed.shellnet.json";
 
@@ -723,7 +730,7 @@ pub const DEFAULT_DASHBOARD_LISTEN: &str = "127.0.0.1:8765";
 pub const DEFAULT_EXPORT_FORMAT: &str = "json";
 
 /// Default hostname used by `dexdo note deploy` for shellnet.
-pub const DEFAULT_NOTE_DEPLOY_ENDPOINT: &str = "shellnet.ackinacki.org";
+pub const DEFAULT_NOTE_DEPLOY_ENDPOINT: &str = "dd-shellnet.ackinacki.org";
 
 /// Default OracleEventList index used by oracle provisioning.
 pub const DEFAULT_ORACLE_EVENT_LIST_INDEX: u128 = 0;
@@ -838,6 +845,116 @@ pub const HOT_FUNDING_LOCK_POLL_INTERVAL: Duration = NOTE_DEPLOY_WALLET_LOCK_POL
 /// the gas voucher(`isFee=true`) -- are single-currency SHELL sends, so both take the one-leg branch
 /// and differ only by its compare-and-subtract. That is why this is ONE value and not two.
 pub const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 100_000_000;
+
+/// How many times ONE `note deploy` attaches [`NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`] out of the funding
+/// wallet.
+/// There are exactly two, both built by `note_cmd::note_deploy_build_voucher_submit_boc` through the
+/// one `submitTransaction` builder: the deposit voucher(`isFee = false`) and the SHELL gas voucher
+/// (`isFee = true`). The same two are what
+/// [`OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]'s budget already counts -- `2 * 100_000_000` of
+/// attached native plus one transaction fee each -- so this is that count named once rather than a
+/// second derivation of it.
+/// The attached native does NOT come back. `RootPN.generateVoucher`(`contracts/dex/RootPN.sol`) is
+/// a `public view internalMsg` that accepts and returns no change, so every raw unit attached leaves
+/// the wallet for good. A money path that funds itself for ONE of these submits therefore stops
+/// after the first voucher, with a halo2 proof and the deposit already paid for.
+pub const NOTE_DEPLOY_WALLET_SUBMITS: u128 = 2;
+
+/// Upper bound on the NATIVE fee ONE funding-wallet `submitTransaction` charges the wallet itself.
+/// This is not the value the submit carries -- that is [`NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`] and it is
+/// attached on top of this. `canonical_multisig::submit_transaction_params` sends with `flag: 1`,
+/// which pays the message's fees from the WALLET's balance instead of out of the amount being sent,
+/// so one submit costs the wallet the attached value AND this fee. A floor counting only the first
+/// half leaves the wallet short by the second.
+/// # Where the value comes from, and why it is a BOUND and not an observation
+/// It is one canonical operator-wallet deploy, measured live on shellnet 2026-08-12 by
+/// `live_1173_operator_wallet_funds_from_an_ordinary_wallet` and
+/// `live_961_operator_wallet_deploys_after_external_funding`. Both read `1_250_000_000_000` raw at
+/// Uninit and `1_249_846_499_000` at Active with exactly ONE transaction between the two reads, and
+/// they agree to the raw unit. Those readings are the same ones tabulated in
+/// [`OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]'s derivation, which already uses this figure for
+/// exactly this purpose: "the fee its own transaction charges... is bounded above by the deploy
+/// measured here". This constant only names a value that derivation already carries; it is not a new
+/// measurement and it was not bisected.
+/// What makes it an upper BOUND rather than the fee itself is the shape of the two transactions: a
+/// `submitTransaction` installs no state-init, runs no constructor and grows no code cell, so it
+/// cannot cost more than the one transaction that does all three. puts real compute at
+/// about `0.07 vmshell` per operation from receipts, so this bound is roughly 2.2x the project's own
+/// measured per-operation rate.
+/// It is deliberately NOT [`ACCUMULATOR_WALLET_MESSAGE_GAS_RAW`](`16_888_658` raw). That figure is
+/// one mainnet accumulator send -- an observation of a different message on a different network -- and
+/// it sits BELOW the per-operation rate above, so a floor built on it would under-fund the wallet
+/// again, which is the whole defect.
+pub const WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW: u128 = 153_501_000;
+
+/// Raw NATIVE vmshell a funding wallet must still hold for its own outgoing messages -- the line
+/// below which it holds ECC[2] SHELL it cannot spend.
+/// [`WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW`] above bounds what ONE outgoing wallet message costs. This
+/// is what a whole money path costs, and it is the figure the client owes an operator BEFORE it
+/// commits a spend rather than after: a wallet below this line cannot pay for the next message, and
+/// one of the messages it cannot pay for is the one that would convert its own held SHELL into gas.
+/// # The state this exists to name
+/// Read off mainnet for: the operator multisig held `8_750_000_000_000` raw ECC[2] SHELL --
+/// 8 750 SHELL, a rich wallet -- against `14_022_000` raw native, `0.014022 vmshell`. That is
+/// `492_980_000` raw BELOW this floor, and under a tenth of the bound on a single submit. The
+/// wallet could not mint, could not send, and could not self-convert, because the conversion is
+/// itself a message it has to pay for. The contracts maintainer's answer on was that at
+/// an already-empty native balance the self-conversion cannot be reached -- there is no gas for the
+/// submit, and the attempt only burns what is left.
+/// Nothing this client ships reaches a wallet in that state. The cure is an ordinary external
+/// transfer that anyone holding SHELL can make; it is not a privileged act and this client does not
+/// model it as one. What the client owes is the arithmetic, stated in time to act on.
+/// # Where the figure comes from
+/// It is the "sends" half of [`OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]'s own budget, and it is
+/// already this repository's floor for the same question on the funding path -- `wallet_funding`'s
+/// `vault_to_hot_native_value` is defined as exactly this and now reads it from here, so there is
+/// one derivation rather than two:
+/// > [`NOTE_DEPLOY_WALLET_SUBMITS`] submits x ([`NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`] attached +
+/// > [`WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW`] fee) = `2 *(100_000_000 + 153_501_000)`
+/// Each submit takes two separate amounts out of the wallet: the value it ATTACHES, which never
+/// returns(`RootPN.generateVoucher` accepts and sends no change back), and the fee its own
+/// transaction charges, which `flag: 1` pays from the wallet's balance rather than out of the amount
+/// being sent. A floor counting either half alone leaves a wallet able to start a money path and
+/// unable to finish it.
+/// This is a statement of what messages COST, taken from constants and live receipts. It is
+/// deliberately NOT a policy about how much of their own money an operator ought to keep back: the
+/// client states the floor, and the operator decides.
+pub const FUNDING_WALLET_NATIVE_FLOOR_RAW: u128 =
+    NOTE_DEPLOY_WALLET_SUBMITS * (NOTE_DEPLOY_SUBMIT_NATIVE_VALUE + WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW);
+
+/// How far a funding wallet's NATIVE balance falls below [`FUNDING_WALLET_NATIVE_FLOOR_RAW`], or
+/// `None` when it is at or above it.
+/// Saturating rather than checked: a wallet under the floor is an ordinary state -- it is the state
+/// this whole mechanism exists to notice -- and it must not be a panic on a money path.
+pub fn funding_wallet_native_shortfall_raw(native_raw: u128) -> Option<u128> {
+    FUNDING_WALLET_NATIVE_FLOOR_RAW
+        .checked_sub(native_raw)
+        .filter(|short| *short > 0)
+}
+
+/// What the client states about a funding wallet's gas before it commits a spend, or `None` when
+/// the wallet is above the floor and there is nothing to say.
+/// Every number an operator needs in order to act, in one place so that no call site can render
+/// half of them. is the lesson being applied: it shipped a funding refusal that rendered one
+/// of its two shortfall figures and not the other, so a mainnet operator was told he was "short
+/// nothing" and then left blocked on a deposit whose size the client never named.
+/// `shell_raw` is the wallet's ECC[2] SHELL, and it is named because it is the whole point: a
+/// wallet under this floor is not poor, it is holding money it cannot spend, and an operator
+/// reading "insufficient balance" against a wallet with 8 750 SHELL in it will not believe the
+/// client before he believes his own balance.
+pub fn funding_wallet_native_floor_notice(native_raw: u128, shell_raw: u128) -> Option<String> {
+    let short_raw = funding_wallet_native_shortfall_raw(native_raw)?;
+    Some(format!(
+        "it holds {native_raw} raw native vmshell against a floor of \
+         {FUNDING_WALLET_NATIVE_FLOOR_RAW} raw ({NOTE_DEPLOY_WALLET_SUBMITS} submits x \
+         ({NOTE_DEPLOY_SUBMIT_NATIVE_VALUE} attached + {WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW} fee)), \
+         so it is short {short_raw} raw native. Its {shell_raw} raw ECC[2] SHELL cannot pay for \
+         this: ECC[2] is currency and the fee is gas, and converting one into the other is itself a \
+         message this wallet can no longer afford. Send at least {short_raw} raw native vmshell to \
+         this address -- an ordinary transfer from any wallet holding SHELL, using the \
+         non-bounceable flag-16 form, which arrives as native gas"
+    ))
+}
 
 /// Native gas consumed by one accumulator wallet outgoing operation, measured from the mainnet
 /// operator-wallet receipt reviewed for.
@@ -1285,10 +1402,111 @@ impl Default for WalletOnboardingParams {
 }
 
 /// Default bee/chain endpoint selected by the `--network shellnet` onboarding flag.
-pub const WALLET_ONBOARD_SHELLNET_ENDPOINT: &str = "shellnet.ackinacki.org";
+pub const WALLET_ONBOARD_SHELLNET_ENDPOINT: &str = "dd-shellnet.ackinacki.org";
 
 /// Default bee/chain endpoint selected by the `--network mainnet` onboarding flag.
 pub const WALLET_ONBOARD_MAINNET_ENDPOINT: &str = "dd-mainnet.ackinacki.org";
+
+/// Canonical `network` label of the Acki Nacki test network.
+/// The exact string `contracts/deployed.shellnet.json` carries in its `network` field, the profile
+/// selector matches on, and the provenance stamped on [`DEAL_GAS_OVERHEAD_RAW`]. Named here because
+/// several independent decisions compare against it, and a literal in each of them is one more
+/// chance for them to disagree about what this network is called.
+pub const NETWORK_SHELLNET: &str = "shellnet";
+
+/// Canonical `network` label of Acki Nacki mainnet(`contracts/deployed.mainnet.json`).
+pub const NETWORK_MAINNET: &str = "mainnet";
+
+/// The second mainnet gateway host.
+/// Both this and [`WALLET_ONBOARD_MAINNET_ENDPOINT`] answer for mainnet; they differ only in the
+/// surface they expose, `dd-mainnet` being the one that serves account lookups. Naming both is what
+/// makes [`NETWORK_ENDPOINT_HOSTS`] a check rather than a formality: a table that knew only one of
+/// them could be stepped around by typing the other.
+pub const MAINNET_DIRECT_ENDPOINT_HOST: &str = "mainnet.ackinacki.org";
+
+/// Endpoint hosts this tree can NAME, paired with the network each one provably is.
+/// **Derivation.** Every entry is a host already fixed elsewhere in this file for a different
+/// reason, so the table states no new fact: the shellnet host is the one
+/// [`WALLET_ONBOARD_SHELLNET_ENDPOINT`] and [`DEFAULT_SHELLNET_ENDPOINT`] both point at, and the
+/// mainnet hosts are [`WALLET_ONBOARD_MAINNET_ENDPOINT`] (the endpoint written into the committed
+/// mainnet manifest) and [`MAINNET_DIRECT_ENDPOINT_HOST`].
+/// **It is deliberately not exhaustive, and that is the safe direction.** A local harness, a private
+/// gateway or a proxy is not evidence of any network, and a table that refused everything it did not
+/// recognize would break those setups while preventing nothing -- the loss in requires a host
+/// that IS mainnet. So an unknown host yields no verdict, and only a host this table can name,
+/// disagreeing with the declared label, is a refusal.
+pub const NETWORK_ENDPOINT_HOSTS: &[(&str, &str)] = &[
+    (WALLET_ONBOARD_SHELLNET_ENDPOINT, NETWORK_SHELLNET),
+    (WALLET_ONBOARD_MAINNET_ENDPOINT, NETWORK_MAINNET),
+    (MAINNET_DIRECT_ENDPOINT_HOST, NETWORK_MAINNET),
+];
+
+/// Host part of a Block Manager endpoint, in whatever form it was supplied.
+/// The endpoint reaching this point may be a bare host, a URL, or a URL with `/graphql` still on it,
+/// so the host is parsed out rather than string-matched: comparing whole endpoints would let
+/// `https://dd-mainnet.ackinacki.org/graphql` slip past a table that spells the same host without a
+/// scheme. Total and allocation-free -- every step is a `split`, so there is no input that panics.
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let rest = endpoint.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, tail)| tail);
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let host = match rest.strip_prefix('[') {
+        // A bracketed IPv6 literal: the address is what the brackets hold, and its colons are not
+        // a port separator.
+        Some(inner) => inner.split_once(']').map_or(inner, |(addr, _)| addr),
+        None => rest.split(':').next().unwrap_or(rest),
+    };
+    let host = host.trim_end_matches('.');
+    (!host.is_empty()).then_some(host)
+}
+
+/// The network an endpoint provably IS, or `None` when this tree cannot name the host.
+pub fn network_for_endpoint(endpoint: &str) -> Option<&'static str> {
+    let host = endpoint_host(endpoint)?;
+    NETWORK_ENDPOINT_HOSTS
+        .iter()
+        .find(|(known, _)| host.eq_ignore_ascii_case(known))
+        .map(|(_, network)| *network)
+}
+
+/// Refuse a deployment manifest whose declared `network` contradicts the endpoint being dialled
+/// .
+/// **Why a label needs proving at all.** `network` is the only input to
+/// [`resolve_deal_gas_overhead_raw`], and that guard exists to stop one network's gas measurement
+/// from funding another network's deal -- its own refusal names the loss, a `TokenContract` stalled
+/// permanently with both bonds inside. It was comparing the measurement's provenance against a
+/// string nobody checked, so a manifest carrying mainnet roots while labelled `shellnet` made the
+/// guard approve a shellnet measurement for mainnet money: exactly the outcome it was written to
+/// prevent. The same unchecked field also selects the SDK profile and keys the funding wallet.
+/// **Offline by construction.** The verdict comes from the endpoint string, so this costs no chain
+/// round trip and can sit on the connect path itself, ahead of every spending path, rather than
+/// being repeated at each one.
+/// Fails closed on a contradiction and stays silent otherwise -- see [`NETWORK_ENDPOINT_HOSTS`] for
+/// why an unrecognized host is not a contradiction.
+pub fn verify_declared_network_matches_endpoint(
+    declared_network: &str,
+    endpoint: &str,
+    manifest_source: &str,
+) -> Result<(), String> {
+    let Some(observed) = network_for_endpoint(endpoint) else {
+        return Ok(());
+    };
+    if observed == declared_network {
+        return Ok(());
+    }
+    let host = endpoint_host(endpoint).unwrap_or(endpoint);
+    Err(format!(
+        "refusing to use the deployment manifest `{manifest_source}`: it declares network \
+         `{declared_network}`, but this client is dialling `{endpoint}`, and `{host}` is the \
+         `{observed}` endpoint. The declared network decides which gas measurement may fund a deal, \
+         which SDK profile is used and which funding wallet may be spent, so proceeding on a label \
+         the endpoint contradicts can strand a TokenContract with both bonds inside. Fix one of the \
+         two so they agree: use the `{observed}` deployment manifest, or correct the `network` \
+         field of `{manifest_source}` -- and check any `--endpoint` override, which overrides the \
+         manifest's own `endpoint` field"
+    ))
+}
 
 /// The agent name `dexdo wallet onboard ackinacki-wallet` sends when `--agent-name` is not given
 /// .
@@ -1321,6 +1539,37 @@ pub const GOSHAI_HOT_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Spacing between the account reads that wait for the Gosh.ai Hot, per the same spec.
 pub const GOSHAI_HOT_ACTIVATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the QR terminal-graphics capability probe waits for the terminal's answer.
+/// The probe(kitty graphics query + DA1) is sent before an onboarding QR is printed; local
+/// terminals answer in single-digit milliseconds, so this budget exists to pay for ssh
+/// round-trips. It is spent at most once per QR, and only when stdin+stdout are TTYs.
+pub const QR_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Spacing between console-input polls while the Windows half of the QR capability probe waits
+/// inside [`QR_PROBE_TIMEOUT`](the unix half sleeps in the tty read itself via `VTIME`).
+pub const QR_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Most pixels per QR module the image rendering will use, and what a small code keeps: at 8 the
+/// 25-module Gosh.ai QR lands at 264px -- phone-scannable without dominating the terminal. Larger
+/// codes scale down to the window(see [`QR_IMAGE_WINDOW_HEIGHT_PERCENT`]).
+pub const QR_IMAGE_MODULE_SCALE_MAX: usize = 8;
+
+/// Fewest pixels per QR module. Below this the modules stop surviving a phone camera, so a window
+/// too small even for this gets an image that overflows rather than one that cannot be scanned --
+/// the unicode rendering, at half a module per cell row, would overflow further.
+pub const QR_IMAGE_MODULE_SCALE_MIN: usize = 2;
+
+/// How much of the terminal's height one QR image may take. The rest carries the link, the hints
+/// and the prompt that follow it, and absorbs the error in an assumed cell size.
+pub const QR_IMAGE_WINDOW_HEIGHT_PERCENT: usize = 66;
+
+/// The character cell assumed when neither the OS nor the terminal's `CSI 16 t` answer reports
+/// one: 8x16 px is the common default-font figure. Overshooting the real height makes the image
+/// smaller than allowed, which is the safe direction.
+pub const QR_IMAGE_ASSUMED_CELL_WIDTH: usize = 8;
+/// See [`QR_IMAGE_ASSUMED_CELL_WIDTH`].
+pub const QR_IMAGE_ASSUMED_CELL_HEIGHT: usize = 16;
 
 /// Maximum wait for an external top-up of the bound Hot wallet to appear on chain.
 /// The wallet specification fixes it at ten minutes for every provider, so it is one bound shared by
@@ -2326,7 +2575,7 @@ mod tests {
         assert_eq!(params.context_event_limit, 50);
         assert_eq!(params.timestamp_future_skew, Duration::from_secs(30));
         assert_eq!(params.agent_name_max_chars, 64);
-        assert_eq!(WALLET_ONBOARD_SHELLNET_ENDPOINT, "shellnet.ackinacki.org");
+        assert_eq!(WALLET_ONBOARD_SHELLNET_ENDPOINT, "dd-shellnet.ackinacki.org");
         assert_eq!(WALLET_ONBOARD_MAINNET_ENDPOINT, "dd-mainnet.ackinacki.org");
     }
 }

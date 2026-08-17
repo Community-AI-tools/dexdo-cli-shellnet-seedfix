@@ -32,8 +32,9 @@ pub use book_events::{
 pub use client::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
 pub use client::{decode_tokens_withdrawn_event, TokensWithdrawnEvent};
 pub use client::{
-    chain_time_secs, decode_multisig_queue_event, read_multisig_queue_history, MultisigQueueEvent,
-    MultisigQueueRecord,
+    chain_time_secs, decode_multisig_queue_event, parse_message_destination,
+    parse_source_transaction_out_messages, prove_multisig_delivery_message,
+    read_multisig_queue_history, sole_delivery_sibling, MultisigQueueEvent, MultisigQueueRecord,
 };
 pub use client::{retry_transient_read, RetryingReads};
 pub use client::{

@@ -173,7 +173,9 @@ fn direct_request(provider: WalletProvider) -> FundingRequest {
         hot_dapp_id: hex64(0xa1),
         creator_pubkey: hex64(0xc3),
         required: [(2u32, 1_000u128)].into_iter().collect(),
+        required_native: vault_to_hot_native_value(),
         shortfall: [(2u32, 600u128)].into_iter().collect(),
+        native_shortfall: 0,
     }
 }
 
