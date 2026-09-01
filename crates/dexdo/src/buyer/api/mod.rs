@@ -1,11 +1,13 @@
 //! Local consumer interface: an OpenAI-compatible HTTP endpoint
 //! (`/v1/chat/completions`, `/v1/models`) and an optional Anthropic-compatible transcode
 //! (`/v1/messages`). The endpoint listens on **loopback** by default.
-//! Request path(B19): receive -> build `CanonRequest` -> route to the(mock) seller ->
+
+//! Request path (B19): receive -> build `CanonRequest` -> route to the (mock) seller ->
 //! authorized TLS gRPC stream -> receive `CanonChunk` -> re-render to SSE in the desired format.
 //! Tick accounting/verification happen on the canonical stream BEFORE re-rendering
 //! ([`crate::buyer::verify::StreamVerifier`]).
-//! The model is forced by the market/frame(B2, B19): the request's `model` field is NOT trusted;
+
+//! The model is forced by the market/frame (B2, B19): the request's `model` field is NOT trusted;
 //! a request outside the configured model frame is rejected. Any API key is accepted: this is a
 //! loopback endpoint.
 
@@ -253,8 +255,8 @@ impl Default for BuyerApiFailurePolicy {
     }
 }
 
-/// Route to the(mock) seller + model frame, shared by the HTTP handlers(B1/B2/B19).
-/// In "routing" is a single fixed match(one seller, mock chain); semantic orders
+/// Route to the (mock) seller + model frame, shared by the HTTP handlers (B1/B2/B19).
+/// In "routing" is a single fixed match (one seller, mock chain); semantic orders
 /// and seller selection are the horizon of.
 #[derive(Clone)]
 pub struct Route {
@@ -268,6 +270,7 @@ pub struct Route {
 }
 
 /// Live weekly allowance of a running subscription route.
+
 /// A subscription's ceiling is one weekly quota measured from what the previous weeks consumed, and it
 /// moves at every week boundary of a four-week term. The figure a client computes from
 /// `getSubscription()` is not reliably that ceiling: the recorded `weekBaseTokens`/`weekIndex` move
@@ -275,6 +278,7 @@ pub struct Route {
 /// (see [`dexdo_core::subscription_claim_cap_at`]) - exact while no boundary has been crossed, an
 /// under-statement across one that nobody booked, and an upper bound past the final boundary, where
 /// the ceiling becomes the cumulative total already declared. Neither of the last two is strict.
+
 /// So this does not predict. When the allowance is spent, or when the recorded week has run out on the
 /// wall clock, it submits the permissionless boundary-booking call and then recomputes from the
 /// coherent state that comes back. The buyer's clock only decides WHEN to go and ask; what is
@@ -286,14 +290,16 @@ pub struct SubscriptionWeeklyBudget {
     refresh_lock: Mutex<()>,
     /// The cumulative claim this route's local counter measures FROM: `tokensPending` as it stood
     /// when the route was built and `delivered_tokens` was zero. Fixed for the life of the deal.
+
     /// Everything the contract bounds is CUMULATIVE, and the local counter is not - so the two are
     /// only comparable through this one baseline. `anchor + delivered` is what the deal has actually
     /// consumed, whether or not the seller has got round to claiming it; the ceiling is therefore
-    /// `_claimCap - anchor` and never `delivered +(_claimCap - tokensPending)`, which reads the
+    /// `_claimCap - anchor` and never `delivered + (_claimCap - tokensPending)`, which reads the
     /// remainder off the seller's claim and hands the difference back to the route every time he
     /// lags. A seller who stops claiming stops the route: his lag no longer buys it anything.
+
     /// Rebased exactly once, and only if the route was built BEFORE the trial tick was accepted:
-    /// `acceptProbe` seeds all three claim stages with one `TICK_SIZE`(`TokenContract.sol:690`),
+    /// `acceptProbe` seeds all three claim stages with one `TICK_SIZE` (`TokenContract.sol:690`),
     /// which is consumption this route did not make and must therefore sit BELOW its local zero. An
     /// anchor taken at zero and left there would authorize one tick more than the term ever sells.
     claim_anchor: std::sync::Mutex<u128>,
@@ -322,6 +328,7 @@ enum RouteBudget {
 }
 
 /// An admitted request's claim on the route's remaining tokens.
+
 /// Reservation happens once, atomically, before the model is contacted - `granted` is the request's
 /// hard output cap. What the stream does not use comes back when this is dropped, so an over-asking
 /// request cannot strand the week's quota.
@@ -357,11 +364,13 @@ impl Drop for RouteReservation {
 }
 
 /// Tell the seller the limit this request was actually ADMITTED for.
+
 /// Admission reserves `granted` against the authoritative weekly ceiling, which is usually smaller
 /// than the caller's own `max_tokens`. Sending the caller's figure upstream asks the seller to
 /// produce output nobody reserved: the buyer's hard cap then has to throw the excess away, and a
 /// single legal multi-token chunk straddling the remaining allowance wastes the whole request. The
 /// grant belongs on the wire, not only in the buyer's bookkeeping.
+
 /// Returns the figure it actually wrote, which is what the buyer then enforces on the way back.
 /// Since the grant can be LARGER than the caller's own limit -- admission reserves the deal's
 /// unpaid identity verification on top of the ask, and whatever verification leaves unspent stays in
@@ -396,6 +405,7 @@ const ORDINARY_BUDGET_EXHAUSTED: &str =
 
 /// Refusal for a deal that still owes its one-per-deal identity verification and no longer has the
 /// budget to pay for that AND deliver an answer.
+
 /// It can fire with tokens still on the route, and that is the point: admitting them would spend the
 /// last of the deal on a probe no answer could follow, which is exactly the paid-verification /
 /// zero-inference outcome this refusal exists to prevent. A resumed deal is where it is reachable --
@@ -432,6 +442,7 @@ impl SubscriptionWeeklyBudget {
 
     /// The local ceiling implied by an authoritative snapshot: the contract's own `_claimCap`,
     /// expressed against the anchor the local counter measures from.
+
     /// Fails closed rather than saturating. A cap below the anchor means the chain has contradicted
     /// the state this route was built on, and a ceiling that does not fit `u64` cannot be enforced by
     /// a `u64` counter - in both cases a manufactured number would be an authorization nobody
@@ -473,14 +484,17 @@ impl SubscriptionWeeklyBudget {
     /// Rebase the anchor the first time an authoritative read shows the trial tick accepted.
     /// Returns whether it moved, because the ceiling that was published against the old one is then
     /// stale and must be recomputed in the same breath.
+
     /// `acceptProbe` sets all three claim stages to a FLAT `TICK_SIZE` - it does not add one. So it
     /// absorbs whatever this route had already delivered before acceptance (`delivered`, capped at a
     /// tick by the seller's own pre-probe capacity), and the part of that seed which is NOT this
     /// route's own delivery is `TICK_SIZE - delivered`. That, and only that, belongs below the local
     /// counter's zero.
+
     /// Adding a whole `TICK_SIZE` instead would be wrong in both directions at once: the current week
     /// would still be over by `TICK_SIZE - delivered`, and the first booking would then measure the
     /// new week short by `delivered`. The errors do not cancel - they change sign at the boundary.
+
     /// The trigger cannot be `weekIndex`: acceptance does not move it. It is the acceptance flag on a
     /// fresh snapshot, which is why a route still anchored pre-probe reconciles on every admission.
     fn rebase_anchor_on_probe(
@@ -515,13 +529,16 @@ impl SubscriptionWeeklyBudget {
     }
 
     /// Book every boundary the CHAIN says is due, then recompute from the state that comes back.
+
     /// Returns the reject text when the route may not serve.
+
     /// The booking is a MONEY PATH, not a read: `_chargeWeeksThrough` moves already-escrowed value -
     /// `_deposit -= pay + fee; _finalizedOwed += pay; _feeAccrued += fee`
     /// (`TokenContract.sol:922-933`). What it does not do is create a new commitment: it charges the
     /// weeks the term already owes, which every exit charges anyway, so it cannot cost the buyer
     /// anything the deal had not already committed. It is also permissionless, and it is the only
     /// thing here that decides a boundary was crossed - the contract refuses it when none was.
+
     /// Nothing is published until the whole coherent state has been validated. Publishing the week or
     /// its expiry before the ceiling that belongs to them would leave a stale positive ceiling looking
     /// fresh, and the next request would skip reconciliation entirely and serve it.
@@ -787,7 +804,7 @@ impl ApiDeal {
             .is_some_and(|weekly| weekly.anchored_before_probe())
         {
             // Flat `TICK_SIZE`, and deliberately NOT `min(TICK_SIZE, published)`: funding refuses
-            // anything under two ticks(`TokenContract.sol:453`, `paid - bond < 2 * unit`) and a
+            // anything under two ticks (`TokenContract.sol:453`, `paid - bond < 2 * unit`) and a
             // subscription's volume is additionally a whole number of weeks of ticks, so the
             // smallest legal shape is four ticks over four weeks and the pre-acceptance ceiling is
             // never below one tick. That `min` could not take its second branch on any reachable
@@ -799,6 +816,7 @@ impl ApiDeal {
 
     /// Take a request's tokens out of the published ceiling, atomically. `asked` is the caller's own
     /// output limit; `None` asks for everything left.
+
     /// A grant has two parts and they are not equal. The FLOOR is what the deal owes its
     /// one-per-deal identity verification, which [`ContentGate::ensure_verified`] spends out of this
     /// same reservation and nothing else; above it sits the answer's clamp. The clamp may be
@@ -806,6 +824,7 @@ impl ApiDeal {
     /// The floor may not: a grant that does not exceed it pays for the verification and delivers
     /// nothing, so clamping down to it would admit precisely the paid-probe / zero-inference outcome
     /// of. That is refused here instead, before any probe is sent.
+
     /// Both are decided against ONE observation of the ceiling and one of the gate, re-read on every
     /// attempt: a request that loses the compare-exchange recomputes what it owes and what is left
     /// together, so a concurrent reservation can never leave it holding a floor it cannot cover. With
@@ -842,6 +861,7 @@ impl ApiDeal {
     }
 
     /// The pre-request admission gate: reserve this request's output cap, or say why not.
+
     /// An ordinary deal answers from its fixed funded budget. A subscription reconciles against the
     /// chain first whenever its published week is spent OR has run out on the wall clock -- the second
     /// is what stops an under-used week being carried across its boundary, and what makes the end of
@@ -956,8 +976,8 @@ impl ApiDeal {
         self.accepted_output_generation.load(Ordering::SeqCst)
     }
 
-    pub fn accepted_output_guard(&self) -> dexdo_core::chain::HeartbeatGuard {
-        dexdo_core::chain::HeartbeatGuard::new(self.accepted_output_generation.clone())
+    pub fn accepted_output_guard(&self) -> dexdo_core::market::HeartbeatGuard {
+        dexdo_core::market::HeartbeatGuard::new(self.accepted_output_generation.clone())
     }
 
     pub(crate) fn begin_request(&self, now_secs: u64) -> ConsumerRequestGuard {
@@ -990,7 +1010,7 @@ pub(crate) struct ConsumerRequestGuard {
     active_requests: Arc<AtomicU64>,
     accepted_output_generation: Arc<AtomicU64>,
     session: Arc<SessionSettle>,
-    failure_heartbeat: Option<dexdo_core::chain::HeartbeatGuard>,
+    failure_heartbeat: Option<dexdo_core::market::HeartbeatGuard>,
     /// This request's slice of the route's remaining tokens. Dropped with the guard, which returns
     /// whatever the stream did not deliver.
     reservation: Option<RouteReservation>,
@@ -1034,7 +1054,7 @@ impl ConsumerRequestGuard {
     }
 
     pub(crate) fn arm_upstream_failure(&mut self) {
-        self.failure_heartbeat = Some(dexdo_core::chain::HeartbeatGuard::new(
+        self.failure_heartbeat = Some(dexdo_core::market::HeartbeatGuard::new(
             self.accepted_output_generation.clone(),
         ));
     }
@@ -1050,7 +1070,7 @@ impl Drop for ConsumerRequestGuard {
         if self
             .failure_heartbeat
             .as_ref()
-            .is_some_and(dexdo_core::chain::HeartbeatGuard::unchanged)
+            .is_some_and(dexdo_core::market::HeartbeatGuard::unchanged)
         {
             self.session.close_recovery_episode(
                 RecoveryKind::ReclaimOpened,
@@ -1061,6 +1081,7 @@ impl Drop for ConsumerRequestGuard {
 }
 
 /// Mutable active deal for a long-running local API service.
+
 /// Single-shot/legacy callers build one deal and never replace it. The buyer continuity monitor can prepare a
 /// next handover first, settle a delivering old session, then atomically publish that next deal. A route that
 /// delivered nothing is dropped without a chain write. That keeps the local OpenAI/Anthropic endpoint alive
@@ -1202,6 +1223,7 @@ pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
 }
 
 /// What one finished consumer request actually delivered, in the figures the money path used.
+
 /// The seller bills on enqueue and the buyer accounts on render, and nothing on the wire joins the
 /// two, so the seller's count is `>=` the buyer's by construction. Closing that gap needs an
 /// acknowledgement the canon does not have. What the buyer CAN do without one is stop discarding
@@ -1255,6 +1277,7 @@ pub enum BuyerClaimObservationKind {
 }
 
 /// Buyer-rendered/accounted delivery sampled immediately after a fresh cumulative chain high-water is read.
+
 /// The chain high-water is the join key for the seller's `claim_submitted` event. The buyer counter comes
 /// straight from the active [`ApiDeal`]'s bound [`SessionSettle`] counter, so the event does not re-derive
 /// tokens from bytes, frames, or text.
@@ -1412,6 +1435,7 @@ fn is_request_scoped_upstream_rejection(error: &str) -> bool {
 
 /// A stream that never opened because the seller ANSWERED with its canonical capacity refusal is
 /// request-scoped, exactly like a 4xx above -- not a dead gateway.
+
 /// Until `acceptProbe` lands the seller's authoritative cap is the one canonical trial tick
 /// ([`crate::seller::capacity`], `TICK_SIZE.min(funded_tokens)`), so on a deal funded for more than
 /// one tick the second request of a fresh session is refused with gRPC `RESOURCE_EXHAUSTED` by a
@@ -1426,28 +1450,28 @@ pub(crate) fn is_capacity_backpressure(error: &anyhow::Error) -> bool {
         .is_some_and(|status| status.code() == tonic::Code::ResourceExhausted)
 }
 
-/// Content-identity check selected for a deal. The buyer pays for a model by NAME(B2); a seller
+/// Content-identity check selected for a deal. The buyer pays for a model by NAME (B2); a seller
 /// declaring the correct name but serving a cheaper model is caught only by the **content** layers B8
-/// ([`Buyer::behavioral_probe`]) + B7-full([`Buyer::reference_spotcheck`]). `Skip` -- no content
-/// fingerprint/reference for the exact model id(degradation R3, name-only) or the mock path; `Probe` -- run the
+/// ([`Buyer::behavioral_probe`]) + B7-full ([`Buyer::reference_spotcheck`]). `Skip` -- no content
+/// fingerprint/reference for the exact model id (degradation R3, name-only) or the mock path; `Probe` -- run the
 /// content gate once for that exact/reference model id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentCheck {
-    /// No content-identity layer applies(mock, or no B8 fingerprint and no B7 reference/key) -- name-only.
+    /// No content-identity layer applies (mock, or no B8 fingerprint and no B7 reference/key) -- name-only.
     Skip,
-    /// Run the one-per-deal content gate(B8 + B7-full) for this exact/reference model id.
+    /// Run the one-per-deal content gate (B8 + B7-full) for this exact/reference model id.
     Probe { model_id: String },
 }
 
 /// decide the content-identity policy for a frame model BEFORE paying/serving. **Shared by BOTH
-/// buyer paths** -- the consumer API(Path B, `cli`) and the gateway routing runner(Path A, `buyer::routing`) --
+/// buyer paths** -- the consumer API (Path B, `cli`) and the gateway routing runner (Path A, `buyer::routing`) --
 /// so neither silently pays a model that no content layer can verify. Pure w.r.t. env (`has_ref_key` is computed
 /// by the caller). A seller can declare the correct model NAME yet serve a cheaper model; only the CONTENT layers
 /// (B8 fingerprint / B7-full reference) catch that, and they are **data-driven** from `models`. Policy:
 /// - `mock_model` -> `Skip`;
-/// - a model id with a B8 fingerprint OR a B7 reference key in env -> `Probe`(run the content gate);
-/// - otherwise `allow_unverified` -> `Skip` with a loud warning(name-only, operator opted in);
-/// - else **refuse**(fail closed): buying/paying on name-only evidence is rejected.
+/// - a model id with a B8 fingerprint OR a B7 reference key in env -> `Probe` (run the content gate);
+/// - otherwise `allow_unverified` -> `Skip` with a loud warning (name-only, operator opted in);
+/// - else **refuse** (fail closed): buying/paying on name-only evidence is rejected.
 pub fn content_check_policy(
     frame_model: &str,
     identity_model: Option<&str>,
@@ -1488,12 +1512,12 @@ pub fn content_check_policy(
 /// fingerprint + B7-full reference spot-check) were never invoked there, so a seller serving a cheaper model
 /// under the correct NAME was paid undetected. This gate runs those layers ONCE, before the first paid stream on
 /// each renderer, and caches the **definitive** verdict so later requests do not re-probe. A transport error is
-/// NOT cached(the next request retries). On a bail the deal is closed to later requests and policy recovery is
+/// NOT cached (the next request retries). On a bail the deal is closed to later requests and policy recovery is
 /// attempted.
 pub struct ContentGate {
     check: ContentCheck,
     /// Loaded model config -- needed for the `Probe` path (B8 fingerprints / B7-full reference are
-    /// data-driven per model). `None` for `Skip`(which never probes).
+    /// data-driven per model). `None` for `Skip` (which never probes).
     models: Option<Arc<ModelsConfig>>,
     /// Cached definitive verdict: `Ok(())` pass, `Err(reason)` bail. A transport error is the cell's init error
     /// (NOT stored) so the gate retries on the next request.
@@ -1509,7 +1533,7 @@ impl ContentGate {
         }
     }
 
-    /// A gate that performs no content check(mock / name-only degradation). Needs no config.
+    /// A gate that performs no content check (mock / name-only degradation). Needs no config.
     pub fn skip() -> Self {
         Self {
             check: ContentCheck::Skip,
@@ -1529,6 +1553,7 @@ impl ContentGate {
     }
 
     /// Output tokens this deal still OWES to its one-per-deal identity verification.
+
     /// Verification is paid output that [`Self::ensure_verified`] spends out of the admitting
     /// request's reservation, so this is the unclampable FLOOR of that reservation
     /// ([`ApiDeal::try_reserve`]): a request that cannot hold it and still deliver an answer is
@@ -1547,9 +1572,10 @@ impl ContentGate {
     }
 
     /// Run the content-identity gate once per deal. `Skip` -> `Ok(())`. `Probe` -> run B8 then B7-full
-    /// ONCE(cached): the cached `Ok(())`/`Err(reason)` is the definitive verdict(pass/bail); a transport error
+    /// ONCE (cached): the cached `Ok(())`/`Err(reason)` is the definitive verdict (pass/bail); a transport error
     /// is propagated as `Err` WITHOUT being cached, so the next request retries. On a bail the deal is closed
     /// to new requests before the verdict is cached and returned.
+
     /// verification spends the CALLER'S held reservation and nothing else. Each accepted probe
     /// chunk is charged through `request_guard` before the probe stream may await again, so dropping
     /// the handler while B7 is pending cannot return quota already spent by B8. A transport error
@@ -1571,12 +1597,12 @@ impl ContentGate {
                         "content gate: Probe selected without a loaded models config".to_string(),
                     );
                 };
-                // OUTER Err = transport error(NOT cached -> retried next request); INNER `Result<(), String>` =
+                // OUTER Err = transport error (NOT cached -> retried next request); INNER `Result<(), String>` =
                 // the cached definitive verdict (`Ok(())` pass, `Err(reason)` bail).
                 let cached: &Result<(), String> = self
                     .verdict
                     .get_or_try_init::<String, _, _>(|| async {
-                        // B8 content fingerprint. The `?` makes a transport error the OUTER Err(not cached);
+                        // B8 content fingerprint. The `?` makes a transport error the OUTER Err (not cached);
                         // a definitive verdict goes through `Ok(...)`.
                         let b8_cap = request_guard
                             .remaining_grant()
@@ -1601,7 +1627,7 @@ impl ContentGate {
                                 .await;
                             return Ok(Err(r));
                         }
-                        // B7-full reference spot-check(greedy vs the official endpoint).
+                        // B7-full reference spot-check (greedy vs the official endpoint).
                         let b7_cap = request_guard
                             .remaining_grant()
                             .min(CONTENT_PROBE_MAX_TOKENS);
@@ -1638,7 +1664,7 @@ impl ContentGate {
 #[derive(Clone)]
 pub struct ApiState {
     pub buyer: Arc<Buyer>,
-    /// The configured market/frame model id -- the only one that is served(B2/B19).
+    /// The configured market/frame model id -- the only one that is served (B2/B19).
     /// The request's `model` field is checked against it; outside the frame -- reject.
     pub frame_model: String,
     /// Active deal slot. A one-shot service never replaces it; continuous service mode may publish the next
@@ -1651,7 +1677,7 @@ pub struct ApiState {
 }
 
 /// Session-scoped deal settlement. The consumer endpoint serves
-/// ONE deal(`route.token_contract`) across MANY requests; the deal is STOPped **once at session end**, not per
+/// ONE deal (`route.token_contract`) across MANY requests; the deal is STOPped **once at session end**, not per
 /// request. A single shared `Arc<SessionSettle>` lives on [`ApiState`]. The funds-safety guarantee is an
 /// **awaited** STOP -- a verification-bail/dispute (`settle().await` in a handler) or graceful shutdown
 /// (`serve()` awaits `settle("shutdown")`). [`Drop`] is ONLY a best-effort backup for abnormal teardown
@@ -1676,7 +1702,7 @@ pub struct SessionSettle {
     /// The consumer route's own cumulative delivered-token counter, shared by [`ApiDeal::new`].
     /// It is the SAME `Arc` the route accounts against, never a copy, so this witness cannot drift
     /// from the figure the money path actually charged. `None` for a session that serves no consumer
-    /// route(the one-shot terminal), which has no delivery model here at all.
+    /// route (the one-shot terminal), which has no delivery model here at all.
     route_delivery: OnceLock<Arc<AtomicU64>>,
 }
 
@@ -2088,6 +2114,7 @@ impl SessionSettle {
     }
 
     /// Fail closed before any user-visible response is rendered unless the chain proves this deal is open.
+
     /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
     /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
     pub async fn ensure_open_for_serving(&self) -> Result<(), String> {
@@ -2170,7 +2197,7 @@ impl SessionSettle {
         }
     }
 
-    /// Mark the session terminal after an external recovery path(`streamCleanup` / `streamStop`) already
+    /// Mark the session terminal after an external recovery path (`streamCleanup` / `streamStop`) already
     /// closed or reclaimed the deal. This prevents a later route swap from sending a duplicate STOP to the
     /// recovered TC.
     pub fn mark_recovered(&self, reason: &str) -> bool {
@@ -2242,7 +2269,7 @@ impl SessionSettle {
 
     pub async fn recover_reclaim_opened(
         &self,
-        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
         handler_origin: bool,
     ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
         if self.preserve_without_implicit_chain_write("reclaim-opened") {
@@ -2389,7 +2416,7 @@ impl SessionSettle {
         failure_class: &str,
         action: &str,
         reason: &str,
-        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
     ) -> bool {
         match self.recover_reclaim_opened(heartbeat, true).await {
             Ok(Some(s)) => {
@@ -2578,7 +2605,7 @@ impl SessionSettle {
     pub async fn settle_dead_gateway(
         &self,
         reason: &str,
-        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
     ) -> bool {
         let action = self.failure_policy.dead_gateway;
         match action {
@@ -2605,7 +2632,7 @@ impl SessionSettle {
     pub async fn settle_empty_stream(
         &self,
         reason: &str,
-        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
     ) -> bool {
         let action = self.failure_policy.empty_stream;
         match action {
@@ -2632,7 +2659,7 @@ impl SessionSettle {
     pub async fn settle_seller_stalls_mid_stream(
         &self,
         reason: &str,
-        heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
     ) -> bool {
         let action = self.failure_policy.seller_stalls_mid_stream;
         match action {
@@ -2717,8 +2744,8 @@ fn not_safely_open_reason(
 
 impl Drop for SessionSettle {
     fn drop(&mut self) {
-        // BEST-EFFORT BACKUP ONLY: the awaited terminal(graceful shutdown / bail) is the
-        // funds-safety guarantee. If the session ended with no explicit settle(abnormal teardown), spawn a
+        // BEST-EFFORT BACKUP ONLY: the awaited terminal (graceful shutdown / bail) is the
+        // funds-safety guarantee. If the session ended with no explicit settle (abnormal teardown), spawn a
         // last-chance STOP -- a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
         // `seller_timeout` is the ultimate backstop.
         if self.lifetime == SessionLifetimePolicy::Preserve
@@ -2835,7 +2862,7 @@ impl ApiState {
         self.deals.current_or_prepare().await
     }
 
-    /// The model is forced by the market(B2/B19): an empty/None `model` is ok (there is a single
+    /// The model is forced by the market (B2/B19): an empty/None `model` is ok (there is a single
     /// frame), otherwise we require a match with `frame_model`. Returns `Err` with a
     /// human-readable reject reason.
     pub fn check_model(&self, requested: Option<&str>) -> Result<(), String> {
@@ -2851,7 +2878,7 @@ impl ApiState {
     }
 }
 
-/// Build the consumer-interface axum router. The Anthropic transcode(B20) is mounted only
+/// Build the consumer-interface axum router. The Anthropic transcode (B20) is mounted only
 /// when `anthropic_compat = true`.
 pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
     use axum::routing::{get, post};
@@ -2866,15 +2893,20 @@ pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
 
 /// Bring up the local consumer interface on `bind`. Returns the actual address
 /// and a handle to the server's background task. `shutdown` is the session terminal signal (the CLI passes
-/// `ctrl_c`/SIGTERM): on it the server drains in-flight requests(graceful shutdown), then the session deal is
+/// `ctrl_c`/SIGTERM): on it the server drains in-flight requests (graceful shutdown), then the session deal is
 /// STOPped via an **awaited** `session.settle("shutdown")` before the task ends -- the funds-safety
-/// guarantee(`SessionSettle::Drop` is only a backup). Tests pass a never-completing signal and abort the task.
+/// guarantee (`SessionSettle::Drop` is only a backup). Tests pass a never-completing signal and abort the task.
 pub async fn serve(
     bind: SocketAddr,
     state: ApiState,
     anthropic_compat: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    // same reason as the seller gateway. `dexdo buyer --local-listen 127.0.0.1:0` serves an
+    // OpenAI-compatible endpoint, and a consumer that closes the connection part-way through an
+    // answer is ordinary. Under the entry policy that a one-shot printer wants, that hangup would
+    // end this process instead of this request. Not a duplicate of `main` -- the opposite decision.
+    crate::serving_process_ignores_sigpipe();
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
     let deals = state.deals.clone();
@@ -2924,10 +2956,10 @@ mod tests {
         );
     }
 
-    // fail-loud content-identity policy(pure), shared by both buyer paths. A seller can declare the
-    // correct model NAME yet serve a cheaper model; only the CONTENT layers(B8 fingerprint / B7 reference)
+    // fail-loud content-identity policy (pure), shared by both buyer paths. A seller can declare the
+    // correct model NAME yet serve a cheaper model; only the CONTENT layers (B8 fingerprint / B7 reference)
     // catch that. A real model identity with neither must FAIL CLOSED unless the operator opts into name-only.
-    // Data-driven: a config with qwen(fingerprint) but NOT llama exercises probe vs fail-closed.
+    // Data-driven: a config with qwen (fingerprint) but NOT llama exercises probe vs fail-closed.
     fn policy_models() -> ModelsConfig {
         ModelsConfig::from_json(
             r#"{ "models": { "qwen": {
@@ -3094,7 +3126,7 @@ mod tests {
 
     #[test]
     fn policy_real_family_no_fingerprint_no_key_fails_closed() {
-        // llama: a real model with NO B8 fingerprint(not in config) and NO B7 reference key -> refuse (fail
+        // llama: a real model with NO B8 fingerprint (not in config) and NO B7 reference key -> refuse (fail
         // closed) without --allow-unverified-model.
         let cfg = policy_models();
         let r = content_check_policy("meta-llama/llama-3.1-8b", None, false, false, false, &cfg);
@@ -3297,8 +3329,8 @@ mod tests {
         }
     }
 
-    fn unchanged_heartbeat() -> dexdo_core::chain::HeartbeatGuard {
-        dexdo_core::chain::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
+    fn unchanged_heartbeat() -> dexdo_core::market::HeartbeatGuard {
+        dexdo_core::market::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
     }
 
     fn never_opened_deal_state(deposit: u128, funded_time: u64) -> dexdo_core::DealChainState {
@@ -3397,7 +3429,7 @@ mod tests {
             &self,
             _token_contract: &TokenContract,
             _note: &dyn Note,
-            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+            heartbeat: &dexdo_core::market::HeartbeatGuard,
         ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
             // Simulate a legitimate claim landing between the decision to exit and the money POST.
             if let Some(deal) = self
@@ -3727,8 +3759,9 @@ mod tests {
     /// Put a route through the accounting a SERVED request performs: begin the request, take an
     /// admitted reservation, charge accepted output against it, and record the output heartbeat --
     /// the same `begin_request` -> `admit` -> `record_delivered` -> `record_accepted_output`
-    /// sequence `openai::chat_completions` runs(`openai.rs:48`, `:228`, `:289`).
-    /// The routes in these tests point at a dead endpoint(`https://127.0.0.1:1`) and this crate's
+    /// sequence `openai::chat_completions` runs (`openai.rs:48`, `:228`, `:289`).
+
+    /// The routes in these tests point at a dead endpoint (`https://127.0.0.1:1`) and this crate's
     /// unit tests have no mock seller, so this is how a request delivers here. The end-to-end proof
     /// over a real gateway is `shutdown_terminal_is_bounded_by_delivered_tokens` in
     /// `crates/e2e/tests/consumer_api.rs`.
@@ -3755,6 +3788,7 @@ mod tests {
 
     /// The lifetime policy decides the shutdown terminal: a durable subscription is PRESERVED across
     /// the operator close, an ordinary deal STOPs once.
+
     /// both legs deliver first, so the lifetime policy is the ONLY thing that differs between
     /// them and this test keeps asserting its own subject. Leaving the ordinary leg with nothing
     /// delivered would make it assert "no delivery -> no STOP" instead, which is what
@@ -4787,23 +4821,26 @@ mod tests {
 
     // ----------------------------------------------------------------------------------------
     // a running subscription route must follow the week the CONTRACT is in.
+
     // The chain double below is a small faithful `TokenContract`: `settleWeek` books a boundary only
-    // when the CHAIN says one is due and otherwise refuses(`ERR_SETTLE_WINDOW_OPEN`), and booking
+    // when the CHAIN says one is due and otherwise refuses (`ERR_SETTLE_WINDOW_OPEN`), and booking
     // re-bases `weekBaseTokens` on the cumulative claim exactly as `_chargeWeeksThrough` does. The
     // buyer's clock is moved only through `period_start`, which is what the contract itself measures
     // against - so a test can never authorize a week the "chain" has not crossed.
+
     // The upstream is registered deliberately unconstrained: the seller's own capacity accounting has
     // its own regressions, and here every refusal must be the buyer's weekly budget and nothing else.
     // ----------------------------------------------------------------------------------------
 
     /// Two ticks a week over a four-week term, eight ticks funded.
+
     /// Not the smallest shape the book accepts - `InferenceOrderBook.sol:1309` requires only that the
-    /// tick count divide by `SUB_WEEKS`, so FOUR ticks(one a week) is the true minimum. Two a week is
+    /// tick count divide by `SUB_WEEKS`, so FOUR ticks (one a week) is the true minimum. Two a week is
     /// the smallest shape in which the accepted probe's tick is visible as a part of a week rather
     /// than the whole of it.
     const WEEK_QUOTA: u128 = 2 * dexdo_core::TICK_SIZE;
 
-    /// What `acceptProbe` has already paid for and claimed: the trial tick(`TokenContract.sol:690`).
+    /// What `acceptProbe` has already paid for and claimed: the trial tick (`TokenContract.sol:690`).
     /// No probe-accepted deal is ever below this, on any of the three claim stages.
     const PROBE_CLAIM: u128 = dexdo_core::TICK_SIZE;
 
@@ -4928,7 +4965,7 @@ mod tests {
 
         /// `acceptProbe`: the trial tick is accepted, seeding all three claim stages and the money
         /// mark with one `TICK_SIZE` and leaving `weekBaseTokens` at zero - week one counts the probe
-        /// against its own quota(`TokenContract.sol:690-696`).
+        /// against its own quota (`TokenContract.sol:690-696`).
         fn accepts_probe(&self) {
             let mut snapshot = self.snapshot.lock().unwrap();
             snapshot.state.probe_accepted = true;
@@ -4938,8 +4975,9 @@ mod tests {
         }
 
         /// The counterparty disputes the deal while the buyer's boundary booking is in flight.
+
         /// This is the only ordering in which a request can reach the reconciliation with a
-        /// disputed deal at all: the serving gate([`SessionSettle::ensure_open_for_serving`]) reads
+        /// disputed deal at all: the serving gate ([`SessionSettle::ensure_open_for_serving`]) reads
         /// the deal a moment earlier and refuses a disputed one on its own terms, so what the
         /// reconciliation defends against is precisely a dispute that lands inside the submission
         /// window it is already past.
@@ -4950,6 +4988,7 @@ mod tests {
     }
 
     /// A probe-accepted deal at cumulative claim `claimed`.
+
     /// `acceptProbe` seeds ALL THREE claim stages and the money mark with one `TICK_SIZE`
     /// (`TokenContract.sol:690-696`), so `claimed` counts the trial tick and can never be below it.
     /// A fixture starting at zero would be a deal no chain can report, and every figure measured from
@@ -5063,9 +5102,10 @@ mod tests {
 
         /// The permissionless boundary booking, as the contract implements it: it settles only what
         /// the CHAIN has actually crossed, and refuses when the window is still open.
+
         /// It is a MONEY PATH and is modelled as one. `_chargeWeeksThrough` charges each week it
-        /// books - `_deposit -= pay; _finalizedOwed += pay`(`TokenContract.sol:922-933`) - against
-        /// `due =(weekIndex + 1) * tokensPerWeek - tokensPaid`, clamped by what the deposit still
+        /// books - `_deposit -= pay; _finalizedOwed += pay` (`TokenContract.sol:922-933`) - against
+        /// `due = (weekIndex + 1) * tokensPerWeek - tokensPaid`, clamped by what the deposit still
         /// holds. What it never does is commit anything NEW: those weeks are already owed and every
         /// exit charges them anyway.
         async fn settle_week(
@@ -5330,6 +5370,7 @@ mod tests {
     /// `expires_in` is how many seconds of the recorded week are left on the WALL CLOCK when the route
     /// is built. A short value lets a test cross the boundary of a RUNNING route by waiting, which is
     /// the only thing that happens in production: `periodStart` never moves, the clock does.
+
     /// `upstream_tokens` is how many tokens the seller's model will emit at most. Below the request's
     /// own cap it is a model that simply stops early - which is what leaves part of a reservation
     /// unused.
@@ -5790,12 +5831,14 @@ mod tests {
     }
 
     /// A seller who does not claim what he served must not thereby enlarge the route.
+
     /// The two counters are not comparable without a baseline: the route's `delivered` starts at zero
     /// while the contract bounds a CUMULATIVE claim. Publishing `delivered + (_claimCap -
     /// tokensPending)` reads the remainder off the seller's claim, so every token he has served but
     /// not claimed is handed back to the route a second time.
+
     /// The boundary is BOOKED first and the booking is confirmed to have moved `weekIndex` before
-    /// anything is compared, so the un-booked-boundary understatement(phase 2) is out of play and
+    /// anything is compared, so the un-booked-boundary understatement (phase 2) is out of play and
     /// what remains is only the baseline. And the assertion is an EQUALITY against the figure the
     /// contract itself would admit - `ceiling <= cap` would pass just as well on two errors that
     /// happen to cancel.
@@ -5885,6 +5928,7 @@ mod tests {
     }
 
     /// A reconciliation that cannot finish must publish NOTHING.
+
     /// The booking landed and the read that followed still shows the old week - a lagging read, which
     /// on a real node is ordinary. Republishing the week's expiry here would mark the route fresh
     /// while its ceiling still belonged to the week that just ended, and the next request would skip
@@ -5951,6 +5995,7 @@ mod tests {
     }
 
     /// A seller decides how many tokens a chunk holds, and the grant must hold anyway.
+
     /// Every chunk here carries four token ids. With three tokens of quota left, the first chunk
     /// already overshoots it - so it must never be rendered at all, on either protocol and whether
     /// the answer is streamed or aggregated. Accounting after rendering would hand the consumer four
@@ -5988,7 +6033,7 @@ mod tests {
     /// review 3). What must not happen is a third chunk being rendered and then noticed.
     #[tokio::test]
     async fn fat_chunks_stop_exactly_at_the_grant() {
-        // Red-by-design reporting shape(ci/run-red-by-design-tests.sh): the conditions below are
+        // Red-by-design reporting shape (ci/run-red-by-design-tests.sh): the conditions below are
         // the ones this test has always required -- the request succeeds, two four-token chunks fit
         // a grant of nine and a third does not, and the token that could not be spent returns.
         // They are accumulated rather than asserted one at a time so every combination is observed
@@ -6021,8 +6066,10 @@ mod tests {
     }
 
     /// The grant must reach the WIRE, and hold even when the seller ignores it.
+
     /// Admission reserves two tokens against a request that asked for eight. Two things must then be
     /// true, on both consumer protocols and whether the answer is streamed or aggregated:
+
     /// 1. the seller is TOLD two - the outbound `CanonRequest.params.max_tokens` carries the grant,
     /// not the caller's larger figure - which is what the seller's own delivery count proves;
     /// 2. and if the seller ignores it anyway, the buyer still refuses. This one is deliberately
@@ -6077,12 +6124,14 @@ mod tests {
     }
 
     /// An answer cut by the grant is not a clean stop, and it says so on the wire.
+
     /// The seller bills on enqueue and the buyer accounts on render, so tokens can be charged and
     /// never arrive. Joining the two needs an acknowledgement the canon does not carry. What was
     /// separately wrong, and is fixed here, is that the buyer did not even report the half it can
     /// see: `length` required `received == 0`, so a stream that stopped at 1,972,000 of a 2,000,000
     /// grant rendered `stop` and was byte-identical to a finished answer. A consumer paying per
     /// token could not tell that its answer had been cut off.
+
     /// This drives the real path with the real noncompliant-seller fixture rather than fabricating
     /// the end state: the seller is told two tokens and answers 1 + 2, so the second chunk cannot
     /// fit and the render genuinely stops at one of a grant of two - short of the grant, with a
@@ -6157,6 +6206,7 @@ mod tests {
 
     /// A render that consumes the grant exactly keeps its existing terminal value, and the numbers
     /// carry the fact.
+
     /// This is a deliberate boundary. The buyer stops reading the moment the grant is spent, so it
     /// genuinely does not know whether the seller had more to say, and there is an argument that
     /// `length` is the honester word for it - it is what the upstream API reports for the same
@@ -6203,10 +6253,12 @@ mod tests {
 
     /// Accounted tokens and rendered frames are DIFFERENT quantities, and only the first one is
     /// money.
+
     /// A seller decides how many tokens a chunk holds. Four token ids in one chunk is four tokens
     /// charged and one SSE frame emitted, so counting frames off the response body and calling the
     /// result "delivered" understates what was paid for - by a factor the seller chooses. The gap
     /// is always in the same direction, and nothing in the renderer enforces the equality.
+
     /// The endpoint therefore publishes the accounted figure. Anything reconciling a seller's claim
     /// against delivery reads that, never a count of frames.
     #[tokio::test]
@@ -6266,6 +6318,7 @@ mod tests {
 
     /// An answer the seller finished on its own is still a clean stop, and the record says how much
     /// of the grant went unused.
+
     /// The counterpart to the two above: making a cut answer visible must not relabel every short
     /// answer as truncated. A model that stops early is the normal case, it keeps `stop`/`end_turn`,
     /// and `ended_before_grant` is where the fact that part of the grant was never spent lives.
@@ -6313,6 +6366,7 @@ mod tests {
 
     /// A route built before the trial tick was accepted must not keep a tick of authorization the
     /// term never sold it.
+
     /// `open()` leaves the claim stages at zero and `acceptProbe` seeds all three with one
     /// `TICK_SIZE`, so a route anchored pre-probe measures its local zero from a cumulative claim the
     /// contract is about to move underneath it. The anchor rebases once on that transition; without
@@ -7351,6 +7405,7 @@ mod tests {
     }
 
     /// A fresh deal can pay for the identity verification it owes and still answer.
+
     /// The live blocker, end to end: an ordinary by-fact deal, a gate that has verified nothing, and
     /// an ordinary caller asking for a couple of tokens. Admission used to reserve the ask and
     /// nothing else, so the verification the deal owed had to come out of it - B8 consumed the whole
@@ -7364,7 +7419,7 @@ mod tests {
         std::env::set_var(REFERENCE_KEY, "test-key");
         // A reference that closes every connection. B7 is live - it buys its seller-side probe out
         // of the same grant, which is the layer the live deal was refused at - and then degrades to
-        // a pass(R3) without this test depending on a real reference model.
+        // a pass (R3) without this test depending on a real reference model.
         let reference_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("closing reference listener");
@@ -7451,6 +7506,7 @@ mod tests {
     }
 
     /// A RESUMED deal is admitted only when it can verify AND still answer.
+
     /// The fresh deal above starts with a whole week in hand, so its first request never comes near
     /// the floor. A resumed one does: [`ApiDeal::new`] builds a new, unverified gate over whatever
     /// remainder the route was rebuilt with, and a subscription route can be rebuilt in the middle of
@@ -7458,6 +7514,7 @@ mod tests {
     /// a reservation is `min(want, free)`, so a positive remainder too small to hold the debt would
     /// still be admitted, spend itself on the probe and refuse the answer for a zero grant: the
     /// reported 502, reached by resuming instead of by starting.
+
     /// So the boundary itself is the invariant, walked one token at a time rather than by enlarging
     /// the fixture until every grant comes out whole. `free == debt` is REFUSED with the whole
     /// remainder untouched and nothing settled; `free == debt + 1` is admitted and answers, with the
@@ -7468,7 +7525,7 @@ mod tests {
         const ASK: u64 = 2;
         std::env::set_var(REFERENCE_KEY, "test-key");
         // A reference that closes every connection: B7 buys its seller-side probe out of the grant
-        // and then degrades to a pass(R3), so the deal really does spend the whole debt it owes and
+        // and then degrades to a pass (R3), so the deal really does spend the whole debt it owes and
         // the rows below are the true boundary rather than a generous one.
         let reference_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -7586,6 +7643,7 @@ mod tests {
     }
 
     /// A CONCURRENT first request is never handed a partial verification.
+
     /// The floor has to be applied inside the same atomic attempt that reads the remainder, not
     /// computed before it. Four first-requests race on a deal that has verified nothing: one of them
     /// can be paid for in full, and what is left afterwards is exactly the verification debt - a
@@ -7673,16 +7731,19 @@ mod tests {
 
     /// The OTHER side of: once the deal has PAID its verification, admission reserves exactly
     /// the ask -- and a remainder smaller than that verification is still servable.
+
     /// Every other test drives the gate while the debt is outstanding, where the floor is
     /// positive. All of them stay green under a regression that made the floor unconditional -- one
     /// that reserved `ask + VERIFICATION_DEBT` forever instead of only while the deal owes it. That
     /// regression is not benign: it re-introduces a-shaped refusal on the TAIL of every deal,
     /// where the remainder is smaller than a verification the deal has already paid for. The buyer
     /// is then 503'd off budget it owns, having been charged for the probe once already.
-    /// `outstanding_verification_tokens`(`:1366-1373`) is where the distinction lives, and it has
+
+    /// `outstanding_verification_tokens` (`:1366-1373`) is where the distinction lives, and it has
     /// no direct test: its only two references are the call sites at `:828` and `:928`. This row
     /// asserts it through the admission gate rather than by calling it, so the guarantee survives a
     /// refactor of the helper.
+
     /// **The verdict is cached by a REAL first request, not by construction.** An earlier revision
     /// used a `ContentCheck::Skip` gate, whose debt is zero before the test starts; it never drove
     /// a probe, so reintroducing the first-request exhaustion would not have failed it. Here the
@@ -7690,6 +7751,7 @@ mod tests {
     /// real fingerprint layer, and only then is the post-verdict floor asserted. Both halves of
     /// therefore hold in one test: the first request is served while the debt is outstanding,
     /// and the tail is served after it is discharged.
+
     /// GREEN on this head -- a regression guard, not a specification.
     #[tokio::test]
     async fn a_paid_verification_stops_inflating_every_later_reservation() {
@@ -7774,6 +7836,7 @@ mod tests {
     }
 
     /// Verification headroom is never served to the caller as answer tokens.
+
     /// Admission reserves the deal's unpaid verification on top of the ask, so the grant a handler
     /// still HOLDS when it caps the answer can be far larger than the caller's own limit. Here the
     /// fingerprint layer is the only one that spends - B7 has no reference key and degrades without
@@ -7854,6 +7917,7 @@ mod tests {
 
     /// A one-token remainder is refused before verification can burn it ( blocker 2, as
     /// closes it).
+
     /// bounded what verification may SPEND: with a grant of one the gate was ISSUED a budget of
     /// one rather than the canonical 64, so nothing escaped the reservation. What that could not do
     /// is make the request worth admitting - the whole grant went to the probe, the answer was then
@@ -7921,6 +7985,7 @@ mod tests {
     }
 
     /// A noncompliant probe chunk cannot cross the verification cap it was issued.
+
     /// An admitted grant now covers the whole verification a deal owes, so the probe's own
     /// budget is always the canonical one - which a four-token chunk divides exactly and can no
     /// longer straddle. A seller that chunks 1, 2, 2,... still can: it reaches 63 of the 64 and then
@@ -7956,7 +8021,7 @@ mod tests {
         let (status, body) = harness.ask(ASK).await;
         let delivered = harness.delivered().await;
         let remaining = harness.remaining().await;
-        // Red-by-design reporting shape(ci/run-red-by-design-tests.sh). The four conditions are
+        // Red-by-design reporting shape (ci/run-red-by-design-tests.sh). The four conditions are
         // unchanged: the probe is refused as a noncompliant chunk, the chunks that fit are charged,
         // the one that would cross the cap is not, and what the refused probe did not spend returns.
         let complete = status == reqwest::StatusCode::BAD_GATEWAY
@@ -7971,6 +8036,7 @@ mod tests {
     }
 
     /// Handler cancellation during B7 returns only the unused part of its held reservation.
+
     /// The grant is the caller's eight tokens plus the verification the deal owes; the seller
     /// emits one token per stream, so the two probes spend two of it and the rest is slack the
     /// cancellation has to give back.
@@ -8027,14 +8093,51 @@ mod tests {
                 "stream": false
             }))
             .expect("OpenAI request");
-        let handler = tokio::spawn(async move {
+        let mut handler = tokio::spawn(async move {
             openai::chat_completions(axum::extract::State(state), axum::Json(request)).await
         });
 
-        tokio::time::timeout(Duration::from_secs(5), seen_rx)
-            .await
-            .expect("B7 reaches the pending reference endpoint")
-            .expect("B7 reference notification");
+        // which of the two outcomes happened is decided by facts, not by a clock. Reaching the
+        // reference point has exactly two exits and both arrive as events -- B7 connects to the
+        // pending endpoint, or the handler resolves without ever calling it, which is precisely the
+        // defect the assertions below exist to catch. Neither is produced by a busy machine, so a
+        // loaded builder only makes the first one arrive later. The five-second deadline this
+        // replaces decided the VERDICT: it could not tell "the client never got there" apart from
+        // "the runner was busy", and chose the second on a builder running five concurrent compiles.
+
+        // The deadline below decides nothing about the verdict; it exists only so a state where
+        // NEITHER event can ever arrive -- a reference notifier kept alive and never fired, a
+        // deadlock -- ends the test instead of the runner. It has to be finite because the gate this
+        // test runs in declares no `timeout-minutes`, so an unbounded hang costs the job's default
+        // 360 minutes on every leg of the matrix. Ninety seconds is ten times the worst wall this
+        // test has ever taken: 9.06 s, measured with the process descheduled for 990 ms of every
+        // second. Load does not reach it. Only a break that stops both events does.
+        const NO_EVENT_CAN_STILL_ARRIVE: Duration = Duration::from_secs(90);
+        tokio::time::timeout(NO_EVENT_CAN_STILL_ARRIVE, async {
+            tokio::select! {
+                seen = seen_rx => seen.expect("B7 reference notification"),
+                finished = &mut handler => {
+                    let outcome = match finished {
+                        Ok(response) => format!("it answered HTTP {}", response.status()),
+                        Err(join) => format!("it ended abnormally: {join}"),
+                    };
+                    panic!(
+                        "B7 never reached the pending reference endpoint: the handler resolved first, so \
+                         the reservation the assertions below read was never held -- {outcome}"
+                    );
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "neither event arrived in {NO_EVENT_CAN_STILL_ARRIVE:?}: B7 did not reach the pending \
+                 reference endpoint AND the handler did not resolve either. This is a defect, not a slow \
+                 machine -- the deadline is ten times this test's worst measured wall under a process \
+                 given 1% of a core, so load cannot reach it. Something stopped both events: a reference \
+                 notifier that is alive but never fires, or a deadlock before the reference call."
+            )
+        });
         assert_eq!(
             deal.delivered_tokens(),
             2,
@@ -8140,6 +8243,7 @@ mod tests {
 
     /// The shared probe spend is charged exactly once, to the request that incurred it (
     /// blocker 2).
+
     /// `OnceCell` lets one caller run the probes while the others wait for its verdict. The spend
     /// belongs to the caller that ran them: a counter shared on the gate would let a waiter take the
     /// charge for output it never asked for, or let two requests each be charged for the same

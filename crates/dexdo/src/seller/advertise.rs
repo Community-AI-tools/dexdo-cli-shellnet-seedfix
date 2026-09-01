@@ -1,29 +1,36 @@
 //! Classification of the seller's advertised gateway address and the error codes used by
 //! the `advertised_gateway` readiness probe.
+
 //! The advertised address is what the seller encrypts into the buyer handover. The default
 //! assumption is a REAL deployment -- seller and buyer on different machines -- so a non-routable
 //! advertise is a footgun: the offer rests in the book and no remote buyer can reach it. It is
 //! rejected fail-closed unless the operator opts into local/LAN testing with
 //! `--allow-private-advertise`.
+
 //! The classifier screens a FINITE, enumerated set of classes -- it is a footgun screen, not a proof
 //! of routability, and an address it accepts is one that matched none of these:
+
 //! * scope-limited -- bind-all wildcard, loopback, RFC1918/ULA, link-local, CGNAT;
-//! * reserved-but-unroutable -- documentation(RFC 5737 / RFC 3849 / RFC 9637), benchmarking
+//! * reserved-but-unroutable -- documentation (RFC 5737 / RFC 3849 / RFC 9637), benchmarking
 //! (RFC 2544), `240.0.0.0/4` reserved-for-future-use, `0.0.0.0/8` "this network", and multicast.
+
 //! The second group matters as much as the first because this classifier is the input to the
 //! probe policy: classifying a documentation range as public let a probe failure no buyer could
 //! ever recover from take the same path as a NAT/VPN hairpin, and rested an ask carrying an
 //! endpoint nobody can dial. rejects the unreachable and forgives the unobservable -- a
 //! gap in the former makes the latter fail open.
+
 //! DNS names are NOT resolved here: resolution at startup would depend on the seller host's own
-//! resolver(split-horizon DNS, VPN resolvers) and would make the check both slow and wrong. A name
+//! resolver (split-horizon DNS, VPN resolvers) and would make the check both slow and wrong. A name
 //! is presumed publicly resolvable, except for the reserved special-use local names.
+
 //! Error codes emitted from this area, rendered in the shape
-//! (`error[CODE](kind): message` + `cause:` lines + a `hint:` line):
+//! (`error[CODE] (kind): message` + `cause:` lines + a `hint:` line):
+
 //! | code | kind | meaning |
 //! |------|------|---------|
 //! | `E_ADVERTISE_NOT_PUBLIC` | config | the advertised host cannot be reached by a remote buyer |
-//! | `E_ADVERTISE_UNREACHABLE` | network | the advertised address did not answer the pinned-TLS(h2) self-probe |
+//! | `E_ADVERTISE_UNREACHABLE` | network | the advertised address did not answer the pinned-TLS (h2) self-probe |
 //! | `E_ADVERTISE_WRONG_GATEWAY` | tls | the advertised address answered, but it is not this gateway |
 
 use dexdo_core::{error_codes, DexdoError};
@@ -36,7 +43,7 @@ pub enum NonPublicReason {
     BindAll,
     /// `127.0.0.0/8`, `::1`, `localhost` -- the seller's own host only.
     Loopback,
-    /// RFC1918(`10/8`, `172.16/12`, `192.168/16`) or IPv6 ULA(`fc00::/7`) -- LAN only.
+    /// RFC1918 (`10/8`, `172.16/12`, `192.168/16`) or IPv6 ULA (`fc00::/7`) -- LAN only.
     Private,
     /// `169.254/16` / `fe80::/10` -- link-local only.
     LinkLocal,
@@ -44,16 +51,16 @@ pub enum NonPublicReason {
     Cgnat,
     /// `0.0.0.0/8` past the wildcard itself -- "this network", valid only as a source address.
     ThisNetwork,
-    /// `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`(RFC 5737), `2001:db8::/32`(RFC 3849)
-    /// and `3fff::/20`(RFC 9637) -- reserved for documentation, never routed to a real host.
+    /// `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` (RFC 5737), `2001:db8::/32` (RFC 3849)
+    /// and `3fff::/20` (RFC 9637) -- reserved for documentation, never routed to a real host.
     Documentation,
-    /// `198.18.0.0/15` -- inter-network benchmarking(RFC 2544), never routed between networks.
+    /// `198.18.0.0/15` -- inter-network benchmarking (RFC 2544), never routed between networks.
     Benchmarking,
     /// `240.0.0.0/4` -- reserved for future use, including the `255.255.255.255` limited broadcast.
     Reserved,
     /// `224.0.0.0/4` / `ff00::/8` -- a multicast group, never a unicast connect target.
     Multicast,
-    /// A reserved special-use local name(`localhost`, `*.local`, `*.internal`, `*.home.arpa`).
+    /// A reserved special-use local name (`localhost`, `*.local`, `*.internal`, `*.home.arpa`).
     LocalName,
 }
 
@@ -91,7 +98,7 @@ impl AdvertiseReachability {
     }
 }
 
-/// Split `host:port`(also `[v6]:port`) into its host part.
+/// Split `host:port` (also `[v6]:port`) into its host part.
 fn advertise_host(addr: &str) -> &str {
     let addr = addr.trim();
     if let Some(rest) = addr.strip_prefix('[') {
@@ -115,7 +122,7 @@ fn classify_v4(ip: Ipv4Addr) -> AdvertiseReachability {
     if ip.is_unspecified() {
         return AdvertiseReachability::NonPublic(NonPublicReason::BindAll);
     }
-    // 0.0.0.0/8 past the wildcard: "this network", a source-only range(RFC 1122 3.2.1.3). No
+    // 0.0.0.0/8 past the wildcard: "this network", a source-only range (RFC 1122 3.2.1.3). No
     // stable or unstable std helper covers it, so it is spelled out.
     if octets[0] == 0 {
         return AdvertiseReachability::NonPublic(NonPublicReason::ThisNetwork);
@@ -129,7 +136,7 @@ fn classify_v4(ip: Ipv4Addr) -> AdvertiseReachability {
     if ip.is_link_local() {
         return AdvertiseReachability::NonPublic(NonPublicReason::LinkLocal);
     }
-    // 100.64.0.0/10(`Ipv4Addr::is_shared` is still unstable).
+    // 100.64.0.0/10 (`Ipv4Addr::is_shared` is still unstable).
     if octets[0] == 100 && (64..=127).contains(&octets[1]) {
         return AdvertiseReachability::NonPublic(NonPublicReason::Cgnat);
     }
@@ -138,7 +145,7 @@ fn classify_v4(ip: Ipv4Addr) -> AdvertiseReachability {
     if ip.is_documentation() {
         return AdvertiseReachability::NonPublic(NonPublicReason::Documentation);
     }
-    // 198.18.0.0/15(`Ipv4Addr::is_benchmarking` is still unstable).
+    // 198.18.0.0/15 (`Ipv4Addr::is_benchmarking` is still unstable).
     if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
         return AdvertiseReachability::NonPublic(NonPublicReason::Benchmarking);
     }
@@ -147,7 +154,7 @@ fn classify_v4(ip: Ipv4Addr) -> AdvertiseReachability {
         return AdvertiseReachability::NonPublic(NonPublicReason::Multicast);
     }
     // 240.0.0.0/4, which also covers the 255.255.255.255 limited broadcast -- neither is a unicast
-    // connect target(`Ipv4Addr::is_reserved` is still unstable).
+    // connect target (`Ipv4Addr::is_reserved` is still unstable).
     if octets[0] >= 240 {
         return AdvertiseReachability::NonPublic(NonPublicReason::Reserved);
     }
@@ -172,7 +179,7 @@ fn classify_v6(ip: Ipv6Addr) -> AdvertiseReachability {
     if first & 0xfe00 == 0xfc00 {
         return AdvertiseReachability::NonPublic(NonPublicReason::Private);
     }
-    // 2001:db8::/32(RFC 3849) and 3fff::/20(RFC 9637) -- the two documentation prefixes
+    // 2001:db8::/32 (RFC 3849) and 3fff::/20 (RFC 9637) -- the two documentation prefixes
     // (`Ipv6Addr::is_documentation` is still unstable). A /20 fixes the first segment plus the top
     // four bits of the second.
     if (first == 0x2001 && segments[1] == 0x0db8) || (first == 0x3fff && segments[1] & 0xf000 == 0)
@@ -219,6 +226,7 @@ pub fn advertise_is_public(addr: &str) -> bool {
 }
 
 /// Fail-closed validation of the advertised gateway address before any order is posted.
+
 /// `defaulted_from_listen` only shapes the message: it says the operator never chose the address.
 /// `allow_private` is the explicit `--allow-private-advertise` opt-in for same-host/LAN testing.
 pub fn validate_advertise(
@@ -341,15 +349,18 @@ mod tests {
 
     /// E2E-ADV-07 -- a seller is refused an address no buyer on the internet could dial, across
     /// the whole of every such range and not merely at a few sampled addresses.
+
     /// Setup: seven ranges of addresses that only work on one machine or one local network, each
     /// with the addresses immediately outside it. Do: ask what the seller makes of each. Observe:
     /// every address inside a range is refused with that range's own reason, every neighbour just
     /// outside is accepted, and the same holds through the alternative spelling that writes an
     /// old-style address inside a new-style one.
+
     /// The ranges implemented on this head are proven here. E2E-ADV-07's remaining special-use
     /// classes are pinned separately by
     /// `every_non_public_special_use_class_is_rejected_before_sell`, which is red-by-design while
     /// the classifier still accepts them.
+
     /// E2E-ADV-07, `tests/e2e/test-specification.md`.
     #[test]
     fn every_decided_non_public_range_holds_across_the_whole_range_and_its_complement() {
@@ -415,7 +426,7 @@ mod tests {
                 );
                 // The complement of the range check: what the classifier rejects, the degradation
                 // gate must not call public. `advertise_is_public` is the predicate the probe
-                // policy reads(`seller/liveness.rs:318-326`), so the two must never disagree.
+                // policy reads (`seller/liveness.rs:318-326`), so the two must never disagree.
                 assert!(!advertise_is_public(addr), "{label}: {addr}");
             }
             for addr in &outside {
@@ -427,7 +438,7 @@ mod tests {
             }
         }
 
-        // The IPv4-mapped IPv6 form re-dispatches(`advertise.rs:147-150`), so the whole sweep has
+        // The IPv4-mapped IPv6 form re-dispatches (`advertise.rs:147-150`), so the whole sweep has
         // to hold through it as well or the mapped form is a smuggling route around every range
         // above.
         for (mapped, verdict) in [
@@ -451,6 +462,7 @@ mod tests {
     /// generated members of the whole prefix, including this-network, documentation,
     /// benchmarking, multicast, future-reserved, IPv4-mapped and both IPv6
     /// documentation prefixes. The fixed seed keeps the red counterexample deterministic.
+
     /// E2E-ADV-07, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-07/LP
     #[test]
@@ -567,6 +579,7 @@ mod tests {
     /// E2E-ADV-08 -- each accepted boundary value is paired with the adjacent rejected value. The
     /// pair makes over-broad range classification observable: proving only the rejected side
     /// would not catch a range which swallowed its public neighbour.
+
     /// E2E-ADV-08, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-08/L0
     #[test]
@@ -600,21 +613,25 @@ mod tests {
     }
 
     /// The prefixes added for must not swallow their neighbours.
+
     /// `e2e_adv_08_near_miss_boundaries_stay_public` holds this seam for the ranges that predate
     /// and `e2e_adv_07_rejects_every_non_public_special_use_class` generates addresses only
     /// from INSIDE each added prefix -- so the address immediately outside one of them is the edge
     /// nothing else holds. Over-rejection is the mirror of the defect and it has a victim: a seller
     /// on a genuinely public address, refused into a market no buyer can reach, by a classifier
     /// that is one octet too wide.
+
     /// Each row is a prefix's own first and last address, then its neighbours just below and just
     /// above. A neighbour is asserted not to carry THAT prefix's class rather than to be public,
     /// because two added ranges are adjacent: `239.255.255.255` is multicast and `240.0.0.0` is
     /// reserved, so "public" would be the wrong claim at that seam. Every neighbour which is
     /// genuinely unscreened is asserted public as well, in the second list.
+
     /// Boundaries that do not exist are absent rather than faked: `0.0.0.0/8` has no neighbour
-    /// below it(`0.0.0.0` is the bind-all wildcard, a class of its own), and `240.0.0.0/4` and
+    /// below it (`0.0.0.0` is the bind-all wildcard, a class of its own), and `240.0.0.0/4` and
     /// `ff00::/8` each end their address space. Every IPv4 row is held at the same four points in
     /// the IPv4-mapped IPv6 form, so the mapped path cannot over-reject either edge.
+
     /// E2E-ADV-08, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-08/L0
     #[test]
@@ -750,10 +767,12 @@ mod tests {
     }
 
     /// The refusal names the class it matched, for each class added.
+
     /// An operator who mistyped into a documentation range must not be told to check their
     /// firewall. Driven through `validate_advertise`, the operator-visible surface, so both the
     /// `NonPublicReason` the classifier chose and the string it renders are pinned -- the enum
     /// alone would let the two drift apart.
+
     /// E2E-ADV-08, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-08/L0
     #[test]
@@ -809,17 +828,21 @@ mod tests {
 
     /// E2E-ADV-09 -- the switch that lets a seller advertise a local address changes the answer
     /// for local addresses and for nothing else.
+
     /// Setup: a list of addresses covering every local kind, ordinary internet addresses and
     /// names, and two strings that are neither. Do: ask for each, once with the switch off and
     /// once on. Observe: with the switch on every address is accepted, and with it off an address
     /// is accepted exactly when a buyer elsewhere could dial it.
+
     /// The equality is the assertion. Turning the switch on skips the address check entirely
     /// rather than loosening it, so if a second, unrelated reason to refuse is ever added it would
     /// be skipped too -- and that shows up here as the equality breaking.
+
     /// Not proven: that a malformed address is refused when the switch is on. Nothing here calls
     /// a malformed address bad in the first place -- with the switch off it is accepted as well --
     /// so the refusal that is owed does not exist at this layer to be skipped. The companion test
     /// in the command-line arguments shows where malformed addresses are actually stopped.
+
     /// E2E-ADV-09, `tests/e2e/test-specification.md`.
     #[test]
     fn the_private_advertise_opt_in_admits_exactly_the_non_public_set() {

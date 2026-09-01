@@ -3,7 +3,7 @@ use dexdo_core::{ChainError, CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX};
 
 #[tokio::test(start_paused = true)]
 async fn producer_exhaustion_context_arms_seller_classifier() {
-    let outcome: anyhow::Result<()> = dexdo_core::shellnet::retry_transient_read(|| async {
+    let outcome: anyhow::Result<()> = dexdo_core::chain::retry_transient_read(|| async {
         std::future::pending::<anyhow::Result<()>>().await
     })
     .await;

@@ -1,21 +1,27 @@
 //! a funding-wallet lock left behind by a KILLED holder must not wedge the next spender.
+
 //! Live on 2026-08-17 a mint process was killed while it held the funding wallet's turn. The lock it
 //! left behind was a sentinel file carrying `pid=<dead pid>`, and the next `dexdo note deploy`
 //! printed `already in use locally; waiting for <lockfile>` and waited with no bound at all. The
 //! whole note stock stopped until an operator deleted the file by hand.
+
 //! had already replaced that sentinel with an `fs2` advisory lock, which the KERNEL drops when
 //! the holder dies by any route -- SIGKILL included -- so the reported wedge cannot form. What was
 //! missing is the proof, and a fix nothing measures is a fix that can be undone by the next edit.
+
 //! Every assertion here therefore outlives a process. `funding_wallet_turn_is_released_when_the_
 //! holder_drops_1291` releases the turn by dropping the guard IN THIS process, which exercises
 //! `Drop` and nothing the kernel does; a holder that runs `Drop` is exactly the holder that never
 //! wedged anything. This test spawns a real child, waits until it really holds the turn, kills it
 //! with SIGKILL so it can run no cleanup of any kind, and requires the next acquisition to proceed.
+
 //! The two halves are both load-bearing:
+
 //! * while the child is ALIVE the parent must be REFUSED -- otherwise a lock that never locks
 //! would pass the second half vacuously, and must not be "fixed" by weakening the turn;
 //! * the child's exit status must be death BY SIGNAL 9 -- otherwise a child that exited normally
 //! would have released the lock politely, which is the case that never needed proving.
+
 //! Bounded throughout, because the regression under test IS an unbounded wait: EVERY acquisition
 //! runs on a worker thread behind `recv_timeout`, so a reintroduced wedge -- on the held turn or on
 //! the dead one -- fails this test instead of hanging CI forever.
@@ -32,7 +38,7 @@ const CHILD_READY_VAR: &str = "DEXDO_TEST_1410_CHILD_READY";
 const CHILD_TEST_NAME: &str = "child_holds_the_funding_wallet_until_it_is_killed_1410";
 
 /// The network half of the lock key. Any label works; it only has to match on both sides.
-const NETWORK: &str = "shellnet";
+const NETWORK: &str = "net-a";
 
 /// `Child::kill` is documented as SIGKILL on Unix. Naming the number keeps the assertion readable
 /// without pulling `libc` into this crate for one integer.
@@ -55,6 +61,7 @@ const REACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACQUIRE_HANG_BOUND: Duration = Duration::from_secs(60);
 
 /// A funding wallet nothing else on this machine can be using.
+
 /// The lock deliberately lives in one machine-wide directory, so a fixed address here would make two
 /// concurrent test binaries contend for one real lock file and turn this into a race.
 fn unique_wallet_account_id() -> String {
@@ -66,6 +73,7 @@ fn unique_wallet_account_id() -> String {
 }
 
 /// The libtest filter that selects the child entry point in a re-executed copy of this binary.
+
 /// Derived from `module_path!()` rather than written out, so moving or renaming this module cannot
 /// leave a stale string that silently selects no test. The crate segment is dropped because libtest
 /// names tests from the crate root's children down.
@@ -79,6 +87,7 @@ fn child_test_filter() -> String {
 }
 
 /// Take the funding wallet's turn on a worker thread, under a hard ceiling.
+
 /// NO acquisition in this test may run on the thread that owns the assertions. The defect under test
 /// IS an unbounded wait, so an acquisition called directly would let a reintroduced wedge hang the
 /// suite forever instead of failing it -- and a test that hangs reports nothing at all. `None` means
@@ -108,6 +117,7 @@ impl Drop for HolderProcess {
 }
 
 /// The child entry point: take the funding wallet's turn for real, say so, then never let go.
+
 /// A no-op in an ordinary run. Only a parent that sets `CHILD_WALLET_VAR` turns it into the holder,
 /// and the turn is taken through the SAME production helper `note deploy` and `note topup` use --
 /// not a hand-rolled `flock` that would prove something about this test instead of about the client.

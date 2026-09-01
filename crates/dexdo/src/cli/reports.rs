@@ -1,18 +1,14 @@
 //! Read-only reporting/view command handlers, extracted from `commands.rs`
 //! (move-only / behavior-identical, anti-entropy refactor Track C4).
 
-#[cfg(feature = "shellnet")]
 use crate::cli::args::ExportFormatArg;
 use crate::cli::args::{DashboardArgs, DealsArgs, ExportArgs, HistoryArgs, StatusArgs};
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
-    close_hint, deal_contracts_path, load_deal_target, shellnet_doctor_preflight_market,
+    close_hint, deal_contracts_path, load_deal_target, chain_doctor_preflight_market,
 };
 use crate::cli::commands::{mock_chain_for_machine, resolve_mock_deal_target, role_arg_str};
 use crate::cli::{audit, dashboard, deals, machine};
 use crate::operator_shutdown_signal;
-#[cfg(not(feature = "shellnet"))]
-use anyhow::bail;
 use anyhow::Result;
 use dexdo_core::address as addr;
 use dexdo_core::ChainBackend;
@@ -20,6 +16,35 @@ use dexdo_core::ChainBackend;
 pub(crate) async fn run_deals(args: DealsArgs) -> Result<()> {
     let dir = deals::resolve_deals_dir(args.deals_dir.as_deref())?;
     let handles = deals::list_deal_handles(&dir)?;
+    // 203: one document, and an EMPTY list is a document too. The human view says `none=true`; a
+    // runtime that got nothing at all could not tell "no deals" from "the command printed nothing",
+    // which are different answers to "is there anything of mine still open".
+    if args.json {
+        let deals: Vec<serde_json::Value> = handles
+            .iter()
+            .map(|(_path, h)| {
+                serde_json::json!({
+                    "handle": h.handle,
+                    "role": h.role.as_str(),
+                    "network": h.network,
+                    "note": addr::display(&h.note_addr),
+                    "model": h.frame_model,
+                    "token_contract": addr::display_self_dapp(&h.token_contract),
+                    "order_book": h.order_book.as_deref().map(addr::display),
+                    "created_at_unix": h.created_at_unix,
+                    "model_hash": h.model_hash,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": crate::cli::machine::DEALS_SCHEMA,
+                "deals": deals,
+            })
+        );
+        return Ok(());
+    }
     if handles.is_empty() {
         println!("deals dir={} none=true", dir.display());
         return Ok(());
@@ -86,10 +111,7 @@ pub(crate) async fn run_history(args: HistoryArgs) -> Result<()> {
 pub(crate) async fn run_dashboard(args: DashboardArgs) -> Result<()> {
     dashboard::ensure_loopback(args.listen)?;
     let dir = deals::resolve_deals_dir(args.deals_dir.as_deref())?;
-    #[cfg(feature = "shellnet")]
-    let state = dashboard::DashboardAppState::shellnet(dir);
-    #[cfg(not(feature = "shellnet"))]
-    let state = dashboard::DashboardAppState::local(dir);
+    let state = dashboard::DashboardAppState::for_chain(dir);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let addr = dashboard::bind_dashboard(args.listen, state, async move {
         let _ = shutdown_rx.await;
@@ -141,20 +163,23 @@ fn status_next_for(
 }
 
 /// render an address the way the versioned machine schemas are pinned to carry it.
-/// `runtime-machine-contract.md` fixes `dexdo.status.v2` and the `dexdo.*.event.v1` payloads to the
+
+/// `runtime-machine-contract.md` fixes `dexdo.status.v3` and the `dexdo.*.event.v1` payloads to the
 /// legacy `0:<account_id>` shape until a coordinated version bump, because every parent process
 /// parses that form. Human output and files keep the canonical `<dapp_id>::<account_id>`; only this
 /// boundary converts.
+
 /// An address that does not parse is passed through unchanged. This function's job is the SHAPE of
 /// a well-formed address, and swallowing an unparseable one into an empty string or a panic would
 /// replace a visible oddity with an invisible one; the reader downstream still sees exactly what
 /// the command was given.
+
 /// The conversion is `address::to_chain_param`, the crate's own seam for exactly this direction, and
-/// not `parse_chain_address`: the latter is `#[cfg(feature = "shellnet")]`, so calling it from here
+/// not `parse_chain_address`: the latter is `#[cfg(feature = "net-a")]`, so calling it from here
 /// broke the default-feature build of the whole workspace -- the shape this boundary converts is
 /// decided by the schema, not by whether the chain client is compiled in. That is also why there is
 /// ONE function here and not a pair split by the feature: a default build that passed the address
-/// through would answer `dexdo.status.v2` in the unpinned shape, which is the defect reports.
+/// through would answer `dexdo.status.v3` in the unpinned shape, which is the defect reports.
 fn pinned_schema_address(address: &str) -> String {
     dexdo_core::address::to_chain_param(address).unwrap_or_else(|_| address.to_string())
 }
@@ -176,14 +201,18 @@ fn status_response_from_summary(
         generated_at_unix: machine::now_unix()?,
         handle,
         role: role.clone(),
-        // `dexdo.status.v2` is pinned to `0:<account_id>` by `runtime-machine-contract.md`,
+        // `dexdo.status.v3` is pinned to `0:<account_id>` by `runtime-machine-contract.md`,
         // and this field used to be whatever reached the command -- the argv string, or the
         // spelling the deal handle happens to store. Both can be canonical, and then a schema the
         // whole parent process reads answers in a form it does not accept.
+
         // Measured, not deduced: the two-runner release gate refused with
+
         // asked about 97256735...::97256735..., status answered '97256735...::97256735...'
+
         // -- the SAME account, so the identity half of the check passed and the shape half did not.
         // That gate had been red since 2026-08-10 and v0.0.22 shipped over it.
+
         // Normalising here, at the one place the machine schema is built, rather than at each of
         // the callers: a caller that forgets is exactly how this arrived.
         token_contract: pinned_schema_address(&token_contract),
@@ -195,12 +224,12 @@ fn status_response_from_summary(
         disputed: s.disputed,
         probe_accepted: s.probe_accepted,
         accounting: machine::StatusAccounting {
-            finalized_owed: machine::amount(s.finalized_owed),
-            buyer_locked: machine::amount(s.buyer_locked()?),
-            deposit: machine::amount(s.deposit),
-            probe_tick: machine::amount(s.probe_tick),
-            buyer_bond: machine::amount(s.buyer_bond),
-            buyer_bond_required: machine::amount(s.buyer_bond_required),
+            finalized_owed: dexdo_core::shell_amount(s.finalized_owed),
+            buyer_locked: dexdo_core::shell_amount(s.buyer_locked()?),
+            deposit: dexdo_core::shell_amount(s.deposit),
+            probe_tick: dexdo_core::shell_amount(s.probe_tick),
+            buyer_bond: dexdo_core::shell_amount(s.buyer_bond),
+            buyer_bond_required: dexdo_core::shell_amount(s.buyer_bond_required),
             tokens_final: machine::amount(s.tokens_final),
             tokens_pending: machine::amount(s.tokens_pending),
             probe_time_unix: Some(s.probe_time).filter(|v| *v != 0),
@@ -324,31 +353,32 @@ async fn run_status_mock(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     if args.mock_chain {
         return run_status_mock(args).await;
     }
     use dexdo_core::RealChainBackend;
     let target = load_deal_target(&args.deal, args.deals_dir.as_deref(), None, None)?;
-    let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
-    let contracts = args
-        .contracts
-        .as_deref()
-        .unwrap_or(&contracts_path)
+    let contracts_path = deal_contracts_path(&target)?;
+    // The handle's own manifest, and nothing that could override it: the flag that used to sit
+    // here is gone. A deal is settled against the chain it was made on, which the handle
+    // recorded -- letting a later run point it somewhere else was a way to answer about one chain
+    // using another's pins.
+    let contracts = contracts_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+        .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
     let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
     // Read the deal BEFORE the market preflight, because a destroyed TokenContract is this
     // command's expected terminal state and not a fault. A seller handle carries a `market`, that
     // manifest pins the deal's TokenContract, and on 4.0.33 the STOP destroys that account in the
-    // same transaction -- so `shellnet_doctor_preflight_market` reports it "inactive/undeployed"
+    // same transaction -- so `chain_doctor_preflight_market` reports it "inactive/undeployed"
     // and a seller could never read the status of his own completed deal, getting INTERNAL instead
     // of the reading canon mandates: "If the TokenContract is absent, status returns
     // `state="closed"` and `active=false`; that is not an error" (`runtime-machine-contract.md`
     // ). The closed branch below already produces exactly that; it was simply unreachable.
+
     // Nothing else is relaxed. The preflight still runs, unchanged, whenever the deal's account is
     // LIVE -- so a wrong code hash on a live account, a malformed manifest or a bad pin still fail
     // here exactly as before -- and an unreachable endpoint fails on this very read rather than
@@ -356,7 +386,7 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
     // is about to move money keep the preflight ahead of everything.
     let deal_snapshot = chain.token_contract_deal_snapshot(&tc).await?;
     if deal_snapshot.is_some() {
-        shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
+        chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
     }
     let Some(snapshot) = deal_snapshot else {
         if args.json {
@@ -423,12 +453,12 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
          buyer_bond_required={} tokens_final={} \
          tokens_pending={} probe_time={} last_claim_time={} \
          dispute_time={} funded_time={}",
-        s.finalized_owed,
-        s.buyer_locked()?,
-        s.deposit,
-        s.probe_tick,
-        s.buyer_bond,
-        s.buyer_bond_required,
+        dexdo_core::shell_amount(s.finalized_owed),
+        dexdo_core::shell_amount(s.buyer_locked()?),
+        dexdo_core::shell_amount(s.deposit),
+        dexdo_core::shell_amount(s.probe_tick),
+        dexdo_core::shell_amount(s.buyer_bond),
+        dexdo_core::shell_amount(s.buyer_bond_required),
         s.tokens_final,
         s.tokens_pending,
         s.probe_time,
@@ -443,30 +473,21 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
         close_hint(
             &target,
             &s,
-            args.deals_dir.as_deref(),
-            Some(&contracts_path)
+            args.deals_dir.as_deref()
         )
     );
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
-    if args.mock_chain {
-        return run_status_mock(args).await;
-    }
-    bail!("status unavailable: build with `--features shellnet`")
-}
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
     let target = load_deal_target(&args.deal, args.deals_dir.as_deref(), None, None)?;
-    let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
-    shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
+    let contracts_path = deal_contracts_path(&target)?;
+    chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
     let contracts = contracts_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+        .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
     let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
@@ -517,43 +538,108 @@ pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_export(_args: ExportArgs) -> Result<()> {
-    bail!("export unavailable: build with `--features shellnet`")
-}
 
 #[cfg(test)]
 mod tests {
+    /// The figure comes off the chain and is compared with what a person is shown.
+
+    /// `TokenContract.getState()` answers in raw ECC[2] decimal strings, and this row feeds exactly
+    /// such an answer through the production decoder and the production status renderer. The
+    /// expectations are written out by hand -- `"4.1"`, not `shell_amount(4_100_000_000)` -- because
+    /// a test that computes its expectation with the same conversion the code uses proves only that
+    /// the conversion equals itself.
+
+    /// What it pins: a raw figure the chain holds is never shown raw, and the SHELL shown is that
+    /// same figure and not a rounding of it. Token counts stay counts: `tokensFinal` is not money
+    /// and must not acquire a decimal point.
+    #[test]
+    fn a_figure_read_off_the_chain_is_shown_in_shell() {
+        let get_state = serde_json::json!({
+            "funded": true,
+            "opened": true,
+            "probeAccepted": true,
+            "disputed": false,
+            "deposit": "4100000000",
+            "probeTick": "3000000000",
+            "finalizedOwed": "6150000000",
+            "tokensFinal": "2000000",
+            "tokensPending": "3000000",
+            "probeTime": "1787000000",
+            "lastClaimTime": "1787000100",
+            "disputeTime": "0",
+            "fundedTime": "1787000000",
+        });
+        let get_buyer_bond = serde_json::json!({
+            "bondHeld": "6000000000",
+            "bondRequired": "6000000000",
+        });
+
+        let bond = dexdo_core::DealBuyerBond::decode_getter(&get_buyer_bond)
+            .expect("the buyer bond getter answers in raw decimal strings");
+        let summary = crate::cli::deals::classify_deal_state(&get_state, bond)
+            .expect("the state getter answers in raw decimal strings");
+
+        let response = super::status_response_from_summary(
+            "net-a",
+            None,
+            None,
+            format!("0:{}", "3".repeat(64)),
+            None,
+            "streaming",
+            true,
+            &summary,
+        )
+        .expect("the status object is built from the decoded state");
+        let rendered = serde_json::to_value(&response).expect("status serializes");
+        let accounting = &rendered["accounting"];
+
+        assert_eq!(accounting["deposit"], "4.1", "{rendered}");
+        assert_eq!(accounting["probe_tick"], "3", "{rendered}");
+        assert_eq!(accounting["finalized_owed"], "6.15", "{rendered}");
+        assert_eq!(accounting["buyer_bond"], "6", "{rendered}");
+        assert_eq!(accounting["buyer_bond_required"], "6", "{rendered}");
+        // deposit + probeTick + the subscription bond the getter reports as held.
+        assert_eq!(accounting["buyer_locked"], "13.1", "{rendered}");
+
+        // Counts are not money: no decimal point appears on them.
+        assert_eq!(accounting["tokens_final"], "2000000", "{rendered}");
+        assert_eq!(accounting["tokens_pending"], "3000000", "{rendered}");
+
+        let text = rendered.to_string();
+        for raw in ["4100000000", "6150000000", "6000000000"] {
+            assert!(
+                !text.contains(raw),
+                "a raw ECC[2] figure reached the reader: {raw} in {text}"
+            );
+        }
+    }
+
     /// A seller handle whose market TokenContract is GONE must report the terminal deal, not fail.
+
     /// The seller's handle carries a `market`, that manifest pins the deal's TokenContract, and a
     /// clean close destroys that account in the same transaction. While `status` ran
-    /// `shellnet_doctor_preflight_market` first, the preflight reported the pinned account
+    /// `chain_doctor_preflight_market` first, the preflight reported the pinned account
     /// "inactive/undeployed" and the command exited `INTERNAL` -- so a seller could not read the
     /// status of his own completed deal, and the `state="closed" active=false` branch canon
     /// mandates was unreachable.
+
     /// The oracle is the ORDER: the deal snapshot is read first, the preflight is gated on the
     /// account still being live, and the closed branch is what an absent snapshot reaches. This is
-    /// a source-structure regression because the behaviour it guards is `feature = "shellnet"` and
+    /// a source-structure regression because the behaviour it guards is the removed chain feature and
     /// needs a live chain to exercise; the behavioural proof is the live run of
     /// `live_67_model_buyer_preserves_resting_order_identity_through_settle`.
     #[test]
     fn status_reports_a_destroyed_token_contract_as_closed_instead_of_failing_its_preflight() {
         let source = include_str!("reports.rs");
-        let start = source
-            .find("pub(crate) async fn run_status(args: StatusArgs)")
-            .expect("shellnet run_status present");
-        let end = source[start..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| start + offset)
-            .expect("run_status end marker present");
-        let body = &source[start..end];
+        let body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_status(args: StatusArgs)");
 
         let snapshot_read = body
             .find("let deal_snapshot = chain.token_contract_deal_snapshot(&tc).await?;")
             .expect("status must read the deal snapshot itself");
         let preflight = body
             .find(
-                "shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?",
+                "chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?",
             )
             .expect("status must still run the market preflight");
         assert!(
@@ -573,23 +659,17 @@ mod tests {
         );
         assert!(
             !body.contains(
-                "shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await;"
+                "chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await;"
             ),
             "the preflight result must stay fatal where it runs; it is gated, never ignored"
         );
 
         // The relaxation is scoped to `status`. Every other command keeps the preflight ahead of
         // everything it does, because there an inactive TokenContract IS a failure.
-        let export = source
-            .find("pub(crate) async fn run_export(args: ExportArgs)")
-            .expect("shellnet run_export present");
-        let export_end = source[export..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| export + offset)
-            .expect("run_export end marker present");
-        let export_body = &source[export..export_end];
+        let export_body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_export(args: ExportArgs)");
         let export_preflight = export_body
-            .find("shellnet_doctor_preflight_market(")
+            .find("chain_doctor_preflight_market(")
             .expect("export keeps its market preflight");
         assert!(
             !export_body[..export_preflight].contains("token_contract_deal_snapshot"),
@@ -618,7 +698,7 @@ mod tests {
             dispute_time: 0,
         };
         let status = super::status_response_from_summary(
-            "shellnet",
+            "net-a",
             Some("deal-seller".to_string()),
             Some("seller".to_string()),
             "0:tc".to_string(),
@@ -654,6 +734,7 @@ mod tests {
 }
 
 /// the versioned machine schemas answer in the shape they are pinned to.
+
 /// Ungated on purpose. The conversion it exercises has no feature of its own, so these rows run in
 /// the default build too -- which is the build whose regression would otherwise be checked by
 /// nothing at all.
@@ -664,11 +745,15 @@ mod pinned_schema_address_1419 {
     /// The shape that shipped the defect. `market.json` stores the canonical form, a deal handle
     /// stores whatever it was written with, and either can reach the schema builder; before this,
     /// whatever arrived was printed verbatim.
+
     /// Measured on the two-runner release gate, which had been red since 2026-08-10:
+
     /// ```text
     /// asked about 97256735...::97256735..., status answered '97256735...::97256735...'
     /// ```
+
     /// The same account -- so the check's identity half passed and its shape half did not.
+
     /// Asserted through `status_response_from_summary`, the place that BUILDS the schema, not
     /// through the helper alone: a helper that exists but is not wired in leaves the defect exactly
     /// where it was, and a test of the helper alone passes either way. (It did, on the first
@@ -708,7 +793,7 @@ mod pinned_schema_address_1419 {
         assert_eq!(
             response.token_contract,
             format!("0:{account}"),
-            "`dexdo.status.v2` must answer in `0:<account_id>`, whatever form reached the command"
+            "`dexdo.status.v3` must answer in `0:<account_id>`, whatever form reached the command"
         );
     }
 

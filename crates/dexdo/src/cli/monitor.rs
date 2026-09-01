@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use dexdo_core::{aggregate_tree, ChainBackend, DobParams, MockChainBackend, ProtocolConsts};
 
 pub(crate) async fn run_monitor(args: MonitorArgs) -> Result<()> {
-    // Real shellnet monitoring: a `RealNote` is a single key, not an HD tree, so the real monitor
+    // Real chain monitoring: a `RealNote` is a single key, not an HD tree, so the real monitor
     // reads the operator's `--market` manifest(s) by-fact on-chain rather than aggregating a `--tree-width`
     // window. The mock path below still aggregates the note tree.
     if !args.mock.mock_chain {
@@ -28,24 +28,31 @@ pub(crate) async fn run_monitor(args: MonitorArgs) -> Result<()> {
     Ok(())
 }
 
-/// Real-shellnet monitor: read the operator's `--market` manifest(s) and print each market's
+/// Real-chain monitor: read the operator's `--market` manifest(s) and print each market's
 /// by-fact deal state on-chain through the SAME `print_tree_snapshot` (per-model breakdown + anomaly
 /// surfacing) as the mock path. Read-only -- only getters, moves nothing. Each manifest's `TokenContract` is
-/// read via `real_market_deal_view`(`getState`/`getSellerBond` + the buyer pubkey); the model/price come from the
+/// read via `real_market_deal_view` (`getState`/`getSellerBond` + the buyer pubkey); the model/price come from the
 /// manifest. Live-verifiable once a deal `TokenContract` is deployed.
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
     use dexdo_core::{real_market_deal_view, MarketManifest, RealChainBackend, TreeSnapshot};
     if args.market.is_empty() {
         bail!(
-            "real shellnet monitor: pass --market <manifest>... (the operator's `dexdo provision` market \
+            "a real chain monitor: pass --market <manifest>... (the operator's `dexdo provision` market \
              record(s)); a RealNote is a single key, not an HD tree, so the monitor reads the markets it is given"
         );
     }
-    let contracts = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let contracts_path = crate::cli::commands::manifest_path()?;
+    let contracts = contracts_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            contracts_path.display()
+        )
+    })?;
     let chain = RealChainBackend::connect(contracts)?;
     let mut note_ids = Vec::new();
     let mut deals = Vec::new();
@@ -59,7 +66,7 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
             .validate()
             .map_err(|e| anyhow::anyhow!("--market {}: {e}", m.display()))?;
         note_ids.push(manifest.seller_note.clone());
-        // Fail loud(review): the real reader returns an error for an undeployed/unreadable TC or a
+        // Fail loud (review): the real reader returns an error for an undeployed/unreadable TC or a
         // manifest/getter mismatch -- surface it with the offending --market file, never as empty data.
         let deal = real_market_deal_view(&chain, &manifest)
             .await
@@ -84,7 +91,3 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_monitor_real(_args: &MonitorArgs) -> Result<()> {
-    bail!("real shellnet monitoring unavailable: build with `--features shellnet`")
-}

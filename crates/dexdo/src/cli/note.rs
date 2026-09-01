@@ -1,4 +1,4 @@
-//! `dexdo note deploy`: deploy a wallet-funded `PrivateNote` on shellnet in-process through
+//! `dexdo note deploy`: deploy a wallet-funded `PrivateNote` on the chain in-process through
 //! `gosh.ackinacki`, then fold the CLI-compatible result into a `DEXDO_PN_POOL` pool the `seller`/`buyer`
 //! already consume. The chain call lives in `note_cmd.rs::run_note_deploy`; the pure schema adapters
 //! live here.
@@ -18,7 +18,6 @@ const NOTE_DEPLOY_RECOVERY_VERSION: u32 = 1;
 /// Note denominations accepted by the in-tree RootPN contract. The pinned SDK's `Nominal` enum is
 /// only a parsing convenience in this flow: dexdo constructs the wallet and RootPN messages from
 /// the raw value itself.
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoteNominal {
     N100,
@@ -28,7 +27,6 @@ pub(crate) enum NoteNominal {
     N1000000,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 impl NoteNominal {
     pub(crate) const ALL: [Self; 5] = [
         Self::N100,
@@ -78,29 +76,36 @@ impl NoteNominal {
 /// `contracts/dex/modifiers/modifiers.sol` declares `uint128 constant GAS_DEPOSIT = 250_000_000_000;`
 /// (250 SHELL). `note_deploy_gas_deposit_mirrors_the_contract_constant` re-derives this number from
 /// that source file rather than restating it.
+
 /// From 4.0.33 `RootPN.generateVoucher(skUCommit, isFee)` takes this out of EVERY non-gas deposit
-/// before the remainder is checked against `ALLOWED_NOMINALS`(`contracts/dex/RootPN.sol`), because
+/// before the remainder is checked against `ALLOWED_NOMINALS` (`contracts/dex/RootPN.sol`), because
 /// the note it will deploy is created cross-dapp where only ECC[2] crosses -- without the collection
-/// the note would be born unable to do anything. A gas voucher(`isFee = true`) pays nothing:
+/// the note would be born unable to do anything. A gas voucher (`isFee = true`) pays nothing:
 /// charging gas for buying gas would be circular, and that leg's ECC is handed straight back to the
 /// same note by `sendEccShellToPrivateNote`.
-pub(crate) const ROOT_PN_GAS_DEPOSIT_RAW: u64 = 250_000_000_000;
+
+/// Stated once, in `dexdo_core::params`: the wallet refill campaign reads it too, and there it used
+/// to be a written-out sum.
+// Brought in by name so the doc links to it in this module resolve; the code paths reach it
+// through `dexdo_core::params`.
+#[allow(unused_imports)]
+pub(crate) use dexdo_core::params::ROOT_PN_GAS_DEPOSIT_RAW;
 
 /// Raw ECC[2] SHELL the operator wallet must hold before `note deploy` will spend anything for
 /// `nominal` -- the figure `note wallet`'s stage-two funding recipe prints, taken from the deploy's
 /// own requirement rather than restated beside it.
+
 /// Keeping this beside [`ROOT_PN_GAS_DEPOSIT_RAW`] prevents the attached figure from entering
 /// `note_cmd.rs`, where the prover and deploy value must remain the nominal.
-#[cfg(feature = "shellnet")]
 pub(crate) fn operator_wallet_funding_raw(nominal: NoteNominal) -> u128 {
     note_deploy_shell_ecc_required_raw(
         nominal.raw_value(dexdo_core::private_note::proof::TokenType::Shell.decimals()),
-        dexdo_core::private_note::proof::ECC_SHELL_DEPOSIT_RAW,
     )
 }
 
 /// Raw NATIVE balance the same address must hold before dexdo submits the canonical state-init --
 /// stage ONE of the recipe, and deliberately not [`operator_wallet_funding_raw`].
+
 /// The two stages fund different things, and only ONE of them has anything to do with the nominal.
 /// probed the flag-16 non-bounceable leg on-chain and read back `balance` in full with
 /// `balance_other[2]` at zero: that leg becomes the wallet's own native gas, never ECC[2], and
@@ -109,53 +114,57 @@ pub(crate) fn operator_wallet_funding_raw(nominal: NoteNominal) -> u128 {
 /// [`dexdo_core::params::OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`], which carries the live deploy
 /// receipt that measures it. It takes no nominal, because asking for a nominal-sized amount of
 /// permanent gas is what this used to do.
-/// Stage two is the ECC[2] `note deploy` actually spends, and that is the stage the nominal and the
-/// SHELL gas voucher belong to. That is why the recipe prints two different amounts rather than one
-/// number twice.
-#[cfg(feature = "shellnet")]
+
+/// Stage two is the ECC[2] `note deploy` actually spends, and that is the stage the nominal belongs
+/// to. That is why the recipe prints two different amounts rather than one number twice.
 pub(crate) fn operator_wallet_predeploy_native_raw() -> u128 {
     dexdo_core::params::OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE
 }
 
-/// The three named summands of [`operator_wallet_funding_raw`], so a recipe can say what the user
-/// is paying for without restating the sum.
-/// Only the two ends are named: the middle is whatever the single source of truth has left over,
-/// so a printed breakdown can never add up to something other than the figure `note deploy` checks.
-#[cfg(feature = "shellnet")]
-pub(crate) fn operator_wallet_funding_summands_raw(nominal: NoteNominal) -> (u128, u128, u128) {
-    let nominal_raw = u128::from(
-        nominal.raw_value(dexdo_core::private_note::proof::TokenType::Shell.decimals()),
-    );
-    let gas_voucher_raw = u128::from(dexdo_core::private_note::proof::ECC_SHELL_DEPOSIT_RAW);
-    let gas_deposit_raw = operator_wallet_funding_raw(nominal) - nominal_raw - gas_voucher_raw;
-    (nominal_raw, gas_deposit_raw, gas_voucher_raw)
+/// The two named summands of [`operator_wallet_funding_raw`], so a recipe can say what the user is
+/// paying for without restating the sum.
+
+/// Only the nominal is named: the rest is whatever the single source of truth has left over, so a
+/// printed breakdown can never add up to something other than the figure `note deploy` checks.
+pub(crate) fn operator_wallet_funding_summands_raw(nominal: NoteNominal) -> (u128, u128) {
+    let nominal_raw =
+        u128::from(nominal.raw_value(dexdo_core::private_note::proof::TokenType::Shell.decimals()));
+    let gas_deposit_raw = operator_wallet_funding_raw(nominal) - nominal_raw;
+    (nominal_raw, gas_deposit_raw)
 }
 
 /// Everything a SHELL `note deploy` must already find in the funding wallet's ECC[2] before it
-/// submits its first wallet POST, as three summands:
-/// - the NOMINAL(`raw_value`), the money the note will be worth;
-/// - `RootPN.GAS_DEPOSIT`([`ROOT_PN_GAS_DEPOSIT_RAW`]), which `generateVoucher` takes out of every
-/// non-gas deposit before the remainder is matched against `ALLOWED_NOMINALS`;
-/// - `ecc_shell_deposit`, the SHELL gas voucher(`isFee = true`) the SAME wallet pays on the next
-/// leg so the new note is born able to move.
-/// The deposit leg's preflight is charged all three rather than the two the deposit itself
-/// attaches, because the gas leg is funded from this same wallet immediately afterwards: a wallet
-/// that cleared the deposit but not the gas voucher would fail with the nominal already spent. So
-/// this is the whole ECC[2] requirement of `note deploy`, not one leg of it -- which is why
-/// `note wallet` calls exactly this function instead of restating `nominal + GAS_DEPOSIT`.
-/// Restating it is what shipped a recipe one gas voucher short of the deploy for every nominal.
-/// Both arguments are `u64` and the result is `u128`, so the sum cannot overflow.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn note_deploy_shell_ecc_required_raw(raw_value: u64, ecc_shell_deposit: u64) -> u128 {
-    note_deploy_voucher_wire_raw(false, raw_value) + u128::from(ecc_shell_deposit)
+/// submits its first wallet POST, as two summands:
+
+/// - the NOMINAL (`raw_value`), the money the note will be worth;
+/// - `RootPN.GAS_DEPOSIT` ([`ROOT_PN_GAS_DEPOSIT_RAW`]), which `generateVoucher` takes out of every
+/// non-gas deposit before the remainder is matched against `ALLOWED_NOMINALS`, and which the
+/// contract hands to the new note as its ECC[2] gas.
+
+/// There is no third summand. `note deploy` used to buy a second, `isFee = true` voucher of
+/// 100 SHELL on top, so the wallet was charged for gas the note already had: `RootPN` credits every
+/// note it creates with the whole `GAS_DEPOSIT`, which is 250 SHELL.
+
+/// Measured, not assumed. The acceptance suite reads the seller note's ECC[2] before each scenario
+/// and reports 350 -> 330 -> 310 -> 290 -> 270 across five of them -- 20 SHELL per full scenario, so the
+/// birth deposit alone carries about a dozen. Dropping the voucher took one note deploy on live
+/// the test chain from 252 s to 113 s, the second halo2 proof being the whole difference. A note that
+/// needs more gas takes it later through `dexdo note topup`, which is the command for exactly that
+/// and does not cost a deploy its second proof.
+
+/// The result is `u128` and the argument `u64`, so the sum cannot overflow.
+pub(crate) fn note_deploy_shell_ecc_required_raw(raw_value: u64) -> u128 {
+    note_deploy_voucher_wire_raw(false, raw_value)
 }
 
 /// What the funding wallet must attach for a voucher whose NOMINAL is `raw_value` -- since 4.0.33 the
 /// two are no longer the same figure, and keeping them one variable is what makes every nominal fail.
-/// `generateVoucher` computes `nominal = attached - GAS_DEPOSIT` on the non-gas(`isFee = false`)
+
+/// `generateVoucher` computes `nominal = attached - GAS_DEPOSIT` on the non-gas (`isFee = false`)
 /// path, then checks THAT against `ALLOWED_NOMINALS`: sending a bare N10000 leaves 9 750 and is
-/// refused with `ERR_NOT_ALLOWED`(141), and a bare N100 does not even reach the list
-/// (`ERR_BELOW_GAS_DEPOSIT`, 408). The gas voucher(`isFee = true`) is deducted nothing.
+/// refused with `ERR_NOT_ALLOWED` (141), and a bare N100 does not even reach the list
+/// (`ERR_BELOW_GAS_DEPOSIT`, 408). The gas voucher (`isFee = true`) is deducted nothing.
+
 /// The nominal must NOT follow this number anywhere else: the halo2 prover, the persisted checkpoint
 /// and `deployPrivateNote`'s `value` all keep the nominal, because `VoucherGenerated` emits the
 /// POST-deduction figure and a proof built over the attached amount is a public-input mismatch
@@ -165,6 +174,7 @@ pub(crate) fn note_deploy_shell_ecc_required_raw(raw_value: u64, ecc_shell_depos
 /// Anchoring an expectation to that constant would measure the client against a second copy of
 /// itself: changing it to 251 would leave every assertion green while the wallet
 /// attached `N+251`, the contract derived `N+1`, and RootPN rejected it.
+
 /// This used to fall back to a literal when the in-tree sources were the generation before 4.0.33
 /// and declared no `GAS_DEPOSIT` at all -- a fallback guarded by the manifest still reading 4.0.32.
 /// The 4.0.33 sources have merged, that generation is withdrawn, and the fallback is gone with it:
@@ -194,42 +204,12 @@ pub(crate) fn contract_gas_deposit_raw() -> u64 {
         .expect("numeric GAS_DEPOSIT")
 }
 
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn note_deploy_voucher_wire_raw(is_fee: bool, raw_value: u64) -> u128 {
-    let raw_value = u128::from(raw_value);
     if is_fee {
-        raw_value
+        u128::from(raw_value)
     } else {
-        raw_value + u128::from(ROOT_PN_GAS_DEPOSIT_RAW)
+        dexdo_core::params::note_deploy_wallet_funding_raw(raw_value)
     }
-}
-
-/// The ECC[2] a `PrivateNote` holds the moment `RootPN` creates it, before any gas voucher is paid.
-/// `deployPrivateNote` builds the new note with `gasCc[CURRENCIES_ID_SHELL] = GAS_DEPOSIT` and
-/// creates it carrying that(`contracts/dex/RootPN.sol`), because a note created cross-dapp would
-/// otherwise be born unable to move. It is the note's floor, owed to nothing the deploy did.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn note_birth_shell_ecc() -> u128 {
-    u128::from(ROOT_PN_GAS_DEPOSIT_RAW)
-}
-
-/// The ECC[2] level that proves the SHELL gas voucher ARRIVED at the note: a delta over what the
-/// note already held before the submit, never an absolute level.
-/// the post-condition used to be the deposit alone -- 100e9, an absolute level -- and a note
-/// clears it the moment it is born, because [`note_birth_shell_ecc`] is larger. `250e9 >= 100e9`
-/// answered "funded" on the first poll, before any voucher was paid, so EVERY stage-two failure read
-/// as success: a `sendEccShellToPrivateNote` that finalized `aborted=true, exit_code=403` with zero
-/// out-messages left the wallet debited 100 SHELL, the note at its birth deposit, and `note deploy`
-/// printing `note deployed` with exit 0. Raising the number would only move the coincidence -- a
-/// level is a derived observation a note can satisfy for reasons unrelated to this submit, while the
-/// delta measures the one thing being asked about.
-/// This figure decides only the branch where the chain has no verdict to give. Where there IS a
-/// finalized transaction, that record is the answer: `note_deploy_rootpn_action_result` reports an
-/// aborted or non-zero-exit transaction as an error carrying its exit code, which is what separates
-/// the retriable 403 from the un-retriable 137.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-pub(crate) fn note_shell_funding_target(baseline_shell_ecc: u128, ecc_shell_deposit: u64) -> u128 {
-    baseline_shell_ecc.saturating_add(u128::from(ecc_shell_deposit))
 }
 
 #[derive(Debug)]
@@ -296,11 +276,13 @@ pub(crate) fn unknown_note_getter_balance_maps(reason: impl Into<String>) -> Not
 
 /// The note's `_busy` latch as `PrivateNote.getDetails()` renders it: an `optional(address)` that is
 /// null while the note holds no latch and carries the counterparty's address while it does.
-/// `dex::ERR_NOTE_BUSY(121)` tells the operator to check what the note is busy with on
+
+/// `dex::ERR_NOTE_BUSY (121)` tells the operator to check what the note is busy with on
 /// `dexdo note balance`, and that command printed no such line -- a latched note rendered exactly
 /// like a free one, `status: Active` included. The latch is not a wait-and-retry state: the contract
 /// clears it only on the acknowledgement of the operation that set it, or when that message bounces
 /// (`contracts/dex/PrivateNote.sol`), so a missing line was not something the operator could sit out.
+
 /// `Unknown` is a third answer on purpose. `getDetails` not being readable, or answering without the
 /// field at all, is not evidence that the note is free, and rendering it as "not busy" would be the
 /// same defect one level down.
@@ -339,6 +321,10 @@ pub(crate) fn note_busy_latch(details: Option<&Value>) -> NoteBusyLatch {
         Some(_) => NoteBusyLatch::Unknown("busyAddress is not an address".to_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "note_balance_render_1714_tests.rs"]
+mod note_balance_render_1714_tests;
 
 pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     let mut out = String::new();
@@ -379,12 +365,42 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
         "PrivateNote.getDetails spendable token balance (trading money)",
         &view.getters.balance,
     );
-    render_ecc_map(
-        &mut out,
-        "PrivateNote.getDetails lockedInOrders",
-        &view.getters.locked_in_orders,
-    );
+    render_locked_in_orders(&mut out, &view.getters.locked_in_orders);
     out
+}
+
+/// The `lockedInOrders` section, titled by what the field actually measures.
+
+/// The field is honest; the heading over it was not. `_lockedInOrders` is PMP `OrderBook`
+/// collateral -- the contract's own comment says incremented on order placement, decremented on
+/// fill or cancel -- and an inference buy never touches it: `placeInferenceBuy` debits
+/// `_balance[CURRENCIES_ID_SHELL]` directly. So a note with 6.1 SHELL locked in a standing inference
+/// order printed `none reported` under a heading an operator reads as "what is holding my money".
+
+/// Measured on the chain: the trading record dropped by exactly 6.100000000 while this said nothing.
+
+/// The direction of the error is what makes it worth a change rather than a note. It pointed at "all
+/// clear", so the operator either plans a spend that will hit `ERR_LOW_VALUE` and looks for the
+/// cause in the wrong place, or -- worse -- reads the reduced record as money GONE and opens an
+/// investigation into a loss that is a standing order waiting to be cancelled.
+
+/// Naming the field rather than adding the inference figure here: that figure is a second chain
+/// read in a command that makes one, and the decision to widen it belongs to whoever owns the
+/// command. What this fixes is that no wrong conclusion is available from the line any more.
+fn render_locked_in_orders(out: &mut String, map: &NoteBalanceMap) {
+    render_ecc_map(
+        out,
+        "PrivateNote.getDetails lockedInOrders (PMP OrderBook collateral)",
+        map,
+    );
+    // Printed on every branch, empty or not: this file's rule is that no state is reported by
+    // silence, and the caveat is exactly as true when the field has a figure in it.
+    writeln!(
+        out,
+        "  inference-order escrow is NOT counted by this field -- a standing inference buy is paid \
+         from the trading record itself. Use `dexdo note outstanding` to see standing orders."
+    )
+    .unwrap();
 }
 
 /// The `_busy` latch section of `dexdo note balance`, in the shape the getter sections above use: a
@@ -410,6 +426,31 @@ pub(crate) fn render_note_busy_latch(latch: &NoteBusyLatch) -> String {
     }
     out
 }
+
+/// The `withdrawTokens` gate section of `dexdo note balance`.
+
+/// The section exists because the two lines above it are a COMPLETE-LOOKING answer to two of the
+/// eleven questions `withdrawTokens` asks. An operator reading `not busy` and `none reported`
+/// concluded the note was free and was refused `exit_code=121` an hour later -- not from
+/// carelessness, but because the other nine gates were neither shown nor marked missing.
+
+/// So this section is obliged to do one of exactly two things: name the gate that is holding the
+/// money, or say plainly that it did not check them all. Silence, and a partial check that reads
+/// like a full one, are the defect itself.
+pub(crate) fn render_note_withdraw_gate(reading: &dexdo_core::NoteWithdrawGate) -> String {
+    let mut out = String::new();
+    writeln!(
+        &mut out,
+        "PrivateNote withdrawTokens gates (what holds the money):"
+    )
+    .unwrap();
+    writeln!(&mut out, "  {}", dexdo_core::withdraw_gate_line(reading)).unwrap();
+    out
+}
+
+#[cfg(test)]
+#[path = "note_withdraw_gate_render_1515_tests.rs"]
+mod note_withdraw_gate_render_1515_tests;
 
 #[cfg(test)]
 #[path = "note_busy_1391_tests.rs"]
@@ -578,7 +619,7 @@ pub(crate) fn ensure_onchain_owner_matches_pool_key(
         bail!(
             "{role} aborted before writing DEXDO_PN_POOL: PrivateNote {} getDetails exposes no \
              ephemeralPubkey. Refusing to leave a pool entry that may fail later with ERR_INVALID_SENDER 101. \
-             Deploy a fresh note with --pool <new_file> after verifying shellnet contracts.",
+             Deploy a fresh note with --pool <new_file> after verifying the chain's contracts.",
             dexdo_core::address::display(note_addr)
         );
     };
@@ -607,7 +648,6 @@ pub(crate) struct NoteDeployRecoveryState {
     pub nominal: String,
     pub token_type: u32,
     pub raw_value: u64,
-    pub ecc_shell_deposit: u64,
     #[serde(serialize_with = "dexdo_core::address::serde_self_dapp::serialize")]
     pub funding_multisig_address: String,
     pub owner_public_key_hex: String,
@@ -618,8 +658,6 @@ pub(crate) struct NoteDeployRecoveryState {
     pub deployed_at_unix: Option<u64>,
     #[serde(default)]
     pub deposit_voucher: Option<NoteDeployVoucherCheckpoint>,
-    #[serde(default)]
-    pub shell_voucher: Option<NoteDeployVoucherCheckpoint>,
     pub shell_funded: bool,
     pub sanity_checked: bool,
 }
@@ -640,7 +678,6 @@ pub(crate) struct NoteDeployRecoveryRequest<'a> {
     pub nominal: &'a str,
     pub token_type: u32,
     pub raw_value: u64,
-    pub ecc_shell_deposit: u64,
     pub funding_multisig_address: &'a str,
 }
 
@@ -649,8 +686,7 @@ pub(crate) struct NoteDeployRecoveryRequest<'a> {
 /// stay honest about the identity information they actually contain.
 pub(crate) fn normalize_funding_multisig_identity(value: &str) -> Result<String> {
     let value = value.trim();
-    let address =
-        dexdo_core::CanonicalAddress::parse(value).map_err(|error| anyhow!("{error}"))?;
+    let address = dexdo_core::CanonicalAddress::parse(value).map_err(|error| anyhow!("{error}"))?;
     if value.starts_with("0:") {
         Ok(address.legacy())
     } else {
@@ -677,7 +713,6 @@ fn funding_multisig_identities_match(left: &str, right: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoteDeployVoucherKind {
     Deposit,
-    ShellGas,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -746,14 +781,12 @@ impl NoteDeployVoucherKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Deposit => "deposit",
-            Self::ShellGas => "SHELL gas",
         }
     }
 
     fn field_name(self) -> &'static str {
         match self {
             Self::Deposit => "deposit_voucher",
-            Self::ShellGas => "shell_voucher",
         }
     }
 }
@@ -970,7 +1003,6 @@ impl NoteDeployVoucherEvent {
     }
 }
 
-#[cfg(feature = "shellnet")]
 impl NoteDeployVoucherEvent {
     pub(crate) fn from_sdk(
         event: dexdo_core::private_note::voucher_event::VoucherExtoutMessage,
@@ -1032,7 +1064,6 @@ impl NoteDeployVoucherProof {
     }
 }
 
-#[cfg(feature = "shellnet")]
 impl NoteDeployVoucherProof {
     pub(crate) fn from_halo2(proof: &dexdo_core::private_note::halo2::live::Halo2Proof) -> Self {
         Self {
@@ -1086,7 +1117,6 @@ impl NoteDeployRecoveryState {
             nominal: request.nominal.to_string(),
             token_type: request.token_type,
             raw_value: request.raw_value,
-            ecc_shell_deposit: request.ecc_shell_deposit,
             funding_multisig_address,
             owner_public_key_hex,
             owner_secret_key_hex: owner_secret_key_hex.into(),
@@ -1094,7 +1124,6 @@ impl NoteDeployRecoveryState {
             deposit_identifier_hash: None,
             deployed_at_unix: None,
             deposit_voucher: None,
-            shell_voucher: None,
             shell_funded: false,
             sanity_checked: false,
         };
@@ -1143,15 +1172,6 @@ impl NoteDeployRecoveryState {
                 false,
             )?;
         }
-        if let Some(voucher) = &self.shell_voucher {
-            voucher.ensure_matches(
-                NoteDeployVoucherKind::ShellGas,
-                &self.owner_public_key_hex,
-                SHELL_CURRENCY_ID,
-                self.ecc_shell_deposit,
-                true,
-            )?;
-        }
         Ok(())
     }
 
@@ -1165,7 +1185,6 @@ impl NoteDeployRecoveryState {
             || self.nominal != request.nominal
             || self.token_type != request.token_type
             || self.raw_value != request.raw_value
-            || self.ecc_shell_deposit != request.ecc_shell_deposit
             || !funding_multisig_identities_match(
                 &self.funding_multisig_address,
                 &funding_multisig_address,
@@ -1180,7 +1199,6 @@ impl NoteDeployRecoveryState {
         Ok(())
     }
 
-    #[cfg(feature = "shellnet")]
     pub(crate) fn mark_private_note_deployed(
         &mut self,
         pn_address: String,
@@ -1193,14 +1211,12 @@ impl NoteDeployRecoveryState {
         self.validate()
     }
 
-    #[cfg(feature = "shellnet")]
     pub(crate) fn voucher_checkpoint(
         &self,
         kind: NoteDeployVoucherKind,
     ) -> Option<&NoteDeployVoucherCheckpoint> {
         match kind {
             NoteDeployVoucherKind::Deposit => self.deposit_voucher.as_ref(),
-            NoteDeployVoucherKind::ShellGas => self.shell_voucher.as_ref(),
         }
     }
 
@@ -1211,7 +1227,6 @@ impl NoteDeployRecoveryState {
     ) -> Result<()> {
         let (token_type, raw_value, is_fee) = match kind {
             NoteDeployVoucherKind::Deposit => (self.token_type, self.raw_value, false),
-            NoteDeployVoucherKind::ShellGas => (SHELL_CURRENCY_ID, self.ecc_shell_deposit, true),
         };
         checkpoint.ensure_matches(
             kind,
@@ -1222,12 +1237,10 @@ impl NoteDeployRecoveryState {
         )?;
         match kind {
             NoteDeployVoucherKind::Deposit => self.deposit_voucher = Some(checkpoint),
-            NoteDeployVoucherKind::ShellGas => self.shell_voucher = Some(checkpoint),
         }
         self.validate()
     }
 
-    #[cfg(feature = "shellnet")]
     pub(crate) fn mark_shell_funded_and_checked(&mut self) -> Result<()> {
         self.shell_funded = true;
         self.sanity_checked = true;
@@ -1261,7 +1274,6 @@ impl NoteDeployRecoveryState {
             nominal: self.nominal.clone(),
             token_type: self.token_type,
             raw_value: self.raw_value,
-            ecc_shell_deposit: self.ecc_shell_deposit,
             pn_address: self.pn_address.clone(),
             deposit_identifier_hash: self.deposit_identifier_hash.clone(),
             owner_public_key_hex: Some(self.owner_public_key_hex.clone()),
@@ -1273,7 +1285,6 @@ impl NoteDeployRecoveryState {
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn default_note_deploy_recovery_path(pool: &Path) -> PathBuf {
     let mut path = pool.as_os_str().to_os_string();
     path.push(".recovery.json");
@@ -1376,6 +1387,15 @@ fn acquire_note_deploy_recovery_write_lock(
     }
 }
 
+/// What the client tells an operator about a recovery file it refuses to touch.
+
+/// Every refusal that leaves such a file where it is says this same sentence. It is stated once so
+/// that a second site cannot drift into a second formula: `note deploy` grew a refusal to overwrite
+/// an unreadable recovery long before it grew a refusal to delete one, and the two have to give the
+/// operator the same instruction because they are protecting the same file for the same reason.
+pub(crate) const NOTE_DEPLOY_RECOVERY_PRESERVE_INSTRUCTION: &str =
+    "Preserve it and pass --recovery <different-file>.";
+
 fn load_existing_note_deploy_recovery_for_write(
     path: &Path,
 ) -> Result<Option<NoteDeployRecoveryState>> {
@@ -1386,16 +1406,16 @@ fn load_existing_note_deploy_recovery_for_write(
     };
     let state: NoteDeployRecoveryState = serde_json::from_slice(&bytes).map_err(|e| {
         anyhow!(
-            "existing note deploy recovery {} is invalid JSON; refusing to overwrite it: {e}. \
-             Preserve it and pass --recovery <different-file>.",
-            path.display()
+            "existing note deploy recovery {} is invalid JSON; refusing to overwrite it: {e}. {}",
+            path.display(),
+            NOTE_DEPLOY_RECOVERY_PRESERVE_INSTRUCTION
         )
     })?;
     state.validate().map_err(|e| {
         anyhow!(
-            "existing note deploy recovery {} is invalid; refusing to overwrite it: {e}. \
-             Preserve it and pass --recovery <different-file>.",
-            path.display()
+            "existing note deploy recovery {} is invalid; refusing to overwrite it: {e}. {}",
+            path.display(),
+            NOTE_DEPLOY_RECOVERY_PRESERVE_INSTRUCTION
         )
     })?;
     Ok(Some(state))
@@ -1414,14 +1434,13 @@ fn note_deploy_request_fields_match(
         && left.nominal == right.nominal
         && left.token_type == right.token_type
         && left.raw_value == right.raw_value
-        && left.ecc_shell_deposit == right.ecc_shell_deposit
         && funding_multisig_identities_match(
             &left.funding_multisig_address,
             &right.funding_multisig_address,
         )
 }
 
-fn note_deploy_recovery_has_no_possible_spend(state: &NoteDeployRecoveryState) -> bool {
+pub(crate) fn note_deploy_recovery_has_no_possible_spend(state: &NoteDeployRecoveryState) -> bool {
     fn voucher_has_no_possible_spend(voucher: Option<&NoteDeployVoucherCheckpoint>) -> bool {
         voucher.is_none_or(|voucher| {
             !voucher.submit_maybe_sent && voucher.event.is_none() && voucher.proof.is_none()
@@ -1434,7 +1453,6 @@ fn note_deploy_recovery_has_no_possible_spend(state: &NoteDeployRecoveryState) -
         && !state.shell_funded
         && !state.sanity_checked
         && voucher_has_no_possible_spend(state.deposit_voucher.as_ref())
-        && voucher_has_no_possible_spend(state.shell_voucher.as_ref())
 }
 
 fn ensure_same_recovery_can_advance(
@@ -1574,9 +1592,9 @@ pub(crate) fn recovery_owner_key_written_message(path: &Path) -> String {
 /// The one `note recover` line the CLI prints complete, because it is the one place both paths are
 /// known. Values are shell-quoted: a recovery or pool path containing a space would
 /// otherwise reach the parser as two arguments, after the operator's shell had already split it.
-/// Its only caller is the shellnet `note deploy` path, so it exists exactly where that does --
+
+/// Its only caller is the chain `note deploy` path, so it exists exactly where that does --
 /// the same boundary the settlement builders use -- rather than shipping behind a suppression.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn note_recover_finalize_command(recovery: &Path, pool: &Path) -> String {
     use crate::cli::support::shell_arg;
     format!(
@@ -1698,7 +1716,6 @@ pub(crate) struct OnboardPnState {
     pub nominal: String,
     pub token_type: u32,
     pub raw_value: u64,
-    pub ecc_shell_deposit: u64,
     #[serde(with = "dexdo_core::address::serde_canonical_opt")]
     pub pn_address: Option<String>,
     pub deposit_identifier_hash: Option<String>,
@@ -1720,7 +1737,6 @@ impl std::fmt::Debug for OnboardPnState {
     }
 }
 
-#[cfg(feature = "shellnet")]
 impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState {
     fn from(s: dexdo_core::private_note::DeployPrivateNoteResult) -> Self {
         Self {
@@ -1728,7 +1744,6 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
             nominal: s.nominal,
             token_type: s.token_type,
             raw_value: s.raw_value,
-            ecc_shell_deposit: s.ecc_shell_deposit,
             pn_address: Some(s.pn_address),
             deposit_identifier_hash: Some(s.deposit_identifier_hash),
             owner_public_key_hex: Some(s.owner_public_key_hex),
@@ -1740,8 +1755,32 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
     }
 }
 
+/// The one spelling a note address is RECORDED in: canonical `<dapp_id>::<account_id>`.
+
+/// The pool is a file the operator reads, and it was holding two conventions side by side -- a
+/// canonical `funding_multisig_address` next to notes spelled `0:<account_id>`, which names no DApp
+/// at all. Downstream that legacy spelling is what makes `note list` print `<account>::<account>`:
+/// [`dexdo_core::address::display_self_dapp`] reconstructs a SELF-DApp identity for anything that
+/// arrives without one, and a `PrivateNote` is not a self-DApp account -- it lives in
+/// [`dexdo_core::DEXDO_DAPP_ID`] (`crates/core/src/address.rs`), which is how `dexdo history` prints
+/// the same note. One note had three spellings across one client.
+
+/// Writing only. Reading stays tolerant of both forms, so pools written by earlier releases keep
+/// working: every matcher here normalizes before it compares.
+
+/// A supplied DApp id is authoritative and survives -- this upgrades the legacy form, it does not
+/// re-scope an address that already names its DApp.
+
+/// A value that is not an address at all is written unchanged, exactly as
+/// [`dexdo_core::address::display`] passes one through: this is a rendering choice and it must not
+/// become a new refusal on a path whose job is to record what a deploy just produced. Whether such
+/// a value may reach the pool at all is a separate question, and answering it here would hide it.
+pub(crate) fn pool_note_address_as_recorded(address: &str) -> String {
+    dexdo_core::address::display(address)
+}
+
 /// output adapter: build a single DEXDO_PN_POOL **note** object from a fully deployed note state. Fails
-/// loud if deploy did not complete(missing `pn_address`/keys, or not `shell_funded`/`sanity_checked`) -- folding a
+/// loud if deploy did not complete (missing `pn_address`/keys, or not `shell_funded`/`sanity_checked`) -- folding a
 /// half-deployed note into the pool would later strand the `seller`/`buyer` on an unusable note.
 pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
     ensure_shell_currency_id(s.token_type, "note deploy state")?;
@@ -1769,7 +1808,7 @@ pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
         );
     }
     Ok(json!({
-        "address": address,
+        "address": pool_note_address_as_recorded(address),
         "deposit_identifier_hash": dih,
         "owner_public_key_hex": pubkey,
         "owner_secret_key_hex": seckey,
@@ -1780,9 +1819,9 @@ pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
 }
 
 /// output adapter: append `note` to a `DEXDO_PN_POOL` JSON, creating the pool with the pool-level fields
-/// from the deploy state(endpoint/nominal/token_type/raw_value/ecc) when it does not yet exist, or appending to an
+/// from the deploy state (endpoint/nominal/token_type/raw_value/ecc) when it does not yet exist, or appending to an
 /// existing matching pool. Refuses to mix nominals/token-types in one pool (the consumers assume a homogeneous
-/// pool), and refuses to add a duplicate note `address`. Pure(takes the existing pool JSON, returns the new one).
+/// pool), and refuses to add a duplicate note `address`. Pure (takes the existing pool JSON, returns the new one).
 pub(crate) fn pool_with_note_added(
     existing: Option<Value>,
     s: &OnboardPnState,
@@ -1791,8 +1830,21 @@ pub(crate) fn pool_with_note_added(
     funding_multisig_address: &str,
 ) -> Result<Value> {
     ensure_shell_currency_id(s.token_type, "note deploy state")?;
-    let funding_multisig_address =
-        normalize_funding_multisig_identity(funding_multisig_address)?;
+    let funding_multisig_address = normalize_funding_multisig_identity(funding_multisig_address)?;
+    // THE WALLET KEEPS THE FORM IT WAS GIVEN, and the note does not. That asymmetry is deliberate
+    // and an earlier revision of this change got it wrong by making both canonical.
+
+    // A note's DApp is knowable: `PrivateNote` lives in `DEXDO_DAPP_ID`, so writing it is recording
+    // a fact. A multisig is a self-DApp account, so its canonical form is `<account>::<account>` --
+    // which `display_self_dapp` RECONSTRUCTS from the account id rather than reads from anywhere.
+    // Storing that in a provenance field would record a claim this client never verified on chain.
+
+    // It also broke the identity comparison, which is what the field is for.
+    // `funding_multisig_identities_match` compares by account alone whenever either side carries no
+    // DApp; canonicalising on write removed that escape, so a pool created from `0:AAAA...` and a
+    // later note deployed with `<dapp_id>::AAAA...` -- the SAME wallet -- compared as two different
+    // multisigs and the run refused with "rewards provenance must not mix PrivateNotes funded by
+    // different multisigs".
     let mut pool = match existing {
         Some(p) => p,
         None => json!({
@@ -1801,12 +1853,11 @@ pub(crate) fn pool_with_note_added(
             "nominal": s.nominal,
             "token_type": s.token_type,
             "raw_value_per_pn": s.raw_value,
-            "ecc_shell_deposit_per_pn": s.ecc_shell_deposit,
             "funding_multisig_address": funding_multisig_address,
             "notes": [],
         }),
     };
-    // Homogeneity: a pool is one nominal + token_type(the seller/buyer pick any note assuming uniform value).
+    // Homogeneity: a pool is one nominal + token_type (the seller/buyer pick any note assuming uniform value).
     if pool["nominal"] != json!(s.nominal) || pool["token_type"] != json!(s.token_type) {
         bail!(
             "pool nominal/token_type ({}/{}) != this note's ({}/{}): the consumers assume a homogeneous pool -- \
@@ -1852,17 +1903,7 @@ pub(crate) fn pool_with_note_added(
         .as_array_mut()
         .ok_or_else(|| anyhow!("--pool: malformed (\"notes\" is not an array)"))?;
     let new_addr = note["address"].as_str().unwrap_or_default();
-    let normalized_new_addr = dexdo_core::normalize_wallet_address(new_addr).ok();
-    if notes
-        .iter()
-        .filter_map(|note| note["address"].as_str())
-        .any(|address| {
-            address == new_addr
-                || normalized_new_addr.as_ref().is_some_and(|new_addr| {
-                    dexdo_core::normalize_wallet_address(address).ok().as_ref() == Some(new_addr)
-                })
-        })
-    {
+    if pool_notes_contain(notes, new_addr) {
         bail!(
             "note {} is already in the pool -- refusing to add a duplicate",
             dexdo_core::address::display(new_addr)
@@ -1870,6 +1911,128 @@ pub(crate) fn pool_with_note_added(
     }
     notes.push(note);
     Ok(pool)
+}
+
+/// Is this note already recorded in these pool entries?
+
+/// One implementation for both readers -- the refusal above, which is the last word before a pool
+/// is written, and [`retire_a_finished_deploy`], which is the first word before a wallet is spent.
+/// Two copies of an address comparison drift, and a drift here means one of them mints a duplicate
+/// the other would have refused.
+
+/// Raw string first, then the normalised form: a pool written by an older client may hold an
+/// address in a different scoping, and that is the same note.
+fn pool_notes_contain(notes: &[Value], address: &str) -> bool {
+    let normalized = dexdo_core::normalize_wallet_address(address).ok();
+    notes
+        .iter()
+        .filter_map(|note| note["address"].as_str())
+        .any(|recorded| {
+            recorded == address
+                || normalized.as_ref().is_some_and(|address| {
+                    dexdo_core::normalize_wallet_address(recorded).ok().as_ref() == Some(address)
+                })
+        })
+}
+
+/// What a loaded recovery file means for the run that loaded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishedDeploy {
+    /// The file describes work still to be done: resume it.
+    Unfinished,
+    /// The file describes a deploy that is finished AND recorded in the pool, and the pool holds
+    /// the same owner key. It has been retired, and this run deploys a new note from scratch.
+    Retired,
+}
+
+/// Retire a recovery file whose deploy is finished and safely recorded -- before anything is spent.
+
+/// The file exists because the owner key of a note is created BEFORE the wallet spends on it: an
+/// interruption in between would leave money on chain and no key to the note it bought. So the key
+/// is written down first, and a rerun continues from it instead of spending twice.
+
+/// Once the note is in the pool that reason is spent. The pool entry carries the same
+/// `owner_secret_key_hex`, so the recovery file is a second copy, not the only one -- and keeping
+/// it makes the next `note deploy` load a finished attempt, deploy nothing, and fail at the pool
+/// write, after the operator has confirmed a Vault -> Hot transfer for a run that could never have
+/// produced a note. Live, that cost a wallet confirmation, a wait, and a page of error.
+
+/// Retiring is therefore the right answer, and the key comparison is what makes it safe: the file
+/// goes only when the pool provably holds the same secret. A pool entry with a different key, or
+/// none, means this file is still the only copy of something, and then the run refuses instead --
+/// deleting it would destroy the only way to ever spend that note.
+pub(crate) fn retire_a_finished_deploy(
+    recovery_path: &Path,
+    recovery: &NoteDeployRecoveryState,
+    pool_path: &Path,
+) -> Result<FinishedDeploy> {
+    let Some(deployed) = recovery.pn_address.as_deref() else {
+        // Nothing was deployed under this file yet: an interrupted attempt, which is exactly what
+        // resuming is for.
+        return Ok(FinishedDeploy::Unfinished);
+    };
+    let Ok(bytes) = std::fs::read(pool_path) else {
+        // No pool, or one that cannot be read: the pool write itself will say so, with the path.
+        return Ok(FinishedDeploy::Unfinished);
+    };
+    let Ok(pool) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(FinishedDeploy::Unfinished);
+    };
+    let Some(notes) = pool["notes"].as_array() else {
+        return Ok(FinishedDeploy::Unfinished);
+    };
+    let Some(recorded) = pool_note_matching(notes, deployed) else {
+        // Deployed but never recorded: finalizing it is the one thing this file is still for, and
+        // retiring it here would strand a note nothing else can add.
+        return Ok(FinishedDeploy::Unfinished);
+    };
+    let pooled_secret = recorded["owner_secret_key_hex"]
+        .as_str()
+        .unwrap_or_default();
+    if pooled_secret != recovery.owner_secret_key_hex.as_str() {
+        bail!(
+            "note deploy: recovery file {} holds the deploy of note {}, which --pool {} records \
+             under a DIFFERENT owner key. Refusing to touch either: this file may be the only copy \
+             of the key to that note. Settle which key is right before deploying again.",
+            recovery_path.display(),
+            dexdo_core::address::display(deployed),
+            pool_path.display()
+        );
+    }
+    let resolved = resolve_private_file_path(recovery_path, "note deploy recovery")?;
+    let _lock = acquire_note_deploy_recovery_write_lock(&resolved)?;
+    match std::fs::remove_file(&resolved) {
+        Ok(()) => Ok(FinishedDeploy::Retired),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FinishedDeploy::Retired),
+        Err(error) => bail!(
+            "retire finished note deploy recovery {}: {error}",
+            resolved.display()
+        ),
+    }
+}
+
+/// The owner secret the pool recorded for `address`, if it holds that note at all.
+
+/// The pool is where `note deploy` writes the key it generated, so this is the client reading back
+/// its own record rather than a new place for a secret to live.
+pub(crate) fn pool_owner_secret(pool: &Value, address: &str) -> Option<String> {
+    let notes = pool["notes"].as_array()?;
+    pool_note_matching(notes, address)?["owner_secret_key_hex"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The pool entry for `address`, under the same matching rule the duplicate refusal uses.
+fn pool_note_matching<'a>(notes: &'a [Value], address: &str) -> Option<&'a Value> {
+    let normalized = dexdo_core::normalize_wallet_address(address).ok();
+    notes.iter().find(|note| {
+        note["address"].as_str().is_some_and(|recorded| {
+            recorded == address
+                || normalized.as_ref().is_some_and(|address| {
+                    dexdo_core::normalize_wallet_address(recorded).ok().as_ref() == Some(address)
+                })
+        })
+    })
 }
 
 pub(crate) fn ensure_shell_pool_currency(pool: &Value) -> Result<()> {
@@ -1895,7 +2058,6 @@ fn ensure_shell_currency_id(token_type: u32, source: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn pool_with_note_token_contract_recorded(
     mut pool: Value,
     note_addr: &str,
@@ -1908,7 +2070,21 @@ pub(crate) fn pool_with_note_token_contract_recorded(
     }
     let note_addr = dexdo_core::normalize_wallet_address(note_addr)
         .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
-    let token_contract = dexdo_core::normalize_wallet_address(token_contract)
+    // Two values from one input, deliberately. The NORMALISED one is for comparing -- it drops the
+    // DApp half, which is what makes two spellings of one account compare equal. The RECORDED one
+    // keeps whatever DApp the caller named and supplies the self-DApp identity only when none was
+    // named, because a per-deal TokenContract is a self-DApp account.
+
+    // Rendering the normalised value would re-scope a TokenContract the caller named under some
+    // other DApp -- the same hazard the `address` write below refuses, and `display_self_dapp`'s own
+    // contract ("a supplied canonical address is authoritative and survives unchanged") is defeated
+    // if a normalise runs in front of it.
+    let token_contract_recorded = dexdo_core::address::display_self_dapp(token_contract);
+    // The normalised form is not stored and not compared here -- the loop below matches on the
+    // note's ADDRESS. It is computed for its refusal alone: a `token_contract` that is not an
+    // address must stop this write before the entry is touched, and that check is this call. Bound
+    // to `_` because a named binding nothing reads is a lint failure and reads as an oversight.
+    let _: String = dexdo_core::normalize_wallet_address(token_contract)
         .map_err(|e| anyhow!("token_contract {token_contract}: {e}"))?;
     let notes = pool["notes"]
         .as_array_mut()
@@ -1922,8 +2098,20 @@ pub(crate) fn pool_with_note_token_contract_recorded(
             .unwrap_or_else(|_| address.trim().to_ascii_lowercase());
         if normalized == note_addr {
             matched += 1;
-            note["address"] = json!(note_addr);
-            note["token_contract"] = json!(token_contract);
+            // The ENTRY'S OWN address upgraded, never the match key. Writing `note_addr` back here
+            // downgraded an already-canonical entry to `0:<account_id>` -- a pool written correctly
+            // by `note deploy` reverted on the first recovery write. Writing the CANONICALISED match
+            // key would be worse in a rarer case and silent: `normalize_wallet_address` drops the
+            // DApp half to compare, so an entry recorded under some other DApp matches here and
+            // would be re-scoped to the dexdo DApp by a write that was only supposed to attach a
+            // TokenContract. A supplied DApp id is authoritative; this upgrades what is missing.
+            let recorded = pool_note_address_as_recorded(address);
+            note["address"] = json!(recorded);
+            // The TokenContract in ITS canonical form, which is the self-DApp one: a per-deal TC is
+            // a self-DApp account, as `pool_note_recovery_records` and the recovery writer already
+            // spell it when they print it. Left as the workchain form it would put the two
+            // conventions this file is unifying inside a single entry, one field apart.
+            note["token_contract"] = json!(token_contract_recorded);
             note["token_contract_role"] = json!(role);
             note["token_contract_updated_at_unix"] = json!(updated_at_unix);
         }
@@ -1942,7 +2130,6 @@ pub(crate) fn pool_with_note_token_contract_recorded(
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Result<()> {
     let note_addr = dexdo_core::normalize_wallet_address(note_addr)
         .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
@@ -1979,7 +2166,6 @@ pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Resul
 /// formatting footgun that costs nothing until the day something logs the struct or folds it into an
 /// error message. Tests compare it by destructuring instead, which is exhaustive in the same way an
 /// `assert_eq!` on the whole value is.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) struct PoolNoteRecoveryRecord {
     pub(crate) note_addr: String,
     pub(crate) owner_secret_hex: String,
@@ -1989,12 +2175,12 @@ pub(crate) struct PoolNoteRecoveryRecord {
 }
 
 /// Read every recovery entry the pool records.
+
 /// A note that records no `token_contract` has simply never been in a deal and is not a recovery entry
 /// at all. A note that **does** claim recovery metadata must carry all of it, well formed: a pool-only
 /// recovery moves money on these recorded facts alone, so a half-recorded or wrong-typed entry is
 /// refused loudly here, before any chain contact, instead of being silently dropped from the plan while
 /// its escrow stays stranded.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn pool_note_recovery_records(pool: &Value) -> Result<Vec<PoolNoteRecoveryRecord>> {
     let notes = pool["notes"]
         .as_array()
@@ -2071,11 +2257,10 @@ mod note_deploy_tests {
         let secret = fixture_secret_hex();
         let public = derive_owner_pubkey_from_secret_hex(&secret).expect("fixture key derives");
         OnboardPnState {
-            endpoint: "dd-shellnet.ackinacki.org".into(),
+            endpoint: "net-a.example".into(),
             nominal: "N100".into(),
             token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
-            ecc_shell_deposit: 100_000_000_000,
             pn_address: Some("0:abc".into()),
             deposit_identifier_hash: Some("123".into()),
             owner_public_key_hex: Some(public),
@@ -2155,35 +2340,30 @@ mod note_deploy_tests {
     /// not from `ROOT_PN_GAS_DEPOSIT_RAW`: anchoring it to the client constant
     /// would compare the client against a second copy of itself.
     #[test]
-    fn note_deploy_shell_ecc_requirement_is_nominal_plus_gas_deposit_plus_gas_voucher() {
+    fn note_deploy_shell_ecc_requirement_is_nominal_plus_gas_deposit() {
         let gas_deposit = u128::from(contract_gas_deposit_raw());
         let decimals = u64::try_from(UNIT_SCALE).expect("unit scale fits u64");
-        // Any gas voucher, not the shipped one: this is the arithmetic under test, and a figure
-        // that only holds for 100e9 would be a coincidence rather than a formula.
-        for gas_voucher in [1u64, 100_000_000_000, 250_000_000_000] {
-            for nominal in NoteNominal::ALL {
-                let raw = nominal.raw_value(decimals);
-                assert_eq!(
-                    note_deploy_shell_ecc_required_raw(raw, gas_voucher),
-                    u128::from(raw) + gas_deposit + u128::from(gas_voucher),
-                    "{} requires nominal + GAS_DEPOSIT + the {gas_voucher} raw gas voucher",
-                    nominal.label()
-                );
-                assert_eq!(
-                    note_deploy_shell_ecc_required_raw(raw, gas_voucher)
-                        - note_deploy_voucher_wire_raw(false, raw),
-                    u128::from(gas_voucher),
-                    "{} deposit leg attaches the wire figure; the gas voucher is the extra the \
-                     wallet must still hold for the next leg",
-                    nominal.label()
-                );
-            }
+        for nominal in NoteNominal::ALL {
+            let raw = nominal.raw_value(decimals);
+            assert_eq!(
+                note_deploy_shell_ecc_required_raw(raw),
+                u128::from(raw) + gas_deposit,
+                "{} requires the nominal and GAS_DEPOSIT, and nothing beyond them",
+                nominal.label()
+            );
+            assert_eq!(
+                note_deploy_shell_ecc_required_raw(raw),
+                note_deploy_voucher_wire_raw(false, raw),
+                "{} has one leg: what the wallet must hold is what the deposit attaches",
+                nominal.label()
+            );
         }
     }
 
     /// The recipe's two stages are different amounts and each is derived from one place. Stage two
     /// is the deploy requirement itself; stage one is the native predeploy leg, which the gas
     /// voucher must NOT reach -- it is ECC[2] money paid to RootPN, not the wallet's own gas.
+
     /// This test used to close with `ecc - native == gas_voucher`. That holds only while stage one
     /// is `nominal + GAS_DEPOSIT`, so the assertion pinned the money defect itself: a native
     /// predeploy leg that scaled with the nominal, on a leg that becomes gas and can never be spent
@@ -2191,22 +2371,20 @@ mod note_deploy_tests {
     /// ([`dexdo_core::params::OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]), so that relationship no
     /// longer exists. It is replaced below by the invariant that took its place rather than dropped:
     /// stage one is identical for every nominal, while stage two still moves with each one.
-    #[cfg(feature = "shellnet")]
     #[test]
-    fn operator_wallet_recipe_stage_one_is_flat_stage_two_carries_the_nominal_and_summands_add_up() {
+    fn operator_wallet_recipe_stage_one_is_flat_stage_two_carries_the_nominal_and_summands_add_up()
+    {
         let gas_deposit = u128::from(contract_gas_deposit_raw());
-        let gas_voucher = u128::from(dexdo_core::private_note::proof::ECC_SHELL_DEPOSIT_RAW);
         let decimals = dexdo_core::private_note::proof::TokenType::Shell.decimals();
         let stage_one = operator_wallet_predeploy_native_raw();
         let mut previous_stage_two: Option<u128> = None;
         for nominal in NoteNominal::ALL {
             let ecc = operator_wallet_funding_raw(nominal);
             let native = operator_wallet_predeploy_native_raw();
-            let (nominal_raw, gas_deposit_raw, gas_voucher_raw) =
-                operator_wallet_funding_summands_raw(nominal);
+            let (nominal_raw, gas_deposit_raw) = operator_wallet_funding_summands_raw(nominal);
 
             assert_eq!(
-                nominal_raw + gas_deposit_raw + gas_voucher_raw,
+                nominal_raw + gas_deposit_raw,
                 ecc,
                 "{} printed breakdown must add up to the figure note deploy checks",
                 nominal.label()
@@ -2221,12 +2399,6 @@ mod note_deploy_tests {
                 gas_deposit_raw,
                 gas_deposit,
                 "{} second summand is the contract's GAS_DEPOSIT",
-                nominal.label()
-            );
-            assert_eq!(
-                gas_voucher_raw,
-                gas_voucher,
-                "{} third summand is the SHELL gas voucher",
                 nominal.label()
             );
             assert_eq!(
@@ -2289,8 +2461,8 @@ mod note_deploy_tests {
     /// The defect this file exists to keep fixed: 4.0.33 `RootPN.generateVoucher` computes
     /// `nominal = attached - GAS_DEPOSIT` on the non-gas path and checks THAT against
     /// `ALLOWED_NOMINALS`, so a client attaching the bare nominal leaves 9 750 for an N10000 deposit
-    /// and is refused(`ERR_NOT_ALLOWED`, 141) at every denomination -- N100 does not even reach the
-    /// list(`ERR_BELOW_GAS_DEPOSIT`, 408). The wallet must attach nominal + `GAS_DEPOSIT`, and the
+    /// and is refused (`ERR_NOT_ALLOWED`, 141) at every denomination -- N100 does not even reach the
+    /// list (`ERR_BELOW_GAS_DEPOSIT`, 408). The wallet must attach nominal + `GAS_DEPOSIT`, and the
     /// nominal must not follow it: on the pre-fix arithmetic the attached figure equals the nominal
     /// and this test fails at the first denomination. The expected figure is the CONTRACT's
     /// -- a client constant moved to 251 fails here rather than dragging the expectation along.
@@ -2365,6 +2537,7 @@ mod note_deploy_tests {
     /// `note_cmd.rs` production nowhere at all. The other three boundaries are observed directly
     /// (`note_deploy_wallet_message_attaches_wire_while_the_persisted_checkpoint_keeps_nominal`,
     /// `note_deploy_private_note_value_is_the_proven_nominal`).
+
     /// Every way of putting nominal + `GAS_DEPOSIT` into the proof is red here: calling the wire
     /// helper raises the count, naming the constant or its literal is refused outright, and either
     /// way `voucher_value: checkpoint.raw_value` no longer stands.
@@ -2454,7 +2627,7 @@ mod note_deploy_tests {
         let onboard_debug = format!("{onboard:?}");
         assert!(!onboard_debug.contains("onboard-secret-sentinel"));
         assert!(onboard_debug.contains("owner_secret_key_hex: \"<redacted>\""));
-        assert!(onboard_debug.contains("dd-shellnet.ackinacki.org"));
+        assert!(onboard_debug.contains("net-a.example"));
 
         let proof = NoteDeployVoucherProof {
             proof: "public-proof".into(),
@@ -2679,7 +2852,6 @@ mod note_deploy_tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn tvm_tonos_fixture_phrase() -> String {
         const WORD_INDICES: [u16; 12] = [
             1636, 1293, 905, 102, 1057, 1956, 1247, 1750, 597, 881, 1302, 3,
@@ -2700,7 +2872,6 @@ mod note_deploy_tests {
             nominal: "N100",
             token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
-            ecc_shell_deposit: 100_000_000_000,
             funding_multisig_address,
         }
     }
@@ -2713,7 +2884,6 @@ mod note_deploy_tests {
             nominal: state.nominal,
             token_type: state.token_type,
             raw_value: state.raw_value,
-            ecc_shell_deposit: state.ecc_shell_deposit,
             funding_multisig_address: format!("0:{}", "a".repeat(64)),
             owner_public_key_hex: state.owner_public_key_hex.unwrap(),
             owner_secret_key_hex: state.owner_secret_key_hex.unwrap(),
@@ -2721,9 +2891,197 @@ mod note_deploy_tests {
             deposit_identifier_hash: state.deposit_identifier_hash,
             deployed_at_unix: state.deployed_at_unix,
             deposit_voucher: None,
-            shell_voucher: None,
             shell_funded: state.shell_funded,
             sanity_checked: state.sanity_checked,
+        }
+    }
+
+    /// A pool file holding exactly the notes named, funded by `funding` -- a pool with notes and no
+    /// funding wallet is refused before anything about duplicates is decided, which is not what
+    /// these cases are about.
+    fn pool_file_with(
+        dir: &std::path::Path,
+        addresses: &[&str],
+        funding: &str,
+    ) -> std::path::PathBuf {
+        let path = dir.join("pn_pool.json");
+        // With the owner key the fixture recovery carries: a pool entry is only a safe second copy
+        // when it holds the same secret, and that is what retiring checks.
+        let notes: Vec<Value> = addresses
+            .iter()
+            .map(|address| {
+                json!({
+                    "address": address,
+                    "owner_secret_key_hex": complete_recovery_state().owner_secret_key_hex.as_str(),
+                })
+            })
+            .collect();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "token_type": SHELL_CURRENCY_ID,
+                "nominal": "N100",
+                "funding_multisig_address": funding,
+                "notes": notes,
+            }))
+            .expect("serialize pool"),
+        )
+        .expect("write pool");
+        path
+    }
+
+    /// The live failure this exists for: a second `note deploy` on the default recovery path
+    /// loaded a finished attempt, asked the operator to confirm a Vault -> Hot transfer, ran the
+    /// whole flow, and only then refused at the pool. Nothing about that run could ever have
+    /// produced a note -- so the spent file is retired and the run deploys a new one.
+    #[test]
+    fn a_finished_recorded_deploy_is_retired_so_the_next_one_can_be_deployed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery = complete_recovery_state();
+        let deployed = recovery.pn_address.clone().expect("fixture deploys a note");
+        let pool = pool_file_with(
+            temp.path(),
+            &[&deployed],
+            &recovery.funding_multisig_address,
+        );
+        let recovery_path = temp.path().join("pn_pool.json.recovery.json");
+
+        std::fs::write(&recovery_path, b"{}").expect("a file to retire");
+
+        let verdict = retire_a_finished_deploy(&recovery_path, &recovery, &pool)
+            .expect("a recorded deploy whose key the pool holds is retirable");
+
+        assert_eq!(verdict, FinishedDeploy::Retired);
+        assert!(!recovery_path.exists(), "the spent file must be gone");
+    }
+
+    /// The guard that makes retiring safe. A pool entry under a DIFFERENT key means this file may
+    /// be the only copy of the key to that note, and deleting it would put the note out of reach
+    /// for good.
+    #[test]
+    fn a_pool_entry_with_another_key_is_refused_and_the_file_kept() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery = complete_recovery_state();
+        let deployed = recovery.pn_address.clone().expect("fixture deploys a note");
+        let pool_path = temp.path().join("pn_pool.json");
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec(&json!({
+                "token_type": SHELL_CURRENCY_ID,
+                "nominal": "N100",
+                "funding_multisig_address": recovery.funding_multisig_address,
+                "notes": [{ "address": deployed, "owner_secret_key_hex": "ff".repeat(32) }],
+            }))
+            .expect("serialize pool"),
+        )
+        .expect("write pool");
+        let recovery_path = temp.path().join("pn_pool.json.recovery.json");
+        std::fs::write(&recovery_path, b"{}").expect("a file that must survive");
+
+        let error = retire_a_finished_deploy(&recovery_path, &recovery, &pool_path)
+            .expect_err("a mismatched key must stop the run, not delete the file");
+
+        assert!(error.to_string().contains("DIFFERENT owner key"), "{error}");
+        assert!(recovery_path.exists(), "the file must be kept");
+    }
+
+    /// The one thing this must not break: a note that WAS deployed but never made it into the pool
+    /// is finished by re-running with that same file. Refusing there would strand it.
+    #[test]
+    fn a_deploy_the_pool_never_recorded_is_still_resumable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery = complete_recovery_state();
+        let pool = pool_file_with(
+            temp.path(),
+            &[&format!("0:{}", "d".repeat(64))],
+            &recovery.funding_multisig_address,
+        );
+
+        assert_eq!(
+            retire_a_finished_deploy(&temp.path().join("r.json"), &recovery, &pool)
+                .expect("an unrecorded deploy must still be finishable"),
+            FinishedDeploy::Unfinished
+        );
+    }
+
+    /// An interrupted attempt has no note yet, and a missing pool is the first run of all. Neither
+    /// is a finished deploy, and refusing either would make the command unusable.
+    #[test]
+    fn an_unfinished_attempt_and_a_missing_pool_both_pass() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut unfinished = complete_recovery_state();
+        unfinished.pn_address = None;
+        let pool = pool_file_with(temp.path(), &[], &unfinished.funding_multisig_address);
+        assert_eq!(
+            retire_a_finished_deploy(&temp.path().join("r.json"), &unfinished, &pool)
+                .expect("an attempt with no note is what resuming is for"),
+            FinishedDeploy::Unfinished
+        );
+
+        let finished = complete_recovery_state();
+        assert_eq!(
+            retire_a_finished_deploy(
+                &temp.path().join("r.json"),
+                &finished,
+                &temp.path().join("absent.json"),
+            )
+            .expect("no pool yet is the first run, not a duplicate"),
+            FinishedDeploy::Unfinished
+        );
+    }
+
+    /// The early refusal and the pool write must agree about what "the same note" means. They read
+    /// the same file for opposite reasons -- one to stop a run before it spends, the other to stop
+    /// a duplicate before it is written -- and a disagreement means one of them lets through
+    /// exactly what the other exists to catch.
+
+    /// Asserted as agreement rather than against a hand-written expectation: the address forms a
+    /// pool can hold are the comparison's business, and pinning them twice is how the two copies
+    /// drifted apart in the first place.
+    #[test]
+    fn retiring_and_the_pool_write_agree_on_what_the_same_note_is() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery = complete_recovery_state();
+        let deployed = recovery.pn_address.clone().expect("fixture deploys a note");
+        let funding = recovery.funding_multisig_address.clone();
+
+        for (index, recorded) in [
+            deployed.clone(),
+            deployed.to_ascii_uppercase(),
+            format!("0:{}", "d".repeat(64)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = temp.path().join(format!("case-{index}"));
+            std::fs::create_dir_all(&dir).expect("case dir");
+            let pool_path = pool_file_with(&dir, &[&recorded], &funding);
+            let recovery_path = dir.join("r.json");
+            std::fs::write(&recovery_path, b"{}").expect("a file to retire");
+
+            // The same question asked of both: is the note in this recovery file already in this
+            // pool. One answers by retiring the spent file, the other by refusing a duplicate.
+            let matched_early = retire_a_finished_deploy(&recovery_path, &recovery, &pool_path)
+                .expect("the pool holds the same key in every case here")
+                == FinishedDeploy::Retired;
+
+            let pool: Value =
+                serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool"))
+                    .expect("parse pool");
+            let refused_at_write = pool_with_note_added(
+                Some(pool),
+                &complete_state(),
+                json!({ "address": deployed, "nominal": "N100" }),
+                42,
+                &funding,
+            )
+            .err()
+            .is_some_and(|error| error.to_string().contains("already in the pool"));
+
+            assert_eq!(
+                matched_early, refused_at_write,
+                "recorded as {recorded}: the two readers disagree about the same note"
+            );
         }
     }
 
@@ -2801,11 +3159,9 @@ mod note_deploy_tests {
         assert!(out.contains("unknown (getter unavailable)"), "{out}");
     }
 
-    /// `ci/two_runner_shellnet_e2e.py` reads spendable trading money, while
-    /// `ci/shell_only_funding_bootstrap.sh` reads account-level SHELL gas. Keep both CI parsers
-    /// pinned to the distinct prefixes emitted here so a CLI wording drift cannot fake funding.
+    /// The renderer keeps spendable trading money distinct from account-level SHELL gas.
     #[test]
-    fn note_balance_ci_consumer_prefixes_match_renderer() {
+    fn note_balance_consumer_prefixes_match_renderer() {
         let view = build_note_balance_view(
             "0:abc",
             Some(NoteAccountSnapshot {
@@ -2824,7 +3180,8 @@ mod note_deploy_tests {
         let out = render_note_balance(&view);
 
         assert!(
-            out.lines().any(|line| line.starts_with("SHELL gas ECC[2]: ")),
+            out.lines()
+                .any(|line| line.starts_with("SHELL gas ECC[2]: ")),
             "account-level gas prefix missing: {out}"
         );
         assert!(
@@ -2834,19 +3191,6 @@ mod note_deploy_tests {
             "spendable trading-money prefix missing: {out}"
         );
 
-        let two_runner = include_str!("../../../../ci/two_runner_shellnet_e2e.py");
-        assert!(
-            two_runner.contains(
-                r#"r"^PrivateNote\.getDetails spendable token balance \(trading money\):\n""#
-            ) && two_runner.contains(r#"r"(?:  .*\n)*?  ECC\[2\] SHELL: "#),
-            "ci/two_runner_shellnet_e2e.py must parse the rendered spendable prefix"
-        );
-
-        let bootstrap = include_str!("../../../../ci/shell_only_funding_bootstrap.sh");
-        assert!(
-            bootstrap.contains(r#"'s/^SHELL gas ECC\[2\]: "#),
-            "ci/shell_only_funding_bootstrap.sh must parse the rendered account-gas prefix"
-        );
     }
 
     /// a configured nominal must not look like proof that the note is funded.
@@ -2953,14 +3297,17 @@ mod note_deploy_tests {
 
     /// When a figure cannot be read at all, the balance report says so in words and gives the
     /// reason, instead of showing a zero or quietly showing a different figure in its place.
+
     /// A report is rendered for an account that does hold money, with both of the figures that
     /// have to be asked for separately made unreadable and a reason attached. Both must come out
     /// as the word "unknown" carrying that reason verbatim; neither may come out as "none
     /// reported", which is what a figure that was read and found empty says; and no figure
     /// anywhere in the report may be a zero, because that is the answer a reader would act on.
+
     /// The 4.0.33 semantics this encodes: `PrivateNote.getDetails().balance` is already the free
     /// record balance, so it is reported as read and never reduced by `lockedInOrders` a second
     /// time -- which is also why an unreadable one cannot be reconstructed from the pocket beside it.
+
     /// E2E-FUND-06, `tests/e2e/test-specification.md`.
     /// Partial/blocked: this proves getter labels and unknown handling only; whole-balance
     /// decomposition, component totals, and overflow behavior require separate evidence.
@@ -3004,13 +3351,16 @@ mod note_deploy_tests {
 
     /// Two figures that have to be asked for separately fail separately: one of them being
     /// unreadable does not turn the other one, which was read perfectly well, into a shrug.
+
     /// The report is rendered twice, once with each of the two figures unreadable and the other
     /// present. In both directions the figure that was read must appear as its own exact number,
     /// and only the other one may say unknown, with the reason naming which figure failed. The
     /// same is then required when one figure is present but malformed rather than absent.
+
     /// The 4.0.33 semantics this encodes: `PrivateNote.getDetails().balance` is already the free
     /// record balance, so the two pockets are reported side by side as read and the free balance is
     /// never reduced by `lockedInOrders` a second time.
+
     /// E2E-FUND-06, `tests/e2e/test-specification.md`.
     /// Partial/blocked: this proves independent getter decoding only; whole-balance decomposition,
     /// component totals, and overflow behavior require separate evidence.
@@ -3196,6 +3546,11 @@ mod note_deploy_tests {
         let pool = pool_with_note_added(None, &s, n1, 42, &wallet).unwrap();
         assert_eq!(pool["nominal"], "N100");
         assert_eq!(pool["raw_value_per_pn"], 100_000_000_000u64);
+        // the WALLET keeps the form it was given, while the note is recorded canonically.
+        // A note's DApp is a fact (`PrivateNote` lives in the dexdo DApp); a multisig's self-DApp
+        // half is only reconstructed from its own account id, and storing that would record an
+        // unverified claim -- and would break the account-only identity comparison this field
+        // exists for.
         assert_eq!(pool["funding_multisig_address"], wallet);
         assert_eq!(pool["notes"].as_array().unwrap().len(), 1);
 
@@ -3203,6 +3558,7 @@ mod note_deploy_tests {
         s2.pn_address = Some("0:def".into());
         let n2 = pn_state_to_pool_note(&s2).unwrap();
         let pool = pool_with_note_added(Some(pool), &s2, n2, 43, &wallet).unwrap();
+        // The append keeps what the pool already recorded -- it does not re-render it.
         assert_eq!(pool["funding_multisig_address"], wallet);
         assert_eq!(pool["notes"].as_array().unwrap().len(), 2);
     }
@@ -3223,7 +3579,15 @@ mod note_deploy_tests {
             pool_with_note_token_contract_recorded(pool, note_addr, &tc, "buyer", 99).unwrap();
 
         let note = &pool["notes"].as_array().unwrap()[0];
-        assert_eq!(note["token_contract"], tc);
+        // recorded in ITS canonical form, which for a per-deal TokenContract is the
+        // self-DApp one -- the spelling this file's own refusals and `pool_note_recovery_records`
+        // already print it in. Written as a literal rather than by calling the renderer: an
+        // expectation stated through the function under test agrees with whatever that function
+        // does, which is not an expectation.
+        assert_eq!(
+            note["token_contract"],
+            format!("{}::{}", "b".repeat(64), "b".repeat(64))
+        );
         assert_eq!(note["token_contract_role"], "buyer");
         assert_eq!(note["token_contract_updated_at_unix"], 99);
         let records = pool_note_recovery_records(&pool).unwrap();
@@ -3374,10 +3738,14 @@ mod note_deploy_tests {
         let mut pool_identities = Vec::new();
 
         for (index, dapp) in ["a".repeat(64), "b".repeat(64)].into_iter().enumerate() {
-            let supplied = format!("{}::{}", dapp.to_ascii_uppercase(), account.to_ascii_uppercase());
+            let supplied = format!(
+                "{}::{}",
+                dapp.to_ascii_uppercase(),
+                account.to_ascii_uppercase()
+            );
             let expected = format!("{dapp}::{account}");
             let state = NoteDeployRecoveryState::new(
-                recovery_request("https://shellnet.example", &supplied),
+                recovery_request("https://net-a.example", &supplied),
                 &owner_public,
                 &owner_secret,
             )
@@ -3421,6 +3789,60 @@ mod note_deploy_tests {
 
     /// compatibility: this fixture is written by hand in the exact account-only shape used
     /// by the current binary. It is deliberately not produced through the writer under test.
+    /// A recovery file written by a binary that still had the second gas voucher carries
+    /// `ecc_shell_deposit`. This branch removed the field, and the operator's file on disk is not
+    /// rewritten by that: `note deploy` resumes from whatever is there. So the record has to LOAD,
+    /// validate and finish -- an unknown field is ignored, not a refusal that strands a deploy
+    /// half-way with the wallet already spent.
+    #[test]
+    fn a_recovery_file_that_still_carries_the_dropped_field_loads_and_finishes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("with-dropped-field.recovery.json");
+        let account = "a".repeat(64);
+        let funding = format!("0:{account}");
+        let owner_secret = fixture_secret_hex();
+        let owner_public = derive_owner_pubkey_from_secret_hex(&owner_secret).expect("owner key");
+
+        let written_by_the_old_binary = json!({
+            "version": 1,
+            "endpoint": "https://net-a.example",
+            "nominal": "N100",
+            "token_type": SHELL_CURRENCY_ID,
+            "raw_value": 100_000_000_000u64,
+            // The field this branch removed, exactly as the old binary wrote it.
+            "ecc_shell_deposit": 100_000_000_000u64,
+            "funding_multisig_address": funding,
+            "owner_public_key_hex": owner_public,
+            "owner_secret_key_hex": owner_secret,
+            "pn_address": format!("0:{}", "d".repeat(64)),
+            "deposit_identifier_hash": "f".repeat(64),
+            "deployed_at_unix": 1234,
+            "deposit_voucher": null,
+            "shell_voucher": null,
+            "shell_funded": true,
+            "sanity_checked": true
+        });
+        std::fs::write(
+            &recovery_path,
+            serde_json::to_vec_pretty(&written_by_the_old_binary).expect("serialize"),
+        )
+        .expect("write the old binary's recovery file");
+
+        let recovery = load_note_deploy_recovery(&recovery_path)
+            .expect("a record with the dropped field still loads")
+            .expect("the record exists");
+        recovery.validate().expect("it validates");
+        recovery
+            .ensure_matches_request(recovery_request(
+                "https://net-a.example",
+                &format!("{}::{account}", "9".repeat(64)),
+            ))
+            .expect("it matches the same funding account");
+        recovery
+            .ensure_ready_for_pool()
+            .expect("it can still be folded into the pool");
+    }
+
     #[test]
     fn legacy_recovery_and_pool_files_load_validate_and_remain_usable_for_deploy_fold() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -3436,11 +3858,10 @@ mod note_deploy_tests {
         let new_note_address = format!("0:{}", "d".repeat(64));
         let legacy_recovery = json!({
             "version": 1,
-            "endpoint": "https://shellnet.example",
+            "endpoint": "https://net-a.example",
             "nominal": "N100",
             "token_type": SHELL_CURRENCY_ID,
             "raw_value": 100_000_000_000u64,
-            "ecc_shell_deposit": 100_000_000_000u64,
             "funding_multisig_address": legacy_funding,
             "owner_public_key_hex": owner_public,
             "owner_secret_key_hex": owner_secret,
@@ -3465,19 +3886,20 @@ mod note_deploy_tests {
         let supplied_canonical = format!("{}::{account}", "9".repeat(64));
         recovery
             .ensure_matches_request(recovery_request(
-                "https://shellnet.example",
+                "https://net-a.example",
                 &supplied_canonical,
             ))
             .expect("legacy recovery matches the same funding account");
-        recovery.ensure_ready_for_pool().expect("legacy recovery ready");
+        recovery
+            .ensure_ready_for_pool()
+            .expect("legacy recovery ready");
 
         let legacy_pool = json!({
-            "endpoint": "https://shellnet.example",
+            "endpoint": "https://net-a.example",
             "created_at_unix": 1000,
             "nominal": "N100",
             "token_type": SHELL_CURRENCY_ID,
             "raw_value_per_pn": 100_000_000_000u64,
-            "ecc_shell_deposit_per_pn": 100_000_000_000u64,
             "funding_multisig_address": legacy_funding,
             "notes": [{
                 "address": format!("0:{}", "e".repeat(64)),
@@ -3515,11 +3937,10 @@ mod note_deploy_tests {
 
     /// the funding wallet seed phrase is an input-only credential. The pool stores only the deployed note
     /// material the runtime consumes; seed words must not appear in serialized pool output.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn pool_output_does_not_contain_seed_words() {
         let phrase = tvm_tonos_fixture_phrase();
-        let derived = dexdo::wallet_seed::derive_multisig_key_from_seed_phrase(&phrase).unwrap();
+        let derived = dexdo::wallet_seed::derive_multisig_private_key_from_seed_phrase(&phrase).unwrap();
         let mut state = complete_state();
         state.owner_public_key_hex = Some(derived.public_hex().to_string());
         state.owner_secret_key_hex = Some(derived.secret_hex().to_string().into());
@@ -3545,7 +3966,7 @@ mod note_deploy_tests {
         let path = dir.join("pn_pool.json.recovery.json");
         let state = NoteDeployRecoveryState::new(
             recovery_request(
-                "https://dd-shellnet.ackinacki.org",
+                "https://net-a.example",
                 &format!("0:{}", "a".repeat(64)),
             ),
             &derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap(),
@@ -3773,7 +4194,7 @@ mod note_deploy_tests {
             "wallet secret leaked into recovery JSON"
         );
         assert!(
-            !json.contains("multisig_key") && !json.contains("multisig_seed"),
+            !json.contains("multisig_private_key") && !json.contains("multisig_seed"),
             "recovery JSON must not serialize funding wallet credential fields: {json}"
         );
     }
@@ -3891,7 +4312,7 @@ mod note_deploy_tests {
             "wallet secret leaked: {json}"
         );
         assert!(
-            !json.contains("multisig_key") && !json.contains("multisig_seed"),
+            !json.contains("multisig_private_key") && !json.contains("multisig_seed"),
             "wallet credential field leaked: {json}"
         );
     }
@@ -3903,7 +4324,7 @@ mod note_deploy_tests {
 
         let err = state
             .ensure_matches_request(recovery_request(
-                "https://other-shellnet.example",
+                "https://other-chain.example",
                 &state.funding_multisig_address,
             ))
             .unwrap_err()
@@ -3922,6 +4343,7 @@ mod note_deploy_tests {
     /// add `--recovery` -- that path is already this run's, and pasting the flag twice is rejected
     /// by clap -- must not hardcode a pool file name, and must hand over no argument-carrying
     /// command line at all, since a resume reuses inputs this message does not know.
+
     /// carried forward, deliberately: "names the next command and the file" is a **separate**
     /// requirement from "carries no key material", and the two are asserted separately here and in
     /// `recovery_guidance_built_from_state_never_carries_key_material`. A message that degraded to
@@ -4062,7 +4484,6 @@ mod note_deploy_tests {
                     nominal: &complete.nominal,
                     token_type: complete.token_type,
                     raw_value: complete.raw_value,
-                    ecc_shell_deposit: complete.ecc_shell_deposit,
                     funding_multisig_address: &complete.funding_multisig_address,
                 })
                 .expect_err("a mismatched request is refused")
@@ -4089,16 +4510,19 @@ mod note_deploy_tests {
 }
 
 /// Stage ONE of the `note wallet` recipe is flat deploy gas, sized from a live deploy receipt.
+
 /// The defect these pin: stage one demanded `nominal + GAS_DEPOSIT` in NATIVE vmshell -- 350 SHELL
 /// on N100, 1_000_250 on N1000000 -- and SHELL that lands as native can never be spent as currency
 /// again. On mainnet that is a permanent loss of a nominal-sized
 /// amount of real money, for a deploy the nominal has nothing to do with.
+
 /// The owner's ruling is the specification: gas is needed strictly only for the deploy, and
 /// subsequent operations spend SHELL, converting it as needed. So stage one is the deploy plus the
 /// sends `note deploy` makes from this wallet, and stops there.
+
 /// Its own module rather than a row in `tests` above: these assert a money figure and its
 /// derivation, not the note schema everything there is about.
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 mod stage_one_native_is_flat_deploy_gas {
     use super::{
         note_deploy_voucher_wire_raw, operator_wallet_funding_raw,
@@ -4109,7 +4533,7 @@ mod stage_one_native_is_flat_deploy_gas {
     };
     use dexdo_core::private_note::proof::TokenType;
 
-    /// Live shellnet, 2026-08-12. `live_1173_operator_wallet_funds_from_an_ordinary_wallet` and
+    /// Measured live on the test chain, 2026-08-12. `live_1173_operator_wallet_funds_from_an_ordinary_wallet` and
     /// `live_961_operator_wallet_deploys_after_external_funding` each read this balance at Uninit,
     /// this one at Active, and this one after the first inbound ECC[2] transfer -- two fresh
     /// addresses, two different funding routes, identical to the raw unit, and each test asserts
@@ -4122,13 +4546,14 @@ mod stage_one_native_is_flat_deploy_gas {
     /// What ONE canonical operator-wallet deploy transaction cost.
     const MEASURED_DEPLOY_COST_RAW: u128 = PREDEPLOY_RAW - AFTER_DEPLOY_RAW;
 
-    /// The sends `note deploy` makes FROM this wallet: the deposit voucher(`isFee = false`) and the
-    /// SHELL gas voucher(`isFee = true`), both through `note_deploy_build_voucher_submit_boc`.
+    /// The sends `note deploy` makes FROM this wallet: the deposit voucher (`isFee = false`) and the
+    /// SHELL gas voucher (`isFee = true`), both through `note_deploy_build_voucher_submit_boc`.
     const NOTE_DEPLOY_WALLET_SUBMITS: u128 = 2;
 
     /// Counting the deploy a second way, against a figure recorded before an intermediate read
     /// existed to separate the deploy from the message that followed it.
-    /// `.claude/skills/dexdo-sell-model/SKILL.md` states that "deploying from a 1,250 SHELL
+
+    /// `.claude/skills/dexdo-sell-model-for-agent/SKILL.md` states that "deploying from a 1,250 SHELL
     /// predeploy balance consumed `156 222 000` raw native". That is the deploy PLUS the first
     /// inbound ECC[2] transfer, and it decomposes into the two readings above exactly -- which is
     /// what makes the smaller half safe to build a shipped constant on. A cost that had drifted
@@ -4239,13 +4664,29 @@ mod stage_one_native_is_flat_deploy_gas {
     }
 }
 
-/// PR1276 review: the persisted pool keeps the address FORM it was given.
+/// PR1276 review, amended by: a pool write records the CANONICAL form, and never
+/// re-renders an entry it was not asked to write.
+
+/// The original rule was "keep the form you were given", everywhere. It was drawn from a real
+/// incident (below) and it over-reached: what that incident actually cost was a write that
+/// re-rendered OTHER notes' addresses, plus a consumer that handed pool bytes to the SDK without
+/// normalising. keeps the first half of that rule and drops the second, because the pool is
+/// an artifact an operator reads and it was showing two conventions in one file -- a canonical
+/// `funding_multisig_address` beside notes spelled `0:<account_id>`, which names no DApp at all.
+
+/// What the incident is now handled by instead: [`crate::cli::note_pick::ask_which`] converts the
+/// picked address to the workchain form before any caller can reach `Address::parse`, which is what
+/// the `--note-addr` flag has always done via `arg_to_chain_param`. That closes the failure class
+/// for pools written by anyone, including the out-of-tree `mint_pn_pool` and any tool that already
+/// emits the canonical spelling.
+
 /// The pool file is a durable operator artifact, not a view. It is written by us and read by
 /// programs that are not ours to change -- the out-of-tree `mint_pn_pool`, which emits
-/// `0:<64hex>`, and `ci/shell_only_funding_bootstrap.sh:295`, which asserts
-/// `^0:[0-9a-fA-F]{64}$` against a pool that `dexdo note deploy` has just written to the path its
-/// `--pool` flag names, on the route `ci/release-artifact-gate.sh:194` runs before a release. A
-/// rendering choice must not perform a one-way migration of that file.
+/// `0:<64hex>`, and `ci/shell_only_funding_bootstrap.sh:370`, which is why that assertion now takes
+/// both spellings, on the route `ci/release-artifact-gate.sh` runs before a release. Reading stays
+/// tolerant of both forms in every matcher, so a pool written by an earlier release keeps working
+/// without a migration.
+
 /// WHY THIS MODULE EXISTS RATHER THAN AN ASSERTION IN AN EXISTING TEST. Every pool fixture in this
 /// crate spells its note address `"0:abc"`. That is not a parseable address: `CanonicalAddress::parse`
 /// rejects it, and `dexdo_core::address::display` returns anything it cannot parse unchanged. So a
@@ -4281,11 +4722,10 @@ mod pool_address_form_tests {
         let secret = secret_seed.repeat(32);
         let public = derive_owner_pubkey_from_secret_hex(&secret).expect("fixture key derives");
         OnboardPnState {
-            endpoint: "dd-shellnet.ackinacki.org".into(),
+            endpoint: "net-a.example".into(),
             nominal: "N100".into(),
             token_type: SHELL_CURRENCY_ID,
             raw_value: 100_000_000_000,
-            ecc_shell_deposit: 100_000_000_000,
             pn_address: Some(address.to_string()),
             deposit_identifier_hash: Some("123".into()),
             owner_public_key_hex: Some(public),
@@ -4323,27 +4763,50 @@ mod pool_address_form_tests {
 
     /// The incident, reduced: an existing legacy pool gains one note, and every address already in
     /// the file keeps the spelling it had.
+
     /// This is what a live campaign did on 2026-08-12. One pool of nine legacy notes was consumed by
     /// a buyer, every address in it came back as `<dapp_id>::<account_id>`, and the run died with 28
     /// identical `unsupported address workchain "0000...0004"` lines -- the SDK `Address::parse`
     /// reading the DApp half as a workchain. The file grew by exactly 9 x 64 bytes: nothing but the
     /// spelling had changed, and a whole minted note set was spent proving it.
+
+    /// THE SEEDED ENTRY IS HAND-BUILT, not folded through `pn_state_to_pool_note`. Since that
+    /// fold records the canonical form, so a pool seeded through it holds nothing legacy and this
+    /// test would be comparing canonical to canonical: mutate `pool_with_note_added` to re-render
+    /// every existing entry -- the exact write that cost the nine-note pool -- and it would stay
+    /// green, because re-rendering an already-canonical address is a no-op. The property is about a
+    /// pool written by SOMEONE ELSE (the out-of-tree minter, an earlier release), so the fixture has
+    /// to be one.
     #[test]
-    fn a_pool_write_preserves_every_legacy_address_already_in_the_file() {
+    fn a_pool_write_leaves_every_address_already_in_the_file_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pn_pool.json");
         let wallet = legacy("b");
-        let first = legacy("a1");
-        let second = legacy("c3");
+        let already_there = legacy("a1");
+        let added = legacy("c3");
 
-        let seeded = fold_and_round_trip(None, &state_for(&first, "2a"), &wallet, &path);
-        assert_eq!(addresses(&seeded), vec![first.clone()]);
+        // A pool as the out-of-tree `mint_pn_pool` leaves it: every note spelled `0:<64hex>`.
+        let seeded = serde_json::json!({
+            "endpoint": "net-a.example",
+            "created_at_unix": 1234,
+            "nominal": "N100",
+            "token_type": SHELL_CURRENCY_ID,
+            "raw_value_per_pn": 100_000_000_000u64,
+            "funding_multisig_address": wallet,
+            "notes": [{ "address": already_there, "owner_secret_key_hex": "00" }],
+        });
 
-        let grown = fold_and_round_trip(Some(seeded), &state_for(&second, "3b"), &wallet, &path);
+        let grown = fold_and_round_trip(Some(seeded), &state_for(&added, "3b"), &wallet, &path);
         assert_eq!(
-            addresses(&grown),
-            vec![first, second],
-            "adding a note must not re-render the addresses already in the pool"
+            addresses(&grown)[0],
+            already_there,
+            "adding a note must not re-render an address already in the pool -- that rewrite is \
+             what cost a nine-note pool on 2026-08-12"
+        );
+        assert_eq!(
+            addresses(&grown).len(),
+            2,
+            "the second note has to actually be in the file, or the check above compares nothing"
         );
         assert_eq!(
             grown["funding_multisig_address"].as_str().expect("wallet"),
@@ -4352,10 +4815,36 @@ mod pool_address_form_tests {
         );
     }
 
-    /// Preservation, not coercion: a pool that was written canonical stays canonical. The rule is
-    /// that a write does not change the spelling it was handed -- not that one spelling wins.
+    /// what a write RECORDS is the canonical `<dapp_id>::<account_id>`, for a note whose
+    /// state carries the legacy spelling.
+
+    /// The legacy `0:<account_id>` is the form an ABI-encoded contract parameter takes, and the
+    /// only place it belongs. Storage is not that place: the pool held it beside a canonical
+    /// `funding_multisig_address`, so one file showed two conventions and the same note reached the
+    /// operator spelled three different ways across `note list`, `history` and this file.
+
+    /// The account half is unchanged -- this upgrades the identity the spelling failed to carry, it
+    /// does not move the address.
     #[test]
-    fn a_pool_write_preserves_a_canonical_address_already_in_the_file() {
+    fn a_written_note_is_recorded_canonically_even_when_its_state_is_legacy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pn_pool.json");
+        let account = hex64("a1");
+        let stored =
+            fold_and_round_trip(None, &state_for(&legacy("a1"), "2a"), &legacy("b"), &path);
+
+        assert_eq!(
+            addresses(&stored),
+            vec![format!("{}::{account}", dexdo_core::DEXDO_DAPP_ID)],
+            "a PrivateNote lives in the dexdo DApp, and that is what the file must say"
+        );
+    }
+
+    /// A supplied DApp id is authoritative: canonical in, the same bytes out. The rule is that a
+    /// note is recorded canonically -- not that this writer invents a DApp for an address that
+    /// already names one.
+    #[test]
+    fn a_canonical_address_survives_a_write_byte_for_byte() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pn_pool.json");
         let wallet = canonical("b", "b");
@@ -4371,28 +4860,74 @@ mod pool_address_form_tests {
         );
     }
 
-    /// The property the two tests above share, stated once over both spellings, so a future writer
-    /// that normalises "just one direction" is still caught.
+    /// The guard on the guard: these fixtures must be addresses the canonical renderer would
+    /// actually change, or the tests above prove nothing. `"0:abc"` -- the spelling every other
+    /// pool fixture in this crate uses -- fails this, and is why the defect was invisible offline.
     #[test]
-    fn a_single_note_round_trips_its_address_byte_for_byte_in_either_spelling() {
-        for (case, address, wallet) in [
-            ("legacy", legacy("a1"), legacy("b")),
-            ("canonical", canonical("4", "a1"), canonical("b", "b")),
-        ] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("pn_pool.json");
-            let pool = fold_and_round_trip(None, &state_for(&address, "2a"), &wallet, &path);
-            assert_eq!(addresses(&pool), vec![address.clone()], "{case}");
-            // And the guard on the guard: this fixture must be an address the canonical renderer
-            // would actually change, or the test proves nothing. `"0:abc"` -- the spelling every
-            // other pool fixture here uses -- fails this and is why the defect was invisible.
-            if case == "legacy" {
-                assert_ne!(
-                    dexdo_core::address::display(&address),
-                    address,
-                    "the fixture must be a real address that canonical rendering would rewrite"
-                );
-            }
-        }
+    fn the_legacy_fixture_is_an_address_canonical_rendering_rewrites() {
+        let address = legacy("a1");
+        assert_ne!(
+            dexdo_core::address::display(&address),
+            address,
+            "the fixture must be a real address that canonical rendering would rewrite"
+        );
+    }
+}
+
+/// the `lockedInOrders` section says what it measures, so no wrong conclusion is available.
+
+/// Measured on the chain: a note with a standing inference order for 6.100000000 SHELL printed
+/// `none reported` under a heading an operator reads as "what is holding my money", while the
+/// trading record had honestly dropped by exactly that amount.
+#[cfg(test)]
+mod issue_1558_locked_in_orders_names_its_own_scope {
+    use super::{render_locked_in_orders, NoteBalanceMap};
+
+    fn rendered(map: NoteBalanceMap) -> String {
+        let mut out = String::new();
+        render_locked_in_orders(&mut out, &map);
+        out
+    }
+
+    /// The empty case is the dangerous one: it is the reading that says "all clear".
+    #[test]
+    fn an_empty_field_does_not_read_as_nothing_is_locked() {
+        let out = rendered(NoteBalanceMap::Known(Vec::new()));
+        assert!(
+            out.contains("PMP OrderBook collateral"),
+            "the heading must name what the field measures: {out}"
+        );
+        assert!(
+            out.contains("inference-order escrow is NOT counted by this field"),
+            "an operator can still read this as 'nothing is locked': {out}"
+        );
+        assert!(
+            out.contains("dexdo note outstanding"),
+            "the line must say where standing orders can be seen: {out}"
+        );
+    }
+
+    /// The caveat is as true when the field has a figure in it, and this file's rule is that no
+    /// state is reported by silence -- so it is printed on every branch, not only the empty one.
+    #[test]
+    fn a_populated_field_carries_the_same_caveat() {
+        let out = rendered(NoteBalanceMap::Known(vec![(
+            dexdo_core::params::SHELL_CURRENCY_ID,
+            3_000_000_000,
+        )]));
+        assert!(out.contains("ECC[2] SHELL: 3.000000000 SHELL"), "{out}");
+        assert!(
+            out.contains("inference-order escrow is NOT counted by this field"),
+            "the caveat vanished as soon as the field had a number: {out}"
+        );
+    }
+
+    /// An unreadable field stays unreadable: narrowing what the section claims must not turn "not
+    /// read" into "nothing there".
+    #[test]
+    fn an_unreadable_field_is_still_reported_as_unread() {
+        let out = rendered(NoteBalanceMap::Unknown("getter unavailable".to_string()));
+        assert!(!out.contains("none reported"), "{out}");
+        assert!(out.contains("getter unavailable"), "{out}");
     }
 }

@@ -1,32 +1,30 @@
-//! Order-book display command handler(Track C6, move-only).
+//! Order-book display command handler (Track C6, move-only).
 
 use crate::cli::args::OrdersArgs;
-#[cfg(feature = "shellnet")]
 use crate::cli::args::OrdersCommand;
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
-    direct_chain_read_with_timeout, fold_snapshot_from_orders, model_target_from_config,
+    fold_snapshot_from_orders, model_target_from_config,
     read_book_target, resolve_order_book_target, retry_executable_read, target_from_market,
     BookTarget,
 };
-#[cfg(feature = "shellnet")]
 use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
-#[cfg(feature = "shellnet")]
+use std::future::Future;
+// `render_order_line` and `render_escrow` are built in a default-features test build too, so
+// `one_unit_everywhere` can drive the order row in the gate that runs on every push.
 use dexdo_core::address as addr;
-#[cfg(feature = "shellnet")]
-use dexdo_core::shellnet::BookEventFold;
-#[cfg(feature = "shellnet")]
-use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
+use dexdo_core::chain::BookEventFold;
+use dexdo_core::OrderBookSnapshot;
+use dexdo_core::OrderBookOrder;
 
 /// An `orders` snapshot together with its provenance: which read path produced the rows and
 /// the freshness marker that came with them.
-#[cfg(feature = "shellnet")]
 struct OrdersView {
     snapshot: OrderBookSnapshot,
     rows: &'static str,
     last_update_id: String,
     /// The order ids the book's own `InferenceOrderExpired` named on this read.
+
     /// The fold computes this and then loses it: `LiveBookOrder::expired_by_event` has no
     /// counterpart on `OrderBookOrder`, so `fold_snapshot_from_orders` cannot carry it and the
     /// rendered row never saw it. It travels beside the snapshot rather than inside it because the
@@ -35,6 +33,7 @@ struct OrdersView {
 }
 
 /// What one read path can honestly say about the escrow behind one row.
+
 /// Three states, not two. The two `orders` read paths do not know the same things. `getOrder`
 /// returns the stored `Order`, whose `escrow` is the SHELL a bid is holding
 /// (`contracts/airegistry/InferenceOrderBook.sol:259`, "BUY: SHELL budget held; SELL: 0"), and the
@@ -43,15 +42,15 @@ struct OrdersView {
 /// (`:371`) never carries escrow, so `LiveBookOrder` has no escrow field and
 /// `fold_snapshot_from_orders` fills the struct with a zero that must never reach an operator as a
 /// quantity.
+
 /// But "the fold cannot tell you the amount" was answering two different questions with one `-`
 /// . For an order past its deadline the owner's question is not "how much" -- it is "is the
 /// book still holding it?", and those are opposite actions: still held means run `dexdo orders
 /// expire <id>` and get the money back, already swept means there is nothing to do. The fold knows
 /// which, through the `InferenceOrderExpired` it deliberately treats as non-terminal, and until now
 /// that knowledge stopped one layer below the row that needed it.
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EscrowRead {
+pub(crate) enum EscrowRead {
     /// `getOrder` answered, so the number on the row is the book's own. A record the getter returned
     /// is by construction still in the book: the sweep removes it.
     Authoritative,
@@ -59,21 +58,22 @@ enum EscrowRead {
     /// is not the same as reporting the filler zero.
     HeldAmountUnknown,
     /// The event fold, and the book's own `InferenceOrderExpired` named this order id: the book has
-    /// removed it and refunded a bid's escrow(`InferenceOrderBook.sol`, the expiry sweep). A SELL
+    /// removed it and refunded a bid's escrow (`InferenceOrderBook.sol`, the expiry sweep). A SELL
     /// commits none in the first place, so on either side the answer to "is the book holding my
     /// money for this order" is now no.
     Returned,
 }
 
-#[cfg(feature = "shellnet")]
 impl OrdersView {
     /// Everything the fold read path derives from one folded book, in ONE place.
+
     /// `read_live_order_snapshot` reads the book and then does nothing else with what it got: the
     /// rows both read paths share come out of `fold_snapshot_from_orders`, and the one thing only
     /// this path can know -- which ids the book's own `InferenceOrderExpired` named -- is derived
     /// here, beside the `ROWS_CHAIN_EVENTS` marker that makes [`OrdersView::escrow_read`] consult
     /// it at all. Those two belong together: the marker without the ids renders every fold row as
     /// an authoritative `escrow=0`, which is the filler zero exists to keep off the row.
+
     /// It is a function rather than three expressions inline in the read closure because a
     /// regression that restates the derivation beside the code proves the carry the TEST performs,
     /// not the carry the read path performs -- and stays green while the read path stops carrying
@@ -81,7 +81,7 @@ impl OrdersView {
     fn from_fold(
         target: &BookTarget,
         order_book: &str,
-        orders: &[&dexdo_core::shellnet::LiveBookOrder],
+        orders: &[&dexdo_core::chain::LiveBookOrder],
         last_update_id: String,
     ) -> Self {
         OrdersView {
@@ -112,38 +112,121 @@ impl OrdersView {
     }
 }
 
-#[cfg(feature = "shellnet")]
+/// A `BookTarget` named only by the model's on-chain id.
+
+/// The hash is validated here rather than at the getter, so a mistyped one is refused before any
+/// chain read and long before anything is signed. `frame_model` stays empty: this route genuinely
+/// does not know the name, and every line that shows it goes through [`model_label`], which says the
+/// hash instead of showing a blank where an identity belongs.
+fn book_target_from_model_hash(model_hash: &str, note_addr: &str) -> Result<BookTarget> {
+    let trimmed = model_hash.trim();
+    let digits = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if digits.len() != 64 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "--model-hash {model_hash} is not a model id: it must be 0x followed by 64 hex digits, \
+             exactly as `dexdo note outstanding` prints it"
+        );
+    }
+    Ok(BookTarget {
+        frame_model: String::new(),
+        model_hash: format!("0x{}", digits.to_ascii_lowercase()),
+        order_book: None,
+        root_model: None,
+        note_addr: Some(note_addr.to_string()),
+    })
+}
+
+/// What to call the model on screen: its name where one is known, its id where none is.
+
+/// A blank in a confirmation line reads as "this field failed to fill", not as "this model has no
+/// name here", and the two call for opposite reactions from someone about to sign. The id is the
+/// honest answer, and it is the same string the operator passed in.
+fn model_label<'a>(frame_model: &'a str, model_hash: &'a str) -> &'a str {
+    if frame_model.is_empty() {
+        model_hash
+    } else {
+        frame_model
+    }
+}
+
+#[cfg(test)]
+#[path = "orders_1659_tests.rs"]
+mod orders_1659_tests;
+
 async fn read_live_order_snapshot(
     chain: &dexdo_core::RealChainBackend,
     target: &BookTarget,
     order_book: &str,
 ) -> Result<OrdersView> {
-    match retry_executable_read("order-book event fold", || async {
-        let fold = chain
-            .fold_order_book_events(order_book, BookEventFold::default())
-            .await?;
-        let last_update_id = fold.last_seen_id().unwrap_or("-").to_string();
-        // explicit non-goal: an expired order is NOT filtered out of the owner's own list --
-        // not by the deadline predicate and not by consuming `InferenceOrderExpired`. Expiry is lazy
-        // on chain, so a lapsed order can sit in the book holding escrow indefinitely; hiding it
-        // loses the operator's money from view. It is shown, and marked `expired=yes`.
-        let orders = fold.all_orders().collect::<Vec<_>>();
-        Ok(OrdersView::from_fold(
-            target,
-            order_book,
-            &orders,
-            last_update_id,
-        ))
-    })
+    read_live_order_snapshot_with(
+        || async {
+            let fold = chain
+                .fold_order_book_events(order_book, BookEventFold::default())
+                .await?;
+            let last_update_id = fold.last_seen_id().unwrap_or("-").to_string();
+            // explicit non-goal: an expired order is NOT filtered out of the owner's own list
+            // -- not by the deadline predicate and not by consuming `InferenceOrderExpired`. Expiry
+            // is lazy on chain, so a lapsed order can sit in the book holding escrow indefinitely;
+            // hiding it loses the operator's money from view. It is shown, and marked `expired=yes`.
+            let orders = fold.all_orders().collect::<Vec<_>>();
+            Ok(OrdersView::from_fold(
+                target,
+                order_book,
+                &orders,
+                last_update_id,
+            ))
+        },
+        || async { read_book_target(chain, target).await },
+    )
     .await
-    {
-        Ok(view) => Ok(view),
+}
+
+/// the rule, with both reads as seams.
+
+/// Split the way `market_views::read_executable_market_view_with` is already split, and for the same
+/// reason: a branch that binds a concrete `RealChainBackend` cannot be brought into execution by a
+/// test, and a rule nobody can execute has no proof -- only the claim that it was written.
+async fn read_live_order_snapshot_with<FF, FFut, FB, FBFut>(
+    fold_read: FF,
+    mut fallback_read: FB,
+) -> Result<OrdersView>
+where
+    FF: FnMut() -> FFut,
+    FFut: Future<Output = Result<OrdersView>>,
+    FB: FnMut() -> FBFut,
+    FBFut: Future<Output = Result<OrderBookSnapshot>>,
+{
+    let mut fold_read = fold_read;
+    match retry_executable_read("order-book event fold", &mut fold_read).await {
+        // a fold that ANSWERED still has to be believed, and an empty answer is the one that
+        // cannot be. History is kept in a window, so "no rows" and "the rows are older than what I
+        // can see" arrive here identically; only the book's own storage separates them.
+        Ok(mut view) => {
+            let fold_rows = std::mem::take(&mut view.snapshot.orders);
+            let (rows, source) = crate::cli::fold_completeness::rows_or_storage_when_empty(
+                fold_rows,
+                || async {
+                    let snapshot = retry_executable_read(
+                        "storage confirmation of an empty order-book fold",
+                        &mut fallback_read,
+                    )
+                    .await?;
+                    Ok(snapshot.orders)
+                },
+            )
+            .await?;
+            view.snapshot.orders = rows;
+            view.rows = source.provenance();
+            if source == crate::cli::fold_completeness::RowSource::Storage {
+                // The storage rows never announce a sweep; they are the rows the book still holds.
+                view.swept_order_ids = std::collections::BTreeSet::new();
+            }
+            Ok(view)
+        }
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "order-book event fold unavailable; using legacy chain fallback");
-            let snapshot = retry_executable_read("legacy order-book fallback", || {
-                read_book_target(chain, target)
-            })
-            .await?;
+            let snapshot =
+                retry_executable_read("legacy order-book fallback", &mut fallback_read).await?;
             Ok(OrdersView {
                 snapshot,
                 rows: crate::cli::provenance::ROWS_CHAIN_GETTERS,
@@ -159,8 +242,15 @@ async fn read_live_order_snapshot(
 /// say where these rows came from and how fresh they are, in the same vocabulary
 /// `dexdo market` uses, so the two views can be compared key for key instead of reading as
 /// contradictory truth. `orders` never consults the indexer, so `source` is always `chain`.
-#[cfg(feature = "shellnet")]
 fn render_orders_context(view: &OrdersView, as_of: u64, owner: &str) -> String {
+    // The owner in the canonical spelling, whatever spelling the flag was given in: what the client
+    // prints is one form, and made that form the one every command reads back.
+
+    // The owner of a resting order is a NOTE, and a note is not a self-DApp account -- it lives in
+    // `DEXDO_DAPP_ID`. The self-DApp seam rendered a legacy `0:<account>` as `<account>::<account>`,
+    // so this line disagreed with the refusal thirty lines below it (`addr::display(note_addr)`)
+    // about the spelling of the same note, inside one command.
+    let owner = dexdo_core::address::display(owner);
     format!(
         "orders {} owner={owner}",
         crate::cli::provenance::render(
@@ -173,7 +263,6 @@ fn render_orders_context(view: &OrdersView, as_of: u64, owner: &str) -> String {
     )
 }
 
-#[cfg(feature = "shellnet")]
 fn own_orders<'a>(snapshot: &'a OrderBookSnapshot, note_addr: &str) -> Vec<&'a OrderBookOrder> {
     let want = dexdo_core::normalize_wallet_address(note_addr)
         .unwrap_or_else(|_| note_addr.trim().to_string());
@@ -190,17 +279,17 @@ fn own_orders<'a>(snapshot: &'a OrderBookSnapshot, note_addr: &str) -> Vec<&'a O
 
 /// `deadline` as a UTC date-time: the raw stamp stays for machines, the rendering is for the
 /// operator who has to decide whether the order is still worth anything.
+
 /// Rendered in place rather than pulled in from a date library: the workspace carries no date
-/// dependency(its manifests say so deliberately for the HTTP and TLS stacks alike), `std` has no
+/// dependency (its manifests say so deliberately for the HTTP and TLS stacks alike), `std` has no
 /// calendar, and the civil-date conversion is a dozen lines pinned by tests below.
-#[cfg(feature = "shellnet")]
 fn render_unix_utc(seconds: u64) -> String {
     if seconds == 0 {
         // No deadline was set. The epoch would be a lie in both directions: a GTC bid never expires,
         // and a zero-deadline SELL is malformed rather than long dead.
         return "-".to_string();
     }
-    // days-from-civil, inverted(Howard Hinnant's algorithm, the one every date library implements):
+    // days-from-civil, inverted (Howard Hinnant's algorithm, the one every date library implements):
     // shift the era to start on 0000-03-01 so the leap day lands at the end of the 400-year cycle.
     let days = (seconds / 86_400) as i64;
     let time_of_day = seconds % 86_400;
@@ -227,22 +316,22 @@ fn render_unix_utc(seconds: u64) -> String {
 }
 
 /// The escrow cell, which is where an owner asks "is the book still holding my money?".
+
 /// Never a zero stand-in. `escrow=0` is a real and meaningful reading -- every SELL rests with it --
 /// so a filler zero is indistinguishable from the book saying "nothing is held here", and on a bid
 /// it reads as "your money is already back" over an order that is still holding it.
+
 /// `returned` is a word rather than a number for the same reason: the fold still has no amount to
 /// report, and the one thing it does know is that the amount is no longer the book's to hold.
-#[cfg(feature = "shellnet")]
 fn render_escrow(order: &OrderBookOrder, escrow: EscrowRead) -> String {
     match escrow {
-        EscrowRead::Authoritative => order.escrow.to_string(),
+        EscrowRead::Authoritative => dexdo_core::shell_amount(order.escrow),
         EscrowRead::HeldAmountUnknown => "-".to_string(),
         EscrowRead::Returned => "returned".to_string(),
     }
 }
 
-#[cfg(feature = "shellnet")]
-fn render_order_line(order: &OrderBookOrder, as_of: u64, escrow: EscrowRead) -> String {
+pub(crate) fn render_order_line(order: &OrderBookOrder, as_of: u64, escrow: EscrowRead) -> String {
     let side = if order.is_buy { "buy" } else { "sell" };
     // A bid has no deal contract to name: the book stores a BUY with `tokenContract: address(0)`
     // (`contracts/airegistry/InferenceOrderBook.sol:254,1185` -- "SELL: seller's deal contract;
@@ -251,6 +340,7 @@ fn render_order_line(order: &OrderBookOrder, as_of: u64, escrow: EscrowRead) -> 
     // ONE deadline predicate for every fold-backed view. `market` uses it to drop a row from
     // the executable scope; here the same verdict is a label, against the very `as_of` the context
     // line above already printed -- so the two views can be reconciled instead of second-guessed.
+
     // `expired` is the CLOCK's verdict and nothing more -- it is true both while the book is
     // still holding the escrow and after the book has swept it and given it back. The escrow cell is
     // what separates those two, which is why this stayed a `yes|no` deadline label.
@@ -265,7 +355,7 @@ fn render_order_line(order: &OrderBookOrder, as_of: u64, escrow: EscrowRead) -> 
         side,
         addr::display(&order.owner_note),
         addr::display_self_dapp(tc),
-        order.price_per_tick,
+        dexdo_core::shell_amount(order.price_per_tick),
         order.ticks,
         render_escrow(order, escrow),
         order.flags,
@@ -276,7 +366,6 @@ fn render_order_line(order: &OrderBookOrder, as_of: u64, escrow: EscrowRead) -> 
 }
 
 /// What `dexdo orders expire` may do about one named order id, decided before any message is sent.
-#[cfg(feature = "shellnet")]
 #[derive(Debug, PartialEq, Eq)]
 enum ExpireAction {
     /// Nothing rests under this id for this note. The chain agrees: `expireOrder` on a gone order
@@ -294,7 +383,6 @@ enum ExpireAction {
 /// The deadline verdict is [`dexdo_core::order_deadline_is_live`] -- the ONE predicate `market` and
 /// `render_order_line` already use -- so the `expired=` column an operator just read and the action
 /// this command takes can never disagree.
-#[cfg(feature = "shellnet")]
 fn expire_action(order: Option<&OrderBookOrder>, as_of: u64) -> ExpireAction {
     let Some(order) = order else {
         return ExpireAction::NotResting;
@@ -309,10 +397,9 @@ fn expire_action(order: Option<&OrderBookOrder>, as_of: u64) -> ExpireAction {
 
 /// Name the deadline that makes the sweep premature, so the operator learns WHEN this becomes
 /// possible instead of only that it is not possible now.
-#[cfg(feature = "shellnet")]
 fn expire_too_early(order_id: u128, deadline: u64, as_of: u64) -> String {
     let until = if deadline == 0 {
-        // A BUY may rest with deadline 0(contract-permitted GTC). Nothing will ever expire it, so
+        // A BUY may rest with deadline 0 (contract-permitted GTC). Nothing will ever expire it, so
         // saying "wait" would be a lie; cancel is the only exit.
         "carries deadline 0, which never expires".to_string()
     } else {
@@ -330,19 +417,21 @@ fn expire_too_early(order_id: u128, deadline: u64, as_of: u64) -> String {
 }
 
 /// Has the book said this order left it?
+
 /// ONE question for both removals, because two predicates that must agree are two predicates that
 /// can drift. The book announces the two removals differently and the fold treats them
 /// differently, and this is the single place that knows it:
+
 /// * `InferenceOrderCancelled` is TERMINAL -- the fold drops the row
-/// (`crates/core/src/shellnet/book_events.rs`), so absence IS the announcement.
+/// (`crates/core/src/chain/book_events.rs`), so absence IS the announcement.
 /// * `InferenceOrderExpired` is deliberately NOT terminal -- it sets `expired_by_event` and the
 /// row STAYS, because `dexdo orders list` must keep showing an owner a row that may still be
 /// sitting in the book holding escrow.
+
 /// So absence alone is right for one and waits forever for the other, over money that is already
 /// back in the note. Both shapes together are the honest answer for either.
-#[cfg(feature = "shellnet")]
 fn order_has_left_the_book<'a>(
-    orders: impl IntoIterator<Item = &'a dexdo_core::shellnet::LiveBookOrder>,
+    orders: impl IntoIterator<Item = &'a dexdo_core::chain::LiveBookOrder>,
     order_id: u128,
 ) -> bool {
     orders
@@ -355,15 +444,16 @@ fn order_has_left_the_book<'a>(
 /// bounded by the read timeout, and read the note's spendable balance on either side of it.
 /// Shared by `cancel` and `expire` -- the two differ in who may ask and in what a replay means, not
 /// in what "the book removed it and the money came back" looks like.
+
 /// The signal is the book's OWN announcement, via [`order_has_left_the_book`]. Absence from the
 /// owner's row list is deliberately not asked directly: for an expiry that list keeps the row on
 /// purpose, and waiting for it to disappear waits forever.
+
 /// The credit reported is one this client OBSERVED. It is never derived from the row's `escrow`
-/// field, which the event-fold read path does not carry at all(`escrow=-`) -- computing a refund
+/// field, which the event-fold read path does not carry at all (`escrow=-`) -- computing a refund
 /// from a number the book did not hand us is exactly the invented money E2E-CXL-14 forbids.
 /// `InferenceOrderCancelled` does carry a `refunded` field; it is deliberately NOT used as the
 /// figure here, so that one command cannot report a refund a different way from the other.
-#[cfg(feature = "shellnet")]
 async fn reconcile_order_removal(
     chain: &dexdo_core::RealChainBackend,
     order_book: &str,
@@ -372,15 +462,64 @@ async fn reconcile_order_removal(
     balance_before: u128,
     wait: std::time::Duration,
 ) -> Result<Option<(u128, u128)>> {
+    let book = dexdo_core::Address::parse(order_book)
+        .map_err(|error| anyhow::anyhow!("order_book {order_book}: {error}"))?;
+    reconcile_order_removal_with(
+        || async {
+            let fold = chain
+                .fold_order_book_events(order_book, BookEventFold::default())
+                .await?;
+            Ok(fold.all_orders().cloned().collect::<Vec<_>>())
+        },
+        || async { chain.inference_orderbook_live_orders(&book).await },
+        || async { chain.private_note_shell_balance(note).await },
+        order_id,
+        balance_before,
+        wait,
+    )
+    .await
+}
+
+/// site 3: the rule pointed the other way, with its three reads as seams.
+
+/// Two different things used to read alike here: the fold SEEING the row and saying it is swept,
+/// which is a statement, and the fold not carrying the row at all, which is silence. Only the first
+/// settles anything; for the second the book's own storage decides, exactly as it does before a
+/// refusal in `read_live_order_snapshot`. Concluding "removed" from silence is how a bounded history
+/// becomes a reported removal that never happened -- and this one CONFIRMS rather than refuses, so it
+/// is the direction that hands an operator a figure instead of withholding one.
+async fn reconcile_order_removal_with<FF, FFut, FS, FSut, FB, FBut>(
+    mut fold_read: FF,
+    mut storage_read: FS,
+    mut balance_read: FB,
+    order_id: u128,
+    balance_before: u128,
+    wait: std::time::Duration,
+) -> Result<Option<(u128, u128)>>
+where
+    FF: FnMut() -> FFut,
+    FFut: Future<Output = Result<Vec<dexdo_core::chain::LiveBookOrder>>>,
+    FS: FnMut() -> FSut,
+    FSut: Future<Output = Result<Vec<dexdo_core::OrderBookOrder>>>,
+    FB: FnMut() -> FBut,
+    FBut: Future<Output = Result<u128>>,
+{
     let started = std::time::Instant::now();
     loop {
         let remaining = wait.saturating_sub(started.elapsed());
         let observe = async {
-            let fold = chain
-                .fold_order_book_events(order_book, BookEventFold::default())
-                .await?;
-            let removed = order_has_left_the_book(fold.all_orders(), order_id);
-            let balance = chain.private_note_shell_balance(note).await?;
+            let folded = fold_read().await?;
+            let removed = match folded.iter().find(|order| order.order_id == order_id) {
+                Some(order) => order.expired_by_event,
+                None => {
+                    crate::cli::fold_completeness::absence_is_confirmed_by_storage(
+                        order_id,
+                        &mut storage_read,
+                    )
+                    .await?
+                }
+            };
+            let balance = balance_read().await?;
             Ok::<_, anyhow::Error>((removed, balance))
         };
         let (removed, balance_after) = match tokio::time::timeout(remaining, observe).await {
@@ -405,19 +544,20 @@ async fn reconcile_order_removal(
 }
 
 /// Render the book's fill history for one note as candidates and refusals.
+
 /// The wording is part of the safety surface. This command exists for an operator whose client died
 /// holding a funded deal, and the two ways it can mislead are opposite: presenting a candidate as a
 /// recovered deal invites acting on money that may already be settled, and presenting an empty list
 /// as "you have no deal" hides a fill the book really emitted. So the header states what was found
 /// before anything is listed, every refusal is printed with the TokenContract's own reason, and the
 /// caveat says plainly that absence here is not proof.
+
 /// Pure `&Report -> String`: no clock, no chain, no IO, so the exact operator text is testable.
-#[cfg(feature = "shellnet")]
 fn render_orders_fills(
     frame_model: &str,
     order_book: &str,
     note_addr: &str,
-    report: &dexdo_core::shellnet::BookFillCandidateReport,
+    report: &dexdo_core::chain::BookFillCandidateReport,
 ) -> String {
     let mut rendered = format!(
         "orders fills model={frame_model} order_book={} owner={} fills_named={}\n",
@@ -453,10 +593,10 @@ fn render_orders_fills(
 }
 
 /// The identity half of one fill, shared by the confirmed and refused lines.
+
 /// Both lines carry it because a refused fill is exactly the case an operator has to reconcile by
 /// hand, and `sellerTC`/`sellerNote`/the order ids are what is about not losing.
-#[cfg(feature = "shellnet")]
-fn render_fill_identity(candidate: &dexdo_core::shellnet::BookFillCandidate) -> String {
+fn render_fill_identity(candidate: &dexdo_core::chain::BookFillCandidate) -> String {
     format!(
         "token_contract={} seller_note={} maker_id={} taker_id={} ticks={} clearing_price={}",
         addr::display(&candidate.seller_token_contract),
@@ -464,28 +604,88 @@ fn render_fill_identity(candidate: &dexdo_core::shellnet::BookFillCandidate) -> 
         candidate.maker_id,
         candidate.taker_id,
         candidate.ticks,
-        candidate.clearing_price
+        dexdo_core::shell_amount_of_text(&candidate.clearing_price)
     )
 }
 
-#[cfg(feature = "shellnet")]
+/// What the confirming `orders` arms print about the subscription journal, INCLUDING when the
+/// journal could not be written.
+
+/// Correcting the journal is fallible in three ways: the buyer's money lock is held (by a
+/// running buyer, or by a sentinel a killed one left behind), the journal on disk does not decode,
+/// or the record disagrees with a refund the chain has already paid. Propagating any of those with
+/// `?` took the whole confirmation line away -- by that point the cancellation is on chain,
+/// `reconcile_order_removal` has confirmed it and the escrow is back, and the operator was shown a
+/// non-zero exit and no `cancel confirmed... refund=` line at all. The lock's own refusal even
+/// reads "no BOC was sent", which is true where that sentence was written and false here.
+
+/// So a failed write is a THIRD outcome of a field that already had two, never a return: the chain
+/// fact is printed either way, and what could not be written to a local file is said separately in
+/// the words of the failure. The exit stays 0 because the subject of the command -- the removal and
+/// its refund -- succeeded, and because the journal left uncorrected reads `resting` about money
+/// that is already back: the alarming direction, and the one an operator checks.
+fn subscription_journal_report(
+    order_id: u128,
+    corrected: Result<bool>,
+) -> (&'static str, Option<String>) {
+    match corrected {
+        Ok(true) => ("closed", None),
+        Ok(false) => ("none", None),
+        Err(error) => (
+            "not-closed",
+            Some(format!(
+                "subscription_journal_not_closed order_id={order_id}: the removal above is \
+                 confirmed on chain and the refund it names is the balance move that removal \
+                 produced -- nothing here undoes either. What failed is only the write to this \
+                 note's local subscription journal, so a `subscription` surface reading that file \
+                 may keep showing an older phase for this order until it is corrected; the chain is \
+                 the authority and `dexdo subscription status` reads it. The reason follows, and it \
+                 is the reason the FILE was not written: some of its wordings belong to a path that \
+                 submits nothing and do not describe this one. {error:#}"
+            )),
+        ),
+    }
+}
+
 pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
         anyhow::anyhow!("orders requires --note-addr (the owner PrivateNote to filter/cancel)")
     })?;
+    // ONE budget for the command, and one read of the manifest path -- but BELOW the
+    // argument check, not above it. `manifest_path()` reads the environment and can fail on its
+    // own, and hoisting it over that check made `dexdo orders list` with no `--note-addr` report a
+    // missing manifest instead of the missing argument, sending the operator to configure a
+    // deployment for a command that was going to be refused on its arguments either way.
+
+    // `direct_chain_read_with_timeout` bounds ONE read; this function made SEVEN, each taking a
+    // fresh full `--read-timeout`. The bound is what the operator asked for, not what each read
+    // asks for.
+
+    // The budget covers READS. `reconcile_order_removal` below waits for chain state to settle
+    // after a write and takes its own `--read-timeout`-shaped wait; that is a different thing from
+    // a read and is deliberately not charged here. Charging it would make the read after a
+    // reconciliation refuse as a timeout while nothing was hung.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let budget = crate::cli::commands::ReadBudget::new(args.read_timeout.read_timeout_secs);
     let chain = dexdo_core::RealChainBackend::connect(
-        args.contracts
+        manifest_path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+            .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?,
     )?;
     if matches!(&args.command, OrdersCommand::Journal) {
-        return direct_chain_read_with_timeout(
-            args.read_timeout.read_timeout_secs,
+        return budget.read(
             crate::cli::buyer::run_buyer_submit_journal(&chain, note_addr),
         )
         .await;
     }
-    let target = if let Some(market) = args.market.as_deref() {
+    let target = if let Some(model_hash) = args.model_hash.as_deref() {
+        // the note-and-key route. No file is read and no name is resolved, because an owner
+        // recovering a stranded order has neither -- what they have is the hash `note outstanding`
+        // read out of the note's own inbound history. `frame_model` is left empty on purpose: the
+        // name is genuinely unknown here, and inventing one would put a guess into a line the
+        // operator reads before signing.
+        book_target_from_model_hash(model_hash, note_addr)?
+    } else if let Some(market) = args.market.as_deref() {
         if args.model.is_some() {
             bail!("--market and --model are mutually exclusive for orders");
         }
@@ -493,9 +693,12 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     } else {
         model_target_from_config(
             &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("orders without --market requires --model"))?,
+            args.model.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "orders without --market requires --model, or --model-hash when the name is \
+                     not known -- `dexdo note outstanding` prints the hash of every resting order"
+                )
+            })?,
             Some(note_addr.to_string()),
         )?
     };
@@ -504,7 +707,7 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     // event, and folding the resting projection first would pay a full history walk to produce
     // rows this command never reads.
     if matches!(&args.command, OrdersCommand::Fills) {
-        return direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        return budget.read(async {
             let order_book = resolve_order_book_target(&chain, &target).await?;
             let book = dexdo_core::Address::parse(&order_book)
                 .map_err(|error| anyhow::anyhow!("order_book {order_book}: {error}"))?;
@@ -513,13 +716,18 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             let report = chain.verified_book_fill_candidates(&book, &note).await?;
             print!(
                 "{}",
-                render_orders_fills(&target.frame_model, &order_book, note_addr, &report)
+                render_orders_fills(
+                    model_label(&target.frame_model, &target.model_hash),
+                    &order_book,
+                    note_addr,
+                    &report,
+                )
             );
             Ok(())
         })
         .await;
     }
-    let view = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+    let view = budget.read(async {
         let order_book = resolve_order_book_target(&chain, &target).await?;
         read_live_order_snapshot(&chain, &target, &order_book).await
     })
@@ -539,7 +747,7 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             if own.is_empty() {
                 println!(
                     "orders model={} order_book={} owner={} none=true",
-                    snapshot.frame_model,
+                    model_label(&snapshot.frame_model, &snapshot.model_hash),
                     addr::display(&snapshot.order_book),
                     addr::display(note_addr)
                 );
@@ -580,24 +788,23 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                         addr::display(&snapshot.order_book)
                     )
                 })?;
-            let note_key = args.identity.note_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "orders cancel requires --note-key to sign the PrivateNote owner method"
-                )
-            })?;
+            // The flag where it was passed, the pool entry for this note where it was not.
+            let secret = crate::cli::support::note_owner_secret_for(
+                args.identity.note_key.as_deref(),
+                note_addr,
+                None,
+                "orders cancel",
+                "the key that signs the note's owner method",
+            )?;
             let note = dexdo_core::Address::parse(note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-            let keys = dexdo_core::KeyPair::from_secret_hex(
-                read_secret_hex(note_key, "--note-key")?.trim(),
-            )
+            let keys = dexdo_core::KeyPair::from_secret_hex(secret.trim())
             .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
+            budget.read(
                 chain.assert_note_owner_matches("orders cancel", &note, &keys),
             )
             .await?;
-            let balance_before = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
+            let balance_before = budget.read(
                 chain.private_note_shell_balance(&note),
             )
             .await?;
@@ -606,7 +813,7 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                 .await?;
             println!(
                 "cancel submitted model={} order_book={} order_id={} owner={}",
-                snapshot.frame_model,
+                model_label(&snapshot.frame_model, &snapshot.model_hash),
                 addr::display(&snapshot.order_book),
                 order.order_id,
                 addr::display(note_addr)
@@ -623,7 +830,7 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             let Some((refund, balance_after)) = confirmed else {
                 // A cancel can also be REFUSED by the book -- a foreign owner or an order already
                 // gone raises `InferenceOrderCancelRejected`, and a full queue means "ask again"
-                // with the order still alive(`InferenceOrderBook.sol:1178-1183,218-221`). This
+                // with the order still alive (`InferenceOrderBook.sol:1178-1183,218-221`). This
                 // client cannot yet tell those apart from a slow read, so it claims neither a
                 // removal nor a refund, and sends nothing a second time.
                 bail!(
@@ -632,23 +839,49 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                     order.order_id
                 );
             };
+            // the removal is confirmed on chain, so the local record of it may be corrected.
+            // A subscription is an ordinary order in the book and this surface cancels it like any
+            // other -- but the journal that says what a subscription is doing is the buyer's, and
+            // until now nothing here told it. An operator who cancelled from here was then shown
+            // `phase: resting` by the cheapest thing they read, about money that was already back.
+
+            // It is done AFTER the confirmation and never before: the journal must record what the
+            // chain did, not what this process attempted.
+
+            // the result is REPORTED, never propagated. A `?` on this line would take the
+            // confirmation below away from an operator whose money is already back.
+            let (subscription_journal, journal_not_closed) = subscription_journal_report(
+                order.order_id,
+                crate::cli::buyer::mark_cancelled_subscription_order_terminal(
+                    note_addr,
+                    &snapshot.order_book,
+                    order.order_id,
+                ),
+            );
             println!(
-                "cancel confirmed model={} order_book={} order_id={} owner={} refund={refund} balance_before={balance_before} balance_after={balance_after}",
-                snapshot.frame_model,
+                "cancel confirmed model={} order_book={} order_id={} owner={} refund={} balance_before={} balance_after={} subscription_journal={}",
+                model_label(&snapshot.frame_model, &snapshot.model_hash),
                 addr::display(&snapshot.order_book),
                 order.order_id,
-                addr::display(note_addr)
+                addr::display(note_addr),
+                dexdo_core::shell_amount(refund),
+                dexdo_core::shell_amount(balance_before),
+                dexdo_core::shell_amount(balance_after),
+                subscription_journal
             );
+            if let Some(reason) = journal_not_closed {
+                eprintln!("{reason}");
+            }
         }
         OrdersCommand::Expire { order_id } => {
             // Permissionless: `expireOrder` accepts its own external message and is not owner-
-            // authenticated(`contracts/airegistry/InferenceOrderBook.sol:1686`), so unlike
+            // authenticated (`contracts/airegistry/InferenceOrderBook.sol:1686`), so unlike
             // `cancel` this action signs nothing and needs no `--note-key`.
             match expire_action(own.iter().find(|o| o.order_id == order_id).copied(), as_of) {
                 ExpireAction::NotResting => {
                     println!(
                         "expire noop model={} order_book={} order_id={order_id} owner={} resting=false submitted=false",
-                        snapshot.frame_model,
+                        model_label(&snapshot.frame_model, &snapshot.model_hash),
                         addr::display(&snapshot.order_book),
                         addr::display(note_addr)
                     );
@@ -661,10 +894,9 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
                     let book = dexdo_core::Address::parse(&snapshot.order_book)
                         .map_err(|e| anyhow::anyhow!("order book {}: {e}", snapshot.order_book))?;
-                    let frame_model = snapshot.frame_model.clone();
+                    let frame_model = model_label(&snapshot.frame_model, &snapshot.model_hash).to_string();
                     let order_book = snapshot.order_book.clone();
-                    let balance_before = direct_chain_read_with_timeout(
-                        args.read_timeout.read_timeout_secs,
+                    let balance_before = budget.read(
                         chain.private_note_shell_balance(&note),
                     )
                     .await?;
@@ -690,11 +922,31 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                              no retry was sent"
                         );
                     };
-                    println!(
-                        "expire confirmed model={frame_model} order_book={} order_id={order_id} owner={} refund={refund} balance_before={balance_before} balance_after={balance_after}",
-                        addr::display(&order_book),
-                        addr::display(note_addr)
+                    // a swept expiry removes the order exactly as a cancel does, and the
+                    // journal is as wrong afterwards. Same discipline as the cancel arm -- only
+                    // after `reconcile_order_removal` confirmed the removal on chain.
+
+                    // reported, not propagated -- same reason as the cancel arm.
+                    let (subscription_journal, journal_not_closed) = subscription_journal_report(
+                        order_id,
+                        crate::cli::buyer::mark_cancelled_subscription_order_terminal(
+                            note_addr,
+                            &order_book,
+                            order_id,
+                        ),
                     );
+                    println!(
+                        "expire confirmed model={frame_model} order_book={} order_id={order_id} owner={} refund={} balance_before={} balance_after={} subscription_journal={}",
+                        addr::display(&order_book),
+                        addr::display(note_addr),
+                        dexdo_core::shell_amount(refund),
+                        dexdo_core::shell_amount(balance_before),
+                        dexdo_core::shell_amount(balance_after),
+                        subscription_journal
+                    );
+                    if let Some(reason) = journal_not_closed {
+                        eprintln!("{reason}");
+                    }
                 }
             }
         }
@@ -706,19 +958,18 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                     addr::display(&snapshot.order_book)
                 );
             }
-            let note_key = args.identity.note_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "orders cancel-all requires --note-key to sign the PrivateNote owner method"
-                )
-            })?;
+            let secret = crate::cli::support::note_owner_secret_for(
+                args.identity.note_key.as_deref(),
+                note_addr,
+                None,
+                "orders cancel-all",
+                "the key that signs the note's owner method",
+            )?;
             let note = dexdo_core::Address::parse(note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-            let keys = dexdo_core::KeyPair::from_secret_hex(
-                read_secret_hex(note_key, "--note-key")?.trim(),
-            )
+            let keys = dexdo_core::KeyPair::from_secret_hex(secret.trim())
             .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
+            budget.read(
                 chain.assert_note_owner_matches("orders cancel-all", &note, &keys),
             )
             .await?;
@@ -727,7 +978,7 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                 .await?;
             println!(
                 "cancel-all submitted model={} order_book={} owner={} order_count={}",
-                snapshot.frame_model,
+                model_label(&snapshot.frame_model, &snapshot.model_hash),
                 addr::display(&snapshot.order_book),
                 addr::display(note_addr),
                 own.len()
@@ -737,14 +988,233 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_orders(_args: OrdersArgs) -> Result<()> {
-    bail!("orders unavailable: build with `--features shellnet`")
-}
 
-#[cfg(all(test, feature = "shellnet"))]
+/// Where the production text ends, for every scanner in this FILE.
+
+/// the attribute ALONE is not a boundary. `#[cfg(test)]` also
+/// gates `#[path = "orders_1659_tests.rs"] mod orders_1659_tests;` near the top of this file, and
+/// `split_once` stops at the FIRST match -- so the window collapsed from 49% of the file to 9%,
+/// leaving every match arm and every display site outside it. The scans then reported absence, and
+/// checks failed naming strings nobody had touched. Anchoring on the module line as well makes the
+/// width independent of how many gated modules are declared, above this point or below it.
+
+/// AT FILE LEVEL, not inside one test module, and that placement is the point. The boundary was
+/// described two ways in this file at once -- repaired here, broken in
+/// `issue_1554_a_failed_journal_write_is_an_outcome_not_a_refusal` -- and a third copy would only
+/// decide which of them the next author happens to read. The boundary gets ONE owner per file.
+#[cfg(test)]
+const PRODUCTION_ENDS_AT: &str = "#[cfg(test)]\nmod tests";
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// - the load-bearing check of that PR, and the one it was missing.
+
+    /// The repair is a call inside the `cancel` arm, and the arm cannot run offline: it needs a
+    /// chain to fold the book, sign, submit and reconcile. So the fact is pinned where it lives --
+    /// in the production text -- and what is pinned is the ORDER, because the order is the whole
+    /// discipline: the journal must record what the chain did, never what this process attempted.
+    /// Remove the call and this fails; move it above `reconcile_order_removal` and it fails too.
+
+    /// What it does NOT prove: that the call reaches a journal on disk. That is
+    /// `mark_cancelled_subscription_order_terminal_at`, driven against a real file in
+    /// `crates/dexdo/src/cli/buyer.rs::issue_1547_both_cancel_surfaces_share_the_journal`.
+    #[test]
+    fn issue_1547_both_confirming_arms_correct_the_journal_after_the_chain_confirms() {
+        let production = include_str!("orders.rs")
+            .split_once(PRODUCTION_ENDS_AT)
+            .expect("orders unit-test module boundary")
+            .0;
+
+        for (arm, label) in [
+            ("OrdersCommand::Cancel { order_id }", "cancel"),
+            ("OrdersCommand::Expire { order_id }", "expire"),
+        ] {
+            let body = production.split_once(arm).expect("the arm").1;
+            let end = body.find("\n        OrdersCommand::").unwrap_or(body.len());
+            let body = &body[..end];
+            let confirms_at = body.find("reconcile_order_removal(").unwrap_or_else(|| {
+                panic!("{label}: the arm must confirm the removal on chain")
+            });
+            let corrects_at = body
+                .find("mark_cancelled_subscription_order_terminal(")
+                .unwrap_or_else(|| {
+                    panic!("{label}: the arm must correct the subscription journal ()")
+                });
+            assert!(
+                confirms_at < corrects_at,
+                "{label}: the journal is corrected BEFORE the chain confirmed the removal, so it \
+                 would record an attempt instead of a fact"
+            );
+        }
+
+        // `cancel-all` is deliberately NOT in that list, and the reason is the same discipline:
+        // it prints "cancel-all submitted" and never reconciles, so there is no confirmed removal
+        // to record. Writing the journal there would record an attempt. Pinned so the omission
+        // stays a decision rather than becoming an oversight.
+        let all = production
+            .split_once("OrdersCommand::CancelAll =>")
+            .expect("the cancel-all arm")
+            .1;
+        let all = &all[..all.find("\n    }").unwrap_or(all.len())];
+        assert!(
+            !all.contains("reconcile_order_removal("),
+            "cancel-all now confirms removal; if so it must correct the journal too ()"
+        );
+        assert!(
+            !all.contains("mark_cancelled_subscription_order_terminal"),
+            "cancel-all must not write the journal while it cannot confirm what the chain did"
+        );
+    }
+
+    /// the note-and-key route into `orders`.
+
+    /// The half this closes is the sending half. `note outstanding` recovers a resting order as
+    /// `modelHash` + `orderId`, and until now `orders` would take neither -- it wanted a model NAME
+    /// (resolved through a `models.json` on disk) or a `market.json`, and `sha256(name)` does not run
+    /// backwards. Everything past the input already worked on the hash.
+    mod issue_1522_orders_take_the_model_id {
+        const HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+        const NOTE: &str = "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        /// The whole point: a target is built from the hash alone, reading nothing.
+
+        /// `book_target_from_model_hash` takes no path and opens no file -- that is what makes this
+        /// the route for an owner who has only the note and its key. The book is left unresolved
+        /// because it is DERIVED from the hash on chain later, which is the step that never needed a
+        /// name in the first place.
+        #[test]
+        fn a_target_is_built_from_the_hash_with_no_file_on_disk() {
+            let target = super::super::book_target_from_model_hash(HASH, NOTE)
+                .expect("a well formed model id names a book");
+            assert_eq!(target.model_hash, HASH);
+            assert_eq!(target.note_addr.as_deref(), Some(NOTE));
+            assert!(
+                target.order_book.is_none(),
+                "the book is derived from the hash on chain, not carried in from a file"
+            );
+            assert!(
+                target.frame_model.is_empty(),
+                "this route does not know the name and must not invent one"
+            );
+        }
+
+        /// Case and the `0x` prefix are the operator's to get wrong; the identity is not.
+        #[test]
+        fn the_hash_is_normalised_the_way_the_getter_wants_it() {
+            let bare = super::super::book_target_from_model_hash(
+                "0000000000000000000000000000000000000000000000000000000000000ABC",
+                NOTE,
+            )
+            .expect("a bare uppercase id is the same id");
+            assert_eq!(bare.model_hash, HASH);
+        }
+
+        /// A mistyped id is refused BEFORE any chain read and long before anything is signed.
+        #[test]
+        fn a_malformed_model_id_is_refused_at_the_input() {
+            for bad in ["0xabc", "", "0xzz00000000000000000000000000000000000000000000000000000000000a", "not-a-hash"] {
+                let message = match super::super::book_target_from_model_hash(bad, NOTE) {
+                    Ok(_) => panic!("a malformed model id must not reach the chain: {bad:?}"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    message.contains("64 hex digits"),
+                    "the refusal has to say what a model id looks like: {message}"
+                );
+                assert!(
+                    message.contains("note outstanding"),
+                    "and where to get a correct one: {message}"
+                );
+            }
+        }
+
+        /// The flag adds a way IN; it must not add a way AROUND. The guard that refuses to cancel an
+        /// order this note does not own sits between the snapshot and the signature, and it reads
+        /// the book's own rows -- so a hash that resolves to some other book yields no matching row
+        /// and the command refuses instead of signing. Pinned on the production text because that
+        /// ordering is one call site a later edit could quietly move.
+        #[test]
+        fn the_ownership_guard_still_stands_between_the_snapshot_and_the_signature() {
+            let production = include_str!("orders.rs")
+                .split_once(super::PRODUCTION_ENDS_AT)
+                .expect("orders unit-test module boundary")
+                .0;
+            let cancel = production
+                .split_once("OrdersCommand::Cancel { order_id }")
+                .expect("the cancel arm")
+                .1;
+            let refuses_at = cancel
+                .find("refusing to cancel: order")
+                .expect("cancel refuses an order this note does not own");
+            let signs_at = cancel
+                .find("cancel_inference_order(")
+                .expect("cancel signs the note's owner method");
+            assert!(
+                refuses_at < signs_at,
+                "the ownership refusal must come before the signature, not after it"
+            );
+            assert!(
+                cancel[..signs_at].contains("assert_note_owner_matches"),
+                "and the key must be checked against the note before it signs"
+            );
+        }
+
+        /// `fills` is the one reader of `frame_model`, and on this route there is no name to read.
+        /// It gets the id instead of a blank -- an empty identity in a line about someone's money
+        /// reads as a field that failed to fill.
+        #[test]
+        fn the_only_reader_of_the_name_is_given_the_id_instead_of_a_blank() {
+            assert_eq!(super::super::model_label("", HASH), HASH);
+            assert_eq!(super::super::model_label("qwen--qwen3--32b", HASH), "qwen--qwen3--32b");
+
+            let production = include_str!("orders.rs")
+                .split_once(super::PRODUCTION_ENDS_AT)
+                .expect("orders unit-test module boundary")
+                .0;
+            // BEFORE ANY "none found" ASSERTION, STATE WHAT WAS FOUND.
+
+            // Both checks below are absences, and an absence over scanned text is true twice over:
+            // when nothing offends, and when the scan has stopped finding anything at all. Rename
+            // the binding or the field -- `snapshot` to `snap`, `frame_model` to `model_name` --
+            // and `match_indices` returns nothing, the count is zero, and this test reports success
+            // without having looked at a single display site. The floor is the same shape the
+            // sweep carries in `main.rs` (`files >= 40`), moved to what THIS scan actually reads.
+
+            // The floor counts the scanned substring itself, not `model_label(`: a field rename
+            // leaves every `model_label(` in place, so counting those would survive exactly the
+            // rename that blinds the scan.
+            let reads = production.matches("snapshot.frame_model").count();
+            assert!(
+                reads >= 6,
+                "the scan found {reads} reads of `snapshot.frame_model`, fewer than the 6 display \
+                 sites this file carries: it is no longer reading the text it checks, so the \
+                 zero-bare-reads assertion below would pass without looking at anything"
+            );
+            assert!(
+                production.contains("model_label(&target.frame_model"),
+                "the fills call no longer reads the label at all, so the absence checked next \
+                 proves nothing about what fills renders"
+            );
+            assert!(
+                !production.contains("render_orders_fills(&target.frame_model"),
+                "fills must render the label, not the raw name that this route leaves empty"
+            );
+            // Every mention of the raw name must be the one INSIDE `model_label(...)`. Counting
+            // bare occurrences would count those too -- `model_label(&snapshot.frame_model,` ends in
+            // the very substring a naive check looks for -- so the reads are matched by what
+            // precedes them.
+            let bare = production.match_indices("snapshot.frame_model").filter(|(at, _)| {
+                !production[..*at].ends_with("model_label(&")
+            });
+            assert_eq!(
+                bare.count(),
+                0,
+                "no display site may print the raw name: every read goes through model_label"
+            );
+        }
+    }
 
     /// The incident, to the second: SELL 11's deadline and the moment the operator read the
     /// book 779 seconds later, still being shown 956 ticks of liquidity no buyer could reach.
@@ -759,8 +1229,8 @@ mod tests {
         order_id: u128,
         is_buy: bool,
         deadline: u64,
-    ) -> dexdo_core::shellnet::LiveBookOrder {
-        dexdo_core::shellnet::LiveBookOrder {
+    ) -> dexdo_core::chain::LiveBookOrder {
+        dexdo_core::chain::LiveBookOrder {
             order_id,
             is_buy,
             price: 5_000_000_000,
@@ -773,7 +1243,7 @@ mod tests {
         }
     }
 
-    fn owner_rows(orders: &[dexdo_core::shellnet::LiveBookOrder]) -> Vec<String> {
+    fn owner_rows(orders: &[dexdo_core::chain::LiveBookOrder]) -> Vec<String> {
         let target = BookTarget {
             frame_model: "qwen--qwen3--32b".to_string(),
             model_hash: "model-hash".to_string(),
@@ -808,10 +1278,12 @@ mod tests {
     }
 
     /// the row carries `flags=`, and carries the fold's own value on the fold-backed path.
+
     /// The whole point of the field is that it distinguishes orders that are otherwise identical, so
     /// the assertion is that two rows differing ONLY in flags render differently. A `flags=` column
     /// that always printed the same number would satisfy "the field is present" and still tell the
     /// operator nothing -- that is the shape reports, a placement value replaced by a constant.
+
     /// Rendered through `owner_rows`, which is the fold path with an unswept `EscrowRead`:
     /// escrow is unknowable there and stays `-`, while flags is known and prints a number. Both
     /// halves are asserted so the two fields cannot be conflated back together.
@@ -819,7 +1291,7 @@ mod tests {
     fn order_line_carries_the_folded_flags() {
         let shaped = dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION;
         let rows = owner_rows(&[
-            dexdo_core::shellnet::LiveBookOrder {
+            dexdo_core::chain::LiveBookOrder {
                 flags: shaped,
                 ..folded_order(11, false, AS_OF + 3_600)
             },
@@ -873,11 +1345,13 @@ mod tests {
 
     /// regression: "the book is still holding your money" and "your money is already back"
     /// stop rendering identically.
+
     /// Observed live on order_id=2: the row read `escrow=-... expired=yes` while the book had
     /// already swept it and the refund had landed at the note -- the same row a bid still holding its
     /// escrow renders. The two states call for OPPOSITE actions (`dexdo orders expire` on that
     /// order id versus nothing at all), and `expired=yes` is true in both because it is the clock's
     /// verdict, not the book's.
+
     /// The fold's own answer is what closes it: `InferenceOrderExpired` sets `expired_by_event`, and
     /// E2E-ORD-08 keep the row visible precisely BECAUSE the money may still be locked. Both
     /// halves are asserted together here, so a later change cannot buy the distinction back by
@@ -889,7 +1363,7 @@ mod tests {
             // Past its deadline, nobody has swept it: the book is still holding this bid's escrow.
             folded_order(2, true, PAST_DEADLINE),
             // The book announced the sweep for this one; the escrow went back to the note.
-            dexdo_core::shellnet::LiveBookOrder {
+            dexdo_core::chain::LiveBookOrder {
                 expired_by_event: true,
                 ..folded_order(3, true, PAST_DEADLINE)
             },
@@ -936,6 +1410,7 @@ mod tests {
 
     /// at the seam the report named: the fold's verdict reaches the row through the READ
     /// PATH's own carry, not through one restated beside it.
+
     /// `owner_rows` assembles an `OrdersView` field by field, `swept_order_ids` included, so
     /// everything built on it pins the renderer and only the renderer. Empty that set where
     /// `read_live_order_snapshot` derives it and every one of those tests stays green while the
@@ -943,11 +1418,12 @@ mod tests {
     /// of, back, and unobserved. So this drives `OrdersView::from_fold`, the one derivation
     /// the fold read path has, with the two rows the report is about: order 2 past its deadline
     /// with nobody having swept it, and one the book announced it swept.
+
     /// Both states, because either alone is satisfiable by a constant.
     #[test]
     fn the_read_paths_own_carry_separates_a_locked_row_from_a_returned_one() {
         let locked = folded_order(2, true, PAST_DEADLINE);
-        let swept = dexdo_core::shellnet::LiveBookOrder {
+        let swept = dexdo_core::chain::LiveBookOrder {
             expired_by_event: true,
             ..folded_order(3, true, PAST_DEADLINE)
         };
@@ -1005,6 +1481,7 @@ mod tests {
     }
 
     /// The authoritative read path can never report a sweep, and must not stop reporting the number.
+
     /// `getOrder` has no expiry announcement to relay -- it simply stops returning a record the book
     /// removed -- so every row it produces is one the book still holds. `escrow=returned` there would
     /// be this client inventing a removal out of a read that cannot observe one.
@@ -1016,7 +1493,7 @@ mod tests {
         let getters = view(crate::cli::provenance::ROWS_CHAIN_GETTERS, "-");
         assert_eq!(getters.escrow_read(&bid), EscrowRead::Authoritative);
         let row = render_order_line(&bid, AS_OF, getters.escrow_read(&bid));
-        assert_eq!(fields(&row).get("escrow"), Some(&"30744"), "{row}");
+        assert_eq!(fields(&row).get("escrow"), Some(&"0.000030744"), "{row}");
 
         // Same row id, same read path, with a swept id recorded: the path still decides, because a
         // getter that returned the record has already proved the book holds it.
@@ -1041,6 +1518,7 @@ mod tests {
 
     /// `dexdo orders expire` decides what it may do BEFORE it sends anything, and it decides with
     /// the same deadline predicate the `expired=` column an operator just read was rendered from.
+
     /// The premature arm is the money-relevant one: an order whose deadline has not passed is
     /// still holding escrow the book will not release, so the refusal names the deadline -- the
     /// operator learns WHEN this becomes possible, and that `cancel` is the way out before then.
@@ -1117,17 +1595,19 @@ mod tests {
     /// buyer-note transactions in the same second, and a replay that emitted nothing because
     /// `_doExpire` took its "already gone" branch -- and `dexdo orders expire` still reported the
     /// removal unconfirmed, because it waited for the row to vanish from the owner's list.
+
     /// That row is designed never to vanish. `InferenceOrderExpired` sets `expired_by_event` and
     /// leaves it in place, so absence alone is the wrong question: the right one
     /// is whether the BOOK said the order left it, which is true of an announced-expired row that
     /// is still listed.
+
     /// `cancel` and `expire` share this one oracle precisely because the answer is asymmetric and
     /// two predicates that must agree are two predicates that can drift. `InferenceOrderCancelled`
     /// IS terminal -- the fold drops the row -- so for a cancel absence is the announcement; for an
     /// expiry it never comes. Both arms are asserted below against the same function.
     #[test]
     fn a_removal_is_confirmed_by_the_books_announcement_not_by_the_row_disappearing() {
-        let announced = dexdo_core::shellnet::LiveBookOrder {
+        let announced = dexdo_core::chain::LiveBookOrder {
             expired_by_event: true,
             ..folded_order(2, true, PAST_DEADLINE)
         };
@@ -1161,14 +1641,16 @@ mod tests {
     }
 
     /// regression, re-armed: the order row carries `escrow`, and it carries it honestly.
+
     /// `cdd7d313` dropped `escrow=` from this formatter on 2026-07-12; `4cb8f496` restored it on
     /// 2026-08-02 but never landed on this branch, so the row shipped without it again. The first
     /// half below is that lost assertion, back on the real formatter.
+
     /// The second half is why the plain restore is not enough. `4cb8f496` printed `order.escrow`
     /// unconditionally, and the default read path is the event fold, which has no escrow to fold --
     /// `fold_snapshot_from_orders` fills a zero. Unconditional rendering therefore prints
     /// `escrow=0` over a bid that is really holding SHELL, which is worse than printing nothing:
-    /// `0` is a legitimate reading(every SELL rests with it), so the operator cannot tell the
+    /// `0` is a legitimate reading (every SELL rests with it), so the operator cannot tell the
     /// filler from the fact. The fold path must say `-`.
     /// E2E-ROW: E2E-ORD-07/L0
     #[test]
@@ -1180,7 +1662,7 @@ mod tests {
         let from_getters = render_order_line(&bid, AS_OF, EscrowRead::Authoritative);
         assert_eq!(
             fields(&from_getters).get("escrow"),
-            Some(&"30744"),
+            Some(&"0.000030744"),
             "an authoritative read must show the escrow the bid is holding: {from_getters}"
         );
 
@@ -1237,6 +1719,20 @@ mod tests {
     #[test]
     fn orders_annotates_its_source_freshness_and_scope() {
         let owner = format!("0:{}", "a".repeat(64));
+        // The INPUT is the legacy spelling and the OUTPUT is the canonical one, because
+        // `render_orders_context` canonicalises on purpose (: "what the client prints is one
+        // form, and made that form the one every command reads back"). This test used to
+        // interpolate `owner` -- its own input -- into both expectations, so it asserted that the
+        // renderer echoed what it was handed, and it went red the moment the renderer started doing
+        // its job. Written out as a literal rather than as `display(&owner)`: calling the canon to
+        // state the expectation would make the assertion agree with whatever that function does,
+        // which is not an assertion at all.
+
+        // changed WHICH canonical form this is. The expectation was `<account>::<account>`,
+        // the self-DApp reconstruction -- but the owner of a resting order is a note, and a note
+        // lives in `DEXDO_DAPP_ID`. The old literal asserted that this command spelled a note
+        // differently from its own neighbouring refusal, which prints `addr::display(note_addr)`.
+        let owner_canonical = format!("{}::{}", dexdo_core::DEXDO_DAPP_ID, "a".repeat(64));
         assert_eq!(
             render_orders_context(
                 &view(crate::cli::provenance::ROWS_CHAIN_EVENTS, "fold-13"),
@@ -1245,7 +1741,7 @@ mod tests {
             ),
             format!(
                 "orders source=chain lastUpdateId=fold-13 as_of=1754006400 \
-                 rows=chain:order-book-events scope=owner-resting-orders owner={owner}"
+                 rows=chain:order-book-events scope=owner-resting-orders owner={owner_canonical}"
             )
         );
         // The legacy getter fallback is a DIFFERENT source and says so.
@@ -1257,12 +1753,15 @@ mod tests {
             ),
             format!(
                 "orders source=chain lastUpdateId=- as_of=1754006400 rows=chain:getters \
-                 scope=owner-resting-orders owner={owner}"
+                 scope=owner-resting-orders owner={owner_canonical}"
             )
         );
     }
 
-    fn order(order_id: u128, price_per_tick: u128, ticks: u128, tc: &str) -> OrderBookOrder {
+    /// The price is given in whole SHELL: the book holds no other kind, and that is how it prints.
+    fn order(order_id: u128, price_shell: u128, ticks: u128, tc: &str) -> OrderBookOrder {
+        let price_per_tick =
+            dexdo_core::price_raw_from_shell(price_shell).expect("whole SHELL price");
         OrderBookOrder {
             order_id,
             owner_note: format!("0:{}", "a".repeat(64)),
@@ -1280,6 +1779,7 @@ mod tests {
     /// The client renders one resting sell offer as one row carrying its whole identity tuple --
     /// order id, side, price, size, deadline and deal -- bound together rather than as independent
     /// substrings satisfiable across two different offers.
+
     /// E2E-ORD-01, tests/e2e/test-specification.md
     /// Partial: the row's L0 half -- the posted order appearing in the book getter with that exact
     /// tuple, and the seller's readiness bound to it -- needs the live book and is not observed
@@ -1383,6 +1883,7 @@ mod tests {
     /// `orders list` renders deadline as a human date-time and computes `expired=yes|no` against
     /// the exact `as_of` value in its context line. Zero, expired, future, and maximal/malformed
     /// boundary inputs may not masquerade as one another after field parsing.
+
     /// E2E-ORD-07, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ORD-07/L0
     #[ignore = "EXPECTED TO FAIL until order rows render a human expiry and an as_of-bound expired field"]
@@ -1460,5 +1961,163 @@ mod tests {
         // Same scope key, different value -- the reason the row sets differ.
         assert!(orders.contains("scope=owner-resting-orders"), "{orders}");
         assert!(market.contains("scope=executable-asks"), "{market}");
+    }
+}
+
+/// a journal write that fails must not take away the confirmation of a settled cancellation.
+
+/// Gated on `test` alone and not on the chain build, so these run in `cargo test --workspace` -- the gate
+/// CI actually executes. The the chain tier is compiled there with `--no-run`, and the defect
+/// this closes is one an operator meets on the money path.
+#[cfg(test)]
+mod issue_1554_a_failed_journal_write_is_an_outcome_not_a_refusal {
+    use super::{subscription_journal_report, PRODUCTION_ENDS_AT};
+
+    /// The `try_acquire` refusal, word for word from `buyer.rs:1050-1056`. It is the first of the
+    /// three sources and the worst: it fires exactly when a buyer is running on this note, and it
+    /// says "no BOC was sent" to an operator whose BOC was sent, accepted and confirmed.
+    fn the_lock_refusal() -> anyhow::Error {
+        anyhow::anyhow!(
+            "buyer note 0:1111 already has another money submission awaiting by-fact \
+             reconciliation; no BOC was sent (/data/note.money: pool lock is already held)"
+        )
+    }
+
+    /// The two outcomes that existed keep their exact words, because operators and scripts read
+    /// this field: a repair that renamed them would be a second defect.
+    #[test]
+    fn the_two_outcomes_that_already_existed_are_unchanged() {
+        assert_eq!(subscription_journal_report(7, Ok(true)).0, "closed");
+        assert_eq!(subscription_journal_report(7, Ok(false)).0, "none");
+        assert!(subscription_journal_report(7, Ok(true)).1.is_none());
+        assert!(subscription_journal_report(7, Ok(false)).1.is_none());
+    }
+
+    /// The repair itself: a failed write yields a value to PRINT, not an error to propagate, and it
+    /// is distinguishable from both of the outcomes that already existed. Before this call
+    /// site was `?`, so there was no third value to ask for -- the line was never reached.
+    #[test]
+    fn a_journal_that_could_not_be_written_is_a_third_printable_outcome() {
+        let (field, reason) = subscription_journal_report(4242, Err(the_lock_refusal()));
+        assert_eq!(
+            field, "not-closed",
+            "a failed journal write must not be reported as either of the outcomes that succeeded"
+        );
+        assert_ne!(field, "closed");
+        assert_ne!(field, "none");
+        assert!(
+            reason.is_some(),
+            "the operator is told the field's value and never why it has that value"
+        );
+    }
+
+    /// The reason says the chain fact first, names the order, carries the underlying failure, and
+    /// warns that the failure's own words were written for a path that submits nothing. That last
+    /// sentence is the whole point: the operator is about to read "no BOC was sent" about a BOC
+    /// that was sent.
+    #[test]
+    fn the_reason_states_the_chain_fact_before_it_repeats_a_message_written_for_another_path() {
+        let (_, reason) = subscription_journal_report(4242, Err(the_lock_refusal()));
+        let reason = reason.expect("a failed write carries its reason");
+        for expected in [
+            "order_id=4242",
+            "confirmed on chain",
+            "only the write to this note's local subscription journal",
+            "dexdo subscription status",
+            "do not describe this one",
+            // the underlying failure survives intact -- it is what the operator acts on
+            "no BOC was sent",
+            "pool lock is already held",
+        ] {
+            assert!(
+                reason.contains(expected),
+                "the journal-failure reason is missing {expected:?}: {reason}"
+            );
+        }
+    }
+
+    /// The wiring, in the production text, because the arms need a chain and cannot run offline.
+
+    /// What is pinned is not an order of lines but a SHAPE: the fallible correction is an ARGUMENT
+    /// of the report, and no `?` stands between the report and the confirmation `println!`. Restore
+    /// the `?` in either form -- on the correction, or on the report -- and this fails.
+    #[test]
+    fn neither_confirming_arm_propagates_the_journal_failure_past_its_confirmation() {
+        let production = include_str!("orders.rs")
+            .split_once(PRODUCTION_ENDS_AT)
+            .expect("orders unit-test module boundary")
+            .0;
+
+        // The window has to prove it can find anything before its emptiness is read as evidence.
+
+        // This is what the defect actually did: it did not refuse, it reported ABSENCE. A second
+        // gated module declared near the top of the file moved the boundary from line 909 to 163,
+        // the `Cancel` arm at 788 fell outside, and the scan below announced a missing string that
+        // nobody had touched. A collapsed window and a genuinely missing arm look identical from
+        // here, so the window is checked against a landmark that must be inside it. Now a collapse
+        // fails loudly and by its own cause.
+        assert!(
+            production.contains("OrdersCommand::Cancel { order_id }"),
+            "the production window does not contain the Cancel arm, so it is not the production \
+             text: the boundary anchor matched something else and every check below would report \
+             absence it cannot distinguish from a collapsed window ({} bytes of {})",
+            production.len(),
+            include_str!("orders.rs").len()
+        );
+
+        for (arm, printed) in [
+            ("OrdersCommand::Cancel { order_id }", "\"cancel confirmed"),
+            ("OrdersCommand::Expire { order_id }", "\"expire confirmed"),
+        ] {
+            let body = production.split_once(arm).expect("the arm").1;
+            let end = body.find("\n        OrdersCommand::").unwrap_or(body.len());
+            let body = &body[..end];
+            let reports_at = body
+                .find("subscription_journal_report(")
+                .unwrap_or_else(|| panic!("{arm}: the journal outcome must be reported, not `?`d"));
+            let prints_at = body
+                .find(printed)
+                .unwrap_or_else(|| panic!("{arm}: the arm must print its confirmation"));
+            assert!(
+                reports_at < prints_at,
+                "{arm}: the confirmation is printed before the journal outcome it reports"
+            );
+            let folded = &body[reports_at..prints_at];
+            assert!(
+                folded.contains("mark_cancelled_subscription_order_terminal("),
+                "{arm}: the correction is not the argument this report is built from: {folded}"
+            );
+            assert!(
+                !folded.contains('?'),
+                "{arm}: a `?` between the journal correction and the confirmation takes the \
+                 confirmation away from an operator whose refund has already landed: {folded}"
+            );
+        }
+    }
+
+    /// the argument check comes BEFORE the manifest is read.
+
+    /// Hoisting `manifest_path()` to the top of the command to stop re-reading it put an
+    /// environment read in front of the `--note-addr` refusal, so a command that was going to be
+    /// refused on its arguments reported a missing deployment instead. The sibling guards in
+    /// `buyer.rs` and `markets.rs` cover their own early returns; this one was left uncovered, and
+    /// the review found it there.
+    #[test]
+    fn the_note_addr_check_comes_before_the_manifest_is_read() {
+        let body = crate::cli::source_probe::code_of(
+            include_str!("orders.rs"),
+            "pub(crate) async fn run_orders(args: OrdersArgs)",
+        );
+        let argument = body
+            .find("orders requires --note-addr")
+            .expect("the argument refusal is in this command");
+        let manifest = body
+            .find("let manifest_path = crate::cli::commands::manifest_path()?;")
+            .expect("the manifest path is bound once");
+        assert!(
+            argument < manifest,
+            "a missing --note-addr would be reported as a missing manifest: the manifest is read \
+             at {manifest}, before the argument check at {argument}"
+        );
     }
 }

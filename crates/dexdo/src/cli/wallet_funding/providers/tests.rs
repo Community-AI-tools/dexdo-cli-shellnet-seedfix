@@ -1,5 +1,6 @@
 //! recognising OUR request in a Vault's queue, and the instructions the request-less
 //! providers print.
+
 //! Recognition is the half of repeat safety the journal cannot supply on its own. A matcher that is
 //! too loose adopts somebody else's transaction and never makes our own; one that is too strict
 //! fails to see our own and makes a second. Both are money errors, in opposite directions.
@@ -167,7 +168,7 @@ fn a_destination_compares_equal_across_the_spellings_the_chain_uses() {
 fn direct_request(provider: WalletProvider) -> FundingRequest {
     FundingRequest {
         provider,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         vault_address: None,
         hot_address: format!("{}::{}", hex64(0xa1), hex64(0xa1)),
         hot_dapp_id: hex64(0xa1),
@@ -187,16 +188,24 @@ fn the_direct_providers_refuse_to_serve_a_provider_that_has_a_vault() {
 }
 
 #[test]
-fn the_goshai_instruction_names_the_shortfall_the_address_and_the_one_link() {
+fn the_goshai_instruction_names_the_shortfall_and_the_address_and_carries_no_link() {
     let provider = DirectTopUpProvider::new(WalletProvider::GoshAi).expect("provider");
     let request = direct_request(WalletProvider::GoshAi);
     let instruction = provider.manual_instruction(&request);
-    assert!(instruction.contains("600 raw ECC[2] SHELL"), "{instruction}");
+    assert!(instruction.contains("0.0000006 SHELL"), "{instruction}");
     assert!(instruction.contains(&request.hot_address), "{instruction}");
-    assert!(
-        instruction.contains(crate::cli::wallet_goshai::GOSHAI_PLACEHOLDER_URL),
-        "the Gosh.ai flow must point at the one link the onboarding flow prints: {instruction}"
-    );
+    // the placeholder link is gone from this sentence -- Gosh.ai's address is the
+    // manifest's to state, and a second copy in a second surface is how the two drift apart.
+    // No link, in any spelling: a schemeless `gosh.ai/subscription` is a link an operator types
+    // into a browser just as readily as one with a scheme, so `http` alone would not hold this.
+    for shaped_like_a_link in ["http", "www.", "gosh.ai/"] {
+        assert!(
+            !instruction.contains(shaped_like_a_link),
+            "the top-up instruction carries a link again ({shaped_like_a_link:?}). Where Gosh.ai \
+             lives is the manifest's to say, and a second copy in a second surface is how the two \
+             come to disagree: {instruction}"
+        );
+    }
 }
 
 #[test]
@@ -204,7 +213,7 @@ fn the_manual_instruction_offers_no_link_and_no_vault() {
     let provider = DirectTopUpProvider::new(WalletProvider::Manual).expect("provider");
     let request = direct_request(WalletProvider::Manual);
     let instruction = provider.manual_instruction(&request);
-    assert!(instruction.contains("600 raw ECC[2] SHELL"), "{instruction}");
+    assert!(instruction.contains("0.0000006 SHELL"), "{instruction}");
     assert!(instruction.contains(&request.hot_address), "{instruction}");
     assert!(
         !instruction.contains("http") && !instruction.to_lowercase().contains("vault"),

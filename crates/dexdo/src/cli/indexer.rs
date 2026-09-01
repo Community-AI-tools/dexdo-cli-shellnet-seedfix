@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use dexdo_core::params::{DEFAULT_INDEXER_URL, INDEXER_ERROR_BODY_MAX_BYTES};
+use dexdo_core::params::INDEXER_ERROR_BODY_MAX_BYTES;
 use reqwest::Url;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
@@ -168,12 +168,103 @@ impl IndexerClient {
     }
 }
 
-pub(crate) fn resolve_base_url(explicit: Option<&str>) -> Result<String> {
-    let raw = match explicit {
-        Some(value) => value.to_string(),
-        None => std::env::var(INDEXER_URL_ENV).unwrap_or_else(|_| DEFAULT_INDEXER_URL.to_string()),
+/// What a deployed-contracts manifest says about the indexer: the chain it is for, and an indexer of
+/// its own if it names one.
+
+/// Read from the raw JSON rather than through `dexdo_core::Deployed`, which used to be compiled only
+/// behind the cargo feature removed. `market-data` signs nothing and ships in the default
+/// build, so its manifest read has to as well.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManifestIndexer {
+    network: String,
+    indexer: Option<String>,
+}
+
+impl ManifestIndexer {
+    pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read the manifest {}", path.display()))?;
+        Self::from_json(&text)
+            .with_context(|| format!("manifest {}", path.display()))
+    }
+
+    pub(crate) fn from_json(text: &str) -> Result<Self> {
+        let json: serde_json::Value =
+            serde_json::from_str(text).context("parse deployed-contracts manifest JSON")?;
+        let network = json
+            .get("network")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "deployed-contracts manifest has no `network` field, so there is nothing to say \
+                     which chain its addresses are on"
+                )
+            })?;
+        Ok(Self {
+            network: network.to_string(),
+            indexer: json
+                .get("indexer")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        })
+    }
+}
+
+/// The market-data indexer this run reads, in descending order of authority: `--indexer-url`, the
+/// `DEXDO_INDEXER_URL` environment fallback, the manifest's own `indexer` field, and only then the
+/// indexer of the network the manifest declares.
+
+/// **A network label is not an indexer address, and an indexer is not network-agnostic.**
+/// One compile-time default answered for every manifest, so pointing the CLI at mainnet listed the
+/// one chain's acceptance book as another's, under a header that names only the indexer host. An
+/// indexer serves one chain; when the declared network has none this tree knows, that is a refusal,
+/// because a market address taken from the wrong chain's list does not exist on the chain the
+/// operator is about to spend on.
+
+/// With no manifest the operator named no network, so the documented default still answers.
+pub(crate) fn resolve_base_url(
+    explicit: Option<&str>,
+    manifest: Option<&ManifestIndexer>,
+) -> Result<String> {
+    resolve_base_url_with_env(
+        explicit,
+        manifest,
+        std::env::var(INDEXER_URL_ENV).ok().as_deref(),
+    )
+}
+
+/// The same order with the environment supplied rather than read, so the decision can be pinned
+/// without a test depending on the environment the suite happens to run in.
+pub(crate) fn resolve_base_url_with_env(
+    explicit: Option<&str>,
+    manifest: Option<&ManifestIndexer>,
+    env: Option<&str>,
+) -> Result<String> {
+    if let Some(value) = explicit {
+        return normalize_base_url(value);
+    }
+    if let Some(value) = env {
+        return normalize_base_url(value);
+    }
+    let Some(manifest) = manifest else {
+        anyhow::bail!(
+            "no manifest, so no network, so no indexer. An indexer answers for ONE chain and this \
+             run cannot say which chain it is on: point {} at a manifest, pass `--indexer-url \
+             <url>`, or set `{INDEXER_URL_ENV}`.",
+            dexdo_core::params::MANIFEST_PATH_VAR
+        );
     };
-    normalize_base_url(&raw)
+    if let Some(indexer) = manifest.indexer.as_deref() {
+        return normalize_base_url(indexer);
+    }
+    anyhow::bail!(
+        "the manifest declares network `{}` and carries no `indexer`, so nothing says who to ask. \
+         An indexer answers for ONE chain, and there is no table of known indexers to fall back \
+         on: answering from another chain's would list books that do not exist on `{}`. Pass \
+         `--indexer-url <url>`, set `{INDEXER_URL_ENV}`, or add an `indexer` field to the manifest.",
+        manifest.network,
+        manifest.network
+    )
 }
 
 pub(crate) fn timeout_from_ms(timeout_ms: u64) -> Result<Duration> {
@@ -379,7 +470,10 @@ fn validate_optional_address(name: &str, value: Option<&str>) -> Result<()> {
 
 fn validate_address(name: &str, value: &str) -> Result<()> {
     dexdo_core::address::CanonicalAddress::parse(value)
-        .map_err(|error| anyhow::anyhow!("{name} `{value}` is not a valid shellnet address: {error}"))?;
+        .map_err(|error| anyhow::anyhow!(
+            "{name} `{value}` is not a valid {} address: {error}",
+            dexdo_core::params::current_network()
+        ))?;
     Ok(())
 }
 
@@ -413,6 +507,11 @@ mod indexer_depth_provenance_1043;
 
 #[cfg(test)]
 mod tests {
+    /// A stand-in indexer address for rendering tests. Deliberately not a real network's: what is
+    /// under test is the TABLE, and a live host in a fixture is how a network name gets back into
+    /// the sources.
+    const TEST_INDEXER_URL: &str = "http://indexer.example:8080";
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -475,12 +574,12 @@ mod tests {
         let response = parse_markets_json(markets_fixture().as_bytes()).unwrap();
         assert_eq!(response.markets.len(), 1);
         assert_eq!(response.markets[0].model.ref_, "qwen--qwen3--32b");
-        let rendered = render_markets_table(&response, DEFAULT_INDEXER_URL);
+        let rendered = render_markets_table(&response, TEST_INDEXER_URL);
         assert_eq!(
             rendered,
             format!(
                 concat!(
-                    "market_data source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 server_time=1782897900000 count=1 has_more=true next_cursor=MTc4Mjg4NDY0MTAwMDAwMDo0\n",
+                    "market_data source=indexer endpoint=http://indexer.example:8080 server_time=1782897900000 count=1 has_more=true next_cursor=MTc4Mjg4NDY0MTAwMDAwMDo0\n",
                     "market address={address} model_ref=qwen--qwen3--32b producer=- name=- version=- status=TRADING quote_asset=SHELL maker_commission=-0.02 taker_commission=0.025 price_precision=9 quantity_precision=0 tick_size=0.000000001 step_size=1 min_notional=0.000000001 reference_price=- created_at=1782897852\n"
                 ),
                 address = canonical_address()
@@ -491,12 +590,12 @@ mod tests {
     #[test]
     fn parses_depth_fixture_and_renders_table() {
         let response = parse_depth_json(depth_fixture().as_bytes()).unwrap();
-        let rendered = render_depth_table(&response, DEFAULT_INDEXER_URL);
+        let rendered = render_depth_table(&response, TEST_INDEXER_URL);
         assert_eq!(
             rendered,
             format!(
                 concat!(
-                    "depth source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 address={address} last_update_id=1782897900:7 bid_levels=1 ask_levels=2\n",
+                    "depth source=indexer endpoint=http://indexer.example:8080 address={address} last_update_id=1782897900:7 bid_levels=1 ask_levels=2\n",
                     "bid price_per_tick=1000 ticks=4\n",
                     "ask price_per_tick=1100 ticks=2\n",
                     "ask price_per_tick=1200 ticks=1\n"
@@ -535,8 +634,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            render_markets_table(&response, DEFAULT_INDEXER_URL),
-            "market_data source=indexer endpoint=http://dodex-dev.ackinacki.org:8080 server_time=1 count=0 has_more=false next_cursor=-\nmarkets none=true\n"
+            render_markets_table(&response, TEST_INDEXER_URL),
+            "market_data source=indexer endpoint=http://indexer.example:8080 server_time=1 count=0 has_more=false next_cursor=-\nmarkets none=true\n"
         );
     }
 

@@ -1,8 +1,10 @@
 //! the `dexdo accumulator` parse surface and the plan it hands the money path.
+
 //! These drive the REAL command entry - `Cli::try_parse_from` into the same argument structs the
 //! handlers receive, and then the same planner the handlers call - rather than asserting on a
 //! helper. Before this feature existed every one of them failed at the parse: `accumulator` was not
 //! a subcommand.
+
 //! What they are guarding is narrow and specific. The accumulator's sell side accepts ONLY four
 //! exact lot sizes, refuses anything else AFTER `tvm.accept()` (so a wrong figure is not a cheap
 //! bounce), and offers no cancel and no timeout once a deposit lands. Every refusal below is
@@ -117,7 +119,7 @@ fn naming_a_wallet_requires_naming_its_key() {
         "10",
         "--multisig-address",
         "0:ab",
-        "--multisig-key",
+        "--multisig-private-key",
         "k.hex"
     ])
     .is_ok());
@@ -130,7 +132,7 @@ fn naming_a_wallet_requires_naming_its_key() {
         "10",
         "--multisig-address",
         "0:ab",
-        "--multisig-key",
+        "--multisig-private-key",
         "k.hex",
         "--multisig-seed-file",
         "s.txt"
@@ -140,7 +142,7 @@ fn naming_a_wallet_requires_naming_its_key() {
 
 #[test]
 fn claiming_one_lot_needs_both_halves_of_its_identity() {
-    // A lot is identified by(denomination, order id) and by nothing else, so half of that pair
+    // A lot is identified by (denomination, order id) and by nothing else, so half of that pair
     // names no lot at all.
     assert!(Cli::try_parse_from(["dexdo", "accumulator", "claim", "--denom", "10"]).is_err());
     assert!(Cli::try_parse_from(["dexdo", "accumulator", "claim", "--order-id", "7"]).is_err());

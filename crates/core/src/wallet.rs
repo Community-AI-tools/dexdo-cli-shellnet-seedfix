@@ -1,18 +1,20 @@
 //! Wallet-address handling. A single parse/normalize for the operator wallet address, so the
 //! canonical display form is not re-parsed at every call site and is rejected fail-loud on bad input.
+
 //! The two accepted forms and the parsing itself live in [`crate::address`]; this stays the
 //! wallet-flavoured entry point that yields the contract-parameter form.
 
 use crate::address::CanonicalAddress;
 
 /// Normalize a wallet address to the contract-parameter form `0:<account>`. Accepts:
-/// - the canonical `<dapp_id>::<account_id>` display form -- **two 64-hex(256-bit) halves**; the account
+/// - the canonical `<dapp_id>::<account_id>` display form -- **two 64-hex (256-bit) halves**; the account
 /// is the **second** half, so `<dapp_id>::<account_id>` -> `0:<account_id>`. The DApp id is not
 /// part of a contract address parameter and is dropped **here only**; output that a user reads goes
 /// through [`crate::address::display`], which puts it back;
 /// - the legacy `0:<hex>` where the account is **exactly 64 hex chars**.
-/// Anything else -- a short/over-long account(not a valid TVM `0:<account>`), a bare hex without a `0:`
-/// prefix, non-hex, missing/extra halves -- is a **fail-loud** error(the repo convention). The output is
+
+/// Anything else -- a short/over-long account (not a valid TVM `0:<account>`), a bare hex without a `0:`
+/// prefix, non-hex, missing/extra halves -- is a **fail-loud** error (the repo convention). The output is
 /// always lowercase `0:<64 hex>`, ready to drop into `dest`/address contract parameters; a malformed address
 /// is rejected here at the shared boundary rather than reaching money-path JSON.
 pub fn normalize_wallet_address(s: &str) -> Result<String, String> {
@@ -22,11 +24,13 @@ pub fn normalize_wallet_address(s: &str) -> Result<String, String> {
 }
 
 /// Normalize a multisig custodian public key to the comparable 64-hex lowercase form.
+
 /// `getCustodians` renders `owner_pubkey` as an unsigned 256-bit integer, so a key whose leading
 /// bytes are zero comes back short and with an `0x` prefix, while a key derived locally is bare and
 /// already 64 chars. Comparing the two textually without this is how a custodian that IS ours reads
 /// as "not a custodian". The answer decides whether a wallet we cannot sign for gets recorded.
-/// `None` = not a public key at all(empty, over-long, non-hex), which callers must treat as a
+
+/// `None` = not a public key at all (empty, over-long, non-hex), which callers must treat as a
 /// mismatch rather than coerce.
 pub fn normalize_multisig_pubkey(pubkey: &str) -> Option<String> {
     let pubkey = pubkey.trim();
@@ -83,7 +87,7 @@ mod tests {
         std::iter::repeat_n(c, 64).collect()
     }
 
-    /// `<dapp_id>::<account_id>` with full 64-hex halves -> `0:<account_id>`(the second half), lowercased;
+    /// `<dapp_id>::<account_id>` with full 64-hex halves -> `0:<account_id>` (the second half), lowercased;
     /// `::`-spaces trimmed.
     #[test]
     fn half1_half2_takes_second_half_lowercased() {
@@ -114,14 +118,14 @@ mod tests {
         );
     }
 
-    /// Fail loud -- including **short forms**(not a 64-hex account is NOT a valid `0:<account>`): bare hex,
+    /// Fail loud -- including **short forms** (not a 64-hex account is NOT a valid `0:<account>`): bare hex,
     /// non-hex, empty, `0:` without account, `a::b::c`, and wrong-length halves/accounts.
     #[test]
     fn garbage_and_short_forms_fail_loud() {
         let h = h64('a');
         for bad in [
             "",
-            "aaaa::bbbb", // short halves(4 hex) -- not valid addresses
+            "aaaa::bbbb", // short halves (4 hex) -- not valid addresses
             "aaaa :: BEEF",
             "0:dead", // short account
             "0:BeEf",

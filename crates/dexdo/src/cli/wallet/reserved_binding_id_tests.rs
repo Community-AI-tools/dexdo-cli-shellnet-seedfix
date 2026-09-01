@@ -1,16 +1,21 @@
 //! the id in `binding.json` is the id the store RESERVED, and the secrets it points at are
 //! reachable through it.
+
 //! # The defect these hold shut
+
 //! A live `dexdo wallet onboard manual` printed one id and recorded another. The store reserved
 //! `bca689...` and created `wallet/bindings/bca689.../` for it; the command printed that id and
 //! that directory; and `binding.json` came out holding `01fb5703...`, an id with no directory
 //! anywhere on disk. The active binding therefore named a directory that did not exist, while the
 //! directory that did exist was referenced by nothing.
+
 //! That is money-path damage, not a cosmetic mismatch. `binding-id` is minted before any key
 //! precisely so that re-binding the same provider writes beside the previous binding's secrets
 //! instead of over them, and so that the secrets of a Hot that still holds funds are reachable from
 //! the record that names it. Two ids per onboarding voids both halves at once.
+
 //! # Why the assertions are about the FILESYSTEM
+
 //! Every check below resolves the id `binding.json` actually holds into a path and then asks the
 //! filesystem whether that path is there. Comparing two strings, or asserting that both are
 //! non-empty, is exactly the check the shipped code would have passed while stranding the key.
@@ -28,10 +33,10 @@ fn store() -> (tempfile::TempDir, WalletStore) {
 /// The binding a provider flow returns, carrying whichever id it decided on.
 fn binding_with(id: &str, key: Option<PathBuf>) -> WalletBinding {
     WalletBinding {
+        network: crate::cli::wallet::test_network_a(),
         version: BINDING_VERSION,
         id: id.to_string(),
         provider: WalletProvider::Manual,
-        network: WalletNetwork::Shellnet,
         hot_address: "4::0000000000000000000000000000000000000000000000000000000000000001"
             .to_string(),
         vault_address: None,
@@ -46,7 +51,7 @@ fn binding_with(id: &str, key: Option<PathBuf>) -> WalletBinding {
 /// id the test happened to pass in.
 fn recorded_secrets_dir(store: &WalletStore) -> (String, PathBuf) {
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(WalletNetwork::Shellnet)).expect("read binding.json"))
+        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read binding.json"))
             .expect("binding.json is json");
     let id = json["id"].as_str().expect("binding.json has an id").to_string();
     let dir = store.bindings_dir().join(&id);
@@ -55,7 +60,7 @@ fn recorded_secrets_dir(store: &WalletStore) -> (String, PathBuf) {
 
 fn recorded_key_file(store: &WalletStore) -> PathBuf {
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(WalletNetwork::Shellnet)).expect("read binding.json"))
+        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read binding.json"))
             .expect("binding.json is json");
     PathBuf::from(
         json["hot_key_file"]
@@ -74,6 +79,7 @@ fn key_in(dir: &Path) -> PathBuf {
 
 /// The property the live run broke: the id `binding.json` holds names a directory that EXISTS, and
 /// the key the binding references lives inside that directory.
+
 /// Resolved from the file's own id and answered by the filesystem, so a binding recording a second
 /// id fails here on the directory that is not there -- which is the exact shape of the defect.
 #[test]
@@ -113,6 +119,7 @@ fn the_recorded_binding_id_names_the_reserved_directory_holding_its_key() {
 }
 
 /// The mutation itself, driven through the real commit path: a flow that mints a SECOND id.
+
 /// Nothing may be written. Recording that binding is what left the operator with a funded Hot whose
 /// key the active binding could not reach, and the reserved directory -- which holds the key -- must
 /// survive untouched so a retry still finds it.
@@ -133,7 +140,7 @@ fn a_flow_that_mints_a_second_id_is_refused_and_writes_nothing() {
     );
 
     assert!(
-        store.load_active(WalletNetwork::Shellnet).expect("load").is_none(),
+        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").is_none(),
         "nothing may be recorded when the id does not name the reserved directory"
     );
     assert!(
@@ -171,11 +178,11 @@ fn a_second_id_on_a_rebind_leaves_the_previous_binding_active_and_resolvable() {
         .expect_err("a rebind to an id that names no directory must be refused");
 
     assert_eq!(
-        store.load_active(WalletNetwork::Shellnet).expect("load").expect("present"),
+        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
         previous,
         "the refusal must not replace the binding it was going to replace"
     );
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("the previous binding still resolves as the funding wallet");
     assert_eq!(resolved.address, "4::hot-previous");
     assert_eq!(resolved.key, Some(previous_key));
@@ -183,6 +190,7 @@ fn a_second_id_on_a_rebind_leaves_the_previous_binding_active_and_resolvable() {
 
 /// The manual provider's own half of the plumbing: the id it is HANDED is the id it records, minted
 /// nowhere in between.
+
 /// This is the function the live `wallet onboard manual` reaches with the draft's id, and it is the
 /// point at which the flow used to substitute a fresh one.
 #[test]
@@ -200,7 +208,7 @@ fn the_manual_provider_records_the_id_it_was_handed() {
     let verified = verify_manual_hot_wallet(
         "0000000000000000000000000000000000000000000000000000000000000004::\
          1111111111111111111111111111111111111111111111111111111111111111",
-        WalletNetwork::Shellnet,
+        crate::cli::wallet::test_network_a(),
         ManualSecretRef {
             kind: ManualSecretKind::Key,
             path: secret,

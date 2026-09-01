@@ -3,8 +3,8 @@
   "generated_at": 1700000000,
   "proof_level": "chain_event_observed",
   "network": {
-    "name": "shellnet",
-    "chain_endpoint": "https://shellnet.example",
+    "name": "net-a",
+    "chain_endpoint": "https://net-a.example",
     "contracts_generation": "4.0.29"
   },
   "token_contract": {
@@ -44,6 +44,19 @@
     "message_id": null,
     "created_at": null,
     "indexer_order": null
+  },
+  "outcome": {
+    "status": "undetermined",
+    "amount": null,
+    "source": null,
+    "deal_amount": null,
+    "note_amount": null,
+    "note_credits": [],
+    "notes_read": [],
+    "missing": [
+      "chain_read_unavailable",
+      "counterparty_note_unidentified"
+    ]
   },
   "settlement_sequence": [],
   "withdrawal": {

@@ -1,4 +1,5 @@
 //! Data-source and freshness annotation for the read-only order-book views.
+
 //! `dexdo orders list` and `dexdo market` read the same book through different paths and show
 //! different subsets of it, so they legitimately disagree. Until now neither said where its rows
 //! came from or how fresh they were, so the divergence read as contradictory truth (, third
@@ -6,17 +7,17 @@
 //! the same keys with the same meaning, so a difference reads as "different scope" or "indexer lag"
 //! rather than "one of these is lying".
 
-/// Rows folded from the order book's own chain events(authoritative).
+/// Rows folded from the order book's own chain events (authoritative).
 pub(crate) const ROWS_CHAIN_EVENTS: &str = "chain:order-book-events";
-/// Rows read through the legacy contract getters(the fallback when the event fold is unavailable).
+/// Rows read through the legacy contract getters (the fallback when the event fold is unavailable).
 pub(crate) const ROWS_CHAIN_GETTERS: &str = "chain:getters";
 /// Aggregated bid/ask levels returned by the indexer depth endpoint.
 pub(crate) const ROWS_INDEXER_DEPTH: &str = "indexer:depth-levels";
-/// Only the querying note's own resting orders(`orders list`).
+/// Only the querying note's own resting orders (`orders list`).
 pub(crate) const SCOPE_OWNER_RESTING: &str = "owner-resting-orders";
-/// Only asks a buy could actually match(`market`).
+/// Only asks a buy could actually match (`market`).
 pub(crate) const SCOPE_EXECUTABLE_ASKS: &str = "executable-asks";
-/// Raw indexer levels; neither expiry nor TokenContract liveness is applied(`market-data depth`).
+/// Raw indexer levels; neither expiry nor TokenContract liveness is applied (`market-data depth`).
 pub(crate) const SCOPE_RAW_INDEXER_LEVELS_UNGATED: &str =
     "raw-indexer-levels-ungated";
 
@@ -39,7 +40,8 @@ pub(crate) fn now_unix() -> Result<u64, dexdo_core::ChainError> {
 }
 
 /// The provenance suffix, in ONE vocabulary so the views can be compared key for key.
-/// * `source` -- where the freshness marker came from: `indexer`(lags the chain by design) or
+
+/// * `source` -- where the freshness marker came from: `indexer` (lags the chain by design) or
 /// `chain`.
 /// * `last_update_id` -- that marker, `-` when the source does not publish one.
 /// * `as_of` -- Unix seconds at which this snapshot was read.

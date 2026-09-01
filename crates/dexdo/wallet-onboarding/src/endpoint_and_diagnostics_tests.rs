@@ -22,21 +22,21 @@ fn sdk_write_base(endpoint: &str) -> String {
 fn a_scheme_less_endpoint_cannot_reach_the_authprofile_write() {
     // Why the guard has to exist: the same bare host that reads fine writes over plain http.
     assert_eq!(
-        sdk_write_base("dd-mainnet.ackinacki.org"),
-        "http://dd-mainnet.ackinacki.org/v2/",
+        sdk_write_base("net-b.example"),
+        "http://net-b.example/v2/",
         "a bare host puts the AuthProfile write on plain http, which the edge answers 405"
     );
     assert_eq!(
-        sdk_write_base("https://dd-mainnet.ackinacki.org"),
-        "https://dd-mainnet.ackinacki.org/v2/"
+        sdk_write_base("https://net-b.example"),
+        "https://net-b.example/v2/"
     );
 
     // So the constructor refuses one instead of carrying it to the write.
     for bare in [
-        "dd-mainnet.ackinacki.org",
-        "dd-shellnet.ackinacki.org",
-        "  dd-mainnet.ackinacki.org  ",
-        "dd-mainnet.ackinacki.org/graphql",
+        "net-b.example",
+        "net-a.example",
+        "  net-b.example  ",
+        "net-b.example/graphql",
     ] {
         let error = CanonicalBeeSessionIo::new(bare)
             .err()
@@ -50,7 +50,7 @@ fn a_scheme_less_endpoint_cannot_reach_the_authprofile_write() {
         );
     }
 
-    assert!(CanonicalBeeSessionIo::new("https://dd-mainnet.ackinacki.org").is_ok());
+    assert!(CanonicalBeeSessionIo::new("https://net-b.example").is_ok());
     assert!(CanonicalBeeSessionIo::new("http://127.0.0.1:8033").is_ok());
     assert!(CanonicalBeeSessionIo::new("   ").is_err());
 }

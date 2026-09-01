@@ -32,10 +32,13 @@ pub const AGENT_WALLETS_BODY_VERSION: u8 = 1;
 const DEXDO_CLI_BEE_APP_ID: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000078";
 /// The onboarding intent this CLI declares on its connect deeplink, verbatim as the wallet reads it.
+
 /// An EXTERNAL query parameter on the final link, deliberately not a `ConnectPayload` field: the
 /// payload is the bee-authenticated part of the invitation and its shape belongs to bee, while this
 /// is a routing hint the wallet reads straight off the URL it was opened with. On seeing it the
+
 /// arrives. It authorises nothing and starts no deployment.
+
 /// `DEXDO_CLI_BEE_APP_ID` stays exactly as it was: it still identifies DEXDO CLI and names it in the
 /// wallet, it just no longer decides which onboarding flow the wallet opens.
 pub const AGENT_ONBOARD_INTENT_QUERY: &str = "intent=agent_onboard";
@@ -124,6 +127,7 @@ pub enum SessionPhase {
     },
     Complete {
         /// The `AuthProfile` address of the authenticated `wallet_hello`, kept rather than dropped.
+
         /// It is the one non-secret identity the completed onboarding proved, and completion used
         /// to discard it: `ResponseReceived` carried it and `Complete` did not, so a finished
         /// session no longer knew which profile it had been onboarded through. Defaulted for
@@ -144,6 +148,7 @@ pub struct PreparedRequest {
     pub profile_address: String,
     /// The multifactor wallet address from the authenticated `wallet_hello`, carried but never
     /// sent.
+
     /// It has to travel with the request because that is the only durable state between the hello
     /// that proves it and the completion that records it: the invitation is spent and cannot be
     /// scanned twice, so an onboarding resumed after a restart would otherwise finish without it.
@@ -194,8 +199,16 @@ impl OnboardingSession {
                 limits.agent_name_max_chars
             );
         }
-        if network != "shellnet" && network != "mainnet" {
-            bail!("wallet onboarding network must be exactly `shellnet` or `mainnet`");
+        // this used to admit exactly two labels by name, which made a binding for any
+        // chain deployed later impossible to express -- and the two names were written here, in a
+        // crate that never reads a manifest and so has no way to know what is deployed. What a
+        // label must be is non-empty: it keys the binding file, and an empty key cannot be told
+        // apart from any other.
+        if network.trim().is_empty() {
+            bail!(
+                "wallet onboarding network must name the chain this binding is for; the manifest's \
+                 `network` field is what says which"
+            );
         }
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
@@ -257,8 +270,12 @@ impl OnboardingSession {
         if self.agent_name.trim().is_empty() {
             bail!("wallet onboarding state has an empty agent name");
         }
-        if self.network != "shellnet" && self.network != "mainnet" {
-            bail!("wallet onboarding state has an unsupported network");
+        // reading a saved session used to admit exactly two labels, so a session recorded
+        // against any other chain was refused on LOAD -- after it had been written, with the money
+        // already committed. The label is a key, not a permission: it must be there, and that is all
+        // this crate can honestly check about it.
+        if self.network.trim().is_empty() {
+            bail!("wallet onboarding state names no network, so nothing says which chain it is for");
         }
         if self.endpoint.trim().is_empty() {
             bail!("wallet onboarding state has an empty endpoint");
@@ -331,6 +348,7 @@ impl OnboardingSession {
     }
 
     /// The `AuthProfile` address this session was onboarded through, once one has been proved.
+
     /// Available in both phases that hold it, so a caller that resumes straight into `complete`
     /// reads the same value as one that has just consumed the response. Empty is reported as
     /// absent: a state file written before the address was retained carries no address at all,
@@ -349,6 +367,7 @@ impl OnboardingSession {
     }
 
     /// The multifactor wallet address the `wallet_hello` carried, on the same terms.
+
     /// A DIFFERENT value from [`Self::profile_address`] -- one is the Connect `AuthProfile`, this
     /// one is the wallet -- and optional: a wallet that sends no address is not a failed
     /// onboarding, so this answers `None` rather than refusing.
@@ -529,12 +548,14 @@ pub trait BeeSessionIo {
 }
 
 /// Render a bee onboarding failure from its structured cause instead of its one-line message.
+
 /// Both failing layers carry far more than `message`. `bee_connect` returns an `AppError` with
 /// `kind`, `module`, `error_code`, `details` and the raw `tvm_error`; `ackinacki_kit` returns a
 /// `KitError` that the same `AppError` already knows how to absorb, lifting the TVM code and the
 /// computed-phase exit code into `details`. Reporting only `message` collapses "TVM code 12, HTTP
 /// 405 on /v2/messages" into the words "Send message", which an operator cannot tell apart from a
 /// service outage.
+
 /// `secrets` are scrubbed from the finished string unconditionally, and this is the only exit from
 /// this function: a transport error is free to quote the request it could not send, and neither the
 /// session's signing secret, nor its DH secrets, nor the encrypted envelope may reach a log.
@@ -566,6 +587,7 @@ fn redact(mut text: String, secrets: &[&str]) -> String {
 }
 
 /// The values that decide whether a delivered message actually executed, quoted as they came back.
+
 /// `aborted` and `exit_code` are `Option`, and the distinction between "the node said false" and
 /// "the node said nothing" is exactly what tells a rejected message from an unread receipt, so the
 /// absent case is reported as `unknown` rather than folded into a default.
@@ -595,6 +617,7 @@ impl CanonicalBeeSessionIo {
     /// The endpoint must already be absolute. This constructor refuses a bare host rather than
     /// repairing one, because the repair belongs at the command boundary and must happen exactly
     /// once -- a second normaliser here could disagree with the one that wrote the durable state.
+
     /// A bare host is not merely untidy, it is the difference between reading and writing.
     /// `ServerLink::new` picks the REST base -- the `/v2/` prefix that carries `/v2/messages`, the
     /// only way an `AuthProfile` write leaves this process -- with
@@ -1165,6 +1188,7 @@ fn is_hex64(value: &str) -> bool {
 }
 
 /// Append [`AGENT_ONBOARD_INTENT_QUERY`] to a connect deeplink, exactly once.
+
 /// Idempotent on purpose: the final link is what gets persisted in the durable session state, so a
 /// resumed onboarding reads back a link that already declares the intent and must not grow a second
 /// copy of it. Compared parameter-wise rather than by substring, so a payload that happens to spell
@@ -1197,7 +1221,7 @@ fn placeholder_response() -> AgentWalletsResponse {
     };
     AgentWalletsResponse {
         version: AGENT_WALLETS_BODY_VERSION,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         vault: address.clone(),
         hot: address,
     }
@@ -1260,8 +1284,8 @@ mod tests {
         let nonce = signing_public(vault_secret());
         let session = OnboardingSession::create(
             "test-agent",
-            "shellnet",
-            "dd-shellnet.ackinacki.org",
+            "net-a",
+            "net-a.example",
             &hot_public,
             None,
             &nonce,
@@ -1305,8 +1329,8 @@ mod tests {
         let nonce = hex::encode(nonce_key.verifying_key().to_bytes());
         let session = OnboardingSession::create(
             "test-agent",
-            "shellnet",
-            "dd-shellnet.ackinacki.org",
+            "net-a",
+            "net-a.example",
             &hot_public,
             distinct_vault.then_some(vault_public.as_str()),
             &nonce,
@@ -1497,8 +1521,8 @@ mod tests {
         let session = OnboardingSession {
             file_version: SESSION_FILE_VERSION,
             agent_name: "test-agent".to_string(),
-            network: "shellnet".to_string(),
-            endpoint: "dd-shellnet.ackinacki.org".to_string(),
+            network: "net-a".to_string(),
+            endpoint: "net-a.example".to_string(),
             hot_pubkey: fixture.hot_public.clone(),
             vault_pubkey: distinct_vault.then_some(fixture.vault_public.clone()),
             phase: SessionPhase::RequestPrepared {
@@ -1584,7 +1608,7 @@ mod tests {
     fn valid_response_body() -> serde_json::Value {
         serde_json::json!({
             "v": 1,
-            "network": "shellnet",
+            "network": "net-a",
             "vault_address": format!("{0}::{0}", "c".repeat(64)),
             "hot_address": format!("{0}::{0}", "d".repeat(64)),
         })
@@ -1808,14 +1832,14 @@ mod tests {
         .unwrap();
         let now = now_unix_secs().unwrap();
         let event = response_event(&request, &fixture.wallet_state, valid_response_body(), now);
-        consume_wallets_response("shellnet", &request, event.clone(), limits(), now).unwrap();
+        consume_wallets_response("net-a", &request, event.clone(), limits(), now).unwrap();
 
         let pre_send = PreparedRequest {
             session_state: fixture.client_state_before_send,
             ..clone_request(&request)
         };
         assert!(
-            consume_wallets_response("shellnet", &pre_send, event.clone(), limits(), now).is_err()
+            consume_wallets_response("net-a", &pre_send, event.clone(), limits(), now).is_err()
         );
 
         for (case, field, value) in [
@@ -1830,7 +1854,7 @@ mod tests {
             envelope[field] = value;
             changed.text = envelope.to_string();
             assert!(
-                consume_wallets_response("shellnet", &request, changed, limits(), now).is_err(),
+                consume_wallets_response("net-a", &request, changed, limits(), now).is_err(),
                 "{case}"
             );
         }
@@ -1841,15 +1865,15 @@ mod tests {
         let replacement = if body.starts_with('A') { "B" } else { "A" };
         envelope["body"] = serde_json::Value::String(format!("{replacement}{}", &body[1..]));
         tampered.text = envelope.to_string();
-        assert!(consume_wallets_response("shellnet", &request, tampered, limits(), now).is_err());
+        assert!(consume_wallets_response("net-a", &request, tampered, limits(), now).is_err());
 
         let (_, _, post_receive, _) =
-            consume_wallets_response("shellnet", &request, event.clone(), limits(), now).unwrap();
+            consume_wallets_response("net-a", &request, event.clone(), limits(), now).unwrap();
         let replay_request = PreparedRequest {
             session_state: post_receive,
             ..clone_request(&request)
         };
-        let replay = consume_wallets_response("shellnet", &replay_request, event, limits(), now)
+        let replay = consume_wallets_response("net-a", &replay_request, event, limits(), now)
             .unwrap_err();
         assert!(replay.to_string().contains("replay"), "{replay}");
     }
@@ -1861,14 +1885,14 @@ mod tests {
         let mut additive = valid_response_body();
         additive["future_field"] = serde_json::json!({"safe": true});
         let event = response_event(&request, &wallet_state, additive, now);
-        consume_wallets_response("shellnet", &request, event, limits(), now).unwrap();
+        consume_wallets_response("net-a", &request, event, limits(), now).unwrap();
 
         let cases = [
             (
                 "version",
                 serde_json::json!({
                     "v": 2,
-                    "network": "shellnet",
+                    "network": "net-a",
                     "vault_address": format!("{0}::{0}", "c".repeat(64)),
                     "hot_address": format!("{0}::{0}", "d".repeat(64)),
                 }),
@@ -1886,7 +1910,7 @@ mod tests {
                 "malformed_address",
                 serde_json::json!({
                     "v": 1,
-                    "network": "shellnet",
+                    "network": "net-a",
                     "vault_address": "0:dead",
                     "hot_address": format!("{0}::{0}", "d".repeat(64)),
                 }),
@@ -1895,7 +1919,7 @@ mod tests {
                 "mismatched_dapp",
                 serde_json::json!({
                     "v": 1,
-                    "network": "shellnet",
+                    "network": "net-a",
                     "vault_address": format!("{}::{}", "c".repeat(64), "e".repeat(64)),
                     "hot_address": format!("{0}::{0}", "d".repeat(64)),
                 }),
@@ -1904,7 +1928,7 @@ mod tests {
                 "missing",
                 serde_json::json!({
                     "v": 1,
-                    "network": "shellnet",
+                    "network": "net-a",
                     "vault_address": format!("{0}::{0}", "c".repeat(64)),
                 }),
             ),
@@ -1912,7 +1936,7 @@ mod tests {
                 "retyped",
                 serde_json::json!({
                     "v": 1,
-                    "network": "shellnet",
+                    "network": "net-a",
                     "vault_address": format!("{0}::{0}", "c".repeat(64)),
                     "hot_address": 7,
                 }),
@@ -1921,7 +1945,7 @@ mod tests {
         for (case, body) in cases {
             let event = response_event(&request, &wallet_state, body, now);
             assert!(
-                consume_wallets_response("shellnet", &request, event, limits(), now).is_err(),
+                consume_wallets_response("net-a", &request, event, limits(), now).is_err(),
                 "{case}"
             );
         }
@@ -1933,12 +1957,12 @@ mod tests {
         let now = now_unix_secs().unwrap();
         let stale = request.session_state.created_at.saturating_sub(1);
         let event = response_event(&request, &wallet_state, valid_response_body(), stale);
-        assert!(consume_wallets_response("shellnet", &request, event, limits(), now).is_err());
+        assert!(consume_wallets_response("net-a", &request, event, limits(), now).is_err());
 
         let future = now
             .saturating_add(limits().timestamp_future_skew.as_secs())
             .saturating_add(1);
         let event = response_event(&request, &wallet_state, valid_response_body(), future);
-        assert!(consume_wallets_response("shellnet", &request, event, limits(), now).is_err());
+        assert!(consume_wallets_response("net-a", &request, event, limits(), now).is_err());
     }
 }

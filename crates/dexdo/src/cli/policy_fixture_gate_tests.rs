@@ -109,7 +109,7 @@ fn collect_test_sources(dir: &Path, inside_test_tree: bool, files: &mut Vec<Path
     }
 }
 
-fn scan_test_tree() -> ScanSummary {
+fn scan_test_tree() -> (ScanSummary, bool) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir
         .parent()
@@ -128,7 +128,8 @@ fn scan_test_tree() -> ScanSummary {
         result.field_literals += scanned.field_literals;
         result.errors.extend(scanned.errors);
     }
-    result
+    let private_fixtures_present = workspace.join("crates/dexdo/tests/live_cli.rs").is_file();
+    (result, private_fixtures_present)
 }
 
 #[test]
@@ -166,10 +167,14 @@ fn test_tree_policy_literals_match_the_shipped_schema() {
         "the source scanner needs unambiguous policy field leaf names"
     );
 
-    let result = scan_test_tree();
+    let (result, private_fixtures_present) = scan_test_tree();
     assert!(
-        result.field_literals > 0,
-        "policy fixture gate found no literals in {} test source files",
+        result.files_scanned > 0,
+        "policy fixture gate found no test source files"
+    );
+    assert!(
+        !private_fixtures_present || result.field_literals > 0,
+        "private policy fixture gate found no literals in {} test source files",
         result.files_scanned
     );
     assert!(

@@ -973,6 +973,7 @@ mod tests {
 
     /// UPS-B5, the native-Anthropic half of the row: the first text delta is EMPTY and no
     /// later one carries text at all, because the whole answer is streamed on the thinking channel.
+
     /// The OpenAI-compatible side of this shape is what was: a thinking model delivered its
     /// answer on a channel the accounting treated as absent, readiness read "billed without
     /// delivery", and the family became unsellable. This adapter must give the opposite answer --

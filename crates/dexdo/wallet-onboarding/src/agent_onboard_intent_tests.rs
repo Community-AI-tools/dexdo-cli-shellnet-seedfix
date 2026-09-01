@@ -1,8 +1,11 @@
 //! Regressions for the `intent=agent_onboard` query parameter on the connect deeplink.
+
 //! The wallet owner specified the final link verbatim:
+
 //! ```text
 //! https://links.gosh.sh/deeplinks/wallet/v1/connect?payload=<payload>&client_dh_public=<client_dh_public>&intent=agent_onboard
 //! ```
+
 //! Three separate claims are pinned here, because the requirement is not one property:
 //! the intent is on the FINAL link, it is there exactly once even when the link already carried it,
 //! and it is NOT inside `ConnectPayload` -- the bee payload is unchanged and still identifies
@@ -38,8 +41,8 @@ fn public_of(secret: [u8; 32]) -> String {
 fn fresh_session() -> OnboardingSession {
     OnboardingSession::create(
         "intent-test-agent",
-        "shellnet",
-        "dd-shellnet.ackinacki.org",
+        "net-a",
+        "net-a.example",
         &public_of([3u8; 32]),
         None,
         &public_of([4u8; 32]),

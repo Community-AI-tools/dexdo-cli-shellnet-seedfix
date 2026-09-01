@@ -1,9 +1,11 @@
 //! Regression for the restart contract of a session that is past its one-time QR.
+
 //! A bee session is cryptographic connection state, and the prepared `agent_onboard_request` is
 //! published into the context of the same `AuthProfile` the `wallet_hello` came from. That makes
 //! restart a reconciliation, not a retry: republishing a re-formed request would burn a sequence
 //! number and desynchronise the ratchet, and rebuilding the session would need an invitation that
 //! cannot be scanned twice.
+
 //! Driven from a `request_prepared` state file in the exact shape of a real one. Every value is
 //! synthetic: a live session's signing and DH secrets must never enter the repository.
 
@@ -25,17 +27,35 @@ const ENVELOPE: &str = concat!(
     r#""dh_public":"6666666666666666666666666666666666666666666666666666666666666666"}"#
 );
 
+/// One clock reading for the whole test binary, not one per call.
+
+/// This fixture is built TWICE by tests that compare a session before and after -- `load()` at the
+/// top, `load()` again for the expectation -- and it used to call `SystemTime::now()` each time. A
+/// run that crossed a second boundary between the two produced `created_at` values one apart and
+/// failed on a diff that was pure clock. Observed on CI: `1787851233` against `1787851232`,
+/// `expires_at` likewise, everything else identical.
+
+/// A test that fails once a minute by construction is worse than no test: it teaches the reader to
+/// re-run instead of to look. `OnceLock` makes the two loads the same fixture, which is what the
+/// comparison was always claiming to be about.
+fn fixture_now() -> u64 {
+    static NOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NOW.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    })
+}
+
 fn request_prepared_state() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = fixture_now();
     let filler = |byte: char| byte.to_string().repeat(64);
     serde_json::to_string(&serde_json::json!({
         "file_version": 1,
         "agent_name": "fixture-agent",
         "network": "mainnet",
-        "endpoint": "https://dd-mainnet.ackinacki.org",
+        "endpoint": "https://net-b.example",
         "hot_pubkey": filler('a'),
         "phase": {
             "name": "request_prepared",

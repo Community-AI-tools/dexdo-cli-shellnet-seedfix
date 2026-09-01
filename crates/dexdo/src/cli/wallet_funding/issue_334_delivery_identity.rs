@@ -1,16 +1,19 @@
 //! re-audit item 2, second reading: a grown balance is not the identity of a delivery.
+
 //! `Executed` is a fact about the VAULT - the message left it. Retiring that generation and opening
 //! the next one needs a second fact: that THIS transfer is what credited the Hot. An aggregated
 //! balance cannot carry it. Any incoming transfer of the same size produces exactly the same reading,
 //! so a Hot topped up from anywhere else while the Vault delivery is still in flight looks identical
 //! to a Hot the delivery has reached - and the replacement generation opened from it asks the Vault
 //! for the same shortfall a second time. When the original delivery lands, the Hot holds both.
+
 //! What carries the identity is on chain. The queued path runs `txn.dest.transfer(...)` and then
 //! `emit TransactionSent(...)` inside ONE Vault transaction, so the event message is an anchor to
 //! that transaction and the delivery is its sibling out-message addressed to the Hot. That sibling's
 //! id, checked through the destination's own finalized receipt, is the fact - and it is recorded on
 //! [`FundingEvidence`] as its own field rather than inside a sentence, because a decision is taken
 //! from it.
+
 //! Every test here drives the real entry point [`ensure_hot_funded_with_turn`] through the real
 //! production provider [`AckinackiVaultProvider`], composed the way a money command composes it.
 //! Generation 1 is always created by the mechanism itself; the only thing a test changes afterwards
@@ -51,7 +54,7 @@ fn creator() -> String {
 fn binding() -> HotFundingBinding {
     HotFundingBinding {
         provider: WalletProvider::AckinackiWallet,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         hot_address: hot_address(),
         vault_address: Some(vault_address()),
     }
@@ -210,7 +213,7 @@ impl HotBalanceReader for FakeHot {
 }
 
 fn record_of(dir: &Path) -> Option<FundingJournalRecord> {
-    load_funding_journal(dir, "shellnet", &hot_address()).expect("read journal")
+    load_funding_journal(dir, "net-a", &hot_address()).expect("read journal")
 }
 
 fn temp() -> tempfile::TempDir {
@@ -274,10 +277,12 @@ fn the_vault_transfer_executes(vault: &FakeVault) {
 // ---------------------------------------------------------------------------------------------
 
 /// Someone else's transfer arrives while ours is still in flight.
+
 /// The Hot now reads exactly what it would read had our delivery landed: the balance generation 1
 /// was sized against, plus the amount generation 1 carries. Sizing generation 2 from that reading
 /// asks the Vault for the remaining shortfall while the Vault still owes the first one - and once
 /// the original delivery lands, the Hot has been credited twice out of a cold Vault.
+
 /// Only the delivery's own identity separates the two readings, and here the chain cannot yet name
 /// it. So nothing is submitted.
 #[tokio::test]
@@ -287,8 +292,8 @@ async fn an_unrelated_credit_of_the_expected_size_opens_no_second_generation() {
     generation_one(dir.path(), &vault).await;
     the_vault_transfer_executes(&vault);
 
-    // The balance the OLD aggregate test accepts as proof of delivery: pre-delivery balance(0)
-    // plus exactly what generation 1 carries(400). It came from somewhere else.
+    // The balance the OLD aggregate test accepts as proof of delivery: pre-delivery balance (0)
+    // plus exactly what generation 1 carries (400). It came from somewhere else.
     let hot = FakeHot::holding(FIRST_REQUIREMENT);
     let _ = money_command_run(dir.path(), &vault, &hot, SECOND_REQUIREMENT).await;
 
@@ -314,6 +319,7 @@ async fn an_unrelated_credit_of_the_expected_size_opens_no_second_generation() {
 
 /// The same observation with the one fact that separates it: the chain names the internal message
 /// that carried our transfer to the Hot, and the Hot's own receipt for it is finalized.
+
 /// This is the half that keeps the refusal above honest. A fix that simply stopped opening
 /// replacement generations would pass that test and leave a Hot that was underfunded once
 /// permanently unfundable, which is worse than the defect.

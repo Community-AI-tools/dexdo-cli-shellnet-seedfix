@@ -1,34 +1,32 @@
 {
   "models": {
     "qwen": {
-      "frame_model": "qwen--qwen3--32b",
+      "frame_model": "Qwen3.6-27B",
       "base_url": "https://api.groq.com/openai/v1",
-      "served_model": "qwen/qwen3-32b",
+      "served_model": "qwen/qwen3.6-27b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
-      "price_per_tick": 1000000000,
+      "price_per_tick": 1,
       "identity_aliases": [
-        "Qwen/Qwen3-32B"
+        "Qwen/Qwen3.6-27B"
       ],
-      "vocab_size": 152064,
       "fingerprints": [
         {
           "probe_prompt": "What is 17*23? Think step by step.",
-          "expected_contains": "<think>",
-          "accepts_reasoning_side_channel": true
+          "expected_contains": "<think>"
         }
       ],
       "capabilities": {
-        "max_output_tokens": 40960
+        "max_output_tokens": 16384
       }
     },
     "claude-sonnet": {
-      "frame_model": "anthropic--claude-sonnet--4",
+      "frame_model": "claude-sonnet-4-5",
       "base_url": "https://api.anthropic.com",
       "served_model": "claude-sonnet-4-5-20250929",
       "api_key_env": "ANTHROPIC_API_KEY",
       "tokenizer_family": "claude",
-      "price_per_tick": 1000000000,
+      "price_per_tick": 1,
       "capabilities": {
         "max_output_tokens": 64000
       }

@@ -1,4 +1,5 @@
 //! Canonical dexdo funding wallet artifact.
+
 //! Source: `gosh-sh/acki-nacki`
 //! `44fe02ea01e4bb31d431ed57d1f9b3dc3dd88a18`.
 
@@ -47,10 +48,11 @@ pub fn submit_transaction_params(
 }
 
 /// `submitTransaction` params for a recipient that does NOT live in the RootPN DApp.
+
 /// The wallet's `dapp_id` argument is reported, not routed: the contract passes only
 /// `(value, bounce, flags, payload, cc)` to `dest.transfer(...)` and its own comment records that
 /// "network-level dest_dapp_id addressing is not wired yet, dapp_id is used only for reading account
-/// state on the client"(`UpdateCustodianMultisigWallet_v2.sol`). So this argument cannot misroute
+/// state on the client" (`UpdateCustodianMultisigWallet_v2.sol`). So this argument cannot misroute
 /// money and cannot make a transfer fail -- but it IS emitted in `TransactionSent`, and an event
 /// that names DApp 4 for a recipient living in DApp 1 tells every off-chain subscriber something
 /// untrue. Callers outside DApp 4 pass the recipient's real DApp id so the receipt is honest.

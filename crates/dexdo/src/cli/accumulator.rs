@@ -1,8 +1,11 @@
 //! `dexdo accumulator`: exchange SHELL <-> eccUSDC from the operator multisig.
+
 //! The seller earns SHELL and needs a stablecoin; the operator holds eccUSDC and needs SHELL. Both
 //! conversions are the Shell Accumulator's, and both are driven here from the SAME operator multisig
 //! `note deploy` and `note topup` spend, taking the SAME funding-wallet turn.
+
 //! What the contract makes this client responsible for, and why each command looks the way it does:
+
 //! * **The sell side has no method.** A lot is created by a bare ECC[2] SHELL transfer into the
 //! root's `receive()`, sized to exactly one of four denominations. The contract does not split a
 //! larger deposit and does not keep the change, so `sell` decomposes the amount here and sends one
@@ -22,15 +25,7 @@ use crate::cli::args::{
 };
 use anyhow::Result;
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_accumulator(_args: AccumulatorArgs) -> Result<()> {
-    anyhow::bail!(
-        "accumulator commands need a live chain: rebuild with `--features shellnet` to exchange \
-         SHELL <-> eccUSDC"
-    )
-}
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_accumulator(args: AccumulatorArgs) -> Result<()> {
     match args.command {
         AccumulatorCommand::Status(args) => run_status(args).await,
@@ -41,12 +36,11 @@ pub(crate) async fn run_accumulator(args: AccumulatorArgs) -> Result<()> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 mod live {
     use super::*;
     use anyhow::{anyhow, bail};
     use dexdo_core::accumulator::{
-        whole_shell_from_raw, whole_usdc_from_raw, LotDetails, LotId, QueueState, RootDetails,
+        whole_usdc_from_raw, LotDetails, LotId, QueueState, RootDetails,
         ACCUMULATOR_LOT_ABI, ACCUMULATOR_ROOT_ABI,
     };
     use dexdo_core::params::{
@@ -55,7 +49,7 @@ mod live {
         GAS_BALANCE_CONFIRM_MAX_READS,
         GAS_BALANCE_CONFIRM_POLL_INTERVAL, NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
     };
-    use dexdo_core::shellnet::RetryingReads;
+    use dexdo_core::chain::RetryingReads;
     use dexdo_core::{Address, ChainClient, KeyPair, RealChainBackend};
 
     /// One resolved on-chain lot: its identity, its address, and whether it can be claimed now.
@@ -85,6 +79,7 @@ mod live {
         }
 
         /// Refuse to read or spend until the address answers as an accumulator root.
+
         /// Fail-closed identity, not a build pin: the two live roots serve DIFFERENT code hashes
         /// under the SAME version string, so this proves we are talking to an accumulator of the
         /// generation whose ABI we carry - and, just as importantly, that the read path reaches it
@@ -207,6 +202,7 @@ mod live {
         }
 
         /// Every live lot owned by `owner`, oldest first, across all four queues.
+
         /// Recovered from the chain alone. A claimed lot has self-destructed, so what this finds is
         /// exactly the set that still holds a position - which is what a run that died mid-sell
         /// needs in order to learn what it actually created.
@@ -378,6 +374,7 @@ mod live {
 
     impl Spender {
         /// Resolve the wallet, take its turn, and connect - in that order.
+
         /// The lock is taken on the RESOLVED wallet and BEFORE any balance is read, because the
         /// decision to spend is made from that reading. This is the same lock under the same key
         /// that `note deploy` and `note topup` take, not a second one beside it.
@@ -385,23 +382,23 @@ mod live {
             manifest: &std::path::Path,
             endpoint: Option<&str>,
             multisig_address: Option<&str>,
-            multisig_key: &Option<std::path::PathBuf>,
+            multisig_private_key: &Option<std::path::PathBuf>,
             multisig_seed_file: &Option<std::path::PathBuf>,
         ) -> Result<(Self, crate::cli::note_cmd::FundingWalletLock)> {
             let manifest_str = manifest
                 .to_str()
-                .ok_or_else(|| anyhow!("--contracts: non-printable path"))?
+                .ok_or_else(|| anyhow!("DEXDO_MANIFEST: non-printable path"))?
                 .to_string();
             let network = dexdo_core::Deployed::load(manifest)
-                .map_err(|e| anyhow!("--contracts {}: {e}", manifest.display()))?
+                .map_err(|e| anyhow!("manifest {}: {e}", manifest.display()))?
                 .network;
             let wallet_network =
                 crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
             let wallet = crate::cli::wallet::resolve_funding_wallet(
                 &crate::cli::wallet::WalletStore::open()?,
-                wallet_network,
+                &wallet_network,
                 multisig_address,
-                multisig_key,
+                multisig_private_key,
                 multisig_seed_file,
             )?;
             let address = dexdo_core::address::parse_chain_address(&wallet.address)
@@ -478,17 +475,20 @@ mod live {
         }
 
         /// Wait, bounded, for an ECC credit to actually arrive, and answer by fact.
+
         /// The wallet's own action phase succeeding is NOT the arrival. Both directions are paid by
         /// a SEPARATE internal message the accumulator sends back (`buyer.transfer(...)` in
         /// `_processUsdcDeposit`, `seller.transfer(...)` in `claimUSDC`), which lands a block or
         /// more after the submit returns. Reading the balance straight afterwards therefore reports
         /// a delta of zero on a perfectly good exchange - a receipt that is worse than none,
         /// because it says the money did not arrive when it simply had not arrived YET.
+
         /// `None` means only "not observed within the read budget", never "lost". The caller turns
         /// that into a refusal rather than a cheerful zero, because an unverified money movement is
         /// exactly what this client must not report as done.
+
         /// The budget is the one this client already uses to confirm a credit landing on this same
-        /// wallet([`GAS_BALANCE_CONFIRM_MAX_READS`]), not a new timer.
+        /// wallet ([`GAS_BALANCE_CONFIRM_MAX_READS`]), not a new timer.
         pub(super) async fn await_ecc_credit(
             &self,
             currency: u32,
@@ -506,6 +506,7 @@ mod live {
         }
 
         /// Send one ECC amount to `dest` with an empty body.
+
         /// An empty payload is what makes this a plain currency transfer into the accumulator's
         /// `receive()`, which is the only entry point the sell side has and the safer of the two the
         /// buy side has. `flag: 1` pays the message fees from the wallet rather than out of the
@@ -585,8 +586,8 @@ mod live {
 
         async fn submit(&self, boc: &str) -> Result<()> {
             let endpoint = self.chain.client().endpoint();
-            let http = dexdo_core::shellnet_http_client()?;
-            dexdo_core::shellnet_clock_skew_preflight(endpoint).await?;
+            let http = dexdo_core::chain_http_client()?;
+            dexdo_core::chain_clock_skew_preflight(endpoint).await?;
             dexdo_core::ackinacki_wallet::query::send_message_routed(
                 &http,
                 endpoint,
@@ -597,19 +598,21 @@ mod live {
             )
             .await?;
             // The receipt read is best-effort, and deliberately so.
+
             // `observe_note_deploy_wallet_action` carries a note-deploy contract: it requires the
             // wallet's LATEST transaction to be the one it just observed, and errors with "stale or
             // advanced" otherwise. That holds for a deploy, which performs exactly one wallet action
             // per run. It does NOT hold here: `sell` sends one message per lot, so by the time a
             // later message is observed the wallet has moved on, and the check fails on a transfer
-            // that succeeded. Measured live on shellnet: `buy` and `claim` both reported failure
+            // that succeeded. Measured live on the chain: `buy` and `claim` both reported failure
             // AFTER the money had moved and the queues had advanced.
+
             // Failing a money command that in fact succeeded is its own hazard - it invites the
             // operator to send again. So a receipt that CANNOT be identified is inconclusive rather
             // than fatal, and every caller proves the outcome by fact instead: `sell` re-reads the
             // lots it created, `buy` and `claim` wait for the credit. A receipt that IS identified
             // and shows a refusal still fails hard, because that is real evidence.
-            match dexdo_core::shellnet::observe_note_deploy_wallet_action(
+            match dexdo_core::chain::observe_note_deploy_wallet_action(
                 &http,
                 endpoint,
                 boc,
@@ -718,9 +721,11 @@ mod live {
         )
     }
 
-    /// Render one whole-unit line describing an amount of SHELL.
+    /// Render one amount of SHELL. The raw figure is gone from the line: it said the same thing in
+    /// units nobody spends, and `shell_amount` loses nothing -- `1.5 SHELL` is exactly what
+    /// `whole_shell_from_raw` used to print as `1`.
     pub(super) fn shell_units(raw: u128) -> String {
-        format!("{} SHELL ({raw} raw ECC[2])", whole_shell_from_raw(raw))
+        format!("{} SHELL", dexdo_core::shell_amount(raw))
     }
 
     /// Render one whole-unit line describing an amount of eccUSDC.
@@ -730,7 +735,7 @@ mod live {
 
 }
 
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 mod review_regressions {
     use super::live::{
         confirmation_complete, expected_credit_landed, is_claim_candidate, load_operation,
@@ -827,19 +832,15 @@ mod review_regressions {
     }
 }
 
-#[cfg(feature = "shellnet")]
 use dexdo_core::accumulator::{BuyPlan, SellPlan};
-#[cfg(feature = "shellnet")]
 use dexdo_core::params::{
     ACCUMULATOR_DAPP_ID, ACCUMULATOR_DENOMS, ACCUMULATOR_SHELL_PER_USDC_RAW,
     GAS_BALANCE_CONFIRM_MAX_READS, SHELL_CURRENCY_ID, USDC_CURRENCY_ID, USDC_UNIT,
 };
-#[cfg(feature = "shellnet")]
 use live::*;
 
-#[cfg(feature = "shellnet")]
 async fn run_status(args: AccumulatorStatusArgs) -> Result<()> {
-    let reader = AccumulatorReader::connect(&args.contracts, args.endpoint.as_deref())?;
+    let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
     let details = reader.details().await?;
 
@@ -875,16 +876,15 @@ async fn run_status(args: AccumulatorStatusArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_sell(args: AccumulatorSellArgs) -> Result<()> {
-    let reader = AccumulatorReader::connect(&args.contracts, args.endpoint.as_deref())?;
+    let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
 
     let (spender, _lock) = Spender::open(
-        &args.contracts,
-        args.endpoint.as_deref(),
+        &crate::cli::commands::manifest_path()?,
+        None,
         args.multisig_address.as_deref(),
-        &args.multisig_key,
+        &args.multisig_private_key,
         &args.multisig_seed_file,
     )
     .await?;
@@ -1036,16 +1036,15 @@ async fn run_sell(args: AccumulatorSellArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_buy(args: AccumulatorBuyArgs) -> Result<()> {
-    let reader = AccumulatorReader::connect(&args.contracts, args.endpoint.as_deref())?;
+    let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
 
     let (spender, _lock) = Spender::open(
-        &args.contracts,
-        args.endpoint.as_deref(),
+        &crate::cli::commands::manifest_path()?,
+        None,
         args.multisig_address.as_deref(),
-        &args.multisig_key,
+        &args.multisig_private_key,
         &args.multisig_seed_file,
     )
     .await?;
@@ -1105,9 +1104,8 @@ async fn run_buy(args: AccumulatorBuyArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_lots(args: AccumulatorLotsArgs) -> Result<()> {
-    let reader = AccumulatorReader::connect(&args.contracts, args.endpoint.as_deref())?;
+    let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
 
     let owner = match args.multisig_address.as_deref() {
@@ -1115,14 +1113,15 @@ async fn run_lots(args: AccumulatorLotsArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("--multisig-address {address}: {e}"))?
             .into_chain(),
         None => {
-            let network = dexdo_core::Deployed::load(&args.contracts)
-                .map_err(|e| anyhow::anyhow!("--contracts {}: {e}", args.contracts.display()))?
+            let manifest = crate::cli::commands::manifest_path()?;
+            let network = dexdo_core::Deployed::load(&manifest)
+                .map_err(|e| anyhow::anyhow!("manifest {}: {e}", manifest.display()))?
                 .network;
             let wallet_network =
                 crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
             let wallet = crate::cli::wallet::resolve_funding_wallet(
                 &crate::cli::wallet::WalletStore::open()?,
-                wallet_network,
+                &wallet_network,
                 None,
                 &None,
                 &None,
@@ -1164,16 +1163,15 @@ async fn run_lots(args: AccumulatorLotsArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_claim(args: AccumulatorClaimArgs) -> Result<()> {
-    let reader = AccumulatorReader::connect(&args.contracts, args.endpoint.as_deref())?;
+    let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
 
     let (spender, _lock) = Spender::open(
-        &args.contracts,
-        args.endpoint.as_deref(),
+        &crate::cli::commands::manifest_path()?,
+        None,
         args.multisig_address.as_deref(),
-        &args.multisig_key,
+        &args.multisig_private_key,
         &args.multisig_seed_file,
     )
     .await?;

@@ -1,5 +1,6 @@
 //! re-audit items 2 and 3: the window a delivery has not landed in, and a floor sized for one
 //! spend on a path that spends twice.
+
 //! Item 2. `Executed` is a fact about the VAULT - the message left it. The credit arrives on the Hot
 //! in a later transaction, and in between the Hot's balance is still the one the executed generation
 //! was sized against. Opening the next generation from that reading asks for the whole old shortfall
@@ -8,6 +9,7 @@
 //! balance. The reconciliation suite's `an_executed_underfill_opens_a_new_generation_for_the_exact_
 //! remaining_shortfall` covers the other side - a delivery that HAS landed and was too small - and
 //! must stay green, because refusing there would leave the Hot permanently unfundable.
+
 //! Item 3. The native floor was one `NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`. A fresh `note deploy` submits
 //! twice - the deposit voucher and the SHELL gas voucher - and EACH submit takes two amounts out of
 //! the Hot: the value it attaches, which does not come back, and the fee its own transaction is
@@ -15,6 +17,7 @@
 //! full cost pays for the first voucher and cannot pay for the second, and the deploy stops half way
 //! with the deposit spent and a halo2 proof already made. One test here proves the short Hot is
 //! refused; the other proves the floor is enough for both, so that lowering it goes red.
+
 //! Both tests drive the real entry point [`ensure_hot_funded_with_turn`] through the real production
 //! provider [`AckinackiVaultProvider`], composed the way a money command composes it: the journal is
 //! read first and what it recorded is handed to the provider. Only the chain underneath is scripted,
@@ -53,7 +56,7 @@ fn creator() -> String {
 fn binding() -> HotFundingBinding {
     HotFundingBinding {
         provider: WalletProvider::AckinackiWallet,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         hot_address: hot_address(),
         vault_address: Some(vault_address()),
     }
@@ -200,7 +203,7 @@ impl HotBalanceReader for FakeHot {
 }
 
 fn record_of(dir: &Path) -> Option<FundingJournalRecord> {
-    load_funding_journal(dir, "shellnet", &hot_address()).expect("read journal")
+    load_funding_journal(dir, "net-a", &hot_address()).expect("read journal")
 }
 
 fn temp() -> tempfile::TempDir {
@@ -236,6 +239,7 @@ async fn money_command_run(dir: &Path, vault: &FakeVault, hot: &FakeHot) -> Resu
 // ---------------------------------------------------------------------------------------------
 
 /// The window between "the message left the Vault" and "the Hot holds it".
+
 /// A second generation opened inside that window is sized from a balance the first transfer has not
 /// reached yet, so it asks for the whole shortfall a second time - and when the first delivery lands
 /// the Hot holds two of them. Nothing here is fabricated: generation 1 is created by the mechanism
@@ -314,6 +318,7 @@ async fn an_executed_transfer_the_hot_has_not_shown_yet_opens_no_second_generati
 
 /// What ONE `note deploy` voucher submit takes out of the Hot, from the canonical facts rather than
 /// from the requirement under test.
+
 /// Both halves leave the wallet: the value the submit ATTACHES never comes back
 /// (`RootPN.generateVoucher` accepts and sends no change), and `flag: 1` pays the message's fee from
 /// the wallet's balance instead of out of the amount being sent.
@@ -322,6 +327,7 @@ fn one_voucher_submit_costs() -> u128 {
 }
 
 /// A Hot funded for ONE voucher submit is short by exactly the OTHER one.
+
 /// This is the failure the floor exists to prevent, in the state it actually occurs in: the Hot can
 /// pay for the deposit voucher and cannot pay for the SHELL gas voucher, so the deploy stops half
 /// way with the deposit spent and a halo2 proof already made. The funding step runs before the
@@ -364,6 +370,7 @@ async fn a_hot_that_can_pay_for_one_voucher_submit_is_short_by_exactly_the_other
 
 /// A Hot standing exactly on the floor holds everything BOTH voucher submits take, and is passed
 /// through without a request.
+
 /// The other half of the same money fact, and the one that keeps the floor from being quietly
 /// lowered again: the left-hand side is derived from the canonical constants of the money path -
 /// how many submits it makes, what each attaches, and the bound on what each is charged - while the

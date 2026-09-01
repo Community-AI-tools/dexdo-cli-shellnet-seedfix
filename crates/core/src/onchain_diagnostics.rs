@@ -70,6 +70,7 @@ pub fn sanitize_onchain_submit_payload(value: &Value) -> Value {
 /// The comment on each arm is the exact declaring line, so a name can be checked against the
 /// Solidity rather than against this table's own past -- which is how the table came to carry
 /// constants that had been deleted two generations earlier.
+
 /// **These numbers are not one namespace.** `dex::` is the `Errors` base every contract under
 /// `contracts/dex` inherits and `airegistry::` is the `AiRegistryErrors` base under
 /// `contracts/airegistry`; `iob::`, `modelregistry::` and `oracleeventlist::` are constants a
@@ -250,7 +251,7 @@ fn action_result_code_fragment(action: &ExitCode) -> String {
     )
 }
 
-/// The action phase has its own result-code space(`32`..`50`) and never carries a compute-phase
+/// The action phase has its own result-code space (`32`..`50`) and never carries a compute-phase
 /// `require` code, so the contract table is not the table to read here. Falling through to it
 /// meant an action result could be reported under a compute-phase constant's name -- the same
 /// defect as reading a number in the wrong contract's table, one phase apart.
@@ -261,6 +262,7 @@ fn action_result_code_label(code: i64) -> Option<String> {
 /// The parenthesised label a user-facing message puts next to a compute-phase exit code: the
 /// declaring contract's namespace and the constant's name, `unknown contract error code` when no
 /// vendored source declares the number, and `ambiguous: a|b` when more than one does.
+
 /// **Every message that shows an exit code must go through this.** The namespace prefix is not
 /// decoration: `ERR_INVALID_SENDER` is 101 in the `dex` base and 302 in the `airegistry` one, and
 /// 101/102/103 each carry two unrelated meanings, so a name without its table is a coin flip
@@ -287,6 +289,7 @@ pub fn contract_error_label(code: i64) -> Option<String> {
 /// The parenthesised label for a compute-phase exit code returned by a contract whose sources
 /// this repo does not vendor, naming that contract and the reason no constant accompanies the
 /// number. `None` for 0, which is success.
+
 /// [`contract_error_label`] answers out of the vendored `contracts/dex` and `contracts/airegistry`
 /// declarations, so putting a code through it asserts that the contract which answered inherits
 /// one of those bases. The funding wallet does not: `UpdateCustodianMultisigWallet_v2` inherits
@@ -593,66 +596,7 @@ fn mask_exact_secrets(text: &str, secrets: &HashSet<String>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
-
-    /// The five files that declare a contract error code, and the namespace this client renders
-    /// each of them under. This is a transcription of the contract layout, not of the table under
-    /// test: `dex/modifiers/errors.sol` is the `Errors` base every dex contract inherits,
-    /// `airegistry/modifiers/errors.sol` is the `AiRegistryErrors` base, and the remaining three
-    /// contracts declare private constants of their own on top of (or, for `ModelRegistry`,
-    /// entirely outside) those bases.
-    const DECLARING_SOURCES: &[(&str, &str)] = &[
-        ("contracts/dex/modifiers/errors.sol", "dex"),
-        ("contracts/dex/OracleEventList.sol", "oracleeventlist"),
-        ("contracts/airegistry/modifiers/errors.sol", "airegistry"),
-        ("contracts/airegistry/InferenceOrderBook.sol", "iob"),
-        ("contracts/airegistry/ModelRegistry.sol", "modelregistry"),
-    ];
-
-    /// Read the contract sources and return `code -> {namespace::NAME}` exactly as declared.
-    /// This is what makes the table tests answer's fourth question. The oracle is
-    /// the vendored Solidity, which this change does not touch; if the contracts renumber a code
-    /// and the table below does not follow, the comparison goes red without anyone editing a
-    /// second copy of the answer. A test that compared the table against a constant shipped
-    /// beside it would stay green through exactly the drift it exists to catch.
-    fn codes_declared_by_the_contract_sources() -> BTreeMap<i64, BTreeSet<String>> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut declared: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-        for (relative, namespace) in DECLARING_SOURCES {
-            let path = root.join(relative);
-            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("contract source {} is unreadable: {e}", path.display())
-            });
-            for line in text.lines() {
-                // Cut trailing comments first, so a line that merely mentions a retired name in
-                // prose is not read as a declaration of it.
-                let code_part = line.split("//").next().unwrap_or("");
-                let tokens: Vec<&str> = code_part.split_whitespace().collect();
-                let [ty, keyword, name, rest @ ..] = tokens.as_slice() else {
-                    continue;
-                };
-                if *ty != "uint16" || *keyword != "constant" || !name.starts_with("ERR_") {
-                    continue;
-                }
-                let Some(value) = rest.iter().skip_while(|t| **t != "=").nth(1) else {
-                    continue;
-                };
-                let Ok(code) = value.trim_end_matches(';').parse::<i64>() else {
-                    continue;
-                };
-                declared
-                    .entry(code)
-                    .or_default()
-                    .insert(format!("{namespace}::{name}"));
-            }
-        }
-        assert!(
-            declared.len() > 50,
-            "parsed only {} codes from the contract sources; the parser, not the table, is broken",
-            declared.len()
-        );
-        declared
-    }
+    use std::collections::BTreeSet;
 
     fn rendered_names(code: i64) -> BTreeSet<String> {
         contract_error_names(code)
@@ -667,40 +611,10 @@ mod tests {
             .to_string()
     }
 
-    /// E2E-RCPT-15: the rendered set equals the declared set for every number, both directions.
-    #[test]
-    fn decoder_names_exactly_what_the_contract_sources_declare() {
-        let declared = codes_declared_by_the_contract_sources();
-        let mut wrong = Vec::new();
-        for (code, names) in &declared {
-            let rendered = rendered_names(*code);
-            if rendered != *names {
-                wrong.push(format!(
-                    "  {code}: contracts declare {names:?}, client renders {rendered:?}"
-                ));
-            }
-        }
-        // The other direction: a number the client names but no contract declares. This is the
-        // half that a "does every contract code have a name?" check silently passes.
-        for code in 0..=1000 {
-            if !declared.contains_key(&code) && !contract_error_names(code).is_empty() {
-                wrong.push(format!(
-                    "  {code}: no contract source declares it, client renders {:?}",
-                    rendered_names(code)
-                ));
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "client error table disagrees with the contract sources:\n{}",
-            wrong.join("\n")
-        );
-    }
-
     /// E2E-RCPT-15, by literal. Every number here was named by a previous contract generation and
     /// is declared by no line of `42c6b3a9`'s sources; the name beside it is what the reviewed
-    /// client still rendered. Spelled out rather than derived so that deleting the parser above
-    /// cannot quietly take this assertion with it.
+    /// client still rendered. Spelled out rather than derived so that deleting the source-parity
+    /// parser in the private integration suite cannot quietly take this assertion with it.
     #[test]
     fn superseded_names_are_not_rendered_at_their_old_numbers() {
         for (code, superseded) in [
@@ -919,7 +833,7 @@ mod tests {
         );
     }
 
-    /// The action phase has its own result-code space(`32`..`50`); a compute-phase `require`
+    /// The action phase has its own result-code space (`32`..`50`); a compute-phase `require`
     /// code never appears there. Borrowing the contract table for it is the same defect as
     /// reading a number in the wrong contract's table, with the tables one phase apart.
     #[test]
@@ -1121,7 +1035,7 @@ mod tests {
         );
     }
 
-    /// The order book's two live codes moved in contracts 4.0.33(333 -> 345, 336 -> 346) so that a
+    /// The order book's two live codes moved in contracts 4.0.33 (333 -> 345, 336 -> 346) so that a
     /// number stops carrying two meanings. Asserting the new numbers alone would still pass if the
     /// old entries were left behind, so each case also asserts the book's name is absent from the
     /// number it vacated -- a stale duplicate is the failure this test exists to catch.

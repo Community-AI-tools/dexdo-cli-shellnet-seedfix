@@ -1,3 +1,10 @@
+// Per crate, not per workspace: `dexdo-core` raises the same limit for the same reason.
+// With no cargo features the whole call graph is proved in one compilation, and the default 128 is
+// not enough to settle `Send` for the admin and buyer command futures -- rustc says "overflow
+// evaluating the requirement" and ASSUMES the bound instead of proving it, which is a warning here
+// and an error on any toolchain that counts a step differently.
+#![recursion_limit = "256"]
+
 //! `dexdo` CLI: `seller` and `buyer` subcommands, each with first-class flags
 //! `--mock-model` and `--mock-chain`.
 
@@ -30,6 +37,35 @@ struct Cli {
     /// provenance; the value is used exactly as supplied.
     #[arg(long, global = true, value_name = "RAW_NANOVMSHELL")]
     deal_gas_overhead_raw: Option<u128>,
+    /// Never ask: refuse instead, naming the flag that carries the answer.
+
+    /// The client asks about what only the operator knows -- which note to spend from, what to do
+    /// when a counterparty vanishes -- and works the rest out from its own state. A script, a CI job
+    /// or a headless host has nobody to answer, so this turns every question into the refusal it
+    /// would otherwise be. A destination that is not a terminal is treated the same way without the
+    /// flag: a question nobody can answer is a hang, not a question.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    /// Add the raw chain figures under the human ones.
+
+    /// By `spec.md` a result states amounts the way a person says them -- `3.00 SHELL`, `2 ticks` --
+    /// and never the integers the chain stores. Whoever is reconciling against the chain needs those
+    /// integers, so they are one flag away rather than in everybody's way.
+    #[arg(long, global = true)]
+    raw: bool,
+    /// Draw everything without colour, as if `NO_COLOR` were set.
+
+    /// The environment variable was the only way to ask for this, and a variable is not reachable
+    /// everywhere a flag is: a one-off run, a shell that does not export it, a runbook line an
+    /// operator copies. Reported on by a reviewer who ran what the description promised --
+    /// `dexdo --no-color note list` -- and got `unexpected argument`, because the guarantee held
+    /// for the variable and for a pipe, and the flag did not exist.
+
+    /// Colour is never the only signal: with it off the words are unchanged, glyphs still mark
+    /// refusals and steps, and the grid still lines up, because the padding counts the invisible
+    /// bytes it removed.
+    #[arg(long, global = true)]
+    no_color: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -54,10 +90,6 @@ mod wallet_onboard_cli_tests {
             "ackinacki-wallet",
             "--agent-name",
             "build-agent",
-            "--network",
-            "mainnet",
-            "--endpoint",
-            "mainnet.example",
             "--state",
             "session.json",
             "--hot-key",
@@ -73,14 +105,13 @@ mod wallet_onboard_cli_tests {
             command:
                 WalletCommand::Onboard(WalletBindArgs {
                     provider: Some(WalletProviderCommand::AckinackiWallet(args)),
+                    ..
                 }),
         }) = cli.command
         else {
             panic!("expected wallet onboard ackinacki-wallet");
         };
         assert_eq!(args.agent_name, "build-agent");
-        assert_eq!(args.network, WalletNetworkArg::Mainnet);
-        assert_eq!(args.endpoint.as_deref(), Some("mainnet.example"));
         assert_eq!(args.state, Some(std::path::PathBuf::from("session.json")));
         assert_eq!(args.hot_key, Some(std::path::PathBuf::from("hot.key")));
         assert_eq!(args.vault_key, Some(std::path::PathBuf::from("vault.key")));
@@ -88,25 +119,63 @@ mod wallet_onboard_cli_tests {
         assert!(args.terminal_qr);
     }
 
+    /// Every command's records go to the error stream, including the ones that used to send them to
+
+    /// result. The two rows are the two halves of the rule that used to disagree.
+    /// Nothing writes records into the operator's screen by default -- not the seller, not the
+    /// buyer, not a library under either. What a command has to say while it runs, it says as a
+    /// step; `RUST_LOG` is what a reconstruction uses afterwards.
     #[test]
-    fn wallet_onboarding_routes_logs_to_stderr() {
-        let cli = Cli::try_parse_from([
+    fn no_command_writes_records_to_the_screen_by_default() {
+        for argv in [
+            vec![
+                "dexdo",
+                "seller",
+                "--note-addr",
+                "0:note",
+                "--token-contract",
+                "0:tc",
+                "--model",
+                "qwen",
+            ],
+            vec!["dexdo", "buyer", "--frame-model", "qwen"],
+            vec!["dexdo", "doctor"],
+            vec!["dexdo", "note", "deploy", "--nominal", "10"],
+        ] {
+            let printed = argv.join(" ");
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{printed}: {error}"));
+            assert_eq!(
+                default_log_level(&cli.command),
+                "error",
+                "{printed} must print its steps, not a commentary"
+            );
+        }
+    }
+
+    #[test]
+    fn records_go_to_stderr_whatever_the_command() {
+        let onboarding = Cli::try_parse_from([
             "dexdo", "wallet", "onboard", "ackinacki-wallet", "--agent-name", "agent",
             "--state", "session.json", "--hot-key", "hot.key",
         ])
         .unwrap();
-        assert!(logs_to_stderr(&cli.command));
+        assert!(records_go_to_stderr(&onboarding.command));
 
-        let other = Cli::try_parse_from(["dexdo", "doctor"]).unwrap();
-        assert!(!logs_to_stderr(&other.command));
+        let human = Cli::try_parse_from(["dexdo", "doctor"]).unwrap();
+        assert!(
+            records_go_to_stderr(&human.command),
+            "a human command's records are records too: stdout carries its result"
+        );
     }
 
     /// follow-up item 6. The successor to `wallet_onboard_requires_agent_state_and_hot_key`,
     /// which asserted that omitting `--state` or `--hot-key` was a parse error.
+
     /// That requirement is what made the provider unreachable from the interactive menu: a menu
     /// carries no command line, so a required path is a dead end there. Both flags now have
     /// canonical defaults. This pins clap's two sentinel filenames; the wallet dispatcher's tests
     /// pin that each sentinel lands in the distinct binding draft reserved for the attempt.
+
     /// `--agent-name` is deliberately still required HERE and keeps its own case below: it is the
     /// label a human reads in the wallet app when approving, so on a command line the operator
     /// chooses it. Only the menu, which cannot ask, falls back to a constant.
@@ -160,42 +229,62 @@ mod wallet_onboard_cli_tests {
     }
 }
 
-fn logs_to_stderr(command: &Command) -> bool {
-    command.machine_operation().is_some()
-        || matches!(
-            command,
-            Command::Wallet(WalletArgs {
-                command: WalletCommand::Onboard(_) | WalletCommand::Rebind(_),
-            })
-        )
+/// How loud a command is by default, when `RUST_LOG` says nothing.
+
+/// Errors only, for every command. What an operator sees while a command runs is the step list and
+/// the live line -- the client's own account of what it is doing -- and a running commentary
+/// underneath it is noise they did not ask for. Measured on a plain buy: the proving stack's own
+/// setup notes arrived at `info` on top of the question the operator was being asked.
+
+/// This is the task owner's decision and it is not "records do not matter": what a live sale owes
+/// the operator is a printed step, not a log line. Where a long command has nothing to show for
+/// minutes at a time, the fix is a step that says so, not a level that lets a library talk. The
+/// records are one `RUST_LOG=info` away for whoever is taking a run apart afterwards.
+fn default_log_level(_command: &Command) -> &'static str {
+    "error"
+}
+
+/// Where records go, and it does not depend on the command.
+
+
+/// Ordinary output is the result -- the addresses, paths and figures a caller parses -- and records,
+/// steps, the live line and refusals are the error stream. A per-command rule was how the same kind
+/// of line ended up in both places: machine commands and wallet onboarding sent records to stderr
+/// and everything else sent them to stdout, so `dexdo buyer` mixed its record stream into the result
+/// a script reads -- including, after, the detail line under every refusal.
+
+/// Kept as a function with a test rather than inlined, because "just this one command" is exactly the
+/// change that put them back on stdout.
+fn records_go_to_stderr(_command: &Command) -> bool {
+    true
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Seller client: gateway, authorization, stream handover(headless, R12).
+    /// Seller client: gateway, authorization, stream handover (headless, R12).
     Seller(SellerArgs),
     /// Buyer client: endpoint decryption, challenge signing, stream reception.
     Buyer(BuyerArgs),
-    /// Monitor(R14): human-readable state view **from the loaded note** --
+    /// Monitor (R14): human-readable state view **from the loaded note** --
     /// own offers, deals, by-fact tokens, exposure. Read-only, moves nothing.
     Monitor(MonitorArgs),
-    /// Doctor: read-only shellnet version/pin and market freshness checks. Alias: `health`.
+    /// Doctor: read-only chain version/pin and market freshness checks. Alias: `health`.
     #[command(alias = "health")]
     Doctor(DoctorArgs),
     /// Check a decrypted seller gateway endpoint without a note, deal, chain call, or inference.
     #[command(name = "gateway-check")]
     GatewayCheck(GatewayCheckArgs),
     /// Provision: bring up the InferenceOrderBook + RootModel + per-deal TokenContract for a
-    /// market -- **all note-funded** from the seller note's own ECC[2] (directive, no operator wallet,
-    /// no giver in the operate path) -- and write the manifest with the deployed, active TC address.
+    /// market -- **all note-funded** from the seller note's own ECC[2] (directive, no operator wallet
+    /// in the operate path) -- and write the manifest with the deployed, active TC address.
     Provision(ProvisionArgs),
-    /// Deploy-market: deploy the per-model `InferenceOrderBook`(the shared market for a model) if absent --
+    /// Deploy-market: deploy the per-model `InferenceOrderBook` (the shared market for a model) if absent --
     /// note-funded, the explicit "list this model" step before a seller posts offers. Idempotent
     /// (the book address is deterministic from `model_hash`; already-deployed -> no-op).
     #[command(name = "deploy-market")]
     DeployMarket(MarketDeployArgs),
     /// Destroy: the seller CLOSES a STOPped deal's per-deal `TokenContract` --
-    /// `TokenContract::destroy()` -> `selfdestruct`. **The payee is not an argument(4.0.33):** the deal
+    /// `TokenContract::destroy()` -> `selfdestruct`. **The payee is not an argument (4.0.33):** the deal
     /// pays the seller note it stored at construction, so nothing the caller passes decides where the
     /// money lands. **DESTRUCTIVE / BURNS:** after the 4.0.8 fund-10 sizing, the unrecovered deploy
     /// remainder is expected to be negligible; `--acknowledge-burn` is accepted and ignored so existing
@@ -234,6 +323,9 @@ enum Command {
     /// Read-only chain-derived terminal settlement and withdrawal receipt for one TokenContract.
     #[command(name = "settlement-receipt")]
     SettlementReceipt(SettlementReceiptArgs),
+    /// Model registry: read the on-chain registry out, whole, into a file.
+    #[command(name = "model-registry")]
+    ModelRegistry(ModelRegistryArgs),
     /// Markets: read-only discovery of active model order books and depth.
     Markets(MarketsArgs),
     /// Market: render ONE model's order book as the human-readable box table, for the model named below.
@@ -263,10 +355,10 @@ enum Command {
     Close(CloseArgs),
     /// Export: secret-free JSON/Markdown evidence for one local deal handle or raw TokenContract.
     Export(ExportArgs),
-    /// Wallet: bind this instance, once and explicitly, to the funding(Hot) wallet its
+    /// Wallet: bind this instance, once and explicitly, to the funding (Hot) wallet its
     /// spending commands draw on. The provider is a subcommand and is never guessed later.
     Wallet(WalletArgs),
-    /// Note: manage the actor's shellnet `PrivateNote`s. `note deploy` mints a wallet-funded PN
+    /// Note: manage the actor's `PrivateNote`s. `note deploy` mints a wallet-funded PN
     /// in-process through `gosh.ackinacki` and folds it into a `DEXDO_PN_POOL` the `seller`/`buyer` consume.
     Note(NoteArgs),
     /// Oracle: deploy OracleEventList-backed range PMPs tied to inference order books and resolve them.
@@ -281,13 +373,34 @@ enum Command {
 impl Command {
     fn machine_operation(&self) -> Option<&'static str> {
         match self {
-            Command::Markets(args) if args.json => Some(machine::OP_MARKETS),
+            Command::ModelRegistry(args) if args.json => Some(machine::OP_MODEL_REGISTRY),
+            // the address subcommand asks a narrower question but is the same command,
+            // so its JSON failures report under the same operation. `raw_machine_operation`
+            // already attributes a parse failure on `markets address` to `markets`; splitting the
+            // runtime side off into its own operation would make those two disagree.
+
+            // The subcommand is named here without its flags on purpose: an argument-carrying
+            // backticked span is run through the shipped parser by the recurrence lint in this
+            // file, and `markets address` without `--model` is a line that cannot run.
+            Command::Markets(args)
+                if args.json
+                    || matches!(&args.command, Some(MarketsCommand::Address(address)) if address.json) =>
+            {
+                Some(machine::OP_MARKETS)
+            }
             Command::Quote(args) if args.json => Some(machine::OP_QUOTE),
             Command::Status(args) if args.json => Some(machine::OP_STATUS),
             Command::Close(args) if args.json => Some(machine::OP_CLOSE),
             Command::SettlementReceipt(args) if args.json => Some(machine::OP_SETTLEMENT_RECEIPT),
             Command::Note(args) if matches!(&args.command, NoteCommand::Deploy(args) if args.json) => {
                 Some(machine::OP_NOTE_DEPLOY)
+            }
+            Command::Deals(args) if args.json => Some(machine::OP_DEALS),
+            Command::Note(args) if matches!(&args.command, NoteCommand::List(args) if args.json) => {
+                Some(machine::OP_NOTE_LIST)
+            }
+            Command::Note(args) if matches!(&args.command, NoteCommand::Balance(args) if args.json) => {
+                Some(machine::OP_NOTE_BALANCE)
             }
             Command::Buyer(args) if args.json => Some(machine::OP_BUYER_START),
             Command::Subscription(args) if args.json => {
@@ -303,9 +416,17 @@ impl Command {
             DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_PN_POOL_PATH,
         };
 
+        // The models config is brought by the operator, not written by the client, so the instance
+        // copy wins only where one exists and the working directory answers otherwise. Rebasing it
+        // unconditionally made a `--data-dir` run unable to see the file lying beside it.
         let models = |path: &mut std::path::PathBuf| {
-            cli::data_dir::rebase_default(path, DEFAULT_MODELS_PATH)
+            cli::data_dir::rebase_default_if_present(path, DEFAULT_MODELS_PATH)
         };
+        // What used to stand here rebased the `--contracts` default onto `--data-dir`, so an
+        // instance directory holding a manifest was read instead of whatever the working directory
+        // happened to hold. Both halves of that are gone: there is no flag and no default,
+        // and the manifest is named outright by `DEXDO_MANIFEST`. A path stated in full has nothing
+        // to rebase onto.
         match self {
             Command::Seller(args) => models(&mut args.models),
             Command::Buyer(args) => models(&mut args.models),
@@ -363,7 +484,7 @@ impl Command {
                 cli::data_dir::InstanceRole::Buyer,
                 args.endpoints_file.is_none()
                     || args.deals_dir.is_none()
-                    || (cfg!(feature = "shellnet") && !args.mock.mock_chain),
+                    || (true && !args.mock.mock_chain),
             )),
             _ => None,
         }
@@ -381,8 +502,21 @@ fn subscription_machine_operation(command: &SubscriptionCommand) -> &'static str
 }
 
 fn raw_machine_operation(args: &[std::ffi::OsString]) -> Option<&'static str> {
+    // The one place left in this binary that reads argv rather than the parse, and it reads it
+    // because it runs when the parse FAILED: there are no matches to consult. Everywhere a value's
+    // origin decides anything, `cli::command_line` answers from `ArgMatches::value_source` instead,
+    // where a spelling in argv cannot be mistaken for an answer.
+
+    // One of that scan's four lies applies to a subcommand name as much as to a flag: everything
+    // after a bare `--` is an argument for whatever runs next. Cut there, `dexdo -- buyer --json`
+    // names no operation of ours and clap's own error stands, which is the correct answer.
+    let args = match args.iter().position(|arg| arg.to_str() == Some("--")) {
+        Some(passthrough) => &args[..passthrough],
+        None => args,
+    };
     for (idx, arg) in args.iter().enumerate().skip(1) {
         let op = match arg.to_str()? {
+            "model-registry" => machine::OP_MODEL_REGISTRY,
             "markets" => machine::OP_MARKETS,
             "quote" => machine::OP_QUOTE,
             "buyer" => machine::OP_BUYER_START,
@@ -416,7 +550,7 @@ fn raw_machine_operation(args: &[std::ffi::OsString]) -> Option<&'static str> {
     None
 }
 
-/// The operator close signal for `dexdo buyer` with `--local-listen`: SIGINT(Ctrl-C) **and** SIGTERM
+/// The operator close signal for `dexdo buyer` with `--local-listen`: SIGINT (Ctrl-C) **and** SIGTERM
 /// (systemd/container/operator). `serve()` runs graceful shutdown on it, then awaits `session.settle("shutdown")`
 /// -- so a `SIGTERM` does NOT bypass the awaited funds-safety terminal into best-effort `Drop`. Non-Unix: Ctrl-C.
 #[cfg(unix)]
@@ -436,9 +570,48 @@ pub(crate) async fn operator_shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // a reader that has gone away is the end of output, not a fault.
+
+    // Rust's runtime sets SIGPIPE to SIG_IGN before `main`, so a closed stdout arrives as `EPIPE`
+    // on the write, and `print!`/`println!` panic on a write error by contract. The result is exit
+    // 101 -- a panic code -- for `dexdo... | less` that was quit, or any consumer that hung up.
+    // Measured against a reader that has closed: a 143-byte single-line command dies 20 times out
+    // of 20. The count of print sites that once stood here is dropped rather than recomputed -- it
+    // reproduces at no scope today, so any number put in its place would be a fresh count wearing
+    // the original measurement's clothes. Restoring the default disposition here, once, ends the
+    // process the way every other Unix tool ends it: signal 13, reported as 141.
+    #[cfg(unix)]
+    // SAFETY: `signal` on SIGPIPE with SIG_DFL only restores the disposition the kernel gave this
+    // process before Rust's runtime overrode it. It is a process-wide setting, so it is done here,
+    // at the one place that owns process entry, and never per print site.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let raw_args = std::env::args_os().collect::<Vec<_>>();
-    let mut cli = match Cli::try_parse_from(raw_args.clone()) {
-        Ok(cli) => cli,
+    // Parsed through the matches rather than through `Cli::try_parse_from`, because the matches are
+    // the only place that records WHERE each value came from. A struct field holds `ticks == 2`
+    // whether the operator wrote it or a default supplied it, and the interactive commands have to
+    // tell those apart before they decide to ask (see `cli::command_line`).
+    // `--no-color` has to be honoured BEFORE the parser runs, or it cannot reach the one surface
+    // the parser owns: its own help and its own errors. clap reads `NO_COLOR` itself and knows
+    // nothing about our flag, and both are drawn before the body of `main` executes at all --
+    // measured on a pty, 97 escape bytes in `--help` with the flag and without it, 0 under
+    // `NO_COLOR=1`. So the flag is read off the raw argv here, recorded, and handed to clap.
+
+    // Read as an exact match rather than a prefix: `--no-color-anything` is a different flag, and
+    // one that does not exist should be refused by the parser rather than silently swallowed here.
+    let no_colour_asked = raw_args.iter().any(|argument| argument == "--no-color");
+    if no_colour_asked {
+        cli::set_no_color(true);
+    }
+    let parser = <Cli as clap::CommandFactory>::command();
+    let parser = if no_colour_asked {
+        parser.color(clap::ColorChoice::Never)
+    } else {
+        parser
+    };
+    let matches = match parser.try_get_matches_from(&raw_args) {
+        Ok(matches) => matches,
         Err(err) => {
             if let Some(operation) = raw_machine_operation(&raw_args) {
                 if operation == machine::OP_BUYER_START {
@@ -456,25 +629,39 @@ async fn main() -> Result<()> {
             err.exit();
         }
     };
+    let mut cli = match <Cli as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
+    cli::command_line::remember(matches);
     let deal_gas_overhead_raw = cli.deal_gas_overhead_raw;
     let deal_gas_override_on_non_funding_command = deal_gas_overhead_raw.is_some()
         && !matches!(&cli.command, Command::Provision(_) | Command::Seller(_));
     let machine_operation = cli.command.machine_operation();
-    let env_filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    if logs_to_stderr(&cli.command) {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(std::io::stderr)
-            .with_ansi(std::io::stderr().is_terminal() && !cli::no_color_requested())
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(std::io::stdout().is_terminal() && !cli::no_color_requested())
-            .init();
-    }
+    // The level is the command's own default (`default_log_level`), and the stream is the error
+    // stream for every command (`records_go_to_stderr`): one says HOW MUCH is recorded, the other
+    // WHERE it goes, and neither is decided per command any more.
+    // BEFORE the subscriber is built, and this order is the whole point. Every other consumer of
+    // `no_color_requested()` resolves the palette on each call, so for them the order is
+    // indifferent -- but `with_ansi` is LATCHED into the formatter at `.init()` and never re-read.
+    // Recorded afterwards, the flag left the record stream coloured while the result was plain, so
+    // the two routes the client offers were not equivalent: measured on a pty, a run that logged
+    // through `RUST_LOG=info` carried 2 escape lines with neither, 1 with `--no-color`, 0 with
+    // `NO_COLOR=1`. Reported on by a reviewer who read the order rather than the promise.
+    cli::set_no_color(cli.no_color);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_log_level(&cli.command).into());
+    debug_assert!(records_go_to_stderr(&cli.command));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal() && !cli::no_color_requested())
+        .init();
 
+    // `--json` is the second reason a run may not ask, and it is decided here because this is where
+    // the machine surface is known.
+    cli::interaction::configure(cli.non_interactive, machine_operation.is_some());
+    cli::style::configure_raw(cli.raw);
     let instance_lock = cli::data_dir::configure(cli.data_dir.take()).and_then(|()| {
         cli.command.apply_data_dir_defaults()?;
         cli.command
@@ -512,6 +699,9 @@ async fn main() -> Result<()> {
             Command::ResolveDisputeTimeout(args) => run_resolve_dispute_timeout(args).await,
             Command::WithdrawShell(args) => run_withdraw_shell(args).await,
             Command::SettlementReceipt(args) => run_settlement_receipt(args).await,
+            Command::ModelRegistry(args) => {
+                crate::cli::model_registry::run_model_registry(args).await
+            }
             Command::Markets(args) => run_markets(args).await,
             Command::Market(args) => run_market(args).await,
             Command::ExecutableBook(args) => run_executable_book(args).await,
@@ -532,6 +722,7 @@ async fn main() -> Result<()> {
             Command::Wallet(args) => cli::wallet::run_wallet(args).await,
             Command::Note(args) => match args.command {
                 NoteCommand::Wallet(w) => run_note_wallet(w).await,
+                NoteCommand::List(l) => cli::note_cmd::run_note_list(l).await,
                 NoteCommand::Balance(b) => run_note_balance(b).await,
                 NoteCommand::Outstanding(o) => run_note_outstanding(o).await,
                 NoteCommand::Deploy(d) => run_note_deploy(d).await,
@@ -539,6 +730,7 @@ async fn main() -> Result<()> {
                 NoteCommand::Topup(t) => run_note_topup(t).await,
                 NoteCommand::Transfer(t) => run_note_transfer(t).await,
                 NoteCommand::Withdraw(w) => run_note_withdraw(w).await,
+                NoteCommand::Sweep(w) => run_note_sweep(w).await,
             },
             Command::Oracle(args) => run_oracle(args).await,
             Command::Policy(args) => policy::run_policy(args),
@@ -557,8 +749,27 @@ async fn main() -> Result<()> {
         // a structured error renders itself -- code, kind, message, the preserved `cause:`
         // chain, any `secondary:` consequence, and the `hint:`. Printing it through `anyhow`'s
         // `Debug` on top of that would repeat every cause under a second `Caused by:` block.
+        // A refusal an operator can act on prints as the two lines it was written as. Its detail is
+
+
+        // Asked of the whole chain and not of the outermost error: the funding wait wraps
+        // its refusal in `FundingContext` to carry the funding state a machine consumer reads, and
+        // a plain downcast could not see past that wrapper. The money-path refusal this branch was
+        // built for was the one refusal it never printed.
+        if let Some(refusal) = cli::refusal::shown_to_operator(&err) {
+            eprintln!("{refusal}");
+            std::process::exit(1);
+        }
         if let Some(structured) = err.downcast_ref::<dexdo_core::DexdoError>() {
             eprintln!("{structured}");
+            std::process::exit(1);
+        }
+        // Everything else, including the refusals nobody has written two lines for yet: translated
+        // into the same shape rather than handed over as the sentence a developer wrote for
+        // themselves. The record stays in the error and one `RUST_LOG=info` away.
+        if let Some(shown) = cli::refusal::for_operator(&err) {
+            tracing::info!("{}", shown.detail());
+            eprintln!("{}", shown.render());
             std::process::exit(1);
         }
         return Err(err);
@@ -571,17 +782,17 @@ mod buyer_mode_tests {
     use crate::cli::support::oneshot_real_upstream_guard;
     use serde_json::json;
 
-    /// one-shot `dexdo buyer`(no `--local-listen`) is promptless -- it must fail closed
-    /// against a real seller(no `--mock-model`) with an actionable error, instead of a deep gateway
-    /// `InvalidArgument`. `--local-listen`(consumer API supplies the prompt) and `--mock-model` both pass.
+    /// one-shot `dexdo buyer` (no `--local-listen`) is promptless -- it must fail closed
+    /// against a real seller (no `--mock-model`) with an actionable error, instead of a deep gateway
+    /// `InvalidArgument`. `--local-listen` (consumer API supplies the prompt) and `--mock-model` both pass.
     #[test]
     fn oneshot_real_upstream_rejected_promptless() {
         let err = oneshot_real_upstream_guard(false, false).unwrap_err();
         assert!(err.contains("--local-listen"), "{err}");
         assert!(err.contains(""), "{err}");
-        // one-shot + --mock-model -> OK(the mock seller synthesizes tokens for the promptless stream).
+        // one-shot + --mock-model -> OK (the mock seller synthesizes tokens for the promptless stream).
         assert!(oneshot_real_upstream_guard(false, true).is_ok());
-        // --local-listen(consumer API supplies the prompt per request) -> OK regardless of --mock-model.
+        // --local-listen (consumer API supplies the prompt per request) -> OK regardless of --mock-model.
         assert!(oneshot_real_upstream_guard(true, false).is_ok());
         assert!(oneshot_real_upstream_guard(true, true).is_ok());
     }
@@ -693,7 +904,6 @@ mod recovery_cli_tests {
 mod note_cli_tests {
     use super::{Cli, Command};
     use crate::cli::args::NoteCommand;
-    #[cfg(feature = "shellnet")]
     use crate::cli::args::{IdentityArgs, NoteWithdrawArgs};
     use clap::Parser;
     use std::path::PathBuf;
@@ -714,7 +924,7 @@ mod note_cli_tests {
             "--json",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--nominal",
             "N100",
@@ -730,13 +940,27 @@ mod note_cli_tests {
         };
         assert_eq!(d.nominal, "N100");
         assert_eq!(d.token_type, "shell");
-        assert_eq!(d.endpoint, "dd-shellnet.ackinacki.org");
-        assert_eq!(
-            d.contracts,
-            PathBuf::from("contracts/deployed.shellnet.json")
+        // there is no `--endpoint` to read. It used to carry a mandatory `default_value` of
+        // one chain's host, substituted on every run and therefore overriding the
+        // manifest's own `endpoint` field -- measured on a mainnet data directory that dialled
+        // that chain regardless. Making it optional would have left two sources of truth; the
+        // manifest is the only one now, and the flag is refused rather than ignored.
+        assert!(
+            Cli::try_parse_from([
+                "dexdo",
+                "note",
+                "deploy",
+                "--nominal",
+                "N100",
+                "--endpoint",
+                "anything.example",
+            ])
+            .is_err(),
+            "--endpoint is still accepted somewhere, which puts a second source of truth beside \
+             the manifest"
         );
         assert_eq!(d.multisig_address, Some("0:wallet".to_string()));
-        assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
+        assert_eq!(d.multisig_private_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
         assert_eq!(d.pool, Some(PathBuf::from("pn_pool.json")));
         assert_eq!(d.recovery, None);
@@ -765,7 +989,7 @@ mod note_cli_tests {
             panic!("expected NoteCommand::Deploy");
         };
         assert_eq!(d.multisig_address, Some("0:wallet".to_string()));
-        assert_eq!(d.multisig_key, None);
+        assert_eq!(d.multisig_private_key, None);
         assert_eq!(
             d.multisig_seed_file,
             Some(PathBuf::from(r"C:\Users\operator\wallet.seed"))
@@ -781,7 +1005,7 @@ mod note_cli_tests {
             "dexdo",
             "note",
             "deploy",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--nominal",
             "N100",
@@ -822,7 +1046,7 @@ mod note_cli_tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--multisig-seed-file",
             "wallet.seed",
@@ -838,14 +1062,18 @@ mod note_cli_tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--nominal",
             "N100",
             "--pool",
             "pn_pool.json",
+            // Any path: this case asserts the PARSE fails, so the value proves nothing. It used to
+            // spell the external SDK's binary, which put a third-party name into our sources for no
+            // work -- and a sweep that renamed it here would have renamed nothing, since we do not
+            // build it.
             "--onboard-bin",
-            "/bin/onboard_user_shellnet",
+            "/bin/onboard-helper",
         ])
         .is_err());
     }
@@ -860,7 +1088,7 @@ mod note_cli_tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "wallet.key",
             "--nominal",
             "N100",
@@ -877,8 +1105,32 @@ mod note_cli_tests {
         .expect("note recover must accept the per-instance pool default");
     }
 
-    /// audit item 5: contracts are application resources, not instance state. This guards
-    /// both defaulting paths: ordinary command arguments and handle-less status/close/report.
+    /// A `--data-dir` uses the manifest lying inside it when there IS one, and never invents one.
+
+    /// **This replaces audit item 5, and the reversal is deliberate.** That item said
+    /// "contracts are application resources, not instance state" and forbade the rebase outright,
+    /// by the same argument that keeps `models.json` out of the instance directory: a file the
+    /// operator brought once and points several instances at should not be captured by one of them.
+
+    /// The argument holds for a configuration file. It does not hold for THIS file, because this
+    /// one decides which chain the command dials and which wallet it may spend. Measured on the
+    /// owner's mainnet run, 25 August 2026: `--data-dir./.dexdo-mainnet`, whose manifest says
+    /// `network = mainnet`, `endpoint = dd-mainnet`, was read past and the compiled default
+    /// a stale committed path used instead -- so `note deploy` announced "no chain
+    /// wallet is bound yet" against a live mainnet binding and opened a twelve-minute onboarding
+    /// nobody asked for, and `doctor` dialled one chain's host nine times while reporting a verdict
+    /// about the operator's own network. A directory devoted to one chain read another chain's
+    /// The manifest is not rebased onto `--data-dir`, because nothing rebases any more.
+
+    /// What stood here asserted that an instance directory holding a manifest read that one rather
+    /// than the working directory's. The mechanism it exercised is gone with the flag and the
+    /// default it worked on: `DEXDO_MANIFEST` names the file outright, one directory at a time, and
+    /// there is no untouched default left to recognise. Kept as a note rather than deleted silently
+    /// -- the protection it bought was real, and is recorded in `cli/data_dir.rs` where it stood.
+
+
+    /// The rest of audit item 5 that does NOT touch: handle-less deal commands still
+    /// resolve contracts without the instance directory, and the pool default is not duplicated.
     #[test]
     fn data_dir_defaulting_never_rebases_the_contracts_manifest() {
         fn body_after<'a>(source: &'a str, marker: &str) -> &'a str {
@@ -891,16 +1143,6 @@ mod note_cli_tests {
                 .unwrap_or_else(|| panic!("missing end after source marker {marker}"));
             &tail[..end]
         }
-
-        let defaults = body_after(
-            include_str!("main.rs"),
-            "fn apply_data_dir_defaults(&mut self)",
-        );
-        assert!(
-            !defaults.contains("DEFAULT_CONTRACTS_PATH")
-                && !defaults.contains("contracts(&mut"),
-            "--data-dir still rebases an application contracts manifest:\n{defaults}"
-        );
 
         let deal_fallback = body_after(
             include_str!("cli/commands.rs"),
@@ -949,7 +1191,7 @@ mod note_cli_tests {
     }
 
     /// `dexdo note withdraw` is owner-signed money movement, so the parser surface and destination
-    /// normalization contract are pinned separately from the live shellnet submit.
+    /// normalization contract are pinned separately from the a live chain submit.
     #[test]
     fn note_withdraw_subcommand_parses_and_requires_destination() {
         let to = format!("{DEST_HALF_1}::{DEST_HALF_2}");
@@ -963,8 +1205,6 @@ mod note_cli_tests {
             "note.key",
             "--to",
             &to,
-            "--contracts",
-            "contracts/custom.json",
         ])
         .expect("note withdraw parses");
         let Command::Note(n) = c.command else {
@@ -976,7 +1216,6 @@ mod note_cli_tests {
         assert_eq!(w.identity.note_addr.as_deref(), Some(NOTE));
         assert_eq!(w.identity.note_key, Some(PathBuf::from("note.key")));
         assert_eq!(w.to, to);
-        assert_eq!(w.contracts, PathBuf::from("contracts/custom.json"));
         assert!(Cli::try_parse_from([
             "dexdo",
             "note",
@@ -1004,10 +1243,6 @@ mod note_cli_tests {
             "balance",
             "--note-addr",
             NOTE,
-            "--contracts",
-            "contracts/custom.json",
-            "--endpoint",
-            "new-shellnet.example",
         ])
         .expect("note balance parses");
         let Command::Note(n) = c.command else {
@@ -1017,8 +1252,6 @@ mod note_cli_tests {
             panic!("expected NoteCommand::Balance");
         };
         assert_eq!(b.note_addr, NOTE);
-        assert_eq!(b.contracts, PathBuf::from("contracts/custom.json"));
-        assert_eq!(b.endpoint.as_deref(), Some("new-shellnet.example"));
         assert!(Cli::try_parse_from(["dexdo", "note", "balance"]).is_err());
         assert!(Cli::try_parse_from([
             "dexdo",
@@ -1032,9 +1265,56 @@ mod note_cli_tests {
         .is_err());
     }
 
-    #[cfg(feature = "shellnet")]
+    /// A manifest that loads and names an endpoint nothing is listening on.
+
+    /// Three requirements, and they have to be met at once.
+
+    /// It must EXIST: it used to be a relative path to a committed manifest, which does not
+    /// resolve from a test's working directory -- and the test passed anyway, because a missing
+    /// manifest at the default path was quietly replaced by a copy compiled into the binary.
+    /// removed that copy.
+
+    /// It must be DEAD: these tests assert which guard a run trips, and the guards under test all
+    /// sit in front of the chain. Pointing them at the repository's own manifest made them dial
+    /// a real host -- a read, and no money, but a live call out of a unit test all the
+    /// same. `--endpoint` is gone, so the only way to keep a run offline is a manifest that
+    /// names a port nothing answers on.
+
+    /// It must be WRITTEN PER TEST: a shared path is a shared file, and these run in parallel.
+    fn offline_manifest(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("deployed.offline.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "network": "net-a",
+                "version": "offline-guard-fixture",
+                "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+                "dapp_config": "",
+                "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
+                "endpoint": "http://127.0.0.1:1",
+            })
+            .to_string(),
+        )
+        .expect("write the offline manifest");
+        path
+    }
+
+    // dev reached the same finding from the other side and marked this `#[ignore]`: the
+    // `--note-key` case it used to carry is refused only AFTER `chain_doctor_preflight` has
+    // reached the chain, so on a runner with no route it failed after five read attempts, and where
+    // it passed it passed because the runner happened to be online.
+
+    // The mark is not carried over, because the reason for it is not carried over either: that case
+    // was removed rather than marked, and what remains needs no chain at all. Marking a test that
+    // runs offline would take a working guard out of every run to describe a dependency it no
+    // longer has.
+
+    // The other half of dev's note stands and is not settled here: disputes what this test's
+    // NAME claims. The name is unchanged, so that dispute is unchanged.
     #[tokio::test]
     async fn note_withdraw_runtime_guards_fail_before_chain() {
+        let dir = tempfile::tempdir().expect("create the fixture directory");
+        let manifest = offline_manifest(dir.path());
         let err = crate::cli::commands::run_note_withdraw(NoteWithdrawArgs {
             identity: IdentityArgs {
                 note_key: Some(PathBuf::from("note.key")),
@@ -1042,24 +1322,22 @@ mod note_cli_tests {
                 note_addr: None,
             },
             to: format!("{DEST_HALF_1}::{DEST_HALF_2}"),
-            contracts: PathBuf::from("contracts/deployed.shellnet.json"),
         })
         .await
         .unwrap_err();
         assert!(err.to_string().contains("--note-addr"), "{err}");
 
-        let err = crate::cli::commands::run_note_withdraw(NoteWithdrawArgs {
-            identity: IdentityArgs {
-                note_key: None,
-                note_index: 0,
-                note_addr: Some(NOTE.to_string()),
-            },
-            to: format!("{DEST_HALF_1}::{DEST_HALF_2}"),
-            contracts: PathBuf::from("contracts/deployed.shellnet.json"),
-        })
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("--note-key"), "{err}");
+        // The missing `--note-key` case that stood here is gone, and what it was really testing is
+        // worth stating. `--note-key` is checked AFTER `chain_doctor_preflight`, deliberately:
+        // the ordering the code documents is that an argument is refused before any SECRET is
+        // looked for, not before the chain. So that case could only ever pass with a chain that
+        // answers -- and it did, by dialling a real host out of a unit test, which is what made it
+        // green on dev. The ordering it cared about is pinned without a network by
+        // `note_cmd::tests::note_withdraw_checks_owner_before_submit`, which reads the call order
+        // out of the function itself.
+
+        // What stays here is the half that needs nothing: arguments this command refuses outright,
+        // refused before the chain is dialled at all.
 
         let err = crate::cli::commands::run_note_withdraw(NoteWithdrawArgs {
             identity: IdentityArgs {
@@ -1068,7 +1346,6 @@ mod note_cli_tests {
                 note_addr: Some(NOTE.to_string()),
             },
             to: "not-a-wallet".to_string(),
-            contracts: PathBuf::from("contracts/deployed.shellnet.json"),
         })
         .await
         .unwrap_err();
@@ -1081,7 +1358,7 @@ mod doctor_cli_tests {
     use super::{Cli, Command};
     use clap::Parser;
 
-    /// `dexdo doctor` is the read-only shellnet health guard; `health` is kept as an alias.
+    /// `dexdo doctor` is the read-only chain health guard; `health` is kept as an alias.
     #[test]
     fn doctor_subcommand_parses() {
         let c = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor parses");
@@ -1091,19 +1368,26 @@ mod doctor_cli_tests {
         assert!(matches!(c.command, Command::Doctor(_)));
     }
 
+    /// `--network` is refused, and a URL through it most of all.
+
+    /// This test used to be called `doctor_accepts_a_foreign_endpoint`, and it asserted that
+    /// `--network https://new-chain.example/` parsed and was kept verbatim -- a HOST arriving
+    /// through the argument that names a CHAIN. That is the defect class is about:
+    /// a network's name used as a decision in place of a fact about that network. The flag is gone
+    /// the manifest says which chain a run is on, and there is nothing to disagree with it.
     #[test]
-    fn doctor_accepts_non_shellnet_endpoint() {
-        let c = Cli::try_parse_from([
-            "dexdo",
-            "doctor",
-            "--network",
-            "https://new-shellnet.example/",
-        ])
-        .expect("doctor accepts an endpoint through --network");
-        let Command::Doctor(args) = c.command else {
-            panic!("expected Command::Doctor");
-        };
-        assert_eq!(args.network, "https://new-shellnet.example/");
+    fn doctor_refuses_a_network_argument() {
+        for value in ["net-a", "mainnet", "https://new-chain.example/"] {
+            assert!(
+                Cli::try_parse_from(["dexdo", "doctor", "--network", value]).is_err(),
+                "`--network {value}` still parses, which puts a second source of truth beside the \
+                 manifest"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["dexdo", "doctor"]).is_ok(),
+            "doctor must still run with no arguments at all"
+        );
     }
 }
 
@@ -1121,6 +1405,7 @@ mod market_orders_cli_tests {
     /// uint128 maximum and rejects the adjacent out-of-range decimal in clap, before dispatch can
     /// construct a backend. Treating one surface as uint64 is the adversary because it rejects a
     /// contract-valid price at the command boundary.
+
     /// E2E-PLACE-04, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-PLACE-04/L0
     #[ignore = "EXPECTED TO FAIL until every applicable CLI price surface uses the contract's uint128 range"]
@@ -1297,24 +1582,24 @@ mod market_orders_cli_tests {
         };
         assert_eq!(b.market, Some(PathBuf::from("m.json")));
         assert_eq!(b.ticks, 8);
-        assert_eq!(b.max_price_per_tick, 1000);
+        // `--max-price-per-tick 1000` is a thousand SHELL a tick; the field carries raw ECC[2].
+        assert_eq!(
+            b.max_price_per_tick,
+            dexdo_core::price_raw_from_shell(1000).expect("a thousand SHELL is a price")
+        );
         assert_eq!(b.read_timeout.read_timeout_secs, 11);
     }
 
-    /// read-only Dodex indexer discovery parses independently of shellnet signing flags.
+    /// read-only Dodex indexer discovery parses independently of chain signing flags.
     #[test]
     fn market_data_subcommands_parse() {
         let c = Cli::try_parse_from([
             "dexdo",
             "market-data",
             "--indexer-url",
-            "http://dodex-dev.ackinacki.org:8080",
+            "http://indexer.example:8080",
             "--output",
             "json",
-            "--contracts",
-            "contracts/custom.json",
-            "--endpoint",
-            "new-shellnet.example",
             "list",
             "--producer",
             "qwen",
@@ -1331,11 +1616,8 @@ mod market_orders_cli_tests {
         };
         assert_eq!(
             args.indexer_url.as_deref(),
-            Some("http://dodex-dev.ackinacki.org:8080")
+            Some("http://indexer.example:8080")
         );
-        assert_eq!(args.output, MarketDataOutput::Json);
-        assert_eq!(args.contracts, Some(PathBuf::from("contracts/custom.json")));
-        assert_eq!(args.endpoint.as_deref(), Some("new-shellnet.example"));
         assert_eq!(args.timeout_ms, 10_000);
         let MarketDataCommand::List {
             producer,
@@ -1367,8 +1649,6 @@ mod market_orders_cli_tests {
             panic!("expected Command::MarketData");
         };
         assert_eq!(args.output, MarketDataOutput::Json);
-        assert_eq!(args.timeout_ms, 10_000);
-        assert_eq!(args.contracts, None);
         assert!(matches!(
             args.command,
             MarketDataCommand::List { limit: Some(1), .. }
@@ -1378,17 +1658,11 @@ mod market_orders_cli_tests {
             "dexdo",
             "market-data",
             "list",
-            "--contracts",
-            "contracts/after-subcommand.json",
         ])
-        .expect("market-data list accepts compatibility --contracts after subcommand");
+        .expect("market-data list parses without a manifest flag");
         let Command::MarketData(args) = c.command else {
             panic!("expected Command::MarketData");
         };
-        assert_eq!(
-            args.contracts,
-            Some(PathBuf::from("contracts/after-subcommand.json"))
-        );
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -1537,7 +1811,7 @@ mod market_orders_cli_tests {
             "m.json",
             "place",
             "--max-price-per-tick",
-            "1000000000",
+            "1",
             "--ticks",
             "4",
         ])
@@ -1553,7 +1827,11 @@ mod market_orders_cli_tests {
             s.read_timeout.read_timeout_secs,
             DEFAULT_CHAIN_READ_TIMEOUT_SECS
         );
-        assert_eq!(p.max_price_per_tick, dexdo_core::PRICE_STEP);
+        // One SHELL a tick, typed as `1`.
+        assert_eq!(
+            p.max_price_per_tick,
+            dexdo_core::price_raw_from_shell(1).expect("one SHELL is a price")
+        );
         assert_eq!(p.ticks, 4);
 
         let c = Cli::try_parse_from([
@@ -1567,7 +1845,7 @@ mod market_orders_cli_tests {
             "--note-key",
             "note.secret",
             "--max-price-per-tick",
-            "1000000000",
+            "1",
             "--ticks",
             "4",
         ])
@@ -1658,7 +1936,7 @@ mod market_orders_cli_tests {
             "m.json",
             "place",
             "--max-price-per-tick",
-            "1000000000",
+            "1",
             "--ticks",
             "4",
             "--budget",
@@ -1677,7 +1955,7 @@ mod market_orders_cli_tests {
             if json_first {
                 argv.push("--json");
             }
-            argv.extend(["place", "--max-price-per-tick", "1000000000", "--ticks", "4"]);
+            argv.extend(["place", "--max-price-per-tick", "1", "--ticks", "4"]);
             if !json_first {
                 argv.push("--json");
             }
@@ -1753,6 +2031,22 @@ mod market_orders_cli_tests {
         for (args, expected) in cases {
             assert_eq!(raw_machine_operation(&raw(&args)), expected, "{args:?}");
         }
+
+        // what follows a bare `--` is somebody else's command line. This is the last reader
+        // of argv in the binary -- it runs only when the parse failed -- and a subcommand name after
+        // the cut is no more ours than a flag would be.
+        let cases: [(Vec<&str>, Option<&'static str>); 3] = [
+            (vec!["dexdo", "--", "buyer", "--json"], None),
+            (
+                vec!["dexdo", "subscription", "place", "--json", "--", "status"],
+                Some(machine::OP_SUBSCRIPTION_PLACE),
+            ),
+            // The `--json` that would make it answer is itself past the cut.
+            (vec!["dexdo", "buyer", "--", "--json"], None),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(raw_machine_operation(&raw(&args)), expected, "{args:?}");
+        }
     }
 }
 
@@ -1778,23 +2072,16 @@ mod deal_handle_cli_tests {
         let Command::Status(status) = c.command else {
             panic!("expected Command::Status");
         };
-        assert_eq!(status.contracts, None);
 
         let c = Cli::try_parse_from([
             "dexdo",
             "status",
             "deal-0-abc",
-            "--contracts",
-            "contracts/custom.json",
         ])
-        .expect("status --contracts parses");
+        .expect("status parses");
         let Command::Status(status) = c.command else {
             panic!("expected Command::Status");
         };
-        assert_eq!(
-            status.contracts,
-            Some(PathBuf::from("contracts/custom.json"))
-        );
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -1813,7 +2100,6 @@ mod deal_handle_cli_tests {
         };
         assert_eq!(close.role, Some(DealRoleArg::Buyer));
         assert_eq!(close.note_addr.as_deref(), Some("0:note"));
-        assert_eq!(close.contracts, None);
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -1855,8 +2141,6 @@ mod deal_handle_cli_tests {
             "deal-0-abc",
             "--format",
             "md",
-            "--contracts",
-            "contracts/custom.json",
         ])
         .expect("export parses");
         let Command::Export(export) = c.command else {
@@ -1864,14 +2148,10 @@ mod deal_handle_cli_tests {
         };
         assert_eq!(export.deal, "deal-0-abc");
         assert_eq!(export.format, ExportFormatArg::Md);
-        assert_eq!(
-            export.contracts,
-            Some(PathBuf::from("contracts/custom.json"))
-        );
     }
 
     /// PR212: explicit `buyer --resume` remains a no-new-buy connect path; model-only resume is covered
-    /// by the shellnet resume validation tests.
+    /// by the chain resume validation tests.
     #[test]
     fn buyer_resume_explicit_deal_parses() {
         let c = Cli::try_parse_from([
@@ -2192,7 +2472,7 @@ mod oracle_cli_tests {
     use clap::Parser;
     use std::path::PathBuf;
 
-    /// oracle/PMP lifecycle commands parse as a single shellnet surface.
+    /// oracle/PMP lifecycle commands parse as a single chain surface.
     #[test]
     fn oracle_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -2314,7 +2594,7 @@ mod deposit_tests {
     const ISSUE999_TICKS: u128 = 8;
 
     #[test]
-    fn shellnet_deposit_validation_message_is_byte_identical() {
+    fn chain_deposit_validation_message_is_byte_identical() {
         let legacy = deposit_per_deploy(0, 53)
             .expect_err("zero is below the deal floor")
             .to_string();
@@ -2323,41 +2603,71 @@ mod deposit_tests {
             .to_string();
         let requirement = dexdo_core::params::deal_gas_requirement_raw(53);
         let floor = dexdo_core::params::min_deploy_shells(53);
-        let before_1236 = format!(
+        let expected = format!(
             "--deposit-shells 0 -> ~0 SHELL/deploy is below the {floor} SHELL/deploy floor \
-             for a 53-tick deal (that deal's TokenContract spends {requirement} raw nanovmshell over its life: the \
-             values it declares on its own outgoing calls, plus one claim per tick, because MAX_CLAIM_DELTA = \
-             TICK_SIZE caps a claim at one tick and claimTokens accepts before its body so the DEAL pays -- \
-             contract-declared values and the published 4.0.34 measurement, not bisected). Below it the deal \
-             under-funds, and it cannot refill itself: deployed by an external message into a dapp with no config, \
-             gosh.mintshellq has nothing to draw on, so the stop is permanent with the bond inside. \
+             for a 53-tick deal (that deal's TokenContract burns {requirement} raw ECC[2] over its life: one charge \
+             per entry from the GAS_* table, plus one claim per tick, because MAX_CLAIM_DELTA = TICK_SIZE caps a \
+             claim at one tick and claimTokens accepts before its body so the DEAL pays -- \
+             contract-declared charges and the reserve the vendored contracts' burn table implies, not bisected). \
+             Below it the deal \
+             under-funds, and NO entry of this generation refills the reserve: PrivateNote.fundDeal and \
+             fundDeployShell both convert the ECC they carry into native balance, so the reserve is chosen once, \
+             on the deploy message, and every entry starts by burning from it -- including the terminal ones. \
              Raise --deposit-shells to >={floor} (default for this deal: {floor}).",
         );
-        assert_eq!(legacy.as_bytes(), before_1236.as_bytes());
-        assert_eq!(network_aware.as_bytes(), before_1236.as_bytes());
+        assert_eq!(legacy.as_bytes(), expected.as_bytes());
+        assert_eq!(network_aware.as_bytes(), expected.as_bytes());
     }
 
+    /// The operator flag can only raise the deposit floor, never lower it (contracts 4.0.36).
+
+    /// This test used to assert the opposite, and was right to: `--deal-gas-overhead-raw` REPLACED
+    /// the measured native remainder, so a smaller measurement genuinely meant a smaller
+    /// requirement, and clamping it would have refused a seller whose own network was cheaper.
+
+    /// A deal's requirement is burnt contract constants now -- the same on every chain -- so there is
+    /// no measurement left to replace and the flag adds a surplus instead. The direction matters
+    /// more than the arithmetic: only the seller note can top the reserve up, so a flag that could
+    /// still shrink it would be a way to strand a BUYER's exit behind somebody else's decision.
     #[test]
-    fn below_shellnet_operator_measurement_is_not_clamped_by_deposit_validation() {
-        let measurement = dexdo_core::params::DEAL_GAS_OVERHEAD_RAW;
-        let supplied = measurement.value / 2;
+    fn the_operator_flag_raises_the_deposit_floor_and_never_lowers_it() {
+        let base_floor = dexdo_core::params::min_deploy_shells(53);
+        assert_eq!(
+            crate::cli::support::deposit_per_deploy_with_overhead(base_floor, 53, None)
+                .expect("the contract-derived floor is exactly fundable"),
+            base_floor * dexdo_core::params::SHELL_UNIT,
+        );
+
+        // A surplus of a whole SHELL lifts the floor by a whole SHELL, so the deposit that just
+        // cleared it no longer does.
+        let surplus = dexdo_core::params::SHELL_UNIT;
         assert!(
-            deposit_per_deploy(1, 53).is_err(),
-            "the existing shellnet measurement needs two whole SHELL at this boundary"
+            crate::cli::support::deposit_per_deploy_with_overhead(base_floor, 53, Some(surplus))
+                .is_err(),
+            "a surplus must raise the floor; a deposit at the bare floor cannot still clear it"
         );
         assert_eq!(
-            crate::cli::support::deposit_per_deploy_with_overhead(1, 53, Some(supplied))
-                .expect("the supplied measurement puts this boundary below one whole SHELL"),
-            dexdo_core::params::SHELL_UNIT
+            dexdo_core::params::min_deploy_shells_with_overhead(53, surplus),
+            base_floor + 1,
         );
+
+        // And a surplus can never make the floor SMALLER, whatever is passed.
+        for supplied in [0, 1, dexdo_core::params::DEAL_GAS_OVERHEAD_RAW.value] {
+            assert!(
+                dexdo_core::params::min_deploy_shells_with_overhead(53, supplied) >= base_floor,
+                "supplied {supplied} lowered the floor below the contract-derived reserve"
+            );
+        }
     }
 
     /// ONE NOTE-FUNDED DEPLOY SINCE 4.0.34, so the whole deposit is that deploy's allocation.
+
     /// This asserted `deposit/2` while the note pre-funded the `RootModel`'s uninit address as well as
     /// the deal's. `SuperRoot` deploys the RootModel now and carries its own value
     /// (`contracts/airegistry/SuperRoot.sol:58`), and `PrivateNote.fundDeployShell` has no leg pointed
-    /// at it any more(`contracts/dex/PrivateNote.sol:1143`) -- so the halved reservation was ECC[2] no
+    /// at it any more (`contracts/dex/PrivateNote.sol:1143`) -- so the halved reservation was ECC[2] no
     /// message could spend, and it burns at `destroy`.
+
     /// The default is still exactly one deploy at the floor; what moved is that the floor is now this
     /// deal's own requirement rather than one figure for every deal.
     #[test]
@@ -2464,38 +2774,6 @@ mod deposit_tests {
         .is_ok());
     }
 
-    #[test]
-    fn provision_script_serializes_every_full_live_suite_command() {
-        let sources = [
-            (
-                "provision-shellnet-actor.sh",
-                include_str!("../../../provision-shellnet-actor.sh"),
-            ),
-            ("README.md", include_str!("../../../README.md")),
-            ("live_cli.rs", include_str!("../tests/live_cli.rs")),
-        ];
-        let commands: Vec<_> = sources
-            .iter()
-            .flat_map(|(source, text)| {
-                text.lines().filter_map(move |line| {
-                    let is_full_ignored_suite = line.contains("cargo test")
-                        && line.contains("-- --ignored")
-                        && (line.contains("--test live_cli") || line.contains("-p dexdo-core"));
-                    is_full_ignored_suite.then_some((*source, line))
-                })
-            })
-            .collect();
-        assert!(
-            !commands.is_empty(),
-            "full live-suite command must remain documented"
-        );
-        for (source, command) in commands {
-            assert!(
-                command.contains("--test-threads=1"),
-                "unserialized full ignored shellnet-suite command in {source}: {command}"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2577,7 +2855,7 @@ mod tests {
     }
 
     /// Every `method(arg,...)` shape the given help renders for `method`, normalized to the argument
-    /// NAMES(`uint128 amount` -> `amount`), so a rendered signature can be held against the compiled
+    /// NAMES (`uint128 amount` -> `amount`), so a rendered signature can be held against the compiled
     /// ABI's declared input list.
     fn rendered_call_arguments(help: &str, method: &str) -> Vec<Vec<String>> {
         let needle = format!("{method}(");
@@ -2604,7 +2882,7 @@ mod tests {
     }
 
     /// `--help` is where an operator learns a contract call's shape, so a signature the CLI
-    /// renders must be the deployed one. 4.0.33(Task O) took the caller-named payee off the
+    /// renders must be the deployed one. 4.0.33 (Task O) took the caller-named payee off the
     /// TokenContract's terminal doors -- `destroy(payoutAddress)` -> `destroy()`,
     /// `withdrawShell(amount, recipient)` -> `withdrawShell(amount)`, `close(payoutAddress)` ->
     /// `close()` -- while the help went on promising the old shapes. A function id derives from the
@@ -2705,7 +2983,6 @@ mod tests {
         );
         assert_eq!(seller.mock_token_count, p::DEFAULT_SELLER_MOCK_TOKEN_COUNT);
         assert_eq!(seller.models, Path::new(p::DEFAULT_MODELS_PATH));
-        assert_eq!(seller.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
 
         let buyer = Cli::try_parse_from(["dexdo", "buyer"]).expect("buyer defaults parse");
         let Command::Buyer(buyer) = buyer.command else {
@@ -2716,21 +2993,17 @@ mod tests {
         assert_eq!(buyer.ticks, p::DEFAULT_BUYER_TICKS);
         assert!(!buyer.wait_for_seller);
         assert_eq!(buyer.models, Path::new(p::DEFAULT_MODELS_PATH));
-        assert_eq!(buyer.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
 
         let monitor = Cli::try_parse_from(["dexdo", "monitor"]).expect("monitor defaults parse");
         let Command::Monitor(monitor) = monitor.command else {
             panic!("monitor command")
         };
         assert_eq!(monitor.tree_width, p::DEFAULT_MONITOR_TREE_WIDTH);
-        assert_eq!(monitor.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
 
         let doctor = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor defaults parse");
         let Command::Doctor(doctor) = doctor.command else {
             panic!("doctor command")
         };
-        assert_eq!(doctor.network, p::DEFAULT_DOCTOR_NETWORK);
-        assert_eq!(doctor.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
 
         let policy =
             Cli::try_parse_from(["dexdo", "policy", "init"]).expect("policy defaults parse");
@@ -2810,7 +3083,7 @@ mod tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "wallet.key",
             "--nominal",
             "N10000",
@@ -2824,8 +3097,8 @@ mod tests {
         let NoteCommand::Deploy(note) = note.command else {
             panic!("note deploy")
         };
-        assert_eq!(note.endpoint, p::DEFAULT_NOTE_DEPLOY_ENDPOINT);
-        assert_eq!(note.contracts, Path::new(p::DEFAULT_CONTRACTS_PATH));
+        // the same guarantee from the defaults side -- an unpassed --endpoint parses to
+        // `None`, not to a constant naming the test network.
 
         let oracle = Cli::try_parse_from([
             "dexdo",
@@ -2914,7 +3187,8 @@ mod tests {
 
     #[test]
     fn subscription_surface_is_only_place_status_cancel() {
-        let price = dexdo_core::PRICE_STEP.to_string();
+        // One SHELL a tick -- what the argument now takes, and what the book's step is.
+        let price = "1".to_string();
         let placed = Cli::try_parse_from([
             "dexdo",
             "subscription",
@@ -2980,7 +3254,8 @@ mod tests {
         std::fs::write(&note_key, "11".repeat(32)).unwrap();
         let endpoints_arg = endpoints.to_str().unwrap();
         let note_key_arg = note_key.to_str().unwrap();
-        let price = dexdo_core::PRICE_STEP.to_string();
+        // One SHELL a tick -- what the argument now takes, and what the book's step is.
+        let price = "1".to_string();
 
         let place = Cli::try_parse_from([
             "dexdo",
@@ -3070,50 +3345,92 @@ mod tests {
     fn seller_help_has_no_obsolete_probe_shell_surface() {
         let help = subcommand_long_help("seller");
         assert!(!help.contains("--probe-shell"), "{help}");
-        assert!(help.contains("[default: 1000000000]"), "{help}");
-        assert!(help.contains("positive multiple of PRICE_STEP"), "{help}");
+        // The price is stated in whole SHELL, so the default reads `1`, not the billion raw units
+        // it used to print at an operator who then typed a billion SHELL.
+        assert!(help.contains("[default: 1]"), "{help}");
+        assert!(help.contains("Tick price P in whole SHELL"), "{help}");
+        assert!(!help.contains("raw ECC[2] units"), "{help}");
     }
 
-    #[cfg(feature = "shellnet")]
-    #[tokio::test]
-    async fn money_command_paths_reject_bad_price_before_backend_or_file_work() {
-        let invalid = (dexdo_core::PRICE_STEP - 1).to_string();
+    /// A command line written before prices were quoted in SHELL is refused, and refused at the
+    /// argument -- before a market is resolved, before a note is read, before anything is sent.
 
-        let seller = Cli::try_parse_from(["dexdo", "seller", "--price-per-tick", invalid.as_str()])
-            .expect("seller parses");
-        let Command::Seller(seller) = seller.command else {
-            panic!("seller command")
-        };
-        let error = run_seller(seller)
-            .await
-            .expect_err("seller must reject before resolving a market")
-            .to_string();
-        assert!(error.contains("PRICE_STEP"), "{error}");
-        assert!(!error.contains("--token-contract"), "{error}");
+    /// This is the safety claim of the whole change: `--price-per-tick 3000000000` used to mean
+    /// three SHELL a tick and now means three billion. Nothing about the figure itself says which
+    /// era it came from, so the refusal is by the only thing that separates them: three billion
+    /// SHELL a tick is more than the largest note that exists (`ALLOWED_NOMINALS` in
+    /// `contracts/dex/modifiers/modifiers.sol` tops out at 1 000 000 SHELL), so no note could pay
+    /// for a single tick at it. Every old raw price -- one SHELL and up, which is all of them --
+    /// is above that bound, and every price a market can execute is below it.
+    #[test]
+    fn a_price_from_before_the_unit_change_is_refused_before_any_money_path() {
+        for command in [
+            vec!["dexdo", "seller", "--price-per-tick"],
+            vec!["dexdo", "buyer", "--max-price-per-tick"],
+        ] {
+            // The band the reviewer measured: every price an operator could have had on a working
+            // command line before this change, stated the way it was stated then.
+            for stale in ["1000000000", "3000000000", "5000000000", "18000000000"] {
+                let mut argv = command.clone();
+                argv.push(stale);
+                let error = match Cli::try_parse_from(argv) {
+                    Ok(_) => panic!("{command:?} must refuse the stale raw price {stale}"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    error.contains("largest note holds"),
+                    "the refusal must say why the figure cannot be a price: {error}"
+                );
+                assert!(
+                    error.contains("3000000000"),
+                    "the refusal must show what a raw figure looks like: {error}"
+                );
+            }
+            // The bound itself is a price, and so is everything a market actually quotes.
+            for good in ["1", "3", "1000000"] {
+                let mut argv = command.clone();
+                argv.push(good);
+                Cli::try_parse_from(argv)
+                    .unwrap_or_else(|error| panic!("{command:?} must accept {good} SHELL: {error}"));
+            }
+        }
+    }
 
-        let buyer =
-            Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", invalid.as_str()])
-                .expect("buyer parses");
-        let Command::Buyer(buyer) = buyer.command else {
-            panic!("buyer command")
-        };
-        let error = run_buyer(buyer)
-            .await
-            .expect_err("buyer must reject before model/book setup")
-            .to_string();
-        assert!(error.contains("PRICE_STEP"), "{error}");
-        assert!(!error.contains("--frame-model"), "{error}");
+    /// A price that is not a whole number of SHELL is refused by the ARGUMENT, before a command
+    /// object exists at all -- earlier than the old refusal, which ran once the command was already
+    /// resolving a market.
 
-        let zero_limit = Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", "0"])
-            .expect("zero limit parses before semantic validation");
-        let Command::Buyer(zero_limit) = zero_limit.command else {
-            panic!("buyer command")
-        };
-        let error = run_buyer(zero_limit)
-            .await
-            .expect_err("this CLI path is a limit BUY and must reject zero")
-            .to_string();
-        assert!(error.contains("PRICE_STEP"), "{error}");
+    /// The old shape of a bad price was a raw figure below one step (`PRICE_STEP - 1`). There is no
+    /// such shape now: prices are stated in whole SHELL, so `999999999` is a valid price of that
+    /// many SHELL, and what remains invalid is a fraction, a zero, and a figure that is not a
+    /// number.
+    #[test]
+    fn a_price_that_is_not_whole_shell_is_refused_at_the_argument() {
+        for command in [
+            vec!["dexdo", "seller", "--price-per-tick"],
+            vec!["dexdo", "buyer", "--max-price-per-tick"],
+        ] {
+            // `-1` is not in this list: the command line reads a leading dash as another flag, so
+            // it is refused as an unexpected argument rather than as a price, and asserting the
+            // price wording on it would be asserting clap's parser instead of ours.
+            for bad in ["0", "0.5", "1.000000001", "x", ""] {
+                let mut argv = command.clone();
+                argv.push(bad);
+                let error = match Cli::try_parse_from(argv) {
+                    Ok(_) => panic!("{command:?} must refuse the price {bad:?}"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    error.contains("SHELL"),
+                    "the refusal must name the unit it wanted: {error}"
+                );
+            }
+            let mut argv = command.clone();
+            argv.push("3");
+            Cli::try_parse_from(argv).unwrap_or_else(|error| {
+                panic!("{command:?} must accept three SHELL a tick: {error}")
+            });
+        }
     }
 
     #[test]
@@ -3178,7 +3495,7 @@ mod tests {
 
     #[test]
     fn default_endpoints_path_is_under_platform_app_dir() {
-        // Pure function(no directory creation) -- no side effects in the test.
+        // Pure function (no directory creation) -- no side effects in the test.
         // ProjectDirs == None only without a home directory; otherwise the path is under dexdo/endpoints.json.
         if let Ok(p) = default_endpoints_path() {
             assert!(
@@ -3193,10 +3510,10 @@ mod tests {
     }
 
     #[test]
-    fn seller_model_help_matches_real_shellnet_requirement() {
+    fn seller_model_help_matches_real_chain_requirement() {
         let help = subcommand_long_help("seller");
         assert!(
-            help.contains("Required on real shellnet even with `--mock-model`"),
+            help.contains("Required on a real chain even with `--mock-model`"),
             "{help}"
         );
         assert!(
@@ -3264,7 +3581,7 @@ mod tests {
                 "deploy",
                 "--multisig-address",
                 "0:wallet",
-                "--multisig-key",
+                "--multisig-private-key",
                 "w.keys.json",
                 "--nominal",
                 "N100",
@@ -3288,7 +3605,7 @@ mod tests {
             "deploy",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--pool",
             "pn_pool.json",
@@ -3303,19 +3620,43 @@ mod tests {
     }
 
     /// The onboarding docs published with the release binary. `release/build-public-tree.sh`
-    /// allow-lists exactly these three skill directories, so they are what a new user reads.
-    const PUBLISHED_ONBOARDING_DOCS: [(&str, &str); 3] = [
+    /// allow-lists exactly these skill directories, so they are what a new user reads.
+
+    /// Six since, and the count is the point: each trade ships one document written to drive
+    /// an AGENT and one written to teach a PERSON to run the commands themselves, plus the ops
+    /// runbook. `published_skills_declare_their_reader_1845.rs` holds this list equal to the
+    /// script's.
+
+    /// What membership buys is narrow, and worth stating narrowly: the two consumers below check
+    /// `--token-type` values against the parser's own set and parse every documented
+    /// `dexdo note deploy`. That is the recurrence and nothing wider. A document in this list
+    /// can still invent a flag on any other subcommand -- shipped `--network` on
+    /// `wallet onboard manual` past exactly these guards -- so being here is not "checked against
+    /// the command line", it is "checked for the two things that went wrong before".
+    const PUBLISHED_ONBOARDING_DOCS: [(&str, &str); 6] = [
         (
             ".claude/skills/dexdo-install/SKILL.md",
             include_str!("../../../.claude/skills/dexdo-install/SKILL.md"),
         ),
         (
-            ".claude/skills/dexdo-buy-model/SKILL.md",
-            include_str!("../../../.claude/skills/dexdo-buy-model/SKILL.md"),
+            ".claude/skills/dexdo-buy-model-for-agent/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-buy-model-for-agent/SKILL.md"),
         ),
         (
-            ".claude/skills/dexdo-sell-model/SKILL.md",
-            include_str!("../../../.claude/skills/dexdo-sell-model/SKILL.md"),
+            ".claude/skills/dexdo-buy-model-for-human/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-buy-model-for-human/SKILL.md"),
+        ),
+        (
+            ".claude/skills/dexdo-sell-model-for-agent/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-sell-model-for-agent/SKILL.md"),
+        ),
+        (
+            ".claude/skills/dexdo-sell-model-for-human/SKILL.md",
+            include_str!("../../../.claude/skills/dexdo-sell-model-for-human/SKILL.md"),
+        ),
+        (
+            ".claude/skills/seller-ops-onboarding/SKILL.md",
+            include_str!("../../../.claude/skills/seller-ops-onboarding/SKILL.md"),
         ),
     ];
 
@@ -3346,12 +3687,14 @@ mod tests {
     /// its target, a pipeline, a list operator, or a trailing comment. A published `dexdo note
     /// deploy` procedure that ends by sending its JSON to a file is normal, correct usage, and the
     /// argv the reader's shell hands `dexdo` stops at the redirection operator.
+
     /// Matched as a **whole token**, which is what keeps this away from the docs' placeholder
     /// convention: `>` and `|` stand alone, while `0:<WALLET>` and `cancel <ID>` are single tokens a
     /// reader substitutes and must stay in the argv the parser checks. That convention is exactly
     /// what a *printed* command line may not use -- the binary's own output is meant to be pasted,
     /// not edited -- which is why this guard and `printed_commands::shell_split` judge angle
     /// brackets differently, on purpose.
+
     /// Whole-token matching also means an attached form such as `>/dev/null` is *not* recognised.
     /// No swept doc uses one on a `dexdo` line today, and if one appears the guard fails loudly
     /// with the parser's own complaint rather than quietly accepting a truncated argv -- which is
@@ -3443,7 +3786,7 @@ mod tests {
 
     /// Recurrence guard, the whole-command half: every `dexdo note deploy` invocation the
     /// published docs hand a user must parse with the shipped parser, so neither a rejected flag
-    /// value nor a missing required flag(such as `--nominal`) can reach a release again.
+    /// value nor a missing required flag (such as `--nominal`) can reach a release again.
     #[test]
     fn published_docs_note_deploy_commands_parse() {
         for (path, body) in PUBLISHED_ONBOARDING_DOCS {
@@ -3568,7 +3911,7 @@ mod tests {
             "names `frobnicate`, which is not a subcommand of this CLI"
         );
 
-        // Redirections and pipelines are structure, not defects(PR687): a published procedure that
+        // Redirections and pipelines are structure, not defects (PR687): a published procedure that
         // sends output to a file is correct usage, and the argv is the command before the operator.
         // Each expectation below was checked against `/bin/sh -n` first -- the model follows the
         // shell, the shell does not follow the model.
@@ -3647,6 +3990,7 @@ mod tests {
     /// backticked command line the shipped parser will not accept -- errors, recovery guidance,
     /// machine-readable next-step hints and `--help` text alike. A printed `note deploy` resume
     /// line that left out the newly required `--nominal` is what it catches.
+
     /// It is a lint over source text, not a proof about output: it sees `{path}` where the user
     /// sees a real path, so the argv a builder actually composes is checked separately, next to
     /// each builder, through `assert_emitted_commands_parse`. Its blind spots are stated in the
@@ -3716,6 +4060,7 @@ mod tests {
         // message in the tree deleted. Raising the number does not fix that. The sweep finds only
         // ~44 single-line production spans across ~15 files, so any threshold low enough to be
         // stable against ordinary edits is also low enough to be met by lines no operator sees.
+
         // So the requirement is named rather than numeric: each of these files must still
         // contribute at least one `Origin::Literal` span -- a command the shipped binary prints
         // from a string literal it actually compiles. A doc comment is `Commentary` and a
@@ -3751,6 +4096,98 @@ mod tests {
              {printable_invocations} printable invocations, {printable_references} printable \
              references, {commentary} commentary spans, {dynamic} run-time-named"
         );
+    }
+
+    /// sweep: the un-backticked half of. No printed command line may carry a
+    /// placeholder a shell would not hand to `dexdo` intact.
+
+    /// The lint above reads backticked spans, and where it reads them the placeholder is quoted --
+    /// `close.rs` prints `'<seller-key>'` for exactly that reason. Outside backticks nothing
+    /// looked, and a bare `<existing note-deploy arguments>` shipped: a POSIX shell opens a file
+    /// named `existing` and hands the binary two stray tokens, so the operator pastes a line that
+    /// is not the line printed. Same defect as, in the one place could not see.
+
+    /// This checks a property of the printed text, not its wording: what a shell does with it.
+    #[test]
+    fn no_printed_command_line_carries_a_placeholder_a_shell_would_eat() {
+        use crate::cli::support::printed_commands::{top_level_subcommands, unshellable_command_literals};
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let subcommands = top_level_subcommands();
+        let mut files = 0;
+        let mut offending = Vec::new();
+        for root in [crate_root.join("src"), crate_root.join("../core/src")] {
+            for path in rust_sources(&root) {
+                files += 1;
+                let raw = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                for run in unshellable_command_literals(&raw, &subcommands) {
+                    offending.push(format!("{}:{}\n    {}", path.display(), run.line, run.text));
+                }
+            }
+        }
+        assert!(
+            offending.is_empty(),
+            "the CLI prints {} command line(s) a shell would not hand over intact; quote the \
+             placeholder, render a real value, or describe the argument in prose instead of \
+             offering a line to paste:\n{}",
+            offending.len(),
+            offending.join("\n")
+        );
+        assert!(
+            files >= 40,
+            "the sweep covered only {files} files, so it is not reading this tree"
+        );
+    }
+
+    /// The sweep above must find the shape it exists for and leave alone the ones it does not.
+
+    /// Without this it is a test that passes because it looks at nothing -- the failure mode the
+    /// lint beside it was rebuilt twice to escape.
+    #[test]
+    fn the_placeholder_sweep_finds_the_shape_it_is_for_and_no_other() {
+        use crate::cli::support::printed_commands::{top_level_subcommands, unshellable_command_literals};
+        let subs = top_level_subcommands();
+        let caught = |src: &str| !unshellable_command_literals(src, &subs).is_empty();
+
+        // The defect itself: a bare placeholder appended to a real command line.
+        assert!(caught(
+            r#"fn f() { println!("dexdo note deploy --multisig-private-key {} <existing note-deploy arguments>", k); }"#
+        ));
+        // Quoted for the shell: this is what the backticked half of the tree already writes.
+        assert!(!caught(
+            r#"fn f() { println!("dexdo close {deal} --note-key '<seller-key>'"); }"#
+        ));
+        // Prose that names a flag's argument and a command in separate clauses offers no line to
+        // paste, and the placeholder belongs to neither.
+        assert!(!caught(
+            r#"fn f() { println!("pass --market <manifest> first (the operator's `dexdo provision` market)"); }"#
+        ));
+        // A backtick hands the span to the lint above, which judges it properly.
+
+        // The backtick is assembled at run time rather than written here: a literal
+        // `dexdo status <deal>` in this source is a printed span like any other, and the lint
+        // above rejects it -- which it did, the first time this fixture was written. The fixture
+        // for one guard must not be a violation of its neighbour.
+        let tick = '\u{60}';
+        assert!(!caught(&format!(
+            "fn f() {{ println!(\"run {tick}dexdo status <deal>{tick} to inspect\"); }}"
+        )));
+        // Markup is not a placeholder.
+        assert!(!caught(
+            r#"fn f() { out.push_str("<title>dexdo dashboard</title>"); }"#
+        ));
+        // A comment is printed by nothing.
+        assert!(!caught(
+            r#"/// dexdo note deploy --multisig-private-key K <existing note-deploy arguments>"#
+        ));
+        // Neither is a test fixture.
+        assert!(!caught(
+            "#[cfg(test)]\nmod t { fn f() { let _ = \"dexdo note deploy --k {} <existing args>\"; } }"
+        ));
+        // A sentence that ends before the placeholder has not offered it as an argument.
+        assert!(!caught(
+            r#"fn f() { println!("run dexdo status now. Later, <deal> is the handle"); }"#
+        ));
     }
 
     /// Every `.rs` file under `root`, so a source file added later is linted without being listed
@@ -3802,9 +4239,13 @@ mod tests {
         assert!(help.contains("1 SHELL = 1e9 raw"), "{help}");
         assert!(help.contains("not raw nano/vmshell"), "{help}");
         assert!(
-            help.contains("Unused deploy remainder burns at `destroy`"),
+            help.contains("Unused remainder burns at `destroy`"),
             "{help}"
         );
+        assert!(help.contains("cannot refill it"), "{help}");
+        // 4.0.36: the deposit is the deal's RESERVE, not a per-deploy figure. `fundDeployShell` is
+        // named on purpose now -- it is the only top-up, and the operator has to know it exists.
+        assert!(help.contains("fundDeployShell"), "{help}");
         assert!(!help.contains("fund-10"), "{help}");
         assert!(!help.contains("MIN_BALANCE"), "{help}");
         assert!(!help.contains("REGISTER_FORWARD_VALUE"), "{help}");
@@ -3824,7 +4265,7 @@ mod tests {
     #[test]
     fn market_loader_resolves_fields() {
         let valid = dexdo_core::MarketManifest {
-            network: "shellnet".into(),
+            network: "net-a".into(),
             frame_model: "qwen/qwen3-32b".into(),
             model_hash: dexdo_core::model_hash_for("qwen/qwen3-32b"),
             inference_order_book: "0:ob".into(),
@@ -3832,7 +4273,9 @@ mod tests {
             token_contract: "0:tc".into(),
             seller_note: "0:n".into(),
             nonce: 1,
-            price_per_tick: 1000,
+            // A thousand SHELL a tick: the manifest carries whole SHELL, and a raw 1000 is not a
+            // price the book can hold.
+            price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 8,
         };
         let dir = tempfile::tempdir().expect("market manifest test dir");
@@ -3854,7 +4297,7 @@ mod tests {
             "--market must preserve the manifest's deal nonce for the seller"
         );
 
-        // Flags path: token_contract + optional frame_model(the seller passes None for frame_model).
+        // Flags path: token_contract + optional frame_model (the seller passes None for frame_model).
         // The explicit path carries no nonce -- the seller must supply it via `--nonce`.
         let (tc, fm, nonce) = resolve_market_fields(None, Some("0:flag"), Some("m")).unwrap();
         assert_eq!((tc.as_str(), fm.as_deref()), ("0:flag", Some("m")));
@@ -3868,11 +4311,11 @@ mod tests {
         // Neither --market nor --token-contract -> explicit error.
         assert!(resolve_market_fields(None, None, None).is_err());
 
-        // Fail-loud: --market is mutually exclusive with the explicit flags(no silent precedence).
+        // Fail-loud: --market is mutually exclusive with the explicit flags (no silent precedence).
         assert!(resolve_market_fields(Some(&p), Some("0:other"), None).is_err());
         assert!(resolve_market_fields(Some(&p), None, Some("other")).is_err());
 
-        // Corrupt manifest(model_hash inconsistent with frame_model) is rejected by load.
+        // Corrupt manifest (model_hash inconsistent with frame_model) is rejected by load.
         let mut bad = valid.clone();
         bad.model_hash = "0xdeadbeef".into();
         let pb = write("bad.json", &bad);
@@ -3885,11 +4328,11 @@ mod tests {
         assert!(resolve_market_fields(Some(&pe), None, None).is_err());
     }
 
-    /// Issue(review): the seller fails closed when the `--market` manifest's model does not match
-    /// the `--model` it would serve(no posting the manifest's TC into the wrong order book).
+    /// Issue (review): the seller fails closed when the `--market` manifest's model does not match
+    /// the `--model` it would serve (no posting the manifest's TC into the wrong order book).
     #[test]
     fn market_model_match_fails_closed() {
-        // No manifest model(flags path) or a matching one -- OK.
+        // No manifest model (flags path) or a matching one -- OK.
         assert!(check_market_model_match(None, "qwen/qwen3-32b", "qwen").is_ok());
         assert!(check_market_model_match(Some("qwen/qwen3-32b"), "qwen/qwen3-32b", "qwen").is_ok());
         // Mismatch -- fail closed.

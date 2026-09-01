@@ -1,23 +1,28 @@
 //! Structured user-facing errors: a stable code, a coarse kind, one human sentence, and the
 //! **preserved** `std::error::Error` source chain.
+
 //! The debugging session in lost hours because `advertised_gateway failed: transport error`
 //! was the whole error: the probed address was not named, and the real cause (`io:...` under a
 //! `tonic::transport::Error` whose `Display` is the literal string `transport error`) had already
 //! been thrown away by an `error.to_string()` at the boundary. The rule this module enforces is
 //! that a cause chain is never flattened into a string early -- [`DexdoError`] keeps the source as
 //! a live `dyn Error` and only walks it when it renders.
-//! Rendered shape(one line per element, deterministic, greppable):
+
+//! Rendered shape (one line per element, deterministic, greppable):
+
 //! ```text
-//! error[E_ADVERTISE_UNREACHABLE](network): advertised gateway 94.156.178.14:8443 did not complete the pinned-TLS(h2) self-probe(stage: tls_handshake)
+//! error[E_ADVERTISE_UNREACHABLE] (network): advertised gateway 94.156.178.14:8443 did not complete the pinned-TLS (h2) self-probe (stage: tls_handshake)
 //! cause: transport error
 //! cause: io: connection reset by peer
-//! secondary(pool owner-fill audit): error[E_POOL_UNKNOWN_OWNER_FILL](pool):...
+//! secondary (pool owner-fill audit): error[E_POOL_UNKNOWN_OWNER_FILL] (pool):...
 //! hint: the advertised address must be reachable from this host
 //! ```
-//! `Display` renders the WHOLE shape(headline + causes + secondary notes + hint), so a renderer
+
+//! `Display` renders the WHOLE shape (headline + causes + secondary notes + hint), so a renderer
 //! must not additionally print the `anyhow` cause chain on top of it or every cause appears twice.
 //! `source()` still returns the live chain, so programmatic inspection (`downcast_ref`,
 //! `anyhow::Error::chain`) keeps working.
+
 //! Every code lives in [`codes::TABLE`] and has a row in `error-codes.md`
 //! (code -> meaning -> likely fix). A code with no table entry is a defect, and
 //! `code_table_matches_the_documented_table` fails the build for it.
@@ -36,7 +41,7 @@ pub enum ErrorKind {
     Config,
     /// Reachability/transport: TCP, DNS, HTTP/2, timeouts.
     Network,
-    /// TLS specifically, including certificate pinning(a wrong endpoint, not a flaky one).
+    /// TLS specifically, including certificate pinning (a wrong endpoint, not a flaky one).
     Tls,
     /// The seller's own deal pool: capacity, handles, lineage.
     Pool,
@@ -61,7 +66,8 @@ impl fmt::Display for ErrorKind {
 }
 
 /// One documented row of the error-code table: the stable identifier plus the two things an
-/// operator needs when they see it(what it means, what to do about it).
+/// operator needs when they see it (what it means, what to do about it).
+
 /// A [`DexdoError`] can only be built from an `ErrorCode`, so a code that is not declared in
 /// [`codes`] cannot be emitted, and every declared code is checked against `error-codes.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +94,7 @@ impl ErrorCode {
         }
     }
 
-    /// The stable, greppable identifier(`E_...`).
+    /// The stable, greppable identifier (`E_...`).
     pub const fn code(self) -> &'static str {
         self.code
     }
@@ -129,7 +135,7 @@ pub mod codes {
          local/LAN testing only, use --allow-private-advertise",
     );
 
-    /// the advertised address did not answer the pinned-TLS(h2) self-probe.
+    /// the advertised address did not answer the pinned-TLS (h2) self-probe.
     pub const E_ADVERTISE_UNREACHABLE: ErrorCode = ErrorCode::new(
         "E_ADVERTISE_UNREACHABLE",
         ErrorKind::Network,
@@ -184,7 +190,7 @@ pub mod codes {
     );
 
     /// the seller pool could not bring its deals up; carries the primary cause and any
-    /// secondary(cascade) notes that were demoted so they cannot masquerade as the root cause.
+    /// secondary (cascade) notes that were demoted so they cannot masquerade as the root cause.
     pub const E_SELLER_POOL_FAILED: ErrorCode = ErrorCode::new(
         "E_SELLER_POOL_FAILED",
         ErrorKind::Pool,
@@ -194,7 +200,7 @@ pub mod codes {
          at the secondary notes",
     );
 
-    /// a command that spends from the funding(Hot) wallet ran with no active wallet binding.
+    /// a command that spends from the funding (Hot) wallet ran with no active wallet binding.
     pub const E_WALLET_NOT_CONFIGURED: ErrorCode = ErrorCode::new(
         "E_WALLET_NOT_CONFIGURED",
         ErrorKind::Config,
@@ -230,16 +236,17 @@ struct Secondary {
 
 /// A user-facing error: stable code, coarse kind, one human sentence, and the preserved source
 /// chain.
+
 /// Build it with [`DexdoError::new`] and the `with_*` modifiers; render it with `Display`.
 #[derive(Debug)]
 pub struct DexdoError {
     code: ErrorCode,
     message: String,
-    /// Appended to the headline as `(stage:...)` -- which step of a multi-step operation failed.
+    /// Appended to the headline as ` (stage:...)` -- which step of a multi-step operation failed.
     stage: Option<&'static str>,
     hint: Option<String>,
     source: Option<BoxError>,
-    /// When the source was *adopted*(its `Display` became the message), the first cause line
+    /// When the source was *adopted* (its `Display` became the message), the first cause line
     /// would repeat the headline verbatim; skip it instead of flattening the chain away.
     skip_first_cause: bool,
     secondary: Vec<Secondary>,
@@ -247,7 +254,7 @@ pub struct DexdoError {
 
 impl DexdoError {
     /// A user-facing error with a stable code and one human sentence. The sentence must name the
-    /// concrete subject(address, TokenContract, file, order id).
+    /// concrete subject (address, TokenContract, file, order id).
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -286,8 +293,8 @@ impl DexdoError {
         self
     }
 
-    /// Which step of a multi-step operation failed(`tcp_connect`, `tls_handshake`,...). Rendered
-    /// as `(stage:...)` at the end of the headline.
+    /// Which step of a multi-step operation failed (`tcp_connect`, `tls_handshake`,...). Rendered
+    /// as ` (stage:...)` at the end of the headline.
     pub fn with_stage(mut self, stage: &'static str) -> Self {
         self.stage = Some(stage);
         self
@@ -301,7 +308,7 @@ impl DexdoError {
         self
     }
 
-    /// Attach a failure that is a *consequence* of this one. It renders under `secondary(label):`
+    /// Attach a failure that is a *consequence* of this one. It renders under `secondary (label):`
     /// and never replaces the primary as the reported error.
     pub fn with_secondary(mut self, label: &'static str, error: impl Into<BoxError>) -> Self {
         self.secondary.push(Secondary {
@@ -341,7 +348,7 @@ impl DexdoError {
         !self.secondary.is_empty()
     }
 
-    /// The first line only: `error[CODE](kind): message [(stage:...)]`.
+    /// The first line only: `error[CODE] (kind): message [(stage:...)]`.
     pub fn headline(&self) -> String {
         match self.stage {
             Some(stage) => format!(
@@ -518,7 +525,7 @@ mod tests {
         assert_eq!(depth, 3);
     }
 
-    /// The cascade rule(issue example 2): the readiness failure is the reported error and the
+    /// The cascade rule (issue example 2): the readiness failure is the reported error and the
     /// pool teardown finding hangs off it, marked `secondary`.
     #[test]
     fn a_cascade_reports_the_primary_and_attaches_the_secondary() {

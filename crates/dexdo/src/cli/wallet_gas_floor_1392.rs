@@ -1,15 +1,18 @@
 //! the client states a funding wallet's gas floor BEFORE it commits a spend.
+
 //! The wallet this came from is on mainnet and is stuck. It holds `8_750_000_000_000` raw ECC[2]
 //! SHELL -- 8 750 SHELL, a rich wallet -- against `14_022_000` raw native, `0.014022 vmshell`. It
 //! cannot mint, cannot send, and cannot convert its own held SHELL into gas, because that
 //! conversion is itself a message it has to pay for. Nothing this client ships reaches a wallet in
 //! that state; the cure is an ordinary external transfer that anyone holding SHELL can make.
+
 //! So the defect is not that the wallet was allowed to spend. It is that the client knew what its
 //! own messages cost, knew what the wallet held, and said nothing about the gap until the spend had
 //! already failed on chain. The fix is that the two commands which spend a funding wallet state the
 //! floor with its numbers before they commit anything, and refuse a spend the wallet demonstrably
 //! cannot pay for -- rather than deciding on the operator's behalf how much of his own money he
 //! ought to keep back.
+
 //! What is pinned here: the floor is the one derivation rather than two; the statement names every
 //! figure needed to act on it; and both spending commands make it. The two command bodies open a
 //! chain client before they reach any of this, so the wiring half is pinned by shape the way
@@ -27,6 +30,7 @@ const STUCK_NATIVE_RAW: u128 = 14_022_000;
 const STUCK_SHELL_RAW: u128 = 8_750_000_000_000;
 
 /// The floor is what this wallet's own outgoing messages cost, from constants and receipts.
+
 /// Pinned as a number as well as an expression. The expression alone would follow any later edit to
 /// its summands without complaint, and the number is the one measured against the live
 /// wallet -- `507_002_000` raw, `0.507002 vmshell`.
@@ -41,6 +45,7 @@ fn the_floor_is_two_submits_of_attached_value_plus_fee() {
 }
 
 /// One derivation, not two.
+
 /// `vault_to_hot_native_value` is the funding gate's floor and was where this product used to be
 /// spelled out. It now reads the constant. Two copies of the same arithmetic in two modules is how
 /// the floor a gate waits for and the floor a command reports come to disagree, and an operator
@@ -94,6 +99,7 @@ fn the_stuck_mainnet_wallet_is_short_by_a_named_amount() {
 }
 
 /// The statement names every number an operator needs, and never renders one of them as nothing.
+
 /// is the lesson: it shipped a funding refusal that rendered one of its two shortfall figures
 /// and not the other, so a mainnet operator was told he was "short nothing" and then left blocked
 /// on a deposit whose size the client never named. Asserted against the real wallet, by value.
@@ -127,6 +133,7 @@ fn the_statement_names_the_floor_the_shortfall_and_the_shell_that_cannot_pay_for
 }
 
 /// `note topup` reads BOTH balances off its one account read, and states the floor before it spends.
+
 /// It used to read one. The ECC[2] check answered "is there SHELL to send" and nothing answered
 /// "can this wallet pay to send it", so a wallet rich in SHELL and out of gas passed the preflight
 /// and failed on chain -- in the one state this client cannot get it out of again.
@@ -164,6 +171,7 @@ fn note_topup_states_the_floor_before_it_commits() {
 }
 
 /// `accumulator sell` states the floor before the first irreversible deposit.
+
 /// A lot cannot be cancelled or withdrawn, and `sell` is the command that converts a wallet's
 /// spendable SHELL away, so it is the one place where a wallet can walk itself into holding money
 /// it cannot move. The statement goes after the plan is known and before anything is persisted or
@@ -204,6 +212,7 @@ fn accumulator_sell_states_the_floor_before_the_first_lot() {
 }
 
 /// The production half of `note_cmd.rs`, with its unit-test module cut off.
+
 /// The same seam `note_funding_wiring_334` uses, for the same reason: a marker matched inside the
 /// test module would let a fixture stand in for the production call site.
 fn production_note_cmd() -> &'static str {

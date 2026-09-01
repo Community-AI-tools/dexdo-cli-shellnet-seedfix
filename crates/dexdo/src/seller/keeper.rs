@@ -1,4 +1,5 @@
 //! Permissionless subscription settlement keeper.
+
 //! The seller claim loop and this loop deliberately stay separate. Claims describe delivered tokens;
 //! this keeper only promotes mature claim slots and advances the take-or-pay weekly clock. Every decision
 //! is made from the current strict typed `TokenContract` getters, and every write is reconciled from a
@@ -95,11 +96,13 @@ impl KeeperClock for SystemClock {
 }
 
 /// Observes the keeper's existing authoritative reads without polling or submitting independently.
+
 /// `Some(snapshot)` is emitted after every coherent `ChainBackend::deal_snapshot` accepted by the
 /// keeper, including its scheduling, immediate pre-write and post-write reads. The same absolute
 /// snapshot may be emitted more than once, so observers must reconcile idempotently. `None` is emitted
 /// only after a live subscription was already established and coherent account absence therefore means
 /// terminal destruction. A stopped `TokenContract` remains a terminal `Some(snapshot)`.
+
 /// Returning an error stops the keeper before its next decision or write.
 #[async_trait]
 pub trait SubscriptionKeeperObserver: Send + Sync {
@@ -122,8 +125,9 @@ impl SubscriptionKeeperObserver for () {
 }
 
 /// Keep one real subscription moving until its `TokenContract` reaches a terminal state.
+
 /// There is no journal and no local "sent" bit. A restart reads the exact current claim pipeline and week
-/// index and continues from there. Dropping this future(the seller's graceful shutdown path) performs no
+/// index and continues from there. Dropping this future (the seller's graceful shutdown path) performs no
 /// terminal action; it merely stops this local loop.
 pub async fn drive_subscription_keeper(
     chain: &dyn ChainBackend,
@@ -1440,7 +1444,7 @@ mod tests {
         let mut before = snapshot(1, 3, 0);
         before.deal.last_claim_time = START;
 
-        // TokenContract 4.0.35 promotes the one pending slot whole(`_tokensFinal <- _tokensPend`),
+        // TokenContract 4.0.35 promotes the one pending slot whole (`_tokensFinal <- _tokensPend`),
         // and a claim landing in the same moment re-anchors `lastClaimTime` and starts its OWN
         // window. Full `tokensPending` equality is deliberately not expected until it serves it.
         let mut after = before;

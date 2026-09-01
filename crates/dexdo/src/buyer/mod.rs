@@ -1,5 +1,5 @@
 //! Buyer client: read the enc endpoint from a file, decrypt it with the note,
-//! connect, sign the challenge(B18), receive the incremental stream, account ticks, STOP.
+//! connect, sign the challenge (B18), receive the incremental stream, account ticks, STOP.
 
 pub mod api;
 pub mod continuity;
@@ -25,7 +25,7 @@ use tonic::transport::Channel;
 /// Outcome of the buyer receiving a stream.
 #[derive(Debug)]
 pub struct StreamOutcome {
-    /// Received fake tokens(text concatenated).
+    /// Received fake tokens (text concatenated).
     pub tokens: Vec<String>,
     /// Provider-side reasoning/thinking deltas, when separated from visible content.
     pub reasoning: Vec<String>,
@@ -33,10 +33,10 @@ pub struct StreamOutcome {
     pub received: u64,
 }
 
-/// Buyer client with a note(private key -- for decryption and signing).
+/// Buyer client with a note (private key -- for decryption and signing).
 pub struct Buyer {
-    /// Buyer's note -- **polymorphic**: `LocalNote`(mock) OR `RealNote`(real shellnet).
-    /// Its ed25519 is registered on-chain(`placeInferenceBuy`); the seller reconstructs the
+    /// Buyer's note -- **polymorphic**: `LocalNote` (mock) OR `RealNote` (a real chain).
+    /// Its ed25519 is registered on-chain (`placeInferenceBuy`); the seller reconstructs the
     /// x25519 handover from it. `decrypt`/`sign` go through the `Note` trait, the note type is
     /// transparent to the scenario.
     pub note: Arc<dyn Note>,
@@ -53,7 +53,7 @@ impl Buyer {
 
     /// Buyer with a **loaded persistent** note: identity from
     /// `--note-key`/wallet, reused across runs -- its orders/deals are visible again.
-    /// The note is polymorphic(`Arc<dyn Note>`): the mock path yields `LocalNote`, the real
+    /// The note is polymorphic (`Arc<dyn Note>`): the mock path yields `LocalNote`, the real
     /// path `RealNote`.
     pub fn from_note(note: Arc<dyn Note>) -> Self {
         Self { note }
@@ -87,16 +87,16 @@ impl Buyer {
             .map_err(|e| anyhow!(e))?
             .ok_or_else(|| anyhow!("no handover for {token_contract_display}"))?;
         let plain = self.note.decrypt(&enc).map_err(|e| {
-            // DX guard: a real-shellnet handover is encrypted to the buyer's x25519 RECONSTRUCTED from
-            // its on-chain ed25519(Montgomery form, `x25519_pub_from_ed25519_pub`). A mock/HKDF identity
-            // (`--mock-chain` / `LocalNote::from_seed`) derives a DIFFERENT x25519(note.rs "do not mix"), so it
+            // DX guard: a real-chain handover is encrypted to the buyer's x25519 RECONSTRUCTED from
+            // its on-chain ed25519 (Montgomery form, `x25519_pub_from_ed25519_pub`). A mock/HKDF identity
+            // (`--mock-chain` / `LocalNote::from_seed`) derives a DIFFERENT x25519 (note.rs "do not mix"), so it
             // can NEVER decrypt a real seller's ciphertext. Fail closed with an actionable message -- the cause is
             // a mock/real mix, not a protocol bug -- instead of the opaque "decrypt failed".
             let pk = self.note.pubkey();
             if dexdo_core::note::x25519_pub_from_ed25519_pub(&pk.ed) != Some(pk.x) {
                 anyhow!(
                     "handover decrypt failed: this note's x25519 is not the chain-reconstructible Montgomery form \
-                     (it is a mock/HKDF identity -- e.g. `--mock-chain` or a `from_seed` note). A real-shellnet \
+                     (it is a mock/HKDF identity -- e.g. `--mock-chain` or a `from_seed` note). A real-chain \
                      handover needs a real RealNote; you are mixing a mock note/endpoints-file with a real seller."
                 )
             } else {
@@ -119,8 +119,8 @@ impl Buyer {
     }
 
     /// Connect to the gateway over TLS, complete the
-    /// challenge-response(B18) and receive the stream incrementally. On a fingerprint
-    /// mismatch the connection does not come up -- the stream is not received(fail-closed).
+    /// challenge-response (B18) and receive the stream incrementally. On a fingerprint
+    /// mismatch the connection does not come up -- the stream is not received (fail-closed).
     /// `max_tokens` -- how many accounted tokens to receive.
     pub async fn connect_and_stream(
         &self,
@@ -133,8 +133,8 @@ impl Buyer {
     }
 
     /// Like [`connect_and_stream`], but carries a **canonical request**
-    /// in the opening gRPC call alongside authorization(R1). Used by the consumer interface
-    /// (B19/B20). `request = None` -- the path(neutral fake tokens).
+    /// in the opening gRPC call alongside authorization (R1). Used by the consumer interface
+    /// (B19/B20). `request = None` -- the path (neutral fake tokens).
     pub async fn connect_and_stream_request(
         &self,
         handover: &Handover,
@@ -182,7 +182,7 @@ impl Buyer {
             tokens_accounted = next_accounted;
             // The seller accounts cumulatively on-chain via claimTokens after acceptProbe, and
             // mature claims are promoted by finalize; here the buyer only counts received tokens
-            // and may break off(STOP).
+            // and may break off (STOP).
             if tokens_accounted >= max_tokens {
                 break; // buyer stops receiving -> STOP is submitted as a separate on-chain action
             }
@@ -196,7 +196,7 @@ impl Buyer {
 
     /// Open an authorized canonical stream to the gateway with a canonical
     /// request and return the incremental `CanonChunk` stream for re-rendering to
-    /// SSE by the consumer interface(B19/B20). Tick accounting/verification happen on this
+    /// SSE by the consumer interface (B19/B20). Tick accounting/verification happen on this
     /// channel BEFORE re-rendering (in verification is a no-op, ticks are kept
     /// on-chain).
     pub async fn open_canon_stream(
@@ -216,7 +216,7 @@ impl Buyer {
     /// claimed exact/reference model (indistinguishable from normal traffic -- it's an ordinary canonical
     /// request), collects the response and checks it against that model's fingerprint
     /// ([`verify::behavioral_check`]). Mismatch -> the model is not the one claimed -> `Bail`.
-    /// No exact-model fingerprint -> degradation(`Pass`). The probe is a separate request (spends the
+    /// No exact-model fingerprint -> degradation (`Pass`). The probe is a separate request (spends the
     /// tick budget), sent as an ordinary completion.
     pub async fn behavioral_probe(
         &self,
@@ -278,14 +278,15 @@ impl Buyer {
         ))
     }
 
-    /// **B7 full spot-check:** the buyer sends a deterministic **greedy** probe(temp=0)
+    /// **B7 full spot-check:** the buyer sends a deterministic **greedy** probe (temp=0)
     /// SIMULTANEOUSLY to the seller AND to the **official reference endpoint** of the claimed exact/reference
     /// model, and compares them by prefix agreement
     /// ([`verify::prefix_agreement`]). Divergence above the threshold -> the model is not the one
     /// claimed -> `Bail`. No exact-model reference / no key in env / reference unavailable ->
     /// **degradation** (`Pass`, R3 -- we don't penalize the seller for the absence/failure of our
-    /// reference). The probe is a separate request(spends the tick budget), sent over the ordinary
+    /// reference). The probe is a separate request (spends the tick budget), sent over the ordinary
     /// completion path -- no audit-only API, no second channel.
+
     /// It is NOT, however, indistinguishable to the seller: this probe sets `greedy: true` while
     /// every ordinary buyer request sets `greedy: false`, so a single boolean on the wire names the audit
     /// with no false positives, and the probe prompt itself is a fixed public constant
@@ -293,7 +294,8 @@ impl Buyer {
     /// cheaper afterwards is not caught by this check. Read the gate as what it is -- a sampled detector of
     /// a substituting-by-default seller, not a defence against one that watches for the flag; making the
     /// audit unidentifiable is tracked in and is a design decision, not a wording fix.
-    /// The cheap B7(claimed-vs-frame) stays separate; this is the strong sampled cross-check(1-5%).
+
+    /// The cheap B7 (claimed-vs-frame) stays separate; this is the strong sampled cross-check (1-5%).
     pub async fn reference_spotcheck(
         &self,
         handover: &Handover,
@@ -308,11 +310,11 @@ impl Buyer {
         };
         let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let Some(endpoint) = reference_endpoint_for(model_id, models) else {
-            return Ok(verify::Verdict::Pass); // no exact-model reference -> degradation(R3)
+            return Ok(verify::Verdict::Pass); // no exact-model reference -> degradation (R3)
         };
         let api_key = match std::env::var(&endpoint.api_key_env) {
             Ok(k) if !k.is_empty() => k,
-            _ => return Ok(verify::Verdict::Pass), // no reference key -> degradation(R3)
+            _ => return Ok(verify::Verdict::Pass), // no reference key -> degradation (R3)
         };
 
         // the caller's grant is what bounds this probe. Zero means the reservation cannot pay
@@ -335,7 +337,7 @@ impl Buyer {
                 temperature: 0.0,
                 max_tokens: max_tokens as u32,
                 stop: Vec::new(),
-                greedy: true, // forced temp=0 at the seller(deterministic cross-check)
+                greedy: true, // forced temp=0 at the seller (deterministic cross-check)
             }),
         };
         let outcome = self
@@ -350,7 +352,7 @@ impl Buyer {
         let seller_content = outcome.tokens.join("");
         let seller_reasoning = outcome.reasoning.join("");
         let seller_response = content_or_reasoning(&seller_content, &seller_reasoning);
-        // Greedy probe to the reference. Network/endpoint failure -> degradation(our fault, not the seller's).
+        // Greedy probe to the reference. Network/endpoint failure -> degradation (our fault, not the seller's).
         let reference_response =
             match reference_completion(&endpoint, &api_key, probe, max_tokens as u32).await {
                 Ok(t) => t,
@@ -373,7 +375,7 @@ impl Buyer {
     }
 
     /// Challenge-response: get a nonce, sign `challenge_bytes` with the note key.
-    /// The canonical request(`request`) travels in the opening call alongside the signature(R1).
+    /// The canonical request (`request`) travels in the opening call alongside the signature (R1).
     async fn authorize(
         &self,
         client: &mut GatewayClient<Channel>,
@@ -397,11 +399,11 @@ impl Buyer {
     }
 }
 
-/// Greedy(temp=0) request to the official reference endpoint:
+/// Greedy (temp=0) request to the official reference endpoint:
 /// non-streaming `chat/completions`, return the comparable text. Some reasoning models return provider-side
 /// reasoning first and visible content only after enough tokens; that reasoning is still a model identity signal
 /// and matches the gateway's `CanonChunk.reasoning` side channel. The key goes only into the Authorization
-/// header and is NOT logged(secret masking).
+/// header and is NOT logged (secret masking).
 async fn reference_completion(
     endpoint: &crate::buyer::verify::ReferenceEndpoint,
     api_key: &str,

@@ -1,17 +1,12 @@
 //! Secret-free deal history/export helpers.
 
 use crate::cli::deals::DealHandle;
-#[cfg(any(feature = "shellnet", test))]
 use crate::cli::deals::{DealHandleRole, DealStateKind, DealStateSummary};
-#[cfg(any(feature = "shellnet", test))]
 use anyhow::Result;
-#[cfg(any(feature = "shellnet", test))]
 use serde::Serialize;
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) const DEAL_AUDIT_VERSION: u32 = 1;
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) struct DealAuditBuild {
     pub(crate) generated_at_unix: u64,
     pub(crate) handle: Option<DealHandle>,
@@ -28,14 +23,12 @@ pub(crate) struct DealAuditBuild {
     pub(crate) deal_terms: Option<DealTermsAudit>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) struct DealTermsAudit {
     pub(crate) tick_size: u128,
     pub(crate) price_per_tick: u128,
     pub(crate) max_ticks: u128,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct DealAuditExport {
     pub(crate) version: u32,
@@ -49,7 +42,6 @@ pub(crate) struct DealAuditExport {
     pub(crate) raw_onchain_state: Option<serde_json::Value>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditSource {
     pub(crate) kind: String,
@@ -58,12 +50,12 @@ pub(crate) struct AuditSource {
 }
 
 /// The addresses of one deal, as `dexdo export` reports them in its JSON format.
+
 /// Issue: every address here is **written** canonically. This export is not one of the wire
 /// schemas `runtime-machine-contract.md` pins to `0:<account_id>` - it is a current audit payload
 /// this client produces - so it carries the same canonical form as `market.json`, the deal handles
 /// and human output. The fields stay in the workchain form in memory, exactly like `DealHandle`
 /// and `MarketManifest`; only what is emitted changes.
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditDeal {
     pub(crate) role: Option<String>,
@@ -86,7 +78,6 @@ pub(crate) struct AuditDeal {
     pub(crate) created_at_unix: Option<u64>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditLifecycle {
     pub(crate) active: bool,
@@ -102,7 +93,6 @@ pub(crate) struct AuditLifecycle {
     pub(crate) stopped_at_unix: Option<u64>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditAccounting {
     pub(crate) tick_size: Option<String>,
@@ -122,7 +112,6 @@ pub(crate) struct AuditAccounting {
     pub(crate) tokens_pending: Option<String>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditActions {
     pub(crate) observed: Vec<String>,
@@ -130,7 +119,6 @@ pub(crate) struct AuditActions {
     pub(crate) caveats: Vec<String>,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Serialize)]
 pub(crate) struct AuditRequests {
     pub(crate) served_request_count: Option<u64>,
@@ -158,7 +146,6 @@ pub(crate) fn history_handle_matches(
     true
 }
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn build_deal_audit(input: DealAuditBuild) -> Result<DealAuditExport> {
     let handle = input.handle.as_ref();
     let role = input.role.or_else(|| handle.map(|h| h.role));
@@ -282,7 +269,6 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> Result<DealAuditExport>
     })
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn build_accounting(
     summary: Option<&DealStateSummary>,
     terms: Option<&DealTermsAudit>,
@@ -290,29 +276,34 @@ fn build_accounting(
     let finalized_owed = summary.map(|s| s.finalized_owed);
     let finalized_ticks =
         summary.map(|state| (state.tokens_final / dexdo_core::TICK_SIZE).to_string());
+    // The export carries the same by-fact figures the machine answer of `dexdo status` reports,
+    // read from the same summary. Money is SHELL there and SHELL here: an export that states them
+    // raw would have one field of one deal differ by a billion between two of this client's own
+    // answers.
+    // Ticks, tokens and the tick size are counts and stay counts.
+    let shell = |value: u128| dexdo_core::shell_amount(value);
     Ok(AuditAccounting {
         tick_size: terms.map(|t| t.tick_size.to_string()),
-        price_per_tick: terms.map(|t| t.price_per_tick.to_string()),
+        price_per_tick: terms.map(|t| shell(t.price_per_tick)),
         max_ticks: terms.map(|t| t.max_ticks.to_string()),
         finalized_ticks,
-        seller_owed: finalized_owed.map(|v| v.to_string()),
+        seller_owed: finalized_owed.map(shell),
         seller_received: None,
         buyer_locked: summary
             .map(DealStateSummary::buyer_locked)
             .transpose()?
-            .map(|value| value.to_string()),
+            .map(shell),
         buyer_refund: None,
         burned_amount: None,
-        deposit: summary.map(|s| s.deposit.to_string()),
-        probe_tick: summary.map(|s| s.probe_tick.to_string()),
-        buyer_bond: summary.map(|s| s.buyer_bond.to_string()),
-        buyer_bond_required: summary.map(|s| s.buyer_bond_required.to_string()),
+        deposit: summary.map(|s| shell(s.deposit)),
+        probe_tick: summary.map(|s| shell(s.probe_tick)),
+        buyer_bond: summary.map(|s| shell(s.buyer_bond)),
+        buyer_bond_required: summary.map(|s| shell(s.buyer_bond_required)),
         tokens_final: summary.map(|s| s.tokens_final.to_string()),
         tokens_pending: summary.map(|s| s.tokens_pending.to_string()),
     })
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn build_actions(
     role: Option<DealHandleRole>,
     deal_ref: &str,
@@ -343,22 +334,22 @@ fn build_actions(
         &public_deal_ref,
         raw_buyer,
         "buyer",
-        None,
-        Some(contracts),
+        None
     );
     let close_as_seller = crate::cli::commands::close_guidance(
         &public_deal_ref,
         raw_seller,
         "seller",
-        None,
-        Some(contracts),
+        None
     );
     let settlement = |command: &str, actor: &str, what: &str| {
         format!(
             "{what}: run `dexdo {command}` with --token-contract {}, the {actor} --note-addr and \
              the {actor} --note-key{}",
             crate::cli::support::shell_arg(&token_contract),
-            crate::cli::support::stated_options(&[("--contracts", Some(contracts))])
+            // The manifest is not repeated into a suggested line any more: the flag is gone
+            // and `DEXDO_MANIFEST` is already in the shell that got here.
+            ""
         )
     };
     let mut observed = Vec::new();
@@ -484,7 +475,6 @@ fn build_actions(
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn render_markdown(export: &DealAuditExport) -> String {
     let mut out = String::new();
     out.push_str("# dexdo deal audit\n\n");
@@ -747,12 +737,10 @@ pub(crate) fn render_markdown(export: &DealAuditExport) -> String {
     out
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn line(out: &mut String, key: &str, value: impl std::fmt::Display) {
     out.push_str(&format!("- {key}: {value}\n"));
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn optional_line(out: &mut String, key: &str, value: Option<&str>) {
     match value {
         Some(v) => line(out, key, v),
@@ -772,7 +760,7 @@ mod tests {
             version: DEAL_HANDLE_VERSION,
             handle: make_handle_id("0:33", DealHandleRole::Seller),
             role: DealHandleRole::Seller,
-            network: "shellnet".into(),
+            network: "net-a".into(),
             token_contract: "0:33".into(),
             note_addr: "0:seller".into(),
             frame_model: "qwen/qwen3-32b".into(),
@@ -780,7 +768,7 @@ mod tests {
             order_book: Some("0:book".into()),
             root_model: Some("0:root".into()),
             market: None,
-            contracts: "contracts/deployed.shellnet.json".into(),
+            contracts: "manifest/deployed.manifest.json".into(),
             endpoint: Some(DealEndpointInfo {
                 kind: "gateway".into(),
                 value: "127.0.0.1:8443".into(),
@@ -839,7 +827,7 @@ mod tests {
             role: Some(DealHandleRole::Seller),
             token_contract: "0:33".into(),
             note_addr: Some("0:seller".into()),
-            contracts: "contracts/deployed.shellnet.json".into(),
+            contracts: "manifest/deployed.manifest.json".into(),
             active: true,
             state: Some(state),
             summary: Some(summary),
@@ -876,7 +864,7 @@ mod tests {
             "disputed": false,
             "deposit": "0",
             "probeTick": "0",
-            "finalizedOwed": "2000",
+            "finalizedOwed": "2000000000",
             "tokensFinal": "0",
             "tokensPending": "0",
             "probeTime": "0",
@@ -896,13 +884,15 @@ mod tests {
             Some(&summary),
             Some(&DealTermsAudit {
                 tick_size: dexdo_core::TICK_SIZE,
-                price_per_tick: 1000,
+                price_per_tick: dexdo_core::PRICE_STEP,
                 max_ticks: 2,
             }),
         )
         .unwrap();
 
-        assert_eq!(accounting.seller_owed.as_deref(), Some("2000"));
+        // The export states money in SHELL, like `dexdo status --json` reading the same fields.
+        assert_eq!(accounting.seller_owed.as_deref(), Some("2"));
+        assert_eq!(accounting.price_per_tick.as_deref(), Some("1"));
         assert_eq!(accounting.tokens_final.as_deref(), Some("0"));
         assert_eq!(accounting.finalized_ticks.as_deref(), Some("0"));
     }
@@ -911,11 +901,13 @@ mod tests {
     /// -- an audit export is secret-free, so it never holds the `--note-key` each of these
     /// handlers demands below clap. The guarantee asserted here is therefore the *name-only* one:
     /// each command span must be exactly a command path, so a later edit that grows an argv
-    /// template(`--note-key <buyer-key>`, which a shell reads as a redirection and never delivers)
+    /// template (`--note-key <buyer-key>`, which a shell reads as a redirection and never delivers)
     /// fails this test rather than reaching an operator.
+
     /// The inputs the operator has to supply are asserted to be stated in the prose around the
     /// name, including the `--role`/`--note-addr` that a raw TokenContract target does not carry
     /// and the manifest this export was built against.
+
     /// The count below is a floor on **spans that were actually classified** -- one per backticked
     /// command name found in an emitted action -- not on lines of output, comments or fixtures:
     /// `checked` is only incremented inside the loop that ran the assertion on a real
@@ -983,7 +975,7 @@ mod tests {
                         // operator settles against the default deployment. A raw TokenContract
                         // carries neither role nor note, so a `close` rendered without a stored
                         // handle states those too; a stored handle already carries them. The
-                        // read-only lines(`dexdo status`) and the "keep it running" lines
+                        // read-only lines (`dexdo status`) and the "keep it running" lines
                         // (`dexdo seller`) demand none of that, and requiring it of them would be
                         // asserting something untrue rather than something stronger.
                         const SIGNING: [&str; 5] = [
@@ -996,7 +988,9 @@ mod tests {
                         let mut required: Vec<&str> = Vec::new();
                         if SIGNING.iter().any(|command| action.contains(command)) {
                             required.push("--note-key");
-                            required.push("--contracts '/tmp/my deploy/deployed.json'");
+                            // `--contracts` used to be required here. removed the flag: the
+                            // manifest arrives in DEXDO_MANIFEST, so a printed command that named
+                            // it would name a flag the parser rejects.
                             if !has_handle && action.contains("dexdo close") {
                                 required.extend(["--role", "--note-addr"]);
                             }
@@ -1051,7 +1045,7 @@ mod tests {
             true,
             Some(&summary),
             true,
-            "contracts/deployed.shellnet.json",
+            "manifest/deployed.manifest.json",
         )
         .available_next_commands
         .join("\n");
@@ -1068,7 +1062,7 @@ mod tests {
             true,
             Some(&summary),
             true,
-            "contracts/deployed.shellnet.json",
+            "manifest/deployed.manifest.json",
         )
         .available_next_commands
         .join("\n");

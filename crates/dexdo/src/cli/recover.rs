@@ -1,5 +1,5 @@
-//! `dexdo` pool-recovery command handlers(`recover`/`dispute`/`reclaim`/`release-dispute`/`withdraw-shell`),
-//! extracted from `commands.rs`(move-only / behavior-identical, anti-entropy refactor Track C2).
+//! `dexdo` pool-recovery command handlers (`recover`/`dispute`/`reclaim`/`release-dispute`/`withdraw-shell`),
+//! extracted from `commands.rs` (move-only / behavior-identical, anti-entropy refactor Track C2).
 
 use crate::cli::args::{
     DisputeArgs, ReclaimArgs, RecoverArgs, ReleaseDisputeArgs, ResolveDisputeTimeoutArgs,
@@ -7,37 +7,29 @@ use crate::cli::args::{
 };
 use anyhow::Result;
 
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     persist_pool_recovery_record, resolve_persistable_pool_recovery_inputs,
     resolve_persistable_pool_recovery_inputs_for_deal, resolve_pool_recovery_inputs,
     resolve_pool_recovery_inputs_for_deal, resolve_pool_recovery_plan, AmbiguousRecoveryDeals,
     PoolRecoveryPlan, PoolRecoveryTarget,
 };
-#[cfg(feature = "shellnet")]
 use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
-#[cfg(not(feature = "shellnet"))]
-use anyhow::bail;
-#[cfg(feature = "shellnet")]
 use serde_json::Value;
 
-#[cfg(feature = "shellnet")]
 fn display_token_contract(value: &dyn std::fmt::Display) -> String {
     dexdo_core::address::display_self_dapp(&value.to_string())
 }
 
-#[cfg(feature = "shellnet")]
 fn display_dexdo_address(value: &dyn std::fmt::Display) -> String {
     dexdo_core::address::display(&value.to_string())
 }
 
 /// recover an orphaned OPEN deal. The buyer process died mid-stream but the buyer note/key are intact,
-/// so no one sent STOP and the deal hangs OPEN(the seller cannot `destroy` an `_opened` deal). `recover`
+/// so no one sent STOP and the deal hangs OPEN (the seller cannot `destroy` an `_opened` deal). `recover`
 /// signs the **normal buyer-STOP** (`streamStop(tokenContract)` -> `TokenContract.stop()`, standard
 /// split) from the buyer note -- it does NOT place a new buy -- after which the seller `destroy`s the TC.
-/// Fails closed(before sending STOP) if the deal is not `_opened`, is `_disputed`, or the note is not the
+/// Fails closed (before sending STOP) if the deal is not `_opened`, is `_disputed`, or the note is not the
 /// deal's recorded buyer; the on-chain `TC.stop()` also enforces `msg.sender == _buyer`.
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait RecoverChain: Sync {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
@@ -55,7 +47,6 @@ trait RecoverChain: Sync {
     ) -> Result<dexdo_core::TokenContractSettlementReceipts>;
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl RecoverChain for dexdo_core::RealChainBackend {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>> {
@@ -95,7 +86,6 @@ impl RecoverChain for dexdo_core::RealChainBackend {
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn exact_prior_stop_receipt(
     receipts: &dexdo_core::TokenContractSettlementReceipts,
     expected_buyer: &str,
@@ -155,7 +145,6 @@ pub(crate) fn exact_prior_stop_receipt(
     Ok(Some((*stops[0]).clone()))
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn prior_stop_receipt_json(
     tc: &dexdo_core::Address,
     receipt: &dexdo_core::TokenContractSettlementReceipt,
@@ -209,7 +198,6 @@ pub(crate) fn prior_stop_receipt_json(
     value
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn prior_stop_confirmation(
     command: &str,
     tc: &dexdo_core::Address,
@@ -234,22 +222,26 @@ pub(crate) fn prior_stop_confirmation(
     )
 }
 
-#[cfg(feature = "shellnet")]
 fn recover_confirmation(
     tc: &dexdo_core::Address,
     note: &dexdo_core::Address,
     receipt: &dexdo_core::SettlementActionReceipt,
 ) -> String {
     let tc_display = display_token_contract(tc);
+    // NO `destroy` FOLLOW-UP IS NAMED HERE, and its absence is the point. Both exits of
+    // `TokenContract.stop()` end in a selfdestruct -- `_payOwedAndDie()` on the unaccepted-probe
+    // branch, `_payFinalAndClose()` on the other -- so after this line there is no deal left to
+    // close and no second step to perform. The advice that used to sit here named `dexdo destroy`,
+    // which is the SELLER's cleanup of a deployed-but-unfunded contract: a different situation,
+    // reached by a different path, and requiring a key the buyer does not have and on a real
+    // market never will. It was printed unconditionally, on success, so it read as instruction.
     format!(
         "recover confirmed -> streamStop(TokenContract {tc_display}) from buyer note {}; \
-         receipt={receipt}; the deal STOPs. Next: {}.",
-        display_dexdo_address(note),
-        crate::cli::support::destroy_guidance(&tc_display, None)
+         receipt={receipt}; the deal STOPs.",
+        display_dexdo_address(note)
     )
 }
 
-#[cfg(feature = "shellnet")]
 fn apply_recover_terminal_marker(
     confirmation: &str,
     marker: impl FnOnce() -> Result<()>,
@@ -263,7 +255,6 @@ fn apply_recover_terminal_marker(
 }
 
 /// one recorded deal, and what the chain says about acting on it in this invocation.
-#[cfg(feature = "shellnet")]
 struct RecordedDealVerdict {
     note_addr: String,
     token_contract: String,
@@ -277,7 +268,6 @@ struct RecordedDealVerdict {
 /// Both preflights re-decode the full gate -- including the buyer key -- on the deal that is actually
 /// selected, so this is strictly weaker than the money gate and can only make the selection refuse more
 /// often, never act more often.
-#[cfg(feature = "shellnet")]
 fn recorded_deal_verdict(
     note_addr: &str,
     token_contract: &str,
@@ -307,10 +297,12 @@ fn recorded_deal_verdict(
 }
 
 /// which recorded deal a one-deal recovery acts on when the pool records several.
+
 /// The choice is made from the chain's verdict on **every** recorded deal -- never from the pool's own row
 /// order or recorded timestamps, which say nothing about which deal is still live. Acting is allowed only
 /// where the chain proves exactly one recorded deal is in the state this command acts on **and** proves
 /// every other one is not.
+
 /// Every direction of doubt errs towards refusing. A chain read that fails for any recorded deal has
 /// already aborted the invocation before this is reached, so a deal whose state could not be read is
 /// never silently dropped from the set; a deal the chain cannot place is not a candidate; two candidates
@@ -318,7 +310,6 @@ fn recorded_deal_verdict(
 /// for money because a wrong pick is irreversible: a `recover` STOP pays a seller for a deal the operator
 /// never meant to end, and a `dispute` freezes the contested amount and the seller bond and starts an
 /// arbitration clock on a deal that was fine. A refusal costs the operator one flag.
-#[cfg(feature = "shellnet")]
 fn select_recorded_deal(
     command: &str,
     ambiguous: &AmbiguousRecoveryDeals,
@@ -384,7 +375,6 @@ fn select_recorded_deal(
     );
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_recover_with_chain(args: RecoverArgs, chain: &dyn RecoverChain) -> Result<()> {
     run_recover_with_chain_and_marker(args, chain, &|note_addr, token_contract| {
         // `recover` needs the marker to have run, not whether it changed a record: an ordinary deal
@@ -394,7 +384,6 @@ async fn run_recover_with_chain(args: RecoverArgs, chain: &dyn RecoverChain) -> 
     .await
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_recover_with_chain_and_marker(
     args: RecoverArgs,
     chain: &dyn RecoverChain,
@@ -487,8 +476,7 @@ async fn run_recover_with_chain_and_marker(
 
     eprintln!(
         "recover {tc_display}: buyer-signed STOP of an OPEN deal (streamStop -> TokenContract.stop(), standard \
-         split). No new buy is placed. After this, {}.",
-        crate::cli::support::destroy_guidance(&tc_display, Some(&args.contracts))
+         split). No new buy is placed."
     );
     let receipt = chain.stop(&note, &keys, &tc).await?;
     let confirmation = recover_confirmation(&tc, &note, &receipt);
@@ -505,25 +493,27 @@ async fn run_recover_with_chain_and_marker(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_recover(args: RecoverArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let manifest = manifest_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            manifest_path.display()
+        )
+    })?;
     let chain = RealChainBackend::connect(manifest)?;
     run_recover_with_chain(args, &chain).await
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_recover(_args: RecoverArgs) -> Result<()> {
-    bail!("recover unavailable: build with `--features shellnet`")
-}
 
 /// The chain surface `dispute` uses, mirroring [`RecoverChain`] so the buyer-side dispute has the same
 /// offline seam its sibling recovery already has.
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait DisputeChain: Sync {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
@@ -537,7 +527,6 @@ trait DisputeChain: Sync {
     ) -> Result<dexdo_core::SettlementActionReceipt>;
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl DisputeChain for dexdo_core::RealChainBackend {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>> {
@@ -565,18 +554,24 @@ impl DisputeChain for dexdo_core::RealChainBackend {
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let manifest = manifest_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            manifest_path.display()
+        )
+    })?;
     let chain = RealChainBackend::connect(manifest)?;
     run_dispute_with_chain(args, &chain).await
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_dispute_with_chain(args: DisputeArgs, chain: &dyn DisputeChain) -> Result<()> {
     use dexdo_core::{check_disputable, keypair_ed_pubkey, Address, KeyPair};
     let resolved = match resolve_pool_recovery_inputs(
@@ -661,12 +656,7 @@ async fn run_dispute_with_chain(args: DisputeArgs, chain: &dyn DisputeChain) -> 
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_dispute(_args: DisputeArgs) -> Result<()> {
-    bail!("dispute unavailable: build with `--features shellnet`")
-}
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn check_reclaimable_state(
     state: dexdo_core::DealChainState,
     buyer_note: Option<&str>,
@@ -690,7 +680,6 @@ pub(crate) fn check_reclaimable_state(
 /// crash the pool file is all the operator has. The pool ordinarily records one entry per deal the notes
 /// took part in, so more than one recoverable entry is the normal case, not an error: every recorded deal
 /// is driven as its own separately decided, individually idempotent reclaim.
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
     let plan = resolve_pool_recovery_plan(
@@ -699,10 +688,18 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
         args.token_contract.as_deref(),
         args.pool.as_deref(),
     )?;
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let manifest = manifest_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            manifest_path.display()
+        )
+    })?;
     let chain = RealChainBackend::connect(manifest)?;
     drive_reclaim_plan(plan, &chain, &|note_addr, token_contract| {
         super::buyer::mark_buyer_subscription_terminal(note_addr, token_contract)
@@ -710,7 +707,6 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
     .await
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait ReclaimChain: Sync {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
@@ -725,7 +721,6 @@ trait ReclaimChain: Sync {
     async fn confirm_cleanup(&self, tc: &dexdo_core::Address) -> Result<()>;
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl ReclaimChain for dexdo_core::RealChainBackend {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>> {
@@ -760,7 +755,6 @@ impl ReclaimChain for dexdo_core::RealChainBackend {
 
 /// What one recorded entry turned into. There is no third case: either this invocation moved that deal's
 /// money, or the chain itself proved there was nothing for `reclaim` to move.
-#[cfg(feature = "shellnet")]
 enum ReclaimEntryOutcome {
     /// `cleanupUnopened` was submitted **and** confirmed by the bounded observer in this invocation.
     Reclaimed,
@@ -773,7 +767,6 @@ enum ReclaimEntryOutcome {
 /// after an earlier confirmed cleanup gets repaired. The marker is idempotent and reports whether it
 /// actually changed anything; a marker that still fails keeps the entry loud rather than leaving local
 /// state permanently stale.
-#[cfg(feature = "shellnet")]
 fn terminal_entry(
     reason: String,
     note_s: &str,
@@ -791,7 +784,6 @@ fn terminal_entry(
 /// One recorded deal's reclaim. This is the whole money path, and it is idempotent by construction: the
 /// strict never-opened preflight is re-decoded from the chain on every attempt, and a deal that was
 /// already reclaimed is no longer active/funded, so it can only come back `NotActionable`.
-#[cfg(feature = "shellnet")]
 async fn reclaim_one(
     chain: &dyn ReclaimChain,
     target: &PoolRecoveryTarget,
@@ -826,7 +818,7 @@ async fn reclaim_one(
     let note_ed = keypair_ed_pubkey(&keys)?;
     // A deal that exists and names a *different* buyer note or key is not a decided chain no-op: the
     // pool claims this note owns the deal and the chain contradicts it. That is a corrupt or forged
-    // recovery record, so it fails loudly(and submits nothing) instead of being counted as "nothing to
+    // recovery record, so it fails loudly (and submits nothing) instead of being counted as "nothing to
     // do". `check_reclaimable_state` below re-checks the same ownership as the admission gate; this
     // decides how severe a mismatch is, not whether the cleanup may be submitted.
     if let Some(buyer) = buyer_note_s.as_deref() {
@@ -888,6 +880,7 @@ async fn reclaim_one(
         // A failed submit is not proof that nothing landed: the action may have been delivered and only
         // its response lost. This code drives no further cleanup for it -- the outcome is resolved with
         // the same bounded observation that confirms an ordinary cleanup, and reported by fact.
+
         // The guarantee is no second **money move**, not no second POST: the submit transport retries a
         // BOC on transient errors, and the operator may re-run the command. Neither can pay twice,
         // because `TokenContract.cleanupUnopened()` requires a funded, never-opened deal and destroys it
@@ -927,6 +920,7 @@ async fn reclaim_one(
 }
 
 /// Drive every planned entry as its own reclaim, one at a time, reporting each by fact.
+
 /// Exactly-once per deal never depends on this loop, and it is a guarantee about **money moves**, not
 /// about network submissions: the transport retries a BOC and the operator may re-run the command, but
 /// `TokenContract.cleanupUnopened()` requires a funded, never-opened deal and destroys it as it refunds,
@@ -934,12 +928,12 @@ async fn reclaim_one(
 /// from the chain for every entry on every attempt. A mid-sequence failure therefore loses nothing: the
 /// remaining entries are still driven, the failed one is reported, and the command exits non-zero so a
 /// retry re-decides every entry from the chain.
+
 /// Authorization is a separate axis, and the two levels are not the same. `cleanupUnopened()` is
 /// permissionless on chain with fixed payouts -- refund to the recorded buyer, bond back to the seller
 /// note -- so no signature of ours decides where the money goes. What is owner-gated is the CLI's wrapper
 /// path, `PrivateNote.streamCleanup`: this client only ever submits it from the deal's own buyer
 /// note key, which is why a contradicted ownership record is refused rather than driven.
-#[cfg(feature = "shellnet")]
 async fn drive_reclaim_plan(
     plan: PoolRecoveryPlan,
     chain: &dyn ReclaimChain,
@@ -956,6 +950,18 @@ async fn drive_reclaim_plan(
             ReclaimEntryOutcome::Reclaimed => Ok(()),
             ReclaimEntryOutcome::NotActionable(reason) => Err(anyhow::anyhow!("{reason}")),
         };
+    }
+
+    if plan.targets.is_empty() && plan.refused.is_empty() {
+        // nothing recorded is the complete answer to what `reclaim` was asked, not a failure to
+        // answer. Only the buyer client writes `token_contract` into a pool entry, so a pool whose notes
+        // never bought carries no reclaimable record by construction -- and a sweep across several pools
+        // hits that case every run. Reported as an error it teaches an operator to read past the word
+        // `Error` in the one log that says whether the cleanup ran, which is the opposite of loud. The
+        // summary below still prints, so `planned=0` is a measured count and not an absence of output.
+        println!(
+            "reclaim: this pool records no entries to reclaim; no money was moved and nothing was submitted"
+        );
     }
 
     for refusal in &plan.refused {
@@ -1040,30 +1046,37 @@ async fn drive_reclaim_plan(
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_reclaim(_args: ReclaimArgs) -> Result<()> {
-    bail!("reclaim unavailable: build with `--features shellnet`")
-}
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> {
     use dexdo_core::{
         check_release_disputable, check_seller_pubkey, Address, KeyPair, RealChainBackend,
     };
     let note_addr =
         crate::cli::support::require_note_addr(&args.identity, "release-dispute", "seller note")?;
-    let note_key = crate::cli::support::require_note_key(
-        &args.identity,
-        "release-dispute",
-        "seller owner key",
-    )?;
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let manifest = manifest_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            manifest_path.display()
+        )
+    })?;
     let (tc_str, _frame, _nonce) =
         resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let seed = read_secret_hex(note_key, "--note-key")?;
+    // The address this command already settled -- resolving it a second time would offer the pool
+    // again, and a key from one note with an address from another is a signature that cannot verify.
+    let seed = crate::cli::support::note_owner_secret_for(
+        args.identity.note_key.as_deref(),
+        &note_addr,
+        None,
+        "release-dispute",
+        "the seller note's owner key",
+    )?;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
@@ -1097,12 +1110,7 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_release_dispute(_args: ReleaseDisputeArgs) -> Result<()> {
-    bail!("release-dispute unavailable: build with `--features shellnet`")
-}
 
-#[cfg(feature = "shellnet")]
 fn required_u64(value: &Value, field: &str, context: &str) -> Result<u64> {
     value[field]
         .as_u64()
@@ -1110,14 +1118,45 @@ fn required_u64(value: &Value, field: &str, context: &str) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("{context}: getter exposes no {field}"))
 }
 
-#[cfg(feature = "shellnet")]
+/// the deal is NOT disputed, so there is nothing for this command to resolve.
+
+/// `runtime-machine-contract.md:1067` defines `DISPUTED_DEAL` as "Deal is disputed and cannot be
+/// closed by the requested command" -- the exact opposite of this condition. The classifier reached
+/// it because it lower-cases the message before matching, so "deal is not DISPUTED" contains
+/// "disputed": the word matched inside its own negation and the consumer was told the reverse of the
+/// fact. Typed, so the sentence keeps saying what it says.
+
+/// It carries `INVALID_ARGUMENT` (`:1049`): the command was asked to resolve a dispute on a deal
+/// that has none, which is a refusal about the request rather than about the chain. That is the one
+/// judgement call in this change, and it is called out in the pull request.
+#[derive(Debug)]
+pub(crate) struct DealIsNotDisputed {
+    message: String,
+}
+
+impl DealIsNotDisputed {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+}
+
+impl std::fmt::Display for DealIsNotDisputed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DealIsNotDisputed {}
+
 fn validate_dispute_timeout(
     state: dexdo_core::DealChainState,
     config: &Value,
     now: u64,
 ) -> Result<u64> {
     if !state.disputed {
-        anyhow::bail!("resolve-dispute-timeout: deal is not DISPUTED -- nothing to resolve");
+        return Err(anyhow::Error::new(DealIsNotDisputed::new(
+            "resolve-dispute-timeout: deal is not DISPUTED -- nothing to resolve",
+        )));
     }
     let dispute_time = state.dispute_time;
     if dispute_time == 0 {
@@ -1136,7 +1175,6 @@ fn validate_dispute_timeout(
     Ok(deadline)
 }
 
-#[cfg(feature = "shellnet")]
 async fn submit_dispute_timeout_after_validation<T>(
     preflight: Result<u64>,
     submit: impl std::future::Future<Output = Result<T>>,
@@ -1146,14 +1184,21 @@ async fn submit_dispute_timeout_after_validation<T>(
     Ok((deadline, receipt))
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs) -> Result<()> {
-    use dexdo_core::{Address, Deployed, RealChainBackend};
+    use dexdo_core::{Address, RealChainBackend};
 
-    let contracts = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let contracts_path = crate::cli::commands::manifest_path()?;
+    let contracts = contracts_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            contracts_path.display()
+        )
+    })?;
     let chain = RealChainBackend::connect(contracts)?;
     let now = chain.observed_chain_timestamp().await?;
     let (tc_str, _frame, _nonce) =
@@ -1161,11 +1206,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
     let tc_display = display_token_contract(&tc);
-    let deployed = Deployed::load(&args.contracts)?;
-    let expected_hash = deployed
-        .contract_hashes
-        .get("TokenContract")
-        .ok_or_else(|| anyhow::anyhow!("deployed manifest has no TokenContract code hash"))?;
+    let expected_hash = dexdo_core::chain::compiled_contract_hash("TokenContract")?;
     let (active, code_hash) = chain.account_active_code_hash(&tc).await?;
     let mut identity_ok =
         active && code_hash.as_deref() == Some(expected_hash.trim_start_matches("0x"));
@@ -1218,40 +1259,43 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_resolve_dispute_timeout(_args: ResolveDisputeTimeoutArgs) -> Result<()> {
-    bail!("resolve-dispute-timeout unavailable: build with `--features shellnet`")
-}
 
-#[cfg(any(feature = "shellnet", test))]
 const WITHDRAW_SHELL_GUIDANCE: &str =
     "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active.";
 
 /// `withdrawShell(uint128 amount)` pays the `_sellerNote` the deal stored at construction.
-#[cfg(any(feature = "shellnet", test))]
 const WITHDRAW_SHELL_PAYEE: &str =
     "The deal pays the seller note it stored at construction; withdrawShell accepts only amount.";
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
     use dexdo_core::{
         check_seller_pubkey, check_withdrawable_shell, Address, KeyPair, RealChainBackend,
     };
     let note_addr =
         crate::cli::support::require_note_addr(&args.identity, "withdraw-shell", "seller note")?;
-    let note_key = crate::cli::support::require_note_key(
-        &args.identity,
-        "withdraw-shell",
-        "seller owner key",
-    )?;
+
     Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    let manifest = args
-        .contracts
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+    // The manifest path comes from the environment now. The flag it used to
+    // come from is gone, and with it the case where an operator typed something
+    // unprintable -- what is left is a path this process was handed, which still has
+    // to be text before it can be passed on as one.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let manifest = manifest_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds a path that is not printable text: {}",
+            dexdo_core::params::MANIFEST_PATH_VAR,
+            manifest_path.display()
+        )
+    })?;
     let (tc_str, _frame, _nonce) =
         resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let seed = read_secret_hex(note_key, "--note-key")?;
+    let seed = crate::cli::support::note_owner_secret_for(
+        args.identity.note_key.as_deref(),
+        &note_addr,
+        None,
+        "withdraw-shell",
+        "the seller note's owner key",
+    )?;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
@@ -1275,28 +1319,28 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!(
-        "withdraw-shell {tc_display}: seller-signed TokenContract.withdrawShell(amount={amount}). \
-         {WITHDRAW_SHELL_PAYEE} {WITHDRAW_SHELL_GUIDANCE}"
+        "withdraw-shell {tc_display}: seller-signed TokenContract.withdrawShell(amount={} SHELL). \
+         {WITHDRAW_SHELL_PAYEE} {WITHDRAW_SHELL_GUIDANCE}",
+        dexdo_core::shell_amount(amount)
     );
     chain.withdraw_shell(&tc, amount, &keys).await?;
     println!(
-        "withdraw-shell submitted -> {amount} finalized SHELL from TokenContract {tc_display} to the seller note it \
-         stored at construction"
+        "withdraw-shell submitted -> {} finalized SHELL from TokenContract {tc_display} to the seller note it \
+         stored at construction",
+        dexdo_core::shell_amount(amount)
     );
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_withdraw_shell(_args: WithdrawShellArgs) -> Result<()> {
-    bail!("withdraw-shell unavailable: build with `--features shellnet`")
-}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "shellnet")]
     use crate::cli::args::{RecoverArgs, RecoveryIdentityArgs};
 
-    #[cfg(feature = "shellnet")]
+    // `include!` rather than a `mod` declaration because the test drives the private
+    // `recover_confirmation` and reuses this module's own `test_stop_receipt` fixture.
+    include!("recover/destroy_advice_1523_test.rs");
+
     #[test]
     fn recover_uses_shared_explicit_stop_while_legacy_reclaim_rejects_open() {
         let source = include_str!("recover.rs");
@@ -1343,7 +1387,6 @@ mod tests {
 
     /// A stale funded read after submission is not success: reclaim uses the existing bounded
     /// observer and marks local state only after that observer confirms absent/unfunded state.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn reclaim_requires_bounded_cleanup_confirmation_before_success() {
         let source = include_str!("recover.rs");
@@ -1418,17 +1461,14 @@ mod tests {
         assert!(preflight.unwrap_err().contains("terminal/drained"));
     }
 
-    #[cfg(feature = "shellnet")]
     struct TempDirCleanup(std::path::PathBuf);
 
-    #[cfg(feature = "shellnet")]
     impl Drop for TempDirCleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct PoolRecoverChain {
         buyer_note: dexdo_core::Address,
         buyer_pubkey: [u8; 32],
@@ -1437,7 +1477,6 @@ mod tests {
         poison_pool_after_stop: Option<std::path::PathBuf>,
     }
 
-    #[cfg(feature = "shellnet")]
     fn test_stop_receipt(tc: &dexdo_core::Address) -> dexdo_core::SettlementActionReceipt {
         dexdo_core::SettlementActionReceipt {
             token_contract: tc.with_workchain(),
@@ -1468,7 +1507,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recover_confirmation_renders_the_authoritative_stop_receipt() {
         let tc = dexdo_core::Address::parse(&format!("0:{}", "2".repeat(64))).unwrap();
@@ -1490,7 +1528,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn foreign_stop_receipt_never_reconciles_local_state_or_submits_money() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1538,7 +1575,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn seller_stop_shape_with_local_beneficiary_is_only_actor_unknown_terminal() {
         let beneficiary = format!("0:{}", "11".repeat(32));
@@ -1585,7 +1621,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recover_marks_subscription_or_noops_for_ordinary_deal_after_rendering_receipt() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1646,7 +1681,6 @@ mod tests {
         assert!(render < marker && marker < pool);
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::RecoverChain for PoolRecoverChain {
         async fn state(
@@ -1710,7 +1744,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn dispute_timeout_validation_matches_deployed_boundary() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1763,7 +1796,6 @@ mod tests {
 
     /// primary regression: the production recover flow must atomically write the selected pool-only buyer
     /// record after STOP, so a fresh pool load observes it as a durable buyer recovery record.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn run_recover_persists_pool_only_record_across_reload() {
         use std::sync::atomic::Ordering;
@@ -1779,7 +1811,19 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let _cleanup = TempDirCleanup(dir.clone());
         let pool_path = dir.join("pn_pool.json");
-        let note_addr = format!("0:{}", "1".repeat(64));
+        // This test gets a buyer note nobody else in the binary uses, and so do its two
+        // neighbours below. The temp dir above is private to this test; the BUYER SUBMIT JOURNAL
+        // is not -- `buyer_submit_state_dir` builds one directory per test PROCESS behind a
+        // `OnceLock`, and `BuyerMoneyLock` names its files `sha256(note address)`. Two tests
+        // sharing a note address therefore share one lock file, and the one that loses the race
+        // fails with "already has another money submission awaiting by-fact reconciliation...
+        // pool lock is already held" -- a sentence about neither test.
+
+        // Measured in CI 6734: this test and `pool_write_failure_after_stop_...` failed together,
+        // both on `note-b2b1ccde....money.lock`, both having used `0:1111...`. Three local runs of
+        // the whole binary did not reproduce it, which is what a scheduling race looks like from
+        // a machine with fewer cores -- and why the fix is a distinct address rather than a retry.
+        let note_addr = format!("0:{}", "1a".repeat(32));
         let token_contract = format!("0:{}", "2".repeat(64));
         let seller_tc = format!("0:{}", "3".repeat(64));
         let secret = "2a".repeat(32);
@@ -1823,7 +1867,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -1833,15 +1876,25 @@ mod tests {
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
         let reloaded = crate::cli::commands::load_pool_json(&pool_path).unwrap();
         let notes = reloaded["notes"].as_array().unwrap();
+        // The seller row was not written by this run, so it keeps the spelling the fixture gave it.
         let seller = notes
             .iter()
             .find(|note| note["token_contract"] == seller_tc)
             .expect("different seller record must remain present");
         assert_eq!(seller["token_contract_role"], "seller");
         assert_eq!(seller["token_contract_updated_at_unix"], 7);
+        // The recovered row WAS written, so since it carries the TokenContract in its
+        // canonical self-DApp form -- a per-deal TC is a self-DApp account, and one pool entry must
+        // not hold two address conventions. Stated as a literal over the same `2` seed the fixture
+        // uses, not by calling the renderer.
+        let recovered_tc = format!("{}::{}", "2".repeat(64), "2".repeat(64));
+        assert_ne!(
+            recovered_tc, token_contract,
+            "the fixture has to be a form the write actually changes, or this proves nothing"
+        );
         let recovered = notes
             .iter()
-            .find(|note| note["token_contract"] == token_contract)
+            .find(|note| note["token_contract"] == recovered_tc)
             .expect("recovered buyer record must survive pool reload");
         assert_eq!(recovered["owner_secret_key_hex"], secret);
         assert_eq!(recovered["token_contract_role"], "buyer");
@@ -1850,7 +1903,6 @@ mod tests {
             .is_some());
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn recover_retry_reconciles_local_state_without_a_second_stop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1866,7 +1918,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let _cleanup = TempDirCleanup(dir.clone());
         let pool_path = dir.join("pn_pool.json");
-        let note_addr = format!("0:{}", "1".repeat(64));
+        // Its own buyer note: the buyer submit journal is one directory per test process,
+        // and the money lock is named after this address. See the neighbour above.
+        let note_addr = format!("0:{}", "1b".repeat(32));
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
         std::fs::write(
@@ -1906,7 +1960,6 @@ mod tests {
             token_contract: None,
             market: None,
             pool: Some(pool_path.clone()),
-            contracts: dir.join("unused-contracts.json"),
         };
 
         let first = super::run_recover_with_chain_and_marker(args(), &chain, &marker)
@@ -1926,7 +1979,6 @@ mod tests {
         assert_eq!(reloaded["notes"][0]["token_contract_role"], "buyer");
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_write_failure_after_stop_preserves_the_authoritative_receipt() {
         use std::sync::atomic::Ordering;
@@ -1942,7 +1994,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let _cleanup = TempDirCleanup(dir.clone());
         let pool_path = dir.join("pn_pool.json");
-        let note_addr = format!("0:{}", "1".repeat(64));
+        // Its own buyer note: the buyer submit journal is one directory per test process,
+        // and the money lock is named after this address. See the neighbour above.
+        let note_addr = format!("0:{}", "1c".repeat(32));
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
         std::fs::write(
@@ -1976,7 +2030,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -2046,7 +2099,6 @@ mod tests {
     /// One fake never-opened deal: the chain facts `reclaim` decodes, plus the submission outcomes a
     /// real node can produce -- a clean failure, an **outcome-ambiguous** failure (the action landed and
     /// only the response was lost), and a bounded observation that stays stale.
-    #[cfg(feature = "shellnet")]
     struct PoolReclaimDeal {
         buyer_note: String,
         buyer_pubkey: [u8; 32],
@@ -2060,7 +2112,6 @@ mod tests {
 
     /// A fake chain keyed by TokenContract. `cleanupUnopened` is modelled exactly as the contract
     /// behaves: it destroys the TC, so a second attempt on the same deal can find nothing to move.
-    #[cfg(feature = "shellnet")]
     #[derive(Default)]
     struct PoolReclaimChain {
         deals: std::sync::Mutex<std::collections::BTreeMap<String, PoolReclaimDeal>>,
@@ -2070,7 +2121,6 @@ mod tests {
         cleanups: std::sync::Mutex<Vec<String>>,
     }
 
-    #[cfg(feature = "shellnet")]
     impl PoolReclaimChain {
         fn key(tc: &dexdo_core::Address) -> String {
             tc.with_workchain()
@@ -2172,7 +2222,7 @@ mod tests {
             self.posts.lock().unwrap().clone()
         }
 
-        /// The deal is really owned by a different buyer note(a corrupt/forged recovery record).
+        /// The deal is really owned by a different buyer note (a corrupt/forged recovery record).
         fn owned_by_note(self, token_contract: &str, buyer_note: &str) -> Self {
             let buyer_note = dexdo_core::Address::parse(buyer_note)
                 .unwrap()
@@ -2192,7 +2242,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::ReclaimChain for PoolReclaimChain {
         async fn state(
@@ -2292,7 +2341,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn reclaim_test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "dexdo-{name}-{}-{}",
@@ -2306,7 +2354,6 @@ mod tests {
         dir
     }
 
-    #[cfg(feature = "shellnet")]
     fn write_reclaim_pool(dir: &std::path::Path, notes: serde_json::Value) -> std::path::PathBuf {
         let pool_path = dir.join("pn_pool.json");
         std::fs::write(
@@ -2323,7 +2370,6 @@ mod tests {
 
     /// The production entry point of `dexdo reclaim` given a pool file: the real plan resolver over the real
     /// pool file, then the real driver. Only the chain and the durable subscription marker are faked.
-    #[cfg(feature = "shellnet")]
     async fn run_pool_only_reclaim(
         pool_path: &std::path::Path,
         chain: &PoolReclaimChain,
@@ -2332,7 +2378,6 @@ mod tests {
         run_pool_only_reclaim_with_marker(pool_path, chain, &|_note, _tc| Ok(false)).await
     }
 
-    #[cfg(feature = "shellnet")]
     async fn run_pool_only_reclaim_with_marker(
         pool_path: &std::path::Path,
         chain: &PoolReclaimChain,
@@ -2350,12 +2395,10 @@ mod tests {
         super::drive_reclaim_plan(plan, chain, marker).await
     }
 
-    #[cfg(feature = "shellnet")]
     fn never_opened_state() -> dexdo_core::DealChainState {
         chain_state(true, false, false, false, 100)
     }
 
-    #[cfg(feature = "shellnet")]
     fn note_a() -> (String, String, String) {
         (
             format!("0:{}", "1".repeat(64)),
@@ -2364,7 +2407,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "shellnet")]
     fn note_b() -> (String, String, String) {
         (
             format!("0:{}", "3".repeat(64)),
@@ -2374,7 +2416,6 @@ mod tests {
     }
 
     /// One recorded pool row, exactly as the buyer writes it.
-    #[cfg(feature = "shellnet")]
     fn recorded_row(
         note_addr: &str,
         secret: &str,
@@ -2384,7 +2425,6 @@ mod tests {
         recorded_row_as(note_addr, secret, token_contract, recorded_at_unix, "buyer")
     }
 
-    #[cfg(feature = "shellnet")]
     fn recorded_row_as(
         note_addr: &str,
         secret: &str,
@@ -2404,7 +2444,6 @@ mod tests {
     /// primary regression: an ordinary pool holding two recoverable entries is driven from pool
     /// metadata alone -- no `--note-addr`, no `--token-contract` -- and the order comes from each entry's
     /// own recorded `token_contract_updated_at_unix`, not from its position in the file.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_drives_every_recorded_entry_in_recorded_order() {
         let dir = reclaim_test_dir("reclaim-two-entries");
@@ -2449,7 +2488,6 @@ mod tests {
     }
 
     /// Restart/idempotence: the very same invocation, run twice, moves no deal's money twice.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_repeated_invocation_moves_no_money_twice() {
         let dir = reclaim_test_dir("reclaim-repeat");
@@ -2493,9 +2531,8 @@ mod tests {
         );
     }
 
-    /// An entry that was already reclaimed(its TokenContract is gone) and an entry that was never funded
+    /// An entry that was already reclaimed (its TokenContract is gone) and an entry that was never funded
     /// are both decided as no-ops, while the one live recoverable entry is still recovered.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_skips_already_reclaimed_entries_without_a_second_move() {
         let dir = reclaim_test_dir("reclaim-already-done");
@@ -2557,7 +2594,6 @@ mod tests {
     /// Contradictory records still fail closed: a note recorded against two different TokenContracts, and
     /// one TokenContract recorded against two different notes, are both refused outright -- the pool is
     /// never guessed at -- while an unambiguous entry alongside them is still recovered.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_fails_closed_on_contradictory_records() {
         let dir = reclaim_test_dir("reclaim-contradictory");
@@ -2619,7 +2655,6 @@ mod tests {
 
     /// The same fail-closed rule for the mirror-image contradiction: two notes recorded as the buyer of
     /// one TokenContract.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_fails_closed_when_two_notes_claim_one_deal() {
         let dir = reclaim_test_dir("reclaim-two-notes-one-tc");
@@ -2663,7 +2698,6 @@ mod tests {
 
     /// A single recorded entry keeps its pre- behaviour exactly: it is reclaimed when it is
     /// reclaimable, and a deal this command cannot move stays a loud, non-zero failure.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn single_recorded_entry_keeps_the_unchanged_loud_failure() {
         let dir = reclaim_test_dir("reclaim-single");
@@ -2724,9 +2758,8 @@ mod tests {
         assert_eq!(live.cleanups().len(), 1);
     }
 
-    /// Option(1)'s own risk: a failure part-way through the sequence must neither lose the remaining
+    /// Option (1)'s own risk: a failure part-way through the sequence must neither lose the remaining
     /// entries nor let a retry drive an already-reclaimed one a second time.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn pool_only_reclaim_partial_failure_neither_loses_nor_double_drives_the_rest() {
         let dir = reclaim_test_dir("reclaim-partial-failure");
@@ -2796,9 +2829,150 @@ mod tests {
         );
     }
 
+    /// what `reclaim` reports when a pool records nothing, and what it still reports when a pool
+    /// records something whose reclaim failed. The two belong together: an assertion that an empty
+    /// sweep exits 0 would pass just as well against a client that had stopped reporting failures at
+    /// all, so the pair -- and not the first test alone -- is what pins the distinction.
+    mod empty_reclaim_plan_is_not_a_failure {
+        use super::*;
+
+        /// Only the buyer client ever writes `token_contract` into a pool entry, so a pool whose notes
+        /// never bought carries no reclaimable record at all -- and an operator sweeping `reclaim` over
+        /// every pool they hold meets that on every run. Nothing was refused, nothing failed, and no
+        /// money was left behind: this is the complete answer to what the command was asked.
+        #[tokio::test]
+        async fn a_pool_recording_no_deal_succeeds_and_submits_nothing() {
+            let dir = reclaim_test_dir("reclaim-empty-plan");
+            let _cleanup = TempDirCleanup(dir.clone());
+            let (note_a, secret_a, _) = note_a();
+            let (note_b, secret_b, _) = note_b();
+            let pool_path = write_reclaim_pool(
+                &dir,
+                serde_json::json!([
+                    { "address": note_a, "owner_secret_key_hex": secret_a },
+                    { "address": note_b, "owner_secret_key_hex": secret_b },
+                ]),
+            );
+            let chain = PoolReclaimChain::default();
+
+            run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect("a pool that records no reclaimable deal is an ordinary, successful sweep");
+            assert!(
+                chain.posts().is_empty(),
+                "an empty plan must reach the chain not at all"
+            );
+        }
+
+        /// The other end, and the one that must not move: the same sweep over a pool that DOES record
+        /// deals, whose submits fail and whose bounded observation still finds each deal funded. Two
+        /// recorded entries, so the decision is made by the aggregate branch an empty plan now returns
+        /// through -- the exact place where silencing an absence could turn into silencing a failure.
+        #[tokio::test]
+        async fn a_pool_recording_deals_that_failed_to_reclaim_still_fails() {
+            let dir = reclaim_test_dir("reclaim-recorded-but-failing");
+            let _cleanup = TempDirCleanup(dir.clone());
+            let (note_a, secret_a, tc_a) = note_a();
+            let (note_b, secret_b, tc_b) = note_b();
+            let pool_path = write_reclaim_pool(
+                &dir,
+                serde_json::json!([
+                    recorded_row(&note_a, &secret_a, &tc_a, 100),
+                    recorded_row(&note_b, &secret_b, &tc_b, 200),
+                ]),
+            );
+            let chain = PoolReclaimChain::default()
+                .with_deal(&tc_a, &note_a, &secret_a, Some(never_opened_state()), 1)
+                .with_deal(&tc_b, &note_b, &secret_b, Some(never_opened_state()), 1);
+
+            let error = run_pool_only_reclaim(&pool_path, &chain)
+                .await
+                .expect_err("recorded deals whose reclaim failed must still exit non-zero")
+                .to_string();
+            assert!(
+                error.contains("2 of 2 recorded entries were not decided"),
+                "{error}"
+            );
+            assert!(
+                error.contains("simulated cleanupUnopened submit failure"),
+                "{error}"
+            );
+            assert!(
+                chain.cleanups().is_empty(),
+                "no money moved, and the command said so by failing"
+            );
+        }
+
+        /// The half an unfiltered sweep cannot reach. `--token-contract` is a FILTER, applied in
+        /// `matching_pool_recovery_records` by dropping every row that misses, so a deal that is named
+        /// and not recorded arrives at the plan as the very same empty set as a pool that records
+        /// nothing at all. The two answer different questions -- "reclaim everything here" and nothing
+        /// recorded is complete, "reclaim deal X" and no X is not -- and collapsing them is how
+        /// `reclaim` would exit 0 on a deal it never touched.
+
+        /// Driven through `resolve_pool_recovery_plan` because that is the function `run_reclaim`
+        /// itself calls; it never enters `resolve_recovery_inputs`, which is where the single-deal
+        /// refusal for `recover`/`dispute` lives.
+        #[test]
+        fn a_named_deal_this_pool_does_not_record_is_refused_not_reported_as_empty() {
+            let dir = reclaim_test_dir("reclaim-named-deal-absent");
+            let _cleanup = TempDirCleanup(dir.clone());
+            let (note_a, secret_a, tc_a) = note_a();
+            let (_note_b, _secret_b, tc_b) = note_b();
+            let pool_path = write_reclaim_pool(
+                &dir,
+                serde_json::json!([recorded_row(&note_a, &secret_a, &tc_a, 100)]),
+            );
+
+            // `expect_err` would demand `Debug` on `PoolRecoveryPlan`, whose targets carry a note owner
+            // secret; the match asks the same question without widening a production type for a test.
+            let error = match crate::cli::commands::resolve_pool_recovery_plan(
+                &RecoveryIdentityArgs {
+                    note_key: None,
+                    note_addr: None,
+                },
+                None,
+                Some(tc_b.as_str()),
+                Some(pool_path.as_path()),
+            ) {
+                Ok(_) => panic!(
+                    "a deal named with --token-contract that this pool does not record must refuse, \
+                     or `reclaim` reports success having touched nothing"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("records no deal matching --token-contract"),
+                "the refusal names the filter that matched nothing: {error}"
+            );
+
+            // The other end, on the SAME pool and through the same call. Without it the assertion above
+            // would pass just as well against a client that had started refusing EVERY filter, matching
+            // or not -- which would break the one thing was opened to fix.
+            let matched = crate::cli::commands::resolve_pool_recovery_plan(
+                &RecoveryIdentityArgs {
+                    note_key: None,
+                    note_addr: None,
+                },
+                None,
+                Some(tc_a.as_str()),
+                Some(pool_path.as_path()),
+            )
+            .expect("the deal this pool DOES record still plans when it is named");
+            assert_eq!(
+                matched.targets.len(),
+                1,
+                "a filter that matches must still plan exactly the deal it names"
+            );
+            assert_eq!(
+                matched.targets[0].token_contract, tc_a,
+                "and it must be that deal, not some other row of the pool"
+            );
+        }
+    }
+
     /// `--note-key` names one note's owner key: applying it to several recorded notes is an ambiguous
     /// instruction on a money path, so it fails closed instead of guessing.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn note_key_with_several_recorded_entries_fails_closed() {
         let dir = reclaim_test_dir("reclaim-note-key-ambiguous");
@@ -2845,7 +3019,6 @@ mod tests {
 
     /// A recorded entry the chain contradicts on ownership is a corrupt or forged recovery record, not a
     /// decided no-op: it must never be counted as a clean "nothing to do" beside a valid sibling.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn contradicted_buyer_note_or_key_fails_loud_with_no_submit() {
         let (note_a, secret_a, tc_a) = note_a();
@@ -2889,9 +3062,8 @@ mod tests {
         }
     }
 
-    /// A submit whose outcome is ambiguous(the action landed, the response was lost) is reconciled by
+    /// A submit whose outcome is ambiguous (the action landed, the response was lost) is reconciled by
     /// the same bounded observation, never by submitting the money action again.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn ambiguous_submit_is_reconciled_by_observation_without_a_second_submit() {
         let dir = reclaim_test_dir("reclaim-ambiguous-submit");
@@ -2926,7 +3098,6 @@ mod tests {
 
     /// A submit that fails while the observation window stays stale is genuinely unresolved: it must be
     /// loud, must not be re-submitted, and must still be recoverable on a later run.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn unresolved_submit_outcome_is_loud_and_still_reclaimable_later() {
         let dir = reclaim_test_dir("reclaim-unresolved-submit");
@@ -2967,7 +3138,6 @@ mod tests {
     /// transport may deliver the same cleanup BOC more than once, and an operator may re-run the command
     /// after an unresolved outcome -- neither can pay the deal out twice, because `cleanupUnopened` only
     /// accepts a funded, never-opened deal and destroys it as it refunds.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn a_duplicated_cleanup_post_moves_the_deals_money_only_once() {
         let (note_a, secret_a, tc_a) = note_a();
@@ -3088,7 +3258,6 @@ mod tests {
 
     /// The other ambiguous shape: the submit is accepted but the bounded observation window stays
     /// stale. That is not a settled cleanup, so it must be loud -- and the retry must not submit again.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn accepted_submit_with_a_stale_observation_is_never_reported_as_settled() {
         let dir = reclaim_test_dir("reclaim-stale-observation");
@@ -3124,7 +3293,6 @@ mod tests {
 
     /// A confirmed cleanup whose local marker failed leaves durable subscription state stale. The next
     /// run must repair it -- with zero submits -- instead of walking past it forever.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn failed_subscription_marker_is_repaired_on_the_next_run_without_a_second_submit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3181,7 +3349,6 @@ mod tests {
 
     /// A pool row that claims recovery metadata but is missing or mistyping part of it is refused before
     /// any chain contact -- never silently dropped from the plan while its escrow stays stranded.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn malformed_recovery_metadata_is_refused_before_any_chain_contact() {
         let (note_a, secret_a, tc_a) = note_a();
@@ -3258,7 +3425,6 @@ mod tests {
     /// The documented duplicate rule: rows for one recorded deal collapse only when every recorded fact
     /// agrees. Exact duplicates are one deal; rows that disagree on the role or the recorded time are a
     /// contradiction. Either way the outcome cannot depend on the order of rows in the file.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn rows_for_one_deal_collapse_only_when_every_recorded_fact_agrees() {
         let (note_a, secret_a, tc_a) = note_a();
@@ -3354,7 +3520,6 @@ mod tests {
 
     /// A generated pool of recorded entries, with an index-derived identity per entry so every note,
     /// key and TokenContract is distinct.
-    #[cfg(feature = "shellnet")]
     fn generated_entry(index: usize) -> (String, String, String) {
         let byte = format!("{:02x}", index as u8 + 1);
         (
@@ -3365,7 +3530,6 @@ mod tests {
     }
 
     /// What the generated entry's deal looks like on chain.
-    #[cfg(feature = "shellnet")]
     #[derive(Clone, Debug)]
     enum GeneratedDeal {
         Reclaimable,
@@ -3373,7 +3537,6 @@ mod tests {
         Unfunded,
     }
 
-    #[cfg(feature = "shellnet")]
     fn generated_plan_run(
         specs: &[(GeneratedDeal, u64, bool, bool)],
         rotation: usize,
@@ -3421,7 +3584,6 @@ mod tests {
         (chain.cleanups(), first.is_ok())
     }
 
-    #[cfg(feature = "shellnet")]
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
 
@@ -3429,6 +3591,7 @@ mod tests {
         /// exactly once and no other deal at all, keeps going past a failing entry, exits non-zero
         /// exactly when an entry failed, and never moves a deal again on a restart. Duplicate rows are
         /// one deal, and the whole outcome is independent of the row order in the file.
+
         /// Sizes start at two recorded deals on purpose: a pool holding exactly one recorded entry keeps
         /// its deliberately different pre- contract, where a deal this command cannot move stays a
         /// loud failure -- `single_recorded_entry_keeps_the_unchanged_loud_failure` owns that case.
@@ -3485,7 +3648,6 @@ mod tests {
     /// re-review item 1: a contradicted deal must refuse every deal it touches. Counting the
     /// note/TokenContract collisions only among the groups that survived contradiction removal let the
     /// contradiction quietly clear the way for its own sibling, which then moved money.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn a_contradicted_deal_also_refuses_the_deals_it_collides_with() {
         let (note_a, secret_a, tc_1) = generated_entry(0);
@@ -3552,7 +3714,6 @@ mod tests {
 
     /// re-review item 2: one deal recorded as both buyer and seller is a contradiction about that
     /// deal. The buyer-only pre-filter used to drop the seller row before anything could compare them.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn a_deal_recorded_as_both_buyer_and_seller_fails_closed() {
         let dir = reclaim_test_dir("reclaim-role-contradiction");
@@ -3586,7 +3747,6 @@ mod tests {
     /// The other half of the same rule, and the shape of every real pool: a note that sold one deal and
     /// bought another is ordinary. Its seller record must neither join the buyer plan nor block it, and
     /// a seller record for the deal another note bought must not look like two claimants.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn unrelated_seller_records_stay_outside_the_buyer_plan() {
         let dir = reclaim_test_dir("reclaim-seller-records");
@@ -3625,21 +3785,18 @@ mod tests {
 
     // ----: `recover`/`dispute` on a pool holding more than one recovery entry ----
 
-    #[cfg(feature = "shellnet")]
     use crate::cli::args::DisputeArgs;
 
     /// A chain that answers per TokenContract, so a pool recording several deals can be put in the state
     /// a real one is in: one deal still OPEN and its siblings already over. A TokenContract absent from
     /// `deals` is inactive, which is what a destroyed deal looks like; one listed in `unreadable` fails
     /// the read, which is what an unreachable node looks like.
-    #[cfg(feature = "shellnet")]
     struct RecordedDeal {
         opened: bool,
         buyer_note: String,
         buyer_pubkey: [u8; 32],
     }
 
-    #[cfg(feature = "shellnet")]
     #[derive(Default)]
     struct RecordedDealsChain {
         deals: std::collections::BTreeMap<String, RecordedDeal>,
@@ -3648,7 +3805,6 @@ mod tests {
         disputed: std::sync::Mutex<Vec<String>>,
     }
 
-    #[cfg(feature = "shellnet")]
     impl RecordedDealsChain {
         fn with_deal(mut self, tc: &str, opened: bool, buyer_note: &str, buyer_secret: &str) -> Self {
             let keys = dexdo_core::KeyPair::from_secret_hex(buyer_secret).unwrap();
@@ -3688,7 +3844,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::RecoverChain for RecordedDealsChain {
         async fn state(
@@ -3753,7 +3908,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::DisputeChain for RecordedDealsChain {
         async fn state(
@@ -3801,7 +3955,6 @@ mod tests {
     /// The ordinary two-deal pool found live: two notes, one recorded deal each. The later-recorded
     /// deal is the one the chain still holds OPEN, so "the first recorded entry" and "the deal to act on"
     /// are different entries.
-    #[cfg(feature = "shellnet")]
     fn two_recorded_deals_pool(dir: &std::path::Path) -> std::path::PathBuf {
         let (note_a, secret_a, tc_a) = note_a();
         let (note_b, secret_b, tc_b) = note_b();
@@ -3814,7 +3967,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "shellnet")]
     fn pool_only_recovery_identity() -> RecoveryIdentityArgs {
         RecoveryIdentityArgs {
             note_key: None,
@@ -3822,7 +3974,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn recorded_row_updated_at(pool_path: &std::path::Path, token_contract: &str) -> u64 {
         // Identify the row by its ACCOUNT ID, not by one spelling of the address: a pool the command
         // rewrote records the canonical `<account_id>::<account_id>` while a pool a refusal
@@ -3852,7 +4003,6 @@ mod tests {
     /// primary regression, through `dexdo recover --pool <file>` itself: a pool recording TWO
     /// recoverable deals no longer refuses. The chain places exactly one of them in the state `recover`
     /// acts on, that one is STOPped, and the other recorded deal is not touched at all.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn recover_acts_on_the_one_recorded_deal_the_chain_places_open() {
         let dir = reclaim_test_dir("recover-two-recorded-deals");
@@ -3872,7 +4022,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -3898,7 +4047,6 @@ mod tests {
     /// The other half of the same rule: when the chain cannot tell the recorded deals apart -- both are
     /// still OPEN and owned by their recorded notes -- `recover` still refuses and moves nothing. This is
     /// the side the change errs on.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn recover_refuses_when_the_chain_places_two_recorded_deals_open() {
         let dir = reclaim_test_dir("recover-two-open-recorded-deals");
@@ -3916,7 +4064,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -3953,7 +4100,6 @@ mod tests {
 
     /// A chain that cannot answer for ONE recorded deal has not ruled that deal out, so the whole
     /// invocation refuses rather than acting on the sibling it happened to read successfully.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn recover_refuses_when_one_recorded_deal_cannot_be_read() {
         let dir = reclaim_test_dir("recover-unreadable-recorded-deal");
@@ -3971,7 +4117,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -3985,7 +4130,6 @@ mod tests {
 
     /// the `dispute` half: the same selection, for the action that also freezes the seller bond and
     /// starts the arbitration clock.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn dispute_acts_on_the_one_recorded_deal_the_chain_places_open() {
         let dir = reclaim_test_dir("dispute-two-recorded-deals");
@@ -4003,7 +4147,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )
@@ -4023,7 +4166,6 @@ mod tests {
         assert_eq!(recorded_row_updated_at(&pool_path, &tc_b), 20);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn dispute_refuses_when_the_chain_places_two_recorded_deals_open() {
         let dir = reclaim_test_dir("dispute-two-open-recorded-deals");
@@ -4041,7 +4183,6 @@ mod tests {
                 token_contract: None,
                 market: None,
                 pool: Some(pool_path.clone()),
-                contracts: dir.join("unused-contracts.json"),
             },
             &chain,
         )

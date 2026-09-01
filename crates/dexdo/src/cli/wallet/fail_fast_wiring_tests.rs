@@ -1,4 +1,5 @@
 //! what `note deploy` and `note topup` do about the wallet, before they touch the chain.
+
 //! The resolver takes the store rather than reading the process-wide data directory, so every case
 //! below is decided by a directory this test created -- never by whatever the machine running the
 //! suite happens to have bound.
@@ -16,10 +17,10 @@ const BOUND_KEY: &str = "/secrets/bound-hot.key";
 
 fn bound(store: &WalletStore, mutate: impl FnOnce(&mut WalletBinding)) {
     let mut binding = WalletBinding {
+        network: crate::cli::wallet::test_network_a(),
         version: BINDING_VERSION,
         id: "0123456789abcdef0123456789abcdef".to_string(),
         provider: WalletProvider::Manual,
-        network: WalletNetwork::Shellnet,
         hot_address: HOT.to_string(),
         vault_address: None,
         hot_key_file: Some(PathBuf::from(BOUND_KEY)),
@@ -52,7 +53,7 @@ fn is_wallet_not_configured(error: &anyhow::Error) -> bool {
 fn no_flags_and_no_binding_is_e_wallet_not_configured() {
     let dir = tempfile::tempdir().unwrap();
     let store = WalletStore::at(dir.path().join("wallet"));
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a command that spends the Hot cannot proceed without one");
     assert!(
         is_wallet_not_configured(&error),
@@ -71,7 +72,7 @@ fn without_flags_the_active_binding_supplies_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let store = WalletStore::at(dir.path().join("wallet"));
     bound(&store, |_| {});
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None).expect("the binding answers");
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None).expect("the binding answers");
     assert_eq!(
         resolved,
         FundingWallet {
@@ -92,7 +93,7 @@ fn an_explicit_multisig_address_wins_over_the_active_binding() {
     bound(&store, |_| {});
     let resolved = resolve_funding_wallet(
         &store,
-        WalletNetwork::Shellnet,
+        &crate::cli::wallet::test_network_a(),
         Some("0:explicit"),
         &Some(PathBuf::from("explicit.key")),
         &None,
@@ -122,7 +123,7 @@ fn an_explicit_wallet_is_unaffected_by_an_unreadable_binding() {
     std::fs::write(root.join("binding.json"), b"{ this is not json").unwrap();
     let resolved = resolve_funding_wallet(
         &store,
-        WalletNetwork::Shellnet,
+        &crate::cli::wallet::test_network_a(),
         Some("0:explicit"),
         &Some(PathBuf::from("explicit.key")),
         &None,
@@ -142,7 +143,7 @@ fn an_unparseable_binding_is_an_error_and_not_a_silent_no_wallet() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("binding.json"), b"{ this is not json").unwrap();
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a binding that cannot be read must not be treated as absent");
     assert!(
         !is_wallet_not_configured(&error),
@@ -161,13 +162,13 @@ fn a_future_version_binding_is_refused_rather_than_treated_as_absent() {
     let root = dir.path().join("wallet");
     let store = WalletStore::at(&root);
     bound(&store, |_| {});
-    let path = store.binding_path(WalletNetwork::Shellnet);
+    let path = store.binding_path(&crate::cli::wallet::test_network_a());
     let mut value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     value["version"] = serde_json::json!(BINDING_VERSION + 1);
     std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a newer binding must not be read with fields this build ignores");
     assert!(!is_wallet_not_configured(&error), "{error:#}");
 }
@@ -182,7 +183,7 @@ fn a_binding_with_no_local_secret_is_refused_as_itself() {
         binding.hot_key_file = None;
         binding.hot_seed_file = None;
     });
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a binding with no secret cannot fund a spend");
     assert!(!is_wallet_not_configured(&error), "{error:#}");
     assert!(
@@ -200,7 +201,7 @@ fn a_seed_file_binding_resolves_to_the_seed_input() {
         binding.hot_key_file = None;
         binding.hot_seed_file = Some(PathBuf::from("/secrets/hot.seed"));
     });
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None).unwrap();
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None).unwrap();
     assert_eq!(resolved.key, None);
     assert_eq!(resolved.seed_file, Some(PathBuf::from("/secrets/hot.seed")));
 }
@@ -216,13 +217,13 @@ fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects
             "dexdo", "note", "deploy", "--nominal", "N100", "--pool", "p.json",
         ],
         vec![
-            "dexdo", "note", "topup", "--note-addr", "0:note", "--to-raw", "1",
+            "dexdo", "note", "topup", "--note-addr", "0:note", "--to", "1",
         ],
         vec![
             "dexdo",
             "note",
             "deploy",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--nominal",
             "N100",
@@ -252,9 +253,9 @@ fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects
             "topup",
             "--note-addr",
             "0:note",
-            "--to-raw",
+            "--to",
             "1",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
         ],
         vec![
@@ -263,7 +264,7 @@ fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects
             "topup",
             "--note-addr",
             "0:note",
-            "--to-raw",
+            "--to",
             "1",
             "--multisig-address",
             "0:wallet",
@@ -273,5 +274,70 @@ fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects
             Cli::try_parse_from(command.clone()).is_err(),
             "{command:?} must still be rejected by the parser"
         );
+    }
+}
+
+/// Deploying a note or posting an order now onboards a wallet instead of dead-ending on the absence
+/// of one -- but only for the absence, and only where an operator can answer. These pin the two
+/// conditions the decision turns on, without running an onboarding: what counts as "nothing is
+/// bound", and what a session with nobody on the other end does instead.
+mod onboarding_on_demand {
+    use super::*;
+    use crate::cli::wallet::{is_wallet_not_configured, resolve_funding_wallet};
+
+    /// The only refusal that may start an onboarding.
+    #[test]
+    fn an_absent_binding_is_recognised_as_the_one_refusal_onboarding_answers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = WalletStore::at(temp.path().join("wallet"));
+
+        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+            .expect_err("nothing is bound");
+
+        assert!(is_wallet_not_configured(&refusal), "{refusal:#}");
+    }
+
+    /// Every other way a wallet can be unusable must NOT start one. A binding that exists but
+    /// records no local key is the operator's own wallet, half set up; onboarding over it would
+    /// bind a second wallet and leave the first paying for nothing.
+    #[test]
+    fn a_keyless_binding_is_a_different_problem_and_must_not_onboard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = WalletStore::at(temp.path().join("wallet"));
+        bound(&store, |binding| {
+            binding.hot_key_file = None;
+            binding.hot_seed_file = None;
+        });
+
+        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+            .expect_err("a binding with no key cannot sign");
+
+        assert!(
+            !is_wallet_not_configured(&refusal),
+            "a half-configured binding must keep its own refusal: {refusal:#}"
+        );
+    }
+
+    /// A corrupt binding file is not an absent one either: onboarding there would run while a
+    /// funded Hot may well be bound, and the file is what has to be looked at.
+    #[test]
+    fn a_corrupt_binding_is_a_different_problem_and_must_not_onboard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = WalletStore::at(temp.path().join("wallet"));
+        let path = store.binding_path(&crate::cli::wallet::test_network_a());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"{ not json").expect("write");
+
+        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+            .expect_err("a corrupt binding cannot be read");
+
+        assert!(!is_wallet_not_configured(&refusal), "{refusal:#}");
+    }
+
+    /// Under `cargo test` there is no terminal, which is exactly the state a script or a machine
+    /// consumer is in: onboarding draws a code to scan and then waits, so it must not be started.
+    #[test]
+    fn a_session_with_nobody_on_the_other_end_does_not_start_an_onboarding() {
+        assert!(!crate::cli::wallet::onboarding_can_be_run());
     }
 }

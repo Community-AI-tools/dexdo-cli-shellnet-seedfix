@@ -1,17 +1,19 @@
 //! the note path's custodian check and the shared normalization are one rule, not two.
+
 //! `normalize_multisig_pubkey` was defined twice -- once in `dexdo-core`, once here -- and the two
 //! copies decided the same money-path question: whether the key dexdo holds is a custodian of the
 //! wallet it is about to spend from. They agreed, so no runtime test could ever have separated
-//! them; that is exactly why the fix is an import(a second definition is now `error[E0255]`)
+//! them; that is exactly why the fix is an import (a second definition is now `error[E0255]`)
 //! rather than an assertion.
+
 //! What a test CAN hold is the other half: that this path's answer is the shared function's answer,
 //! on the renderings that made two spellings of one key look like two keys in the first place. The
 //! cases below drive the real entry points -- `multisig_custodian_pubkeys`, which reads
-//! `getCustodians` output, and `ensure_multisig_key_is_custodian`, which decides -- against
+//! `getCustodians` output, and `ensure_multisig_private_key_is_custodian`, which decides -- against
 //! `dexdo_core::normalize_multisig_pubkey` as the oracle. A future copy that drifts on `0X`, on a
 //! short key, or on case fails here.
 
-use super::{ensure_multisig_key_is_custodian, multisig_custodian_pubkeys};
+use super::{ensure_multisig_private_key_is_custodian, multisig_custodian_pubkeys};
 
 /// The wallet the refusals name. Its spelling does not matter to any case below.
 const FUNDING_WALLET: &str = "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -20,6 +22,7 @@ const FUNDING_WALLET: &str = "0:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const KEY: &str = "00000000000000000000000000000000000000000000000000000000cafebabe";
 
 /// Every spelling of `KEY` a getter or a local derivation can hand over.
+
 /// `getCustodians` renders `owner_pubkey` as an unsigned 256-bit integer, so a key with leading
 /// zero bytes comes back short and `0x`-prefixed; a locally derived one is bare and already 64
 /// characters. Both are the same key.
@@ -73,7 +76,7 @@ fn the_getter_reader_normalizes_through_the_shared_function() {
 fn a_custodian_is_recognized_in_every_rendering() {
     for rendering in RENDERINGS {
         for derived in RENDERINGS {
-            ensure_multisig_key_is_custodian(FUNDING_WALLET, derived, &custodians(&[rendering]))
+            ensure_multisig_private_key_is_custodian(FUNDING_WALLET, derived, &custodians(&[rendering]))
                 .unwrap_or_else(|error| {
                     panic!("custodian {rendering} must accept the same key spelled {derived}: {error}")
                 });
@@ -88,7 +91,7 @@ fn a_custodian_is_recognized_in_every_rendering() {
 fn a_stranger_key_is_still_refused_in_every_rendering() {
     let stranger = "00000000000000000000000000000000000000000000000000000000deadbeef";
     for rendering in RENDERINGS {
-        let error = ensure_multisig_key_is_custodian(
+        let error = ensure_multisig_private_key_is_custodian(
             FUNDING_WALLET,
             stranger,
             &custodians(&[rendering]),

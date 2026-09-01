@@ -1,11 +1,11 @@
-//! Buyer command handlers, moved out of `commands.rs`(C15, move-only).
+//! Buyer command handlers, moved out of `commands.rs` (C15, move-only).
 
 use crate::cli::args::*;
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 use crate::cli::commands::acquire_pool_write_lock;
-#[cfg(any(test, feature = "shellnet"))]
+#[cfg(test)]
 use crate::cli::commands::direct_chain_read_with_timeout;
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 use crate::cli::commands::{
     close_hint, is_note_deploy_wallet_busy_error, note_deploy_error,
     note_deploy_fold_state_into_pool, note_deploy_fold_state_into_pool_locked,
@@ -19,9 +19,8 @@ use crate::cli::commands::{
     load_enabled_model_registry_policy, mock_orders_from_offers, note_pubkey_id,
     order_book_active_from_contracts, print_book_table, resolve_model_registry_target,
     save_mock_runtime_deal_handle, save_runtime_deal_handle_for_network,
-    shellnet_doctor_preflight, unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput,
+    chain_doctor_preflight, unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput,
 };
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     load_pool_json, model_target_from_config, note_pool_path, preload_default_model_registry,
     preload_model_registry_policy, registry_requested_model, resolve_order_book_target,
@@ -39,9 +38,8 @@ use crate::cli::seller_policy::{
 use crate::cli::support::*;
 use crate::operator_shutdown_signal;
 use anyhow::{anyhow, bail, Result};
-#[cfg(feature = "shellnet")]
 use dexdo_core::params::BUYER_SUBMIT_RECONCILE_POLL_INTERVAL;
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 use dexdo_core::params::EXECUTABLE_READ_BACKOFF;
 use dexdo_core::params::{
     BUYER_API_READINESS_TIMEOUT, BUYER_HANDOVER_POLL_INTERVAL,
@@ -53,6 +51,7 @@ use dexdo_core::params::{
 use dexdo_core::params::{BUYER_MONITOR_POLL_INTERVAL, BUYER_MONITOR_RECOVERY_BACKOFF};
 
 /// Absolute deadline for a BUY order the client is about to place.
+
 /// The contract permits a zero deadline as GTC. The dexdo CLI deliberately applies a stricter finite-deadline
 /// policy: past the deadline anyone may expire the order permissionlessly and the escrow returns, which keeps
 /// a stale bid from sitting at an untouched price level forever.
@@ -64,12 +63,10 @@ fn buy_order_deadline() -> Result<u64> {
         )
     })
 }
-#[cfg(feature = "shellnet")]
 use dexdo::registry::{
-    default_model_registry_address, resolve_registered_model_identity, ShellnetModelRegistryReader,
+    default_model_registry_address, resolve_registered_model_identity, ChainModelRegistryReader,
 };
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
-#[cfg(feature = "shellnet")]
 use dexdo_core::{
     check_buy_deposit_headroom, subscription_buy_clearing_refund, DealBuyerBond, DealSellerBond,
     DealSubscription, InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill,
@@ -94,7 +91,6 @@ fn display_dexdo_address(value: impl std::fmt::Display) -> String {
     dexdo_core::address::display(&value.to_string())
 }
 
-#[cfg(feature = "shellnet")]
 struct BuyerMoneyLock {
     note_addr: String,
     path: std::path::PathBuf,
@@ -102,12 +98,11 @@ struct BuyerMoneyLock {
     subscriptions_path: std::path::PathBuf,
     lock: Option<PoolWriteLock>,
 }
-// Persisted-journal enum: these variants are constructed only by the shellnet-gated
+// Persisted-journal enum: these variants are constructed only by the chain-gated
 // serde derive when an on-disk journal is read back.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "shellnet", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "shellnet", serde(rename_all = "snake_case"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum BuyerSubmitIntentKind {
     LegacyUnknown,
     Foreground,
@@ -118,14 +113,16 @@ enum BuyerSubmitIntentKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "shellnet", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "shellnet", serde(deny_unknown_fields))]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BuyerSubmitIntent {
     kind: BuyerSubmitIntentKind,
-    #[cfg_attr(
-        feature = "shellnet",
-        serde(with = "dexdo_core::address::serde_self_dapp_opt")
-    )]
+    // Unconditional. This was a `cfg_attr` on the removed chain feature, which means the field
+    // serialised one way in the build that talked to a chain and another way in the build that did
+    // not -- for a record that is WRITTEN by one run and READ by the next. With the feature gone
+    // the attribute would simply stop applying, silently changing the on-disk form of a durable
+    // record, so it is stated here instead.
+    #[serde(with = "dexdo_core::address::serde_self_dapp_opt")]
     predecessor_token_contract: Option<dexdo_core::TokenContract>,
 }
 
@@ -151,7 +148,6 @@ impl BuyerSubmitIntent {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn validate(&self) -> Result<()> {
         let requires_predecessor = matches!(
             self.kind,
@@ -174,25 +170,16 @@ impl BuyerSubmitIntent {
     }
 }
 
-#[cfg(feature = "shellnet")]
 const BUYER_SUBMIT_JOURNAL_SCHEMA: &str = "dexdo.buyer.submit.v3";
-#[cfg(feature = "shellnet")]
 const BUYER_SUBMIT_JOURNAL_SCHEMA_V2: &str = "dexdo.buyer.submit.v2";
-#[cfg(feature = "shellnet")]
 const BUYER_SUBMIT_JOURNAL_SCHEMA_V1: &str = "dexdo.buyer.submit.v1";
-#[cfg(feature = "shellnet")]
 const BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v2";
-#[cfg(feature = "shellnet")]
 const BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v3";
-#[cfg(feature = "shellnet")]
 const LEGACY_BUYER_SUBSCRIPTION_SUBMIT_SCHEMA: &str = "dexdo.buyer.subscription.submit.v1";
-#[cfg(feature = "shellnet")]
 const LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA: &str = "dexdo.buyer.subscriptions.v1";
-#[cfg(feature = "shellnet")]
 const LEGACY_BUYER_SUBSCRIPTION_STATE_SCHEMA_V2: &str = "dexdo.buyer.subscriptions.v2";
 /// Journal-only representation of an owner-facing fill. The chain event decoder
 /// that produces these records is intentionally wired in a later layer.
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerJournalMatch {
@@ -203,7 +190,6 @@ struct BuyerJournalMatch {
     clearing_price: u128,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubmitJournal {
@@ -223,6 +209,7 @@ struct BuyerSubmitJournal {
     max_price_per_tick: u128,
     escrow: u128,
     /// This note's own order id, written as soon as the book proves it assigned one.
+
     /// `quoted_order.order_id` is the SELLER's ask, so without this a cancellation or a rejection of the
     /// buyer's own order cannot be attributed to this record at all.
     #[serde(default)]
@@ -236,7 +223,6 @@ struct BuyerSubmitJournal {
 }
 
 /// Schema v2: the same record before it carried this note's own order id.
-#[cfg(feature = "shellnet")]
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,7 +255,6 @@ struct BuyerSubmitJournalV2 {
     resolved_matches: Vec<BuyerJournalMatch>,
 }
 
-#[cfg(feature = "shellnet")]
 impl From<BuyerSubmitJournalV2> for BuyerSubmitJournal {
     fn from(previous: BuyerSubmitJournalV2) -> Self {
         Self {
@@ -293,7 +278,6 @@ impl From<BuyerSubmitJournalV2> for BuyerSubmitJournal {
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubmitJournalV1 {
@@ -316,7 +300,6 @@ struct BuyerSubmitJournalV1 {
     resolved_match: Option<BuyerJournalMatch>,
 }
 
-#[cfg(feature = "shellnet")]
 impl From<BuyerSubmitJournalV1> for BuyerSubmitJournal {
     fn from(legacy: BuyerSubmitJournalV1) -> Self {
         let resolved_matches = legacy.resolved_match.clone().into_iter().collect();
@@ -344,7 +327,6 @@ impl From<BuyerSubmitJournalV1> for BuyerSubmitJournal {
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubscriptionSubmitJournal {
@@ -370,7 +352,6 @@ struct BuyerSubscriptionSubmitJournal {
     created_at_unix: u64,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubscriptionState {
@@ -380,7 +361,42 @@ struct BuyerSubscriptionState {
     orders: Vec<BuyerSubscriptionOrderRecord>,
 }
 
-#[cfg(feature = "shellnet")]
+/// The key carrying [`PHASE_AUTHORITY`] in the written file.
+
+/// It is added on the way out and removed on the way in rather than being a field of
+/// [`BuyerSubscriptionState`], so the struct keeps `deny_unknown_fields` and the statement stays
+/// what it is -- a sentence for whoever opens the file, not data anything computes on.
+const PHASE_AUTHORITY_KEY: &str = "phase_authority";
+
+/// What every subscription journal says about its own phases, in the file itself.
+
+/// the operator reads this file before the chain precisely because it is cheaper, and a
+/// phase sitting in JSON reads as a finding. A rule that lives only in a doc comment is not present
+/// at the moment it is needed, which is when someone is looking at the file and deciding whether
+/// their money is locked.
+const PHASE_AUTHORITY: &str = "phase is this instance's last belief, not the chain's answer: this \
+     order can be cancelled with this note's key from another instance or machine, and nothing \
+     would reach this file. Confirm it by running `dexdo subscription status` for the order id \
+     below, which reads the chain.";
+
+/// What this client last believed about one subscription order. **A belief, never a fact.**
+
+/// was read the other way round and it cost an operator an evening: `orders cancel` took the
+/// order off chain, the escrow came back, and this file still said `resting`. The repair makes that
+/// surface write here too -- but no repair can make this phase authoritative, and pretending
+/// otherwise is the more dangerous half.
+
+/// The reason is structural, not a gap in the code. This file lives in ONE instance's data
+/// directory (`data_dir::automatic("buyer-submits")`, keyed by the note), while the order lives on
+/// chain, where anyone holding the note's key can cancel it -- from another instance, another
+/// machine, another client entirely. Such a cancellation cannot reach this file by any mechanism,
+/// so `Resting` here means "nothing this instance did has changed it", and never "it is resting".
+
+/// Which is why the dangerous direction is the reverse of the one that was reported. A stale
+/// `Resting` says the money is locked when it is back: alarming, and checked. A journal trusted to
+/// be complete would one day say `Terminal` -- clear -- while the escrow is still locked, and
+/// nobody would go and look. That error comes from TRUSTING the record, not from the record being
+/// incomplete, so completeness cannot fix it and only the chain can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BuyerSubscriptionPhase {
@@ -389,7 +405,6 @@ enum BuyerSubscriptionPhase {
     Terminal,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuyerSubscriptionMatch {
@@ -401,7 +416,6 @@ struct BuyerSubscriptionMatch {
     deal_handle: String,
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerSubscriptionMatch {
     fn from_fill(fill: &BuyerJournalMatch) -> Self {
         Self {
@@ -423,10 +437,9 @@ impl BuyerSubscriptionMatch {
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BuyerSubscriptionOrderRecord {
+pub(crate) struct BuyerSubscriptionOrderRecord {
     #[serde(with = "dexdo_core::address::serde_canonical")]
     order_book: String,
     frame_model: String,
@@ -446,18 +459,15 @@ struct BuyerSubscriptionOrderRecord {
     matched: Option<BuyerSubscriptionMatch>,
 }
 
-#[cfg(feature = "shellnet")]
 type PersistSubscriptionHandle<'a> =
     dyn Fn(&BuyerSubscriptionOrderRecord, &BuyerJournalMatch) -> Result<String> + Send + Sync + 'a;
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug)]
 enum BuyerMoneyJournal {
     Buy(Box<BuyerSubmitJournal>),
     Subscription(Box<BuyerSubscriptionSubmitJournal>),
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerSubmitJournal {
     fn validate(&self, expected_note_addr: &str) -> Result<()> {
         if self.schema != BUYER_SUBMIT_JOURNAL_SCHEMA {
@@ -611,7 +621,6 @@ fn validate_subscription_order_terms(
     Ok(reserve)
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_fund_split(
     deposit: u128,
     buyer_bond: u128,
@@ -620,17 +629,18 @@ fn validate_subscription_fund_split(
 ) -> Result<()> {
     if deposit != reserve.deposit || buyer_bond != reserve.buyer_bond {
         bail!(
-            "{label} money split conflicts with total escrow: stored deposit={deposit}, \
-             buyer_bond={buyer_bond}; expected deposit={}, buyer_bond={}, total_escrow={}",
-            reserve.deposit,
-            reserve.buyer_bond,
-            reserve.total_escrow
+            "{label} money split conflicts with total escrow: stored deposit={} SHELL, \
+             buyer_bond={} SHELL; expected deposit={}, buyer_bond={}, total_escrow={}",
+            dexdo_core::shell_amount(deposit),
+            dexdo_core::shell_amount(buyer_bond),
+            dexdo_core::shell_amount(reserve.deposit),
+            dexdo_core::shell_amount(reserve.buyer_bond),
+            dexdo_core::shell_amount(reserve.total_escrow)
         );
     }
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerSubscriptionSubmitJournal {
     fn validate(&self, expected_note_addr: &str) -> Result<()> {
         if self.schema != BUYER_SUBSCRIPTION_SUBMIT_SCHEMA {
@@ -674,7 +684,6 @@ impl BuyerSubscriptionSubmitJournal {
     }
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerSubscriptionState {
     fn empty(note_addr: &str) -> Result<Self> {
         let note_addr = dexdo_core::Address::parse(note_addr)
@@ -777,7 +786,6 @@ impl BuyerSubscriptionState {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_match_record(
     order: &BuyerSubscriptionOrderRecord,
     matched: &BuyerSubscriptionMatch,
@@ -796,7 +804,6 @@ fn validate_subscription_match_record(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_match(
     order: &BuyerSubscriptionOrderRecord,
     matched: &BuyerJournalMatch,
@@ -829,14 +836,13 @@ fn validate_subscription_match(
         bail!(
             "subscription order #{} clearing price {} exceeds limit {}",
             order.order_id,
-            matched.clearing_price,
-            order.max_price_per_tick
+            dexdo_core::shell_amount(matched.clearing_price),
+            dexdo_core::shell_amount(order.max_price_per_tick)
         );
     }
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_buyer_submit_identity(identity: &str, label: &str) -> Result<()> {
     let digest = identity
         .strip_prefix("boc-sha256:")
@@ -847,7 +853,6 @@ fn validate_buyer_submit_identity(identity: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 fn buyer_submit_recovery_anchor(
     journal: &BuyerSubmitJournal,
 ) -> Result<dexdo::buyer::api::BuyerSubmitRecoveryAnchor> {
@@ -877,7 +882,6 @@ fn buyer_submit_recovery_anchor(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn buyer_submit_reconciliation(
     journal: &BuyerSubmitJournal,
     state: dexdo::buyer::api::BuyerSubmitReconciliationState,
@@ -892,7 +896,6 @@ fn buyer_submit_reconciliation(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn buyer_submit_state_dir() -> Result<std::path::PathBuf> {
     // The test journal root lives beside the test binary, INSIDE the cargo target
     // directory, and never in the system temp dir. `PATH` is a `static`, so it is never
@@ -946,7 +949,6 @@ fn buyer_submit_state_dir() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerMoneyLock {
     fn open(note_addr: &str) -> Result<Self> {
         use sha2::{Digest, Sha256};
@@ -1016,15 +1018,18 @@ impl BuyerMoneyLock {
     }
 
     /// The same lock, taken by the one command whose job is recovering from a crash.
+
     /// A buyer SIGKILLed inside `complete_buyer_submit_with_journal`'s fill wait leaves the sentinel
     /// behind -- `Drop` never runs -- and `try_acquire` above then refuses every later attempt for the
     /// lifetime of the file, `--resume` included. That is the one command that exists to get out of
     /// exactly this state, and it was the one command that could not.
+
     /// The lock is not weakened to fix it, because refusing a second money submission while one is
     /// still awaiting by-fact reconciliation is the whole point of it. What changes is that a holder
     /// the kernel says is GONE stops counting as a holder: see
     /// [`reclaim_pool_write_lock_if_holder_is_gone`] for what is and is not treated as proof. A live
     /// holder is still refused, and so is anything the client cannot establish.
+
     /// Reclaiming is not forgetting. The caller takes this lock in order to run the journal's
     /// by-fact reconciliation FIRST -- a pending record is resolved or closed against the chain, and
     /// only a note with no pending money reaches a fresh submission.
@@ -1059,7 +1064,6 @@ impl BuyerMoneyLock {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn read_buyer_private_state(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
     let path = crate::cli::note::resolve_private_file_path(path, label)?;
     match std::fs::read(&path) {
@@ -1069,7 +1073,6 @@ fn read_buyer_private_state(path: &std::path::Path, label: &str) -> Result<Optio
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn load_buyer_money_journal(
     path: &std::path::Path,
     expected_note_addr: &str,
@@ -1142,7 +1145,6 @@ fn load_buyer_money_journal(
     Ok(Some(journal))
 }
 
-#[cfg(feature = "shellnet")]
 fn load_buyer_submit_journal(
     path: &std::path::Path,
     expected_note_addr: &str,
@@ -1160,7 +1162,6 @@ fn load_buyer_submit_journal(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn write_buyer_submit_journal(path: &std::path::Path, journal: &BuyerSubmitJournal) -> Result<()> {
     journal.validate(&journal.note_addr)?;
     let bytes = serde_json::to_vec_pretty(journal)?;
@@ -1168,7 +1169,6 @@ fn write_buyer_submit_journal(path: &std::path::Path, journal: &BuyerSubmitJourn
         .map_err(|error| anyhow::anyhow!("write buyer submit journal {}: {error}", path.display()))
 }
 
-#[cfg(feature = "shellnet")]
 fn write_buyer_subscription_submit_journal(
     path: &std::path::Path,
     journal: &BuyerSubscriptionSubmitJournal,
@@ -1183,7 +1183,6 @@ fn write_buyer_subscription_submit_journal(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn load_buyer_subscription_state(
     path: &std::path::Path,
     expected_note_addr: &str,
@@ -1213,6 +1212,12 @@ fn load_buyer_subscription_state(
     if schema != BUYER_SUBSCRIPTION_STATE_SCHEMA {
         bail!("unsupported buyer subscription state schema {schema}");
     }
+    // The statement is for the reader, not for the decoder: take it back out so the struct can keep
+    // refusing every field it does not know.
+    let mut value = value;
+    if let Some(object) = value.as_object_mut() {
+        object.remove(PHASE_AUTHORITY_KEY);
+    }
     let state: BuyerSubscriptionState = serde_json::from_value(value).map_err(|error| {
         anyhow::anyhow!(
             "buyer subscription state {} is invalid: {error}",
@@ -1223,13 +1228,19 @@ fn load_buyer_subscription_state(
     Ok(state)
 }
 
-#[cfg(feature = "shellnet")]
 fn write_buyer_subscription_state(
     path: &std::path::Path,
     state: &BuyerSubscriptionState,
 ) -> Result<()> {
     state.validate(&state.note_addr)?;
-    let bytes = serde_json::to_vec_pretty(state)?;
+    let mut value = serde_json::to_value(state)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            PHASE_AUTHORITY_KEY.to_string(),
+            Value::String(PHASE_AUTHORITY.to_string()),
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
     with_pool_write_lock(path, |path| write_pool_private(path, &bytes)).map_err(|error| {
         anyhow::anyhow!("write buyer subscription state {}: {error}", path.display())
     })
@@ -1237,7 +1248,6 @@ fn write_buyer_subscription_state(
 
 /// Retain the durable subscription history after an explicit buyer terminal command has been
 /// authoritatively confirmed. Ordinary deals and notes without a v3 subscription store are untouched.
-#[cfg(feature = "shellnet")]
 pub(crate) fn mark_buyer_subscription_terminal(
     note_addr: &str,
     token_contract: &str,
@@ -1282,7 +1292,81 @@ pub(crate) fn mark_buyer_subscription_terminal(
     }
 }
 
-#[cfg(feature = "shellnet")]
+/// Bring the subscription journal in line with a cancellation another surface already confirmed.
+
+/// A subscription is an ORDINARY buy order on chain -- the contract says so itself, above
+/// `placeInferenceBuy`: "a subscription is now an ORDINARY buy order carrying FLAG_AON plus the
+/// SUBSCRIPTION deal-flag... no separate call, no separate registry, no separate deal contract".
+/// So it rests in the book beside every other order, `orders list` shows it and `orders cancel`
+/// cancels it -- while the journal that records what a subscription is doing lives here, and
+/// `orders` has never had a word about it. The two surfaces were not split by a decision; the two
+/// CONCEPTS were merged on chain and the surfaces were never brought together after.
+
+/// **It looks before it locks, and that order is the point.** `orders cancel` cancels any resting
+/// order, and almost none of them are subscriptions. Taking the buyer's money lock for all of them
+/// would make cancelling an ordinary order fail whenever a buyer happens to be running on the same
+/// note -- repairing the journal at the price of breaking the cancel, which is the worst trade
+/// available here: a misleading journal misleads, a cancel that will not run loses the money
+/// outright. So the file's existence and the record's presence are checked unlocked, and the lock
+/// is taken only once there is something of ours to write. The decision itself is still made under
+/// the lock: `mark_cancelled_buyer_subscription_terminal` re-reads the state there, so the unlocked
+/// look is an optimisation and never the authority.
+pub(crate) fn mark_cancelled_subscription_order_terminal(
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+) -> Result<bool> {
+    let mut money_lock = BuyerMoneyLock::open(note_addr)?;
+    if !money_lock.subscriptions_path.exists() {
+        return Ok(false);
+    }
+    if !subscription_journal_names_order(
+        &money_lock.subscriptions_path,
+        &money_lock.note_addr,
+        order_book,
+        order_id,
+    )? {
+        return Ok(false);
+    }
+    money_lock.try_acquire()?;
+    mark_cancelled_subscription_order_terminal_at(
+        &money_lock.subscriptions_path,
+        &money_lock.note_addr,
+        order_book,
+        order_id,
+    )
+}
+
+/// Does this note's journal hold a record for exactly this order? The unlocked look.
+fn subscription_journal_names_order(
+    path: &std::path::Path,
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+) -> Result<bool> {
+    let state = load_buyer_subscription_state(path, note_addr)?;
+    Ok(subscription_order_record(&state, order_book, order_id).is_some())
+}
+
+/// The decision itself, against a journal named by path.
+
+/// Split out from [`mark_cancelled_subscription_order_terminal`] so it can be driven against a real
+/// journal file without a money lock or a chain -- the path-free entry point resolves where the
+/// journal lives, and this is what it then does. A regression that exercised only
+/// `mark_cancelled_buyer_subscription_terminal` would exercise code that predates and prove
+/// nothing about it; this is the surface adds.
+pub(crate) fn mark_cancelled_subscription_order_terminal_at(
+    path: &std::path::Path,
+    note_addr: &str,
+    order_book: &str,
+    order_id: u128,
+) -> Result<bool> {
+    if !subscription_journal_names_order(path, note_addr, order_book, order_id)? {
+        return Ok(false);
+    }
+    mark_cancelled_buyer_subscription_terminal(path, note_addr, order_book, order_id)
+}
+
 fn mark_cancelled_buyer_subscription_terminal(
     path: &std::path::Path,
     note_addr: &str,
@@ -1314,7 +1398,6 @@ fn mark_cancelled_buyer_subscription_terminal(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn clear_buyer_submit_journal(path: &std::path::Path) -> Result<()> {
     with_pool_write_lock(path, |path| match std::fs::remove_file(path) {
         Ok(()) => crate::cli::note::sync_parent_dir(path),
@@ -1326,7 +1409,6 @@ fn clear_buyer_submit_journal(path: &std::path::Path) -> Result<()> {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn buyer_money_lock_for_submit(
     mock_chain: bool,
     note_addr: Option<&str>,
@@ -1335,12 +1417,11 @@ fn buyer_money_lock_for_submit(
         return Ok(None);
     }
     let note_addr = note_addr.ok_or_else(|| {
-        anyhow::anyhow!("real shellnet buyer money submit requires --note-addr before locking")
+        anyhow::anyhow!("real {} buyer money submit requires --note-addr before locking", dexdo_core::params::current_network())
     })?;
     BuyerMoneyLock::open(note_addr).map(Some)
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_pool_token_contract_for_note(
     pool_path: &std::path::Path,
     note_addr: &str,
@@ -1361,17 +1442,16 @@ fn persist_pool_token_contract_for_note(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn preflight_buyer_pool_for_note(note_addr: Option<&str>) -> Result<()> {
     let Some(pool_path) = note_pool_path(None) else {
         bail!(
-            "real shellnet buyer money writes require DEXDO_PN_POOL before any escrow POST so a matched \
+            "the real chain buyer money writes require DEXDO_PN_POOL before any escrow POST so a matched \
              TokenContract can be persisted durably; set DEXDO_PN_POOL to the pool containing --note-addr"
         );
     };
     let note_addr = note_addr.ok_or_else(|| {
         anyhow::anyhow!(
-            "real shellnet: --note-addr is required to preflight DEXDO_PN_POOL before buying"
+            format!("real {}: --note-addr is required to preflight DEXDO_PN_POOL before buying", dexdo_core::params::current_network())
         )
     })?;
     // The preflight reads; it does not write. It adds no note and changes no field, and
@@ -1390,10 +1470,6 @@ fn preflight_buyer_pool_for_note(note_addr: Option<&str>) -> Result<()> {
     })
 }
 
-#[cfg(not(feature = "shellnet"))]
-fn preflight_buyer_pool_for_note(_note_addr: Option<&str>) -> Result<()> {
-    Ok(())
-}
 
 fn preflight_buyer_pool_for_money_move(args: &BuyerArgs) -> Result<()> {
     if args.mock.mock_chain {
@@ -1438,7 +1514,6 @@ fn is_ambiguous_submit_error(error: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn money_submit_error_clears_journal(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -1451,7 +1526,6 @@ fn money_submit_error_clears_journal(error: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn journal_match(fill: &dexdo_core::MatchedFill) -> BuyerJournalMatch {
     BuyerJournalMatch {
         token_contract: fill.token_contract.clone(),
@@ -1461,9 +1535,9 @@ fn journal_match(fill: &dexdo_core::MatchedFill) -> BuyerJournalMatch {
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SubscriptionDealFacts {
+#[cfg_attr(test, derive(serde::Deserialize))]
+pub(crate) struct SubscriptionDealFacts {
     state: DealChainState,
     subscription: DealSubscription,
     seller_bond: DealSellerBond,
@@ -1473,15 +1547,14 @@ struct SubscriptionDealFacts {
     buyer_note: String,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SubscriptionQuotaView {
+#[cfg_attr(test, derive(serde::Deserialize))]
+pub(crate) struct SubscriptionQuotaView {
     claimed_current_week: u128,
     remaining_current_week: u128,
     buyer_locked_total: u128,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SubscriptionRuntimeView {
     ticks: u128,
@@ -1491,6 +1564,7 @@ struct SubscriptionRuntimeView {
 }
 
 /// What a resumed subscription hands the running route.
+
 /// `remaining_current_week` is the allowance of the BOOKED week the deal stands on; `subscription` is
 /// the coherent shape it was read from, so the route knows which week that allowance belongs to and
 /// when that week runs out - and can go and book the next boundary instead of holding this scalar for
@@ -1519,13 +1593,13 @@ fn subscription_oneshot_budget(requested: u64, remaining_current_week: Option<u6
 }
 
 /// The current-week quota this deal stands on, read from the RECORDED weekly books.
+
 /// Both halves come from the same recorded `weekBaseTokens`, so what the status reports as claimed and
 /// what it reports as remaining always belong to the same week. How that figure stands to the ceiling
 /// the contract applies has three phases - exact, understated, or an upper bound (see
 /// [`dexdo_core::subscription_claim_cap_at`]) - and which one holds cannot be read off the books
 /// alone. So a caller that needs it to be an authorization books the boundary first and reads again,
 /// rather than guessing the phase.
-#[cfg(feature = "shellnet")]
 fn subscription_quota_view(facts: &SubscriptionDealFacts) -> Result<SubscriptionQuotaView> {
     let buyer_locked_total = facts
         .state
@@ -1572,11 +1646,11 @@ fn subscription_quota_view(facts: &SubscriptionDealFacts) -> Result<Subscription
 
 /// Whether a boundary booking must be attempted before this deal's quota may be treated as an
 /// allowance.
+
 /// Two triggers, and the second is the one a stale positive remainder hides behind: the recorded week
 /// shows nothing left, OR it has run out on the wall clock. Booking only on a zero remainder would
 /// serve the previous week's unspent tokens straight across its boundary, which is exactly the
 /// roll-over the term does not have.
-#[cfg(feature = "shellnet")]
 fn subscription_boundary_is_due(facts: &SubscriptionDealFacts) -> bool {
     if facts.subscription.term_is_over() || !facts.subscription.is_subscription() {
         return false;
@@ -1589,11 +1663,11 @@ fn subscription_boundary_is_due(facts: &SubscriptionDealFacts) -> bool {
 }
 
 /// The part of a recorded quota that may actually be handed to a route.
+
 /// After a booking attempt the books are as authoritative as they are going to get. If the week they
 /// describe has still run out on the wall clock, no boundary was booked, and what is on record belongs
 /// to a week that has ended: report nothing rather than a figure that would resume onto a spent week.
 /// The running route reconciles again on its first request and picks the new week up from the chain.
-#[cfg(feature = "shellnet")]
 fn subscription_authorized_remaining(
     facts: &SubscriptionDealFacts,
     quota: &SubscriptionQuotaView,
@@ -1607,7 +1681,6 @@ fn subscription_authorized_remaining(
     quota.remaining_current_week
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_deal_facts(
     expected_note_addr: &str,
     order: &BuyerSubscriptionOrderRecord,
@@ -1655,7 +1728,7 @@ fn validate_subscription_deal_facts(
     }
     if !facts.subscription.is_subscription()
         || facts.subscription.sub_weeks != SUBSCRIPTION_WEEKS
-        // The book-side identity is exactly AON|SUBSCRIPTION(validated from the durable order).
+        // The book-side identity is exactly AON|SUBSCRIPTION (validated from the durable order).
         // TokenContract deliberately records only the DEAL_MASK slice, so the corresponding exact
         // on-chain identity is SUBSCRIPTION with no TEE bit or other mutation.
         || facts.subscription.deal_flags != flags::SUBSCRIPTION
@@ -1682,46 +1755,46 @@ fn validate_subscription_deal_facts(
     let expected_bond = matched_reserve.buyer_bond;
     if facts.buyer_bond.bond_required != expected_bond {
         bail!(
-            "subscription TokenContract {} buyer bondRequired {} differs from canonical 2P {} at \
-             clearing price {}",
+            "subscription TokenContract {} buyer bondRequired {} SHELL differs from canonical 2P {} \
+             SHELL at clearing price {} SHELL",
             token_contract,
-            facts.buyer_bond.bond_required,
-            expected_bond,
-            matched.clearing_price
+            dexdo_core::shell_amount(facts.buyer_bond.bond_required),
+            dexdo_core::shell_amount(expected_bond),
+            dexdo_core::shell_amount(matched.clearing_price)
         );
     }
     if facts.seller_bond.bond_required != expected_bond {
         bail!(
-            "subscription TokenContract {} seller bondRequired {} differs from canonical 2P {} at \
-             clearing price {}",
+            "subscription TokenContract {} seller bondRequired {} SHELL differs from canonical 2P {} \
+             SHELL at clearing price {} SHELL",
             token_contract,
-            facts.seller_bond.bond_required,
-            expected_bond,
-            matched.clearing_price
+            dexdo_core::shell_amount(facts.seller_bond.bond_required),
+            dexdo_core::shell_amount(expected_bond),
+            dexdo_core::shell_amount(matched.clearing_price)
         );
     }
     if facts.seller_bond.bond_held > expected_bond {
         bail!(
-            "subscription TokenContract {} seller bondHeld {} exceeds canonical 2P {}",
+            "subscription TokenContract {} seller bondHeld {} SHELL exceeds canonical 2P {} SHELL",
             token_contract,
-            facts.seller_bond.bond_held,
-            expected_bond
+            dexdo_core::shell_amount(facts.seller_bond.bond_held),
+            dexdo_core::shell_amount(expected_bond)
         );
     }
     let live = !facts.state.disputed && !facts.state.is_stopped();
     if live && facts.buyer_bond.bond_held != expected_bond {
         bail!(
-            "subscription TokenContract {} live buyer bondHeld {} differs from canonical 2P {}",
+            "subscription TokenContract {} live buyer bondHeld {} SHELL differs from canonical 2P {} SHELL",
             token_contract,
-            facts.buyer_bond.bond_held,
-            expected_bond
+            dexdo_core::shell_amount(facts.buyer_bond.bond_held),
+            dexdo_core::shell_amount(expected_bond)
         );
     }
     if !facts.seller_bond.bond_funded && facts.seller_bond.bond_held != 0 {
         bail!(
-            "subscription TokenContract {} unfunded seller bond unexpectedly holds {}",
+            "subscription TokenContract {} unfunded seller bond unexpectedly holds {} SHELL",
             token_contract,
-            facts.seller_bond.bond_held
+            dexdo_core::shell_amount(facts.seller_bond.bond_held)
         );
     }
     if facts.state.opened && !facts.seller_bond.bond_funded {
@@ -1732,17 +1805,16 @@ fn validate_subscription_deal_facts(
     }
     if live && facts.seller_bond.bond_funded && facts.seller_bond.bond_held != expected_bond {
         bail!(
-            "subscription TokenContract {} live funded seller bondHeld {} differs from canonical \
-             2P {}",
+            "subscription TokenContract {} live funded seller bondHeld {} SHELL differs from \
+             canonical 2P {} SHELL",
             token_contract,
-            facts.seller_bond.bond_held,
-            expected_bond
+            dexdo_core::shell_amount(facts.seller_bond.bond_held),
+            dexdo_core::shell_amount(expected_bond)
         );
     }
     subscription_quota_view(facts)
 }
 
-#[cfg(feature = "shellnet")]
 async fn classify_subscription_resume_target(
     chain: &dyn ChainBackend,
     expected_note_addr: &str,
@@ -1898,7 +1970,6 @@ async fn classify_subscription_resume_target(
     }))
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait SubscriptionOrderOps: Send + Sync {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1949,15 +2020,15 @@ trait SubscriptionOrderOps: Send + Sync {
     ) -> Result<SubscriptionDealFacts>;
 
     /// Attempt the permissionless weekly boundary booking.
+
     /// Returns nothing on purpose: the submission's ANSWER is not evidence either way. A booking
     /// whose response was lost still moved the chain, and one the contract refused leaves the books
     /// exactly where they stood - so every caller re-reads the authoritative snapshot afterwards and
     /// decides from the booked state. It is a money path: it charges weeks the term already owes out
-    /// of escrow(`_deposit -= pay + fee`), while committing nothing new.
+    /// of escrow (`_deposit -= pay + fee`), while committing nothing new.
     async fn book_subscription_week(&self, token_contract: &str);
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl SubscriptionOrderOps for dexdo_core::RealChainBackend {
     async fn submit_subscription_order(
@@ -2099,12 +2170,10 @@ impl SubscriptionOrderOps for dexdo_core::RealChainBackend {
     }
 }
 
-#[cfg(feature = "shellnet")]
 struct BuyerSubscriptionResumeOps<'a> {
     chain: &'a dyn ChainBackend,
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl SubscriptionOrderOps for BuyerSubscriptionResumeOps<'_> {
     async fn submit_subscription_order(
@@ -2209,7 +2278,6 @@ impl SubscriptionOrderOps for BuyerSubscriptionResumeOps<'_> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn subscription_order_record<'a>(
     state: &'a BuyerSubscriptionState,
     order_book: &str,
@@ -2220,7 +2288,6 @@ fn subscription_order_record<'a>(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn subscription_order_record_mut<'a>(
     state: &'a mut BuyerSubscriptionState,
     order_book: &str,
@@ -2231,7 +2298,6 @@ fn subscription_order_record_mut<'a>(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn record_subscription_placement(
     state: &mut BuyerSubscriptionState,
     journal: &BuyerSubscriptionSubmitJournal,
@@ -2311,7 +2377,6 @@ fn record_subscription_placement(
     Ok(candidate)
 }
 
-#[cfg(feature = "shellnet")]
 fn coalesce_journal_subscription_placements(
     journal: &BuyerSubscriptionSubmitJournal,
     placements: Vec<InferenceSubscriptionPlacement>,
@@ -2371,7 +2436,6 @@ fn coalesce_journal_subscription_placements(
     Ok(correlated)
 }
 
-#[cfg(feature = "shellnet")]
 async fn sync_subscription_match_once(
     ops: &dyn SubscriptionOrderOps,
     state_path: &std::path::Path,
@@ -2473,7 +2537,6 @@ async fn sync_subscription_match_once(
     Ok(result)
 }
 
-#[cfg(feature = "shellnet")]
 async fn refresh_subscription_match(
     ops: &dyn SubscriptionOrderOps,
     state_path: &std::path::Path,
@@ -2547,7 +2610,6 @@ async fn refresh_subscription_match(
     Ok((record, facts, quota, booked_week))
 }
 
-#[cfg(feature = "shellnet")]
 async fn reconcile_subscription_submit(
     ops: &dyn SubscriptionOrderOps,
     journal_path: &std::path::Path,
@@ -2637,7 +2699,6 @@ async fn reconcile_subscription_submit(
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn submit_subscription_with_journal(
     ops: &dyn SubscriptionOrderOps,
@@ -2734,7 +2795,6 @@ async fn submit_subscription_with_journal(
     .await
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_buyer_token_contract_for_note_result(
     note_addr: Option<&str>,
     token_contract: &str,
@@ -2746,7 +2806,6 @@ fn persist_buyer_token_contract_for_note_result(
     persist_pool_token_contract_for_note(&pool_path, note_addr, token_contract, "buyer")
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_subscription_runtime_handle(
     record: &BuyerSubscriptionOrderRecord,
     matched: &BuyerJournalMatch,
@@ -2805,7 +2864,6 @@ fn persist_subscription_runtime_handle(
     Ok(handle)
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn place_quote_bound_buy_with_journal(
     chain: &dyn ChainBackend,
@@ -2823,7 +2881,7 @@ async fn place_quote_bound_buy_with_journal(
 ) -> Result<()> {
     let order_book = chain.model_buy_order_book_identity().ok_or_else(|| {
         anyhow::anyhow!(
-            "real shellnet backend did not expose its canonical model order-book identity; no BOC was sent"
+            "real chain backend did not expose its canonical model order-book identity; no BOC was sent"
         )
     })?;
     let canonical_note = dexdo_core::Address::parse(note_addr)
@@ -2862,7 +2920,28 @@ async fn place_quote_bound_buy_with_journal(
                            final_cursor: dexdo_core::MatchWatchCursor,
                            note_shell_balance: u128| {
         if let Some(frame_model) = human_model {
+            // The operator gets the block; the field dump goes to `info`.
+
+            // The dump is unchanged and still emitted -- the whole-line assertion reads the
+            // renderer, not the stream, and `RUST_LOG=info` brings it back for anyone reconstructing
+            // a run. It is twenty-one key=value pairs, of which four decide anything, and it was
+            // printed at the exact moment an operator is watching their money leave.
+            // The live line comes down before the block goes up, or the two write over each other;
+            // and once the block is read, the wait it announced becomes the step that says how long
+            // it has been going. A buy that rests can wait hours for a seller, and an unnamed wait
+            // reads as a hung command.
+
+            // Only the line goes -- the checklist stays as it is. Finishing it here would tick the
+            // seller's match and the endpoint as done while both are still ahead.
+            crate::cli::progress::clear_live_line();
             println!(
+                "{}",
+                render_buyer_order_block(frame_model, selection, ticks, max_price_per_tick, escrow)
+            );
+            if selection.resting_buy {
+                crate::cli::progress::step(BUYER_STEP_WAITING.0);
+            }
+            tracing::info!(
                 "{}",
                 render_buyer_human_preflight(
                     frame_model,
@@ -2877,20 +2956,26 @@ async fn place_quote_bound_buy_with_journal(
         let reserve = dexdo_core::ordinary_buy_reserve(ticks, max_price_per_tick)
             .map_err(|error| {
                 ChainError::Chain(format!(
-                    "buyer preflight failed: ordinary BUY Note SHELL balance available={note_shell_balance} \
-                     required=<overflow> for escrow {escrow} plus the buyer bond at \
-                     --max-price-per-tick={max_price_per_tick}: {error}; lower \
-                     --max-price-per-tick to reduce the required bond; no escrow was sent"
+                    "buyer preflight failed: ordinary BUY Note SHELL balance available={} SHELL \
+                     required=<overflow> for escrow {} SHELL plus the buyer bond at \
+                     --max-price-per-tick={} SHELL: {error}; lower \
+                     --max-price-per-tick to reduce the required bond; no escrow was sent",
+                    dexdo_core::shell_amount(note_shell_balance),
+                    dexdo_core::shell_amount(escrow),
+                    dexdo_core::shell_amount(max_price_per_tick)
                 ))
             })?;
         if note_shell_balance < reserve.total_escrow {
             return Err(ChainError::Chain(format!(
-                "buyer preflight failed: insufficient Note SHELL balance required={} \
-                 available={note_shell_balance}; ordinary BUY requires escrow {escrow} + buyer \
-                 bond {} at --max-price-per-tick={max_price_per_tick}; \
-                 escrow_required={escrow} available={note_shell_balance}; lower \
+                "buyer preflight failed: insufficient Note SHELL balance required={} SHELL \
+                 available={} SHELL; ordinary BUY requires escrow {} SHELL + buyer \
+                 bond {} SHELL at --max-price-per-tick={} SHELL; lower \
                  --max-price-per-tick to reduce the required bond; no escrow was sent",
-                reserve.total_escrow, reserve.buyer_bond
+                dexdo_core::shell_amount(reserve.total_escrow),
+                dexdo_core::shell_amount(note_shell_balance),
+                dexdo_core::shell_amount(escrow),
+                dexdo_core::shell_amount(reserve.buyer_bond),
+                dexdo_core::shell_amount(max_price_per_tick)
             )));
         }
         let mut journal = template.clone();
@@ -2916,7 +3001,6 @@ async fn place_quote_bound_buy_with_journal(
         .map_err(anyhow::Error::new)
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_resolved_buyer_submits(
     journal_path: &std::path::Path,
     note_addr: &str,
@@ -2940,7 +3024,6 @@ fn persist_resolved_buyer_submits(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn complete_buyer_submit_with_journal(
     chain: &dyn ChainBackend,
@@ -3013,22 +3096,70 @@ async fn complete_buyer_submit_with_journal(
 }
 
 /// What the order book proves about the BUY order behind a durable submit record.
+
 /// A cancelled or rejected order is terminal: it is out of the book and its money is back at the note, so
 /// there is nothing left to resolve and nothing that could be paid twice. Expiry is deliberately NOT
 /// terminal -- an order past its deadline can still be matched and settled, and the record is what ties the
 /// escrow behind it to this client, so it is reported and kept. A resting order is the one honestly
 /// unresolved case where blocking is right, and it is named rather than described as "ambiguous".
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BuyerSubmitStanding {
-    Cancelled { order_id: u128, refunded: u128 },
-    Rejected { reason: u8, refund: u128 },
-    Expired { order_id: u128, cleared: bool },
-    Resting { order_id: u128, deadline: u64 },
-    Unresolved { order_id: Option<u128> },
+    Cancelled {
+        order_id: u128,
+        refunded: u128,
+        release: EscrowRelease,
+    },
+    Rejected {
+        reason: u8,
+        refund: u128,
+        release: EscrowRelease,
+    },
+    Expired {
+        order_id: u128,
+        cleared: bool,
+        release: EscrowRelease,
+    },
+    Resting {
+        order_id: u128,
+        deadline: u64,
+        release: EscrowRelease,
+    },
+    Unresolved {
+        order_id: Option<u128>,
+        release: EscrowRelease,
+    },
 }
 
-#[cfg(feature = "shellnet")]
+/// Whether the BOOK accounted for this submit's escrow leaving the note's money lock.
+
+/// This is the whole of what closing the durable record is allowed to depend on, and it is a field
+/// on every standing rather than a list of variants read by `closes_record`. A list is something
+/// the author of the NEXT outcome has to remember, and the author before them did not: a swept
+/// expiry sat outside it, so the record never closed, the money lock was retaken on every journal
+/// run, and every later buy from that note was refused. A field cannot be forgotten,
+/// because it cannot be left unwritten.
+
+/// `ProvenByChain` is never inferred from a deadline, a clock, or the client's own opinion. It is
+/// written only where a book event accounts for the money:
+
+/// * `InferenceOrderCancelled` and `InferenceOrderRejected` carry the refunded amount themselves;
+/// * a swept expiry does NOT -- `contracts/airegistry/InferenceOrderBook.sol` states it outright,
+/// "an expiring bid emits this alongside `InferenceOrderExpired` -- the refund and the reason
+/// are separate facts", and `BuyerOrderFactKind::Expired` is documented as "reported, never
+/// terminal for the record". A sweep proves removal; `InferenceRefunded` on the same order id
+/// proves the money came back; only the pair proves the escrow stopped being held.
+
+/// Swept with no refund fact is therefore `Unproven` and keeps the record open. That is not a gap
+/// left for later: closing on the sweep alone would lift a money lock over an escrow nobody has
+/// accounted for, which is the same defect pointing the other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscrowRelease {
+    /// A book event accounted for the escrow leaving the lock.
+    ProvenByChain,
+    /// Nothing on chain has accounted for it yet.
+    Unproven,
+}
+
 impl BuyerSubmitStanding {
     fn order_id(&self) -> Option<u128> {
         match *self {
@@ -3036,13 +3167,28 @@ impl BuyerSubmitStanding {
             | Self::Expired { order_id, .. }
             | Self::Resting { order_id, .. } => Some(order_id),
             Self::Rejected { .. } => None,
-            Self::Unresolved { order_id } => order_id,
+            Self::Unresolved { order_id, .. } => order_id,
         }
     }
 
-    /// Whether the book proved an outcome that closes the record.
+    /// What the book accounted for, per standing.
+
+    /// Deliberately an exhaustive `match` and not a wildcard: a standing added later cannot compile
+    /// until its author has said what happened to the money.
+    fn release(&self) -> EscrowRelease {
+        match *self {
+            Self::Cancelled { release, .. }
+            | Self::Rejected { release, .. }
+            | Self::Expired { release, .. }
+            | Self::Resting { release, .. }
+            | Self::Unresolved { release, .. } => release,
+        }
+    }
+
+    /// Whether the book proved the escrow left the lock, which is the only thing that closes the
+    /// record. Not a list of outcomes -- see [`EscrowRelease`] for why that list was the defect.
     fn closes_record(&self) -> bool {
-        matches!(self, Self::Cancelled { .. } | Self::Rejected { .. })
+        matches!(self.release(), EscrowRelease::ProvenByChain)
     }
 
     fn operator_state(&self) -> String {
@@ -3050,23 +3196,31 @@ impl BuyerSubmitStanding {
             Self::Cancelled {
                 order_id,
                 refunded,
+                ..
             } => format!(
                 "buyer_submit_journal_state outcome=cancelled terminal=true order_id={order_id} \
                  refund={refunded}"
             ),
-            Self::Rejected { reason, refund } => format!(
+            Self::Rejected { reason, refund, .. } => format!(
                 "buyer_submit_journal_state outcome=rejected terminal=true reason={reason} \
                  refund={refund}"
             ),
-            Self::Expired { order_id, cleared } => format!(
-                "buyer_submit_journal_state outcome=expired terminal=false order_id={order_id} \
-                 cleared={cleared}"
+            Self::Expired {
+                order_id,
+                cleared,
+                release,
+            } => format!(
+                "buyer_submit_journal_state outcome=expired terminal={} order_id={order_id} \
+                 cleared={cleared}",
+                matches!(release, EscrowRelease::ProvenByChain)
             ),
-            Self::Resting { order_id, deadline } => format!(
+            Self::Resting {
+                order_id, deadline, ..
+            } => format!(
                 "buyer_submit_journal_state outcome=resting terminal=false order_id={order_id} \
                  deadline={deadline}"
             ),
-            Self::Unresolved { order_id } => format!(
+            Self::Unresolved { order_id, .. } => format!(
                 "buyer_submit_journal_state outcome=unresolved terminal=false order_id={}",
                 order_id.map_or_else(|| "-".to_string(), |order_id| order_id.to_string())
             ),
@@ -3079,17 +3233,20 @@ impl BuyerSubmitStanding {
             Self::Cancelled {
                 order_id,
                 refunded,
+                ..
             } => format!(
                 "durable buyer submit {}: buy order #{order_id} was cancelled in order book {} and \
                  refunded {refunded}",
                 journal.submit_identity, order_book
             ),
-            Self::Rejected { reason, refund } => format!(
+            Self::Rejected { reason, refund, .. } => format!(
                 "durable buyer submit {}: order book {} rejected the order (reason {reason}) and \
                  refunded {refund}",
                 journal.submit_identity, order_book
             ),
-            Self::Expired { order_id, cleared } => format!(
+            Self::Expired {
+                order_id, cleared, ..
+            } => format!(
                 "your buy order #{order_id} in order book {} has expired{}; the record is kept \
                  because expiry alone does not prove where its escrow ended up, and no BOC was sent \
                  (durable buyer submit {})",
@@ -3101,19 +3258,26 @@ impl BuyerSubmitStanding {
                 },
                 journal.submit_identity
             ),
-            Self::Resting { order_id, deadline } => format!(
+            Self::Resting {
+                order_id, deadline, ..
+            } => format!(
                 "your buy order #{order_id} is resting in order book {}, not filled (deadline \
                  {deadline}); the record is kept until it fills or you cancel it with `dexdo orders \
                  cancel {order_id}`, and no BOC was sent (durable buyer submit {})",
                 order_book, journal.submit_identity
             ),
-            Self::Unresolved { order_id: Some(order_id) } => format!(
+            Self::Unresolved {
+                order_id: Some(order_id),
+                ..
+            } => format!(
                 "durable buyer submit {} names buy order #{order_id}, but order book {} reports \
                  neither a fill nor a cancellation, rejection or expiry for it; journal retained and \
                  no BOC was sent",
                 journal.submit_identity, order_book
             ),
-            Self::Unresolved { order_id: None } => format!(
+            Self::Unresolved {
+                order_id: None, ..
+            } => format!(
                 "durable buyer submit {} is unresolved: order book {} reports no order for this note \
                  since the submit; journal retained and no BOC was sent",
                 journal.submit_identity, order_book
@@ -3123,11 +3287,11 @@ impl BuyerSubmitStanding {
 }
 
 /// Read the buyer's own order out of the book's owner-facing facts and say where it stands.
+
 /// Attribution is by fact, never by a clock: the book names the owning note on every outcome, the record's
 /// own order id wins once it is known, and otherwise exactly one placement made after this record was
 /// written and carrying this record's terms may claim it. Two candidate placements resolve to unresolved
 /// rather than to a guess.
-#[cfg(feature = "shellnet")]
 fn classify_buyer_submit_standing(
     journal: &BuyerSubmitJournal,
     facts: &[dexdo_core::BuyerOrderFact],
@@ -3161,12 +3325,34 @@ fn classify_buyer_submit_standing(
             .filter(|fact| mine(fact))
             .find_map(|fact| match fact.kind {
                 dexdo_core::BuyerOrderFactKind::Rejected { reason, refund } => {
-                    Some(BuyerSubmitStanding::Rejected { reason, refund })
+                    Some(BuyerSubmitStanding::Rejected {
+                        reason,
+                        refund,
+                        // `InferenceOrderRejected` carries the refunded amount itself.
+                        release: EscrowRelease::ProvenByChain,
+                    })
                 }
                 _ => None,
             })
-            .unwrap_or(BuyerSubmitStanding::Unresolved { order_id: None });
+            .unwrap_or(BuyerSubmitStanding::Unresolved {
+                order_id: None,
+                release: EscrowRelease::Unproven,
+            });
     };
+    // A sweep proves the order left the book; `InferenceRefunded` on the SAME order id proves the
+    // escrow came back. Only the pair proves the money stopped being held -- the book emits them as
+    // two facts on purpose (`contracts/airegistry/InferenceOrderBook.sol`), and
+    // `BuyerOrderFactKind::Expired` is documented as "reported, never terminal for the record".
+    // Read here, from facts already in hand, so nothing new is asked of the chain.
+    let refunded_this_order = facts.iter().any(|fact| {
+        matches!(
+            fact.kind,
+            dexdo_core::BuyerOrderFactKind::Refunded {
+                order_id: refunded_order_id,
+                ..
+            } if refunded_order_id == order_id
+        )
+    });
     // Facts arrive oldest first, so the last one about this order id is its current standing.
     facts
         .iter()
@@ -3174,6 +3360,7 @@ fn classify_buyer_submit_standing(
         .fold(
             BuyerSubmitStanding::Unresolved {
                 order_id: Some(order_id),
+                release: EscrowRelease::Unproven,
             },
             |standing, fact| match fact.kind {
                 // The money half of an exit, never the exit itself: `InferenceRefunded` also fires
@@ -3181,25 +3368,43 @@ fn classify_buyer_submit_standing(
                 // The reason event that accompanies it does, and it is folded on its own line.
                 dexdo_core::BuyerOrderFactKind::Refunded { .. } => standing,
                 dexdo_core::BuyerOrderFactKind::Cancelled { refunded, .. } => {
-                    BuyerSubmitStanding::Cancelled { order_id, refunded }
+                    BuyerSubmitStanding::Cancelled {
+                        order_id,
+                        refunded,
+                        // `InferenceOrderCancelled` carries the refunded amount itself.
+                        release: EscrowRelease::ProvenByChain,
+                    }
                 }
                 dexdo_core::BuyerOrderFactKind::Expired { .. } => BuyerSubmitStanding::Expired {
                     order_id,
+                    // Swept from the book. That is removal, not payment.
                     cleared: true,
+                    release: if refunded_this_order {
+                        EscrowRelease::ProvenByChain
+                    } else {
+                        EscrowRelease::Unproven
+                    },
                 },
                 dexdo_core::BuyerOrderFactKind::Placed { deadline, .. } => {
                     if deadline != 0 && deadline < now_unix {
                         BuyerSubmitStanding::Expired {
                             order_id,
+                            // The client's own clock passed the deadline; the book has not swept it.
                             cleared: false,
+                            release: EscrowRelease::Unproven,
                         }
                     } else {
-                        BuyerSubmitStanding::Resting { order_id, deadline }
+                        BuyerSubmitStanding::Resting {
+                            order_id,
+                            deadline,
+                            release: EscrowRelease::Unproven,
+                        }
                     }
                 }
                 dexdo_core::BuyerOrderFactKind::Rejected { .. } => {
                     BuyerSubmitStanding::Unresolved {
                         order_id: Some(order_id),
+                        release: EscrowRelease::Unproven,
                     }
                 }
             },
@@ -3207,12 +3412,12 @@ fn classify_buyer_submit_standing(
 }
 
 /// Operator recovery for one durable BUY submit.
+
 /// The note-wide money lock excludes a concurrent submit while this command reads and possibly
 /// removes the double-pay guard. Local `resolved_matches` are deliberately ignored: closing is
 /// based on fresh owner-facing note fills and the same order-book fact path used by automatic
 /// reconciliation. A fill closes only when one event accounts for the journal's complete AON
 /// volume; partial or ambiguous fills retain the journal.
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_buyer_submit_journal(
     chain: &dexdo_core::RealChainBackend,
     note_addr: &str,
@@ -3276,7 +3481,7 @@ pub(crate) async fn run_buyer_submit_journal(
             fill.order_id,
             dexdo_core::address::display_self_dapp(&fill.token_contract),
             fill.ticks,
-            fill.price_per_tick
+            dexdo_core::shell_amount(fill.price_per_tick)
         );
         clear_buyer_submit_journal(&journal_path)?;
         println!(
@@ -3321,7 +3526,16 @@ pub(crate) async fn run_buyer_submit_journal(
     let outcome = match standing {
         BuyerSubmitStanding::Cancelled { .. } => "cancelled",
         BuyerSubmitStanding::Rejected { .. } => "rejected",
-        _ => unreachable!("closes_record accepts only cancelled or rejected"),
+        // A swept expiry whose refund the book also accounted for. It reaches here only through
+        // `closes_record`, which is now a reading of `EscrowRelease` rather than a list.
+        BuyerSubmitStanding::Expired { .. } => "expired",
+        // Deliberately named rather than folded into a wildcard. The trap stays a trap -- a
+        // standing that begins to close the record without being named here must fail loudly --
+        // and spelling both remaining variants out means a NEW one cannot compile until its author
+        // has decided which side of this it is on.
+        BuyerSubmitStanding::Resting { .. } | BuyerSubmitStanding::Unresolved { .. } => {
+            unreachable!("closes_record is false for a resting or unresolved standing")
+        }
     };
     clear_buyer_submit_journal(&journal_path)?;
     println!(
@@ -3332,7 +3546,6 @@ pub(crate) async fn run_buyer_submit_journal(
 }
 
 /// Persist this note's own order id into the durable record as soon as the book proves it.
-#[cfg(feature = "shellnet")]
 fn persist_buyer_submit_order_id(
     journal_path: &std::path::Path,
     note_addr: &str,
@@ -3349,10 +3562,10 @@ fn persist_buyer_submit_order_id(
 }
 
 /// Resolve a durable buyer submit that has produced no fill, by the book's own outcome for it.
+
 /// Closing on a proven cancellation or rejection is what keeps the client usable: the order is gone, the
 /// escrow is back, and a record that outlives its order blocks every later buy AND the buyer endpoint. Every
 /// other standing keeps the record and says what it is.
-#[cfg(feature = "shellnet")]
 async fn resolve_unfilled_buyer_submit(
     chain: &dyn ChainBackend,
     note_addr: &str,
@@ -3386,7 +3599,6 @@ async fn resolve_unfilled_buyer_submit(
     )))
 }
 
-#[cfg(feature = "shellnet")]
 async fn reconcile_pending_buyer_submit(
     chain: &dyn ChainBackend,
     note_addr: &str,
@@ -3469,7 +3681,6 @@ async fn reconcile_pending_buyer_submit(
     Ok(Some((fill.token_contract.clone(), status)))
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::large_enum_variant)]
 enum DurableBuyerSubmitStart {
     Submitted {
@@ -3487,7 +3698,6 @@ enum DurableBuyerSubmitStart {
     },
 }
 
-#[cfg(feature = "shellnet")]
 struct BuyerJournalResumeProof {
     submit_reconciliation: dexdo::buyer::api::BuyerSubmitReconciliation,
     ticks: u128,
@@ -3495,7 +3705,6 @@ struct BuyerJournalResumeProof {
     escrow: u128,
 }
 
-#[cfg(feature = "shellnet")]
 impl BuyerJournalResumeProof {
     fn from_journal(journal: &BuyerSubmitJournal) -> Result<Self> {
         Ok(Self {
@@ -3511,28 +3720,24 @@ impl BuyerJournalResumeProof {
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug)]
 struct DurableBuyerSubmitReconciliationError {
     deal_init: dexdo::buyer::api::DealInitError,
     source: ChainError,
 }
 
-#[cfg(feature = "shellnet")]
 impl std::fmt::Display for DurableBuyerSubmitReconciliationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.deal_init.fmt(formatter)
     }
 }
 
-#[cfg(feature = "shellnet")]
 impl std::error::Error for DurableBuyerSubmitReconciliationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn durable_buyer_submit_reconciliation_error(
     error: anyhow::Error,
     journal: &BuyerSubmitJournal,
@@ -3574,7 +3779,6 @@ struct BuyerQuoteSubmitOutcome {
 /// be taken over. Everything after this point is identical either way, and that is deliberate -- the
 /// by-fact reconciliation below is what makes reclaiming safe, so it must not be something the
 /// recovery path can skip.
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn raise_pending_buyer_money_before_fresh_reads(
     chain: &dyn ChainBackend,
@@ -3588,7 +3792,7 @@ async fn raise_pending_buyer_money_before_fresh_reads(
     recovery: bool,
 ) -> Result<Option<BuyerQuoteSubmitOutcome>> {
     let mut money_lock = buyer_money_lock_for_submit(false, note_addr)?
-        .ok_or_else(|| anyhow::anyhow!("real shellnet buyer recovery requires a money lock"))?;
+        .ok_or_else(|| anyhow::anyhow!("real {} buyer recovery requires a money lock", dexdo_core::params::current_network()))?;
     if recovery {
         money_lock.try_acquire_for_recovery()?;
     } else {
@@ -3662,7 +3866,6 @@ async fn raise_pending_buyer_money_before_fresh_reads(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn clear_adopted_buyer_money_journal(
     note_addr: Option<&str>,
     submit_identity: Option<&str>,
@@ -3687,37 +3890,13 @@ fn clear_adopted_buyer_money_journal(
     clear_buyer_submit_journal(&money_lock.journal_path)
 }
 
-#[cfg(not(feature = "shellnet"))]
-fn clear_adopted_buyer_money_journal(
-    _note_addr: Option<&str>,
-    _submit_identity: Option<&str>,
-    _token_contract: &str,
-) -> Result<()> {
-    Ok(())
-}
 
-#[cfg(not(feature = "shellnet"))]
-#[allow(clippy::too_many_arguments)]
-async fn raise_pending_buyer_money_before_fresh_reads(
-    _chain: &dyn ChainBackend,
-    _buyer: &dexdo::buyer::Buyer,
-    _note_addr: Option<&str>,
-    _intent: &BuyerSubmitIntent,
-    _expected_token_contract: Option<&str>,
-    _ticks: u128,
-    _max_price_per_tick: u128,
-    _escrow: u128,
-    _recovery: bool,
-) -> Result<Option<BuyerQuoteSubmitOutcome>> {
-    Ok(None)
-}
 
 struct BuyerSubmitProgress {
     reconciled_ambiguous_submit: bool,
     submit_reconciliation: Option<dexdo::buyer::api::BuyerSubmitReconciliation>,
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 fn ensure_pending_buyer_submit_matches_invocation(
     pending: &BuyerSubmitJournal,
@@ -3750,24 +3929,28 @@ fn ensure_pending_buyer_submit_matches_invocation(
 }
 
 /// what the probe tick costs the buyer, in tokens, BEFORE any money leaves the note.
+
 /// `TokenContract::_recordDelivered` bills the probe as a WHOLE tick no matter how little it
 /// actually delivered:
+
 /// ```solidity
 /// uint128 delivered = _tokensFinal;
-/// if(_probeAccepted && delivered < TICK_SIZE) { delivered = TICK_SIZE; }
+/// if (_probeAccepted && delivered < TICK_SIZE) { delivered = TICK_SIZE; }
 /// ```
+
 /// Measured live on mainnet on 2026-08-17: the probe delivered 143 465 tokens and billed
 /// 1 000 000, so every one of the twelve claims carried the same 856 535-token gap between
 /// delivered and counted. A two-tick deal paid for 2 000 000 tokens and received 1 159 177 -- the
 /// buyer got **58%** of the volume he paid for, and the deal then ended on "delivery capacity is
 /// exhausted", counting the tokens it had billed rather than the ones it had sent.
+
 /// None of that was knowable from the preflight line: `probe_tick` appeared only in the accounting
 /// printed AFTER the escrow was committed. The economics themselves are the contract's and are not
 /// this function's business -- being told the number in time is.
-/// The share shrinks with deal size(2 ticks -> 50% of ticks, 100 ticks -> 1%), so the sentence is
+
+/// The share shrinks with deal size (2 ticks -> 50% of ticks, 100 ticks -> 1%), so the sentence is
 /// added only where it changes a decision: a deal small enough for the probe to take a quarter or
 /// more of it. That is exactly the size a first-time buyer picks.
-#[cfg(feature = "shellnet")]
 fn probe_share_clause(ticks: u128) -> String {
     let tick_size = dexdo_core::params::TICK_SIZE;
     let streaming_ticks = ticks.saturating_sub(1);
@@ -3787,7 +3970,7 @@ fn probe_share_clause(ticks: u128) -> String {
 }
 
 /// the preflight must name the probe's cost before the escrow is committed.
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 mod probe_share_clause_1425 {
     use super::probe_share_clause;
 
@@ -3852,8 +4035,147 @@ mod probe_share_clause_1425 {
     }
 }
 
-#[cfg(feature = "shellnet")]
-fn render_buyer_human_preflight(
+/// The one outcome that travels as an error and is not one: this note already has a buy resting.
+
+/// Carried as an error because it must stop everything below it -- no second submit, no escrow --
+/// and turned back into a plain exit at the command boundary, where the block has already been
+/// printed. Its own type rather than a marker shared with printed failures: only this outcome may
+/// end a command successfully.
+/// It carries the block rather than printing it on the way past: the stream a result goes to depends
+/// on whether anyone asked for `--json`, and this site is too deep to know. Printed at the command
+/// boundary, where that is the one thing already decided.
+#[derive(Debug)]
+struct BuyerAlreadyResting(String);
+
+impl std::fmt::Display for BuyerAlreadyResting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a buy from this note is already resting in the book")
+    }
+}
+
+impl std::error::Error for BuyerAlreadyResting {}
+
+/// The block for "you already have one of these waiting", or `None` if that is not what happened.
+
+/// Recognised from the standing the reconciler describes rather than from a new chain read: this
+/// runs on the money path, and a second read to re-learn what the error already carries would be a
+/// second answer to the same question.
+fn resting_order_already_placed(error: &anyhow::Error) -> Option<String> {
+    let message = format!("{error:#}");
+    if !message.contains("is resting in order book") {
+        return None;
+    }
+    let order = message
+        .split_once("buy order #")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or("?")
+        .to_string();
+    Some(format!(
+        "Buy already resting
+  order:   #{order}
+  waiting: for a seller to post an ask it crosses
+  cancel:  dexdo orders cancel {order}
+
+Nothing new was sent: one note holds one buy at a time."
+    ))
+}
+
+/// The order as the operator reads it: what was asked for, at what ceiling, and what it costs while
+/// it waits.
+
+/// A heading and its fields, the shape every other result in this client has. The figures are the
+/// ones a buy is judged by -- the volume, the ceiling, the escrow that is held whether or not a
+/// seller ever shows up, and how much of the volume is the probe tick that is billed whole.
+// Compiled exactly where its parts are: its only caller is the chain build, and its own dependencies --
+// `note_pick::whole_units` and `probe_share_clause` -- are gated `any(chain, test)`. Ungated, as
+// it was, the default build has to compile a body whose halves are not there, which is how this
+// branch stood red on the configuration CI runs while the feature build was green.
+fn render_buyer_order_block(
+    frame_model: &str,
+    selection: &BuyerQuoteSelection,
+    ticks: u128,
+    max_price_per_tick: u128,
+    escrow: u128,
+) -> String {
+    let heading = if selection.resting_buy {
+        "buy resting in the book"
+    } else {
+        "buy matched"
+    };
+    use crate::cli::style::{self, Palette, Role};
+    let palette = Palette::stdout();
+    // `spec.md`: the block opens with the side glyph, the heading is bold, and the rows are
+    // `label value` with the value in column twelve. Amounts are what a person says -- two
+    // decimals, no raw units beside them.
+    let mut out = style::glyph_line(
+        palette,
+        style::BUY,
+        Role::Ok,
+        &style::paint(palette, Role::Bold, heading),
+    );
+    out.push('\n');
+    out.push_str(&style::field(palette, "model", frame_model, Role::Id));
+    out.push('\n');
+    out.push_str(&style::field(
+        palette,
+        "volume",
+        &format!(
+            "{ticks} ticks{}",
+            if ticks > 1 {
+                " - incl. probe, billed whole"
+            } else {
+                " - the probe tick, billed whole"
+            }
+        ),
+        Role::Bold,
+    ));
+    out.push('\n');
+    out.push_str(&style::field(
+        palette,
+        "ceiling",
+        &format!("{} SHELL / tick", style::shell(max_price_per_tick)),
+        Role::Bold,
+    ));
+    out.push('\n');
+    out.push_str(&style::field(
+        palette,
+        "escrow",
+        &format!("{} SHELL held now", style::shell(escrow)),
+        Role::Bold,
+    ));
+    // What ends the wait, on the block that announces it. The escrow above is locked from here on,
+    // and this is the sentence that says what unlocks it: an ask at or under the ceiling this order
+    // named. The checklist step under it says "waiting for a seller", which is a different and
+    // weaker claim -- a seller can be posting asks all day above your ceiling and none of them ends
+    // this. It was dropped in the redraw and is back with the condition it always carried.
+    if selection.resting_buy {
+        out.push('\n');
+        out.push_str(&style::field(
+            palette,
+            "waiting",
+            "until a seller posts an ask this crosses",
+            Role::Text,
+        ));
+    }
+    // `spec.md`: the integers the chain stores are one flag away, not in everybody's way.
+    if style::raw_requested() {
+        out.push('\n');
+        out.push_str(&style::raw_line(
+            palette,
+            &format!(
+                "ceiling {max_price_per_tick} ECC - escrow {escrow} ECC - PRICE_STEP {} = 1 SHELL \
+                 - tick = {} tokens",
+                dexdo_core::params::SHELL_UNIT,
+                dexdo_core::DobParams::canonical().tick_size,
+            ),
+        ));
+    }
+    out
+}
+
+// Same gate as the clause it prints and as the command that prints it: see the note on
+// `render_buyer_order_block`.
+pub(crate) fn render_buyer_human_preflight(
     frame_model: &str,
     selection: &BuyerQuoteSelection,
     ticks: u128,
@@ -3862,6 +4184,13 @@ fn render_buyer_human_preflight(
     note_shell_balance: u128,
 ) -> String {
     let probe = probe_share_clause(ticks);
+    // Every money figure of this line is stated in SHELL: the ceiling as it was typed, the escrow,
+    // the fee and the balance as the note holds them. One line stating two units is what the change
+    // exists to remove.
+    let balance_sufficient = note_shell_balance >= escrow;
+    let max_price_per_tick = dexdo_core::shell_amount(max_price_per_tick);
+    let escrow = dexdo_core::shell_amount(escrow);
+    let note_shell_balance = dexdo_core::shell_amount(note_shell_balance);
     if selection.resting_buy {
         return format!(
             "BUYER_PREFLIGHT model={frame_model} requested_ticks={ticks} minimum_ticks={} \
@@ -3869,22 +4198,25 @@ fn render_buyer_human_preflight(
              note_shell_balance={note_shell_balance} order_id=<pending> token_contract=<pending> \
              matchable=wait_for_seller balance_sufficient={} {probe}",
             dexdo_core::params::MIN_STREAM_BUY_TICKS,
-            note_shell_balance >= escrow
+            balance_sufficient
         );
     }
     let fill = &selection.quote.fills[0];
-    let fee = fill
-        .cost_with_fee
-        .saturating_sub(fill.ticks.saturating_mul(fill.price_per_tick));
-    // both fields by-fact wrong on shellnet and undetectable from the line itself:
+    let fee = dexdo_core::shell_amount(
+        fill.cost_with_fee
+            .saturating_sub(fill.ticks.saturating_mul(fill.price_per_tick)),
+    );
+    // both fields by-fact wrong on the chain and undetectable from the line itself:
+
     // `order_id` was `fills[0].order_id` -- the SELECTED SELLER's resting ask. The buyer has no
     // order id here at all: this renders inside `before_post`, and the book assigns ours only after
     // the money message, which is why the journal written on the very next lines records
-    // `order_id: None`(see `place_quote_bound_buy_with_journal`). The line printed `order_id=11`
+    // `order_id: None` (see `place_quote_bound_buy_with_journal`). The line printed `order_id=11`
     // for an order the book numbered 12, and `orders... show 11` then refused it as not owned. A
     // field named `order_id` in the buyer's own output is read as the buyer's order, so the
     // counterparty's is carried under a name that says whose it is, and no `order_id` is claimed
     // while ours does not exist.
+
     // `matchable=true` was a literal in the format string, printed whatever the book held. It read
     // `true` while the chosen ask had expired thirteen minutes earlier; the escrow went out, no
     // deal happened and the bid rested. Executability cannot be re-derived here -- `selection` is a
@@ -3903,14 +4235,13 @@ fn render_buyer_human_preflight(
          note_shell_balance={note_shell_balance} matched_ask_order_id={} \
          matched_ask_token_contract={} balance_sufficient={} {probe}",
         dexdo_core::params::MIN_STREAM_BUY_TICKS,
-        fill.price_per_tick,
+        dexdo_core::shell_amount(fill.price_per_tick),
         fill.order_id,
         dexdo_core::address::display_self_dapp(&fill.token_contract),
-        note_shell_balance >= escrow
+        balance_sufficient
     )
 }
 
-#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn start_durable_buyer_submit(
     chain: &dyn ChainBackend,
@@ -3943,7 +4274,7 @@ async fn start_durable_buyer_submit(
         } else {
             let current_order_book = chain.model_buy_order_book_identity().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "real shellnet backend did not expose its canonical model order-book identity; no BOC was sent"
+                    "real chain backend did not expose its canonical model order-book identity; no BOC was sent"
                 )
             })?;
             if !pending.order_book.eq_ignore_ascii_case(&current_order_book) {
@@ -3954,6 +4285,7 @@ async fn start_durable_buyer_submit(
                 // book address does move, because it is derived from the vendored order-book code
                 // cell. Reading two unequal hex strings sent one investigation down a re-derivation
                 // bug that did not exist, so the record's own deal is spelled out here.
+
                 // The record identifies its model only by that book address, so there is no recorded
                 // model NAME to print; what is printed is the model this invocation was asked for,
                 // which is the other half a reader needs to tell the two apart.
@@ -3988,10 +4320,22 @@ async fn start_durable_buyer_submit(
                 max_price_per_tick,
                 escrow,
             )?;
-            if let Some((token_contract, status)) =
-                reconcile_pending_buyer_submit(chain, note_addr, journal_path, None)
-                    .await
-                    .map_err(|error| durable_buyer_submit_reconciliation_error(error, &pending))?
+            let reconciled = reconcile_pending_buyer_submit(chain, note_addr, journal_path, None)
+                .await
+                .map_err(|error| {
+                    // An order of this note's that is simply RESTING is not a failure and never was:
+                    // nothing was sent, nothing is lost, and the operator's own earlier buy is
+                    // waiting for a seller exactly as they asked. It arrived here as an error only
+                    // because the reconciler has no terminal fact to record, and it read as a crash
+                    // -- "could not preserve durable buyer submit recovery facts" over a working
+                    // order. Said plainly instead, and the command stops without submitting a
+                    // second buy.
+                    if let Some(resting) = resting_order_already_placed(&error) {
+                        return anyhow::Error::new(BuyerAlreadyResting(resting));
+                    }
+                    durable_buyer_submit_reconciliation_error(error, &pending)
+                })?;
+            if let Some((token_contract, status)) = reconciled
             {
                 return Ok(DurableBuyerSubmitStart::Reconciled {
                     proof: BuyerJournalResumeProof::from_journal(&pending)?,
@@ -4046,13 +4390,10 @@ where
     F: FnMut(BuyerSubmitProgress) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    #[cfg(not(feature = "shellnet"))]
-    let _ = (intent, expected_token_contract, human_model);
 
-    #[cfg(feature = "shellnet")]
     if !mock_chain {
         let mut money_lock = buyer_money_lock_for_submit(false, note_addr)?
-            .ok_or_else(|| anyhow::anyhow!("real shellnet buyer submit requires a money lock"))?;
+            .ok_or_else(|| anyhow::anyhow!("real {} buyer submit requires a money lock", dexdo_core::params::current_network()))?;
         money_lock.try_acquire()?;
         let journal_note = money_lock.note_addr.clone();
         let journal_path = money_lock.journal_path.clone();
@@ -4244,7 +4585,6 @@ fn record_buyer_token_contract_after_money_move(args: &BuyerArgs, token_contract
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_buyer_token_contract_in_env_pool(args: &BuyerArgs, token_contract: &str) -> Result<()> {
     if args.mock.mock_chain {
         return Ok(());
@@ -4254,13 +4594,12 @@ fn persist_buyer_token_contract_in_env_pool(args: &BuyerArgs, token_contract: &s
     };
     let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "real shellnet: --note-addr is required to persist TokenContract in DEXDO_PN_POOL"
+            format!("real {}: --note-addr is required to persist TokenContract in DEXDO_PN_POOL", dexdo_core::params::current_network())
         )
     })?;
     persist_pool_token_contract_for_note(&pool_path, note_addr, token_contract, "buyer")
 }
 
-#[cfg(feature = "shellnet")]
 fn persist_buyer_token_contract_for_note(note_addr: Option<&str>, token_contract: &str) {
     let Some(note_addr) = note_addr else {
         return;
@@ -4281,16 +4620,7 @@ fn persist_buyer_token_contract_for_note(note_addr: Option<&str>, token_contract
     }
 }
 
-#[cfg(not(feature = "shellnet"))]
-fn persist_buyer_token_contract_in_env_pool(
-    _args: &BuyerArgs,
-    _token_contract: &str,
-) -> Result<()> {
-    Ok(())
-}
 
-#[cfg(not(feature = "shellnet"))]
-fn persist_buyer_token_contract_for_note(_note_addr: Option<&str>, _token_contract: &str) {}
 
 fn reject_buyer_raw_token_contract_without_registry_book_proof(
     market: Option<&std::path::Path>,
@@ -4310,7 +4640,6 @@ fn reject_buyer_raw_token_contract_without_registry_book_proof(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn resolve_content_identity_model(
     contracts: &std::path::Path,
     frame_model: &str,
@@ -4321,7 +4650,7 @@ async fn resolve_content_identity_model(
             contracts.display()
         )
     })?;
-    let reader = ShellnetModelRegistryReader::from_manifest(contracts, &registry_address)?;
+    let reader = ChainModelRegistryReader::from_manifest(contracts, &registry_address)?;
     let identity = resolve_registered_model_identity(
         &reader,
         RegistryRole::Buyer,
@@ -4332,22 +4661,85 @@ async fn resolve_content_identity_model(
     Ok(identity.registry_model)
 }
 
-#[cfg(not(feature = "shellnet"))]
-async fn resolve_content_identity_model(
-    contracts: &std::path::Path,
-    frame_model: &str,
-) -> Result<String> {
-    let _ = (contracts, frame_model);
-    bail!("content identity ModelRegistry resolution requires a shellnet build")
-}
 
 fn buyer_content_identity_resolution_result(
     frame_model: &str,
     allow_unverified_model: bool,
+    resuming: bool,
     result: Result<String>,
 ) -> Result<Option<String>> {
     match result {
-        Ok(identity_model) => Ok(Some(identity_model)),
+        Ok(identity_model) if identity_model == frame_model => Ok(Some(identity_model)),
+        // RESUME IS NOT A NEW SPEND, so it is not refused.
+
+        // The seller's version of this rule guards `provision` and `deploy-market`, where nothing
+        // is at risk yet -- refuse, and the operator has lost nothing. On the buyer the check runs
+        // before the resume branch, so refusing here locks an operator out of a deal whose escrow
+        // is ALREADY frozen and whose ticks are already paid for, and the opt-out deliberately
+        // cannot reach this arm. That is not the rule being applied evenly; that is money the
+        // client is holding hostage over a spelling.
+
+        // The rule is about not putting NEW money on a book the registry does not name. A resume
+        // puts none: the deal exists, at the address it already has.
+        Ok(identity_model) if resuming => {
+            tracing::warn!(
+                %frame_model,
+                registry_model = %identity_model,
+                "the ModelRegistry holds this model under a different spelling; resuming anyway \
+                 because the deal already exists -- a new buy under this name would be refused"
+            );
+            Ok(Some(identity_model))
+        }
+        // The seller's refusal, on the buyer's side, for the same reason. The book is
+        // derived from `model_hash_for(frame_model)` -- the bytes the buyer was given, not the
+        // registry's -- so a name the registry spells differently rests escrow on a book that
+
+        // rule to be identical on both sides: with only one of them refusing, the two still meet on
+        // different books, which is the fragmentation the rule exists to end.
+
+        // The opt-out does not reach here either: a model the registry CONFIRMED under another
+        // spelling is a confirmed model plus a typo, and the flag is about an unconfirmed model.
+        Ok(identity_model) => {
+            // Same shape as the seller's arm, including the flag case: a name carrying capability
+            // flags resolves to the base, so "write `{identity_model}`" would name a different,
+            // unflagged market. See `admin.rs` for the measurement.
+            let dropped: Vec<&str> = frame_model
+                .split("--")
+                .skip(3)
+                .filter(|token| {
+                    // Token, not substring. `contains` would call a flag "kept" because its letters
+                    // appear somewhere in the registered name -- `dexdo-executor` records that class
+                    // by itself, and it fails in the direction that hides a dropped flag rather than
+                    // inventing one. A capability flag is a whole `--` segment or it is nothing.
+                    !identity_model
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+                        .any(|part| part.eq_ignore_ascii_case(token))
+                })
+                .collect();
+            if !dropped.is_empty() {
+                return Err(anyhow!(
+                    "the ModelRegistry holds this model as `{identity_model}`, which is \
+                     `{frame_model}` without `{}`. Those are capability flags and part of the \
+                     market's identity, so buying as `{identity_model}` would rest escrow on a \
+                     different, unflagged book -- and no spelling carries both, because the flag \
+                     grammar is built on the `producer--model--version` form the registry does not \
+                     use",
+                    dropped.join("`, `")
+                ));
+            }
+            // Worded without asserting how the book address is derived, because that differs by
+            // path: a model-only buy derives it from `sha256(frame_model)`, while `--market` and
+            // `--token-contract` take it from the manifest the seller handed over. The first
+            // draft said "the book address is `sha256` over the exact bytes", which is false on
+            // the pinned paths -- a true refusal there for a false reason. What holds everywhere
+            // is that the registry names one spelling and this is not it.
+            Err(anyhow!(
+                "the ModelRegistry holds this model as `{identity_model}`, and `{frame_model}` is \
+                 a different name to the chain. A market listed under a name the registry does not \
+                 hold is one no buyer resolving through the registry can reach, so escrow placed \
+                 against it may find no seller at all. Write `{identity_model}`"
+            ))
+        }
         Err(error) if allow_unverified_model => {
             tracing::warn!(
                 %frame_model,
@@ -4364,42 +4756,127 @@ async fn resolve_buyer_content_identity_model(
     contracts: &std::path::Path,
     frame_model: &str,
     allow_unverified_model: bool,
+    resuming: bool,
 ) -> Result<Option<String>> {
     buyer_content_identity_resolution_result(
         frame_model,
         allow_unverified_model,
+        resuming,
         resolve_content_identity_model(contracts, frame_model).await,
     )
 }
 
+/// What the operator is told when the models file carries no verification data for their model.
+
+/// Pure, and separate from the preflight, so the words can be asserted without a chain, a wallet
+/// and a note -- the run that produced this refusal had all three before it reached here.
+
+/// The wording it replaces was `model X has no available exact buyer reference; refusing before
+/// backend/quote/buy. Pass --allow-unverified-model to proceed without this preflight`. Measured
+/// against a real run: it never said a FILE was read, never said WHICH file -- `--data-dir` moves
+/// it to `<data-dir>/models.json` and the operator's own `models.json` in the working directory
+/// went unread -- and it appeared while `--wait-for-seller` was on the command line, so it read as
+/// "the client refuses to wait for a seller". That is a different failure entirely, and the search
+/// went that way for it.
+fn models_reference_missing_refusal(
+    frame_model: &str,
+    models_path: &std::path::Path,
+    known: &[String],
+) -> crate::cli::refusal::Refusal {
+    let names = if known.is_empty() {
+        "none -- the file lists no models".to_string()
+    } else {
+        known.join(", ")
+    };
+    crate::cli::refusal::Refusal::new(
+        format!(
+            "Nothing was bought: {} carries no verification data for `{frame_model}`, and this \
+             check runs before the book is read, so the wait for a seller never started.",
+            models_path.display()
+        ),
+        format!(
+            "Add `{frame_model}` to that file, point --models at the one that has it, or pass \
+             --allow-unverified-model to buy without the check. It currently describes: {names}."
+        ),
+        format!(
+            "BUYER_PREFLIGHT model={frame_model} models_config={} known={known:?}",
+            models_path.display()
+        ),
+    )
+    .with_alternatives([
+        (
+            "use another models file".to_string(),
+            crate::cli::support::command_here(&format!(
+                "buyer --model {frame_model} --models <path>"
+            )),
+        ),
+        (
+            "buy without the check".to_string(),
+            crate::cli::support::command_here(&format!(
+                "buyer --model {frame_model} --allow-unverified-model"
+            )),
+        ),
+    ])
+}
+
+/// The exact buyer reference for the identity the chain attested, tried in BOTH spellings that
+/// attestation covers.
+
+/// contracts 4.0.36 seed ModelRegistry from a catalog that dropped the producer, so a chain
+/// answers `resolve_registered_model_identity` with `Qwen3-32B` where a 4.0.35 chain answered
+/// `Qwen/Qwen3-32B`. `executable_reference_model_for` compares exactly, and deliberately -- fuzzy
+/// model-family matching must never admit money -- while an operator's `models.json` is keyed for
+/// the generation their client was written against. So one convention or the other misses, and the
+/// buyer refuses a model the market is holding and the seller is already serving.
+
+/// The comparison is not loosened. What is handed to it is. `registry_model` and `frame_model` are
+/// not two guesses at one name: `registry_identity_candidates` derived the former FROM the latter
+/// and the chain confirmed that entry, `sha256(entry)` included, so they are two exact spellings of
+/// one attested identity. The registry spelling is tried FIRST, so a chain carrying the name the
+/// config already lists binds on it and that path is byte-for-byte what it was. No registry
+/// resolution at all -- a mock chain, or the resolution error `--allow-unverified-model` downgrades
+/// -- leaves `registry_model` `None`, and this is the single `frame_model` lookup it has always
+/// been.
+fn buyer_executable_reference_model<'a>(
+    frame_model: &str,
+    registry_model: Option<&str>,
+    models: &'a dexdo::seller::ModelsConfig,
+) -> Option<&'a str> {
+    registry_model
+        .and_then(|registry_model| {
+            dexdo::buyer::verify::executable_reference_model_for(registry_model, models)
+        })
+        .or_else(|| dexdo::buyer::verify::executable_reference_model_for(frame_model, models))
+}
+
+/// `content_identity_model` is resolved by the caller and handed in, not read again here:
+/// the name check now runs on every money path, and one resolution per run is the point -- the
+/// registry rate-limits above three requests a second from one address.
 async fn build_buyer_content_policy(
     args: &BuyerArgs,
     frame_model: &str,
+    content_identity_model: Option<String>,
 ) -> Result<(
     dexdo::buyer::api::ContentCheck,
     Arc<dexdo::seller::ModelsConfig>,
 )> {
-    let content_identity_model = if args.mock.mock_chain {
-        None
-    } else {
-        resolve_buyer_content_identity_model(
-            &args.contracts,
-            frame_model,
-            args.allow_unverified_model,
-        )
-        .await?
-    };
     let content_identity_model_ref = content_identity_model.as_deref();
-    let content_check_model = content_identity_model_ref.unwrap_or(frame_model);
     let models_cfg = Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
     let executable_reference_model =
-        dexdo::buyer::verify::executable_reference_model_for(content_check_model, &models_cfg);
+        buyer_executable_reference_model(frame_model, content_identity_model_ref, &models_cfg);
     if !args.mock.mock_model && !args.allow_unverified_model && executable_reference_model.is_none()
     {
-        bail!(
-            "model `{frame_model}` has no available exact buyer reference; refusing before \
-             backend/quote/buy. Pass --allow-unverified-model to proceed without this preflight"
-        );
+        // Named by the FILE and the models in it, because that is the whole of what went wrong and
+        // none of it was on the screen. The old wording -- "has no available exact buyer reference;
+        // refusing before backend/quote/buy" -- says nothing an operator can act on: it does not
+        // say that a file was read, which file, or that the answer is a line in it. Measured on a
+        // real run: `--data-dir./.dexdo-net-a` moves this file to `<data-dir>/models.json`, the
+        // operator's own `models.json` sat in the working directory unread, and the refusal came
+        // out while `--wait-for-seller` was on the command line -- so it read as "the client will
+        // not wait for a seller", which is a different thing entirely and sent the search in the
+        // wrong direction.
+        let known: Vec<String> = models_cfg.models.keys().cloned().collect();
+        return Err(models_reference_missing_refusal(frame_model, &args.models, &known).into_error());
     }
     let policy_model = executable_reference_model.or(content_identity_model_ref);
     let content_check = dexdo::buyer::api::content_check_policy(
@@ -4419,14 +4896,13 @@ async fn build_buyer_content_policy(
     Ok((content_check, models_cfg))
 }
 #[derive(Debug)]
-struct BuyerQuoteSelection {
-    order_book: &'static str,
-    escrow: u128,
-    quote: ExecutableQuote,
-    resting_buy: bool,
-    // Written on every path; read only by the shellnet pre-submit quote-unchanged check.
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-    quoted_order: Option<OrderBookOrder>,
+pub(crate) struct BuyerQuoteSelection {
+    pub(crate) order_book: &'static str,
+    pub(crate) escrow: u128,
+    pub(crate) quote: ExecutableQuote,
+    pub(crate) resting_buy: bool,
+    // Written on every path; read only by the chain pre-submit quote-unchanged check.
+    pub(crate) quoted_order: Option<OrderBookOrder>,
 }
 
 fn shell_arg(value: &str) -> String {
@@ -4434,20 +4910,25 @@ fn shell_arg(value: &str) -> String {
 }
 
 /// The read-only line `next_command=` hands the operator after a buy failed to quote.
+
 /// here is the *parse* guarantee: every value interpolated below is shell-quoted, so the line
 /// survives the operator's shell as the argv that was printed, and the regression next to this
 /// builder parses it back with the shipped parser. Whether `executable-book` is a command the
 /// running build can serve at all is a different defect and a separate change.
+
 /// That separate change is in this tree too, and it is why the backend is chosen below:
+
 /// The read-only follow-up has to be a command *this build* can run, against *the state that just
 /// failed*. The buy runs on one of two backends and they do not share a read-only view.
-/// `executable-book` exists only in a `shellnet` build (`market_views.rs` bails without the
+
+/// `executable-book` exists only in a chain build (`market_views.rs` bails without the
 /// feature) and always reads the real chain. Printing it after a `--mock-chain` buy therefore hands
-/// the operator a line the default binary rejects outright, and which a shellnet binary would
+/// the operator a line the default binary rejects outright, and which a a chain build would
 /// answer from a different book than the one that failed -- either way it cannot inspect the state
 /// that produced the error. `quote --mock-chain` is served by *both* builds, because
 /// `market_views::run_quote` routes it to `run_quote_mock` without the feature, and it reads the
 /// same mock state this run used.
+
 /// The mock line carries `--endpoints-file` precisely because under `--mock-chain` that file *is*
 /// the chain state: dropping it would point the operator at the default mock book instead of the
 /// one their buy failed against. The real-chain line still never echoes it, and neither echoes
@@ -4459,11 +4940,13 @@ fn buyer_read_only_quote_command(
     max_price_per_tick: u128,
 ) -> String {
     if args.mock.mock_chain {
+        // No `--contracts` in the line an operator types back: the flag is gone, and the
+        // manifest travels in `DEXDO_MANIFEST`, which their shell already carries -- this command
+        // ran, so the variable is set. A suggestion naming a removed flag would fail on paste.
         let mut command = format!(
-            "dexdo quote --mock-chain --model {} --ticks {ticks} --models {} --contracts {}",
+            "dexdo quote --mock-chain --model {} --ticks {ticks} --models {}",
             shell_arg(frame_model),
             shell_arg(&args.models.to_string_lossy()),
-            shell_arg(&args.contracts.to_string_lossy())
         );
         if let Some(path) = args.endpoints_file.as_deref() {
             command.push_str(&format!(
@@ -4480,12 +4963,14 @@ fn buyer_read_only_quote_command(
     } else {
         String::new()
     };
+    // A line an operator will type back, so the ceiling in it is the figure they type: whole
+    // SHELL a tick.
+    let max_price_per_tick = dexdo_core::shell_amount(max_price_per_tick);
     let mut command = format!(
         "dexdo executable-book {} --ticks {ticks} --max-price-per-tick {max_price_per_tick}{source} \
-         --models {} --contracts {}",
+         --models {}",
         shell_arg(frame_model),
         shell_arg(&args.models.to_string_lossy()),
-        shell_arg(&args.contracts.to_string_lossy())
     );
     if let Some(path) = args.registry.model_registry_validation.as_deref() {
         command.push_str(&format!(
@@ -4499,7 +4984,11 @@ fn buyer_read_only_quote_command(
     command
 }
 
-fn human_buyer_quote_error(error: anyhow::Error, next_command: &str) -> anyhow::Error {
+fn human_buyer_quote_error(
+    error: anyhow::Error,
+    next_command: &str,
+    wanted: BuyRequest<'_>,
+) -> anyhow::Error {
     let detail = format!("{error:#}");
     let lower = detail.to_ascii_lowercase();
     let reason = if (lower.contains("best ask price")
@@ -4528,7 +5017,7 @@ fn human_buyer_quote_error(error: anyhow::Error, next_command: &str) -> anyhow::
         // An empty book cannot be read the same way: "nothing matched" is produced against
         // whichever ask set was searched, and an empty EXECUTABLE set over a full raw book is
         // "nothing here is usable", not "nothing is here". Only the chain side holds both sets, so
-        // it decides(`buy_refusal_class`) and stamps the class, and this reads the verdict back
+        // it decides (`buy_refusal_class`) and stamps the class, and this reads the verdict back
         // rather than re-deriving it from prose.
         dexdo_core::params::EMPTY_MODEL_BOOK_CLASS
     } else if lower.contains("no_executable_ask")
@@ -4539,12 +5028,311 @@ fn human_buyer_quote_error(error: anyhow::Error, next_command: &str) -> anyhow::
     } else {
         return error;
     };
-    anyhow!(
-        "BUYER_PREFLIGHT matchable=false reason={reason} detail={detail}\nnext_command={next_command}"
-    )
+    let machine =
+        format!("BUYER_PREFLIGHT matchable=false reason={reason} detail={detail}\nnext_command={next_command}");
+    // Two layers, one error: the operator reads the two lines, and the machine line with the chain's
+    // own words stays underneath for `{error:#}`, the machine surface and a later reconstruction.
+    buyer_refusal(reason, wanted, &machine).into_error()
 }
 
-#[cfg(feature = "shellnet")]
+/// The operator's two lines for one buy refusal class: what did not happen, and what to do.
+
+/// The class is the client's own verdict, read back rather than re-derived -- the arms above already
+/// decided it from facts this function does not have. What is added is the instruction, and it is
+/// per class because that is the whole point: "no seller right now" and "the one seller cannot cover
+/// your volume" send an operator to two different flags, and the refusal they shared said neither.
+
+/// `wanted` carries what the operator asked for, so the sentence can name it in their own units.
+// Compiled wherever its caller is, which is ungated: a helper gated more narrowly than the function
+// that calls it is how the default build goes red while the chain build was green.
+fn buyer_refusal(
+    reason: &str,
+    wanted: BuyRequest,
+    machine: &str,
+) -> crate::cli::refusal::Refusal {
+    use crate::cli::refusal::{shell, Refusal};
+
+    let model = wanted.model;
+    let ceiling = shell(wanted.max_price_per_tick);
+    let ticks = wanted.ticks;
+    match reason {
+        // The reference case of: correct behaviour that read as breakage for half an evening,
+        // because the one flag that settles it was never named.
+        // `spec.md` draws a refusal with more than one way out as a `try:` block: the choice on the
+        // left, the command that makes it on the right. Three options inside one paragraph make the
+        // operator read prose to find a flag; three rows make it a choice.
+        class if class == dexdo_core::params::EMPTY_MODEL_BOOK_CLASS => Refusal::new(
+            format!("No seller is offering {model} right now, and nothing was committed."),
+            "Add --wait-for-seller to queue the buy until one appears, or try again later.",
+            machine,
+        )
+        .with_alternatives([
+            (
+                "queue the buy".to_string(),
+                crate::cli::support::command_here(&format!(
+                    "buyer --model {model} --wait-for-seller"
+                )),
+            ),
+            (
+                "see what is offered".to_string(),
+                crate::cli::support::command_here("markets"),
+            ),
+        ]),
+        class if class == dexdo_core::params::INSUFFICIENT_HEAD_ASK_CLASS => Refusal::new(
+            format!(
+                "No single seller can cover {ticks} tick(s) of {model} at {ceiling} SHELL or less, \
+                 and nothing was committed."
+            ),
+            "Buy fewer ticks, or add --wait-for-seller to queue this volume until one seller can \
+             cover it. A buy is filled by one seller, so smaller asks are not added together.",
+            machine,
+        ),
+        "ceiling_below_best_ask" => Refusal::new(
+            format!(
+                "Every {model} ask is above your ceiling of {ceiling} SHELL a tick, and nothing was \
+                 committed."
+            ),
+            "Raise --max-price-per-tick to the asking price, or wait for a cheaper seller.",
+            machine,
+        )
+        .with_alternatives([
+            (
+                "see what is asked".to_string(),
+                crate::cli::support::command_here(&format!("market --model {model}")),
+            ),
+            (
+                "wait for a cheaper seller".to_string(),
+                crate::cli::support::command_here(&format!(
+                    "buyer --model {model} --wait-for-seller"
+                )),
+            ),
+        ]),
+        class if class == dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS => Refusal::new(
+            format!(
+                "The {model} ask this buy would have taken had already expired, and nothing was \
+                 committed."
+            ),
+            "Run the same command again: the book is re-read each time, and an expired ask is \
+             cleared from it.",
+            machine,
+        ),
+        "wrong_target" => Refusal::new(
+            format!(
+                "The {model} book would have matched a different deal than the one named, so no \
+                 escrow was sent."
+            ),
+            "Drop --token-contract/--market to buy from the model book, or point them at the deal \
+             you mean.",
+            machine,
+        ),
+        _ => Refusal::new(
+            format!(
+                "No {model} ask can fill {ticks} tick(s) at {ceiling} SHELL or less right now, and \
+                 nothing was committed."
+            ),
+            "Add --wait-for-seller to queue the buy, raise --max-price-per-tick, or ask for fewer \
+             ticks. `dexdo markets` shows what is resting.",
+            machine,
+        ),
+    }
+}
+
+/// every buy refusal must name a flag or a command the operator can act on.
+
+/// Asserted against the ACTION, never against length or wording: a test that says "longer than N"
+/// or "contains this sentence" pins prose, and prose is the thing that must stay free to improve.
+/// What must not change is that each class sends the operator somewhere specific, and that two
+/// classes needing different actions do not share one.
+#[cfg(test)]
+mod refusal_1432_tests {
+    use super::*;
+
+    /// The models-file preflight names the file, and does not read as a refusal to wait.
+
+    /// From a real run: `buyer --model openai--gpt-4.1--mini --wait-for-seller` under
+    /// `--data-dir./.dexdo-net-a` printed `model... has no available exact buyer reference;
+    /// refusing before backend/quote/buy`. Every fact needed to act on it was missing: that a file
+    /// was consulted, which one (`--data-dir` moves it, so the `models.json` sitting in the working
+    /// directory was not the one read), and what it does contain. With `--wait-for-seller` on the
+    /// line, the refusal read as "this client will not wait for a seller" -- and that is where the
+    /// operator went looking.
+    #[test]
+    fn the_models_preflight_names_the_file_it_read_and_not_the_wait() {
+        let refusal = models_reference_missing_refusal(
+            "openai--gpt-4.1--mini",
+            std::path::Path::new("/srv/run/.dexdo-net-a/models.json"),
+            &["qwen".to_string(), "claude-sonnet".to_string()],
+        );
+        let shown = refusal.render_with(crate::cli::style::Palette::None);
+
+        assert!(
+            shown.contains("/srv/run/.dexdo-net-a/models.json"),
+            "the operator cannot find the file that refused them: {shown}"
+        );
+        assert!(
+            shown.contains("qwen") && shown.contains("claude-sonnet"),
+            "what the file DOES describe is the fastest way to see the model is absent: {shown}"
+        );
+        assert!(
+            shown.contains("the wait for a seller never started"),
+            "with --wait-for-seller on the command line, a refusal that does not say the wait was \
+             never reached is read as a refusal to wait: {shown}"
+        );
+        assert!(
+            shown.contains("--allow-unverified-model"),
+            "the escape hatch stays named: {shown}"
+        );
+        assert!(
+            !shown.contains("BUYER_PREFLIGHT"),
+            "the record stays off the screen: {shown}"
+        );
+        assert_eq!(
+            refusal.kind(),
+            crate::cli::refusal::Kind::Business,
+            "a models file without this model is the operator's situation, not a client failure"
+        );
+    }
+
+    /// An empty models file says so, rather than printing an empty list where names should be.
+    #[test]
+    fn a_models_file_describing_nothing_says_that_in_words() {
+        let shown = models_reference_missing_refusal(
+            "openai--gpt-4.1--mini",
+            std::path::Path::new("/srv/run/models.json"),
+            &[],
+        )
+        .render_with(crate::cli::style::Palette::None);
+        assert!(
+            shown.contains("none -- the file lists no models"),
+            "an empty file has to be named as empty; a bare `describes: .` reads as a truncated \
+             message: {shown}"
+        );
+    }
+
+    fn wanted() -> BuyRequest<'static> {
+        BuyRequest {
+            model: "openai--gpt-4.1--mini",
+            ticks: 2,
+            max_price_per_tick: 3 * dexdo_core::params::SHELL_UNIT,
+        }
+    }
+
+    /// The reference case the issue was raised on: an empty book is correct behaviour, and the
+    /// refusal never said that `--wait-for-seller` is what turns it into a wait.
+    #[test]
+    fn an_empty_book_names_the_flag_that_queues_the_buy() {
+        let refusal = buyer_refusal(
+            dexdo_core::params::EMPTY_MODEL_BOOK_CLASS,
+            wanted(),
+            "BUYER_PREFLIGHT matchable=false reason=empty_model_book detail=...",
+        );
+        assert!(
+            refusal.do_next().contains("--wait-for-seller"),
+            "{}",
+            refusal.do_next()
+        );
+        let rendered = refusal.render_with(crate::cli::style::Palette::None);
+        assert!(
+            rendered.contains("openai--gpt-4.1--mini"),
+            "the model the operator asked for: {rendered}"
+        );
+        assert!(
+            !rendered.contains("BUYER_PREFLIGHT"),
+            "the machine line is a record, not something an operator reads: {rendered}"
+        );
+        assert!(
+            refusal.detail().contains("BUYER_PREFLIGHT matchable=false reason=empty_model_book"),
+            "and it survives whole underneath: {}",
+            refusal.detail()
+        );
+        let carried = format!("{:#}", refusal.into_error());
+        assert!(
+            carried.contains("BUYER_PREFLIGHT matchable=false reason=empty_model_book"),
+            "the error still carries it for `{{error:#}}` and the machine surface: {carried}"
+        );
+    }
+
+    /// A head ask too small is a different problem with a different answer -- fewer ticks -- and it
+    /// used to arrive under the same wall of prose as the empty book.
+    #[test]
+    fn a_short_head_ask_says_the_volume_is_the_problem() {
+        let refusal = buyer_refusal(
+            dexdo_core::params::INSUFFICIENT_HEAD_ASK_CLASS,
+            wanted(),
+            "detail",
+        );
+        let action = refusal.do_next();
+        assert!(action.contains("fewer ticks"), "{action}");
+        assert!(
+            refusal.render_with(crate::cli::style::Palette::None).contains("one seller"),
+            "why it cannot be added up: {}",
+            refusal.render_with(crate::cli::style::Palette::None)
+        );
+    }
+
+    /// A ceiling below every ask sends the operator to the price, and must not send them to
+    /// `--wait-for-seller`: waiting for a seller who is already there changes nothing.
+    #[test]
+    fn a_low_ceiling_names_the_price_flag_and_not_the_wait() {
+        let refusal = buyer_refusal("ceiling_below_best_ask", wanted(), "detail");
+        let action = refusal.do_next();
+        assert!(action.contains("--max-price-per-tick"), "{action}");
+        assert!(
+            !action.contains("--wait-for-seller"),
+            "waiting does not fix a ceiling: {action}"
+        );
+    }
+
+    /// Every class, including the fallback, has to be actionable: a refusal with no next step is a
+    /// log line in the wrong stream.
+    #[test]
+    fn every_class_names_something_to_do() {
+        for class in [
+            dexdo_core::params::EMPTY_MODEL_BOOK_CLASS,
+            dexdo_core::params::INSUFFICIENT_HEAD_ASK_CLASS,
+            dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS,
+            "ceiling_below_best_ask",
+            "wrong_target",
+            "no_executable_ask",
+        ] {
+            let refusal = buyer_refusal(class, wanted(), "detail");
+            let action = refusal.do_next();
+            assert!(
+                action.contains("--") || action.contains("dexdo ") || action.contains("again"),
+                "{class}: no flag, command or retry to act on: {action}"
+            );
+            let shown = refusal.render_with(crate::cli::style::Palette::None);
+            // The operator's line comes first, and it opens with the glyph for WHOSE problem this
+            // is: `spec.md` gives the market's answer a warning and the client's own failure an
+            // error, and colour repeats what the glyph already says. This used to demand `\u{2718}`
+            // -- one glyph for both -- which stopped being true when the two were told apart, and
+            // stayed unnoticed because this tier is only compiled by CI, never run.
+            let opens_with = shown.chars().next();
+            let expected = match refusal.kind() {
+                crate::cli::refusal::Kind::Business => '\u{26a0}',
+                crate::cli::refusal::Kind::Breakage => '\u{2716}',
+            };
+            assert_eq!(
+                opens_with,
+                Some(expected),
+                "{class}: the first line must open with the glyph for its kind: {shown}"
+            );
+            assert!(
+                !shown.contains("detail"),
+                "{class}: the record does not belong on the screen: {shown}"
+            );
+        }
+    }
+}
+
+/// What the operator asked for, carried into the refusal so it can be said back to them.
+#[derive(Clone, Copy, Debug)]
+struct BuyRequest<'a> {
+    model: &'a str,
+    ticks: u128,
+    max_price_per_tick: u128,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pending_buyer_submit_selection(
     journal_path: &std::path::Path,
@@ -4599,12 +5387,11 @@ async fn buyer_quote_selection_for_submit(
     escrow: Option<u128>,
     human_context: Option<(&BuyerArgs, &str)>,
 ) -> Result<BuyerQuoteSelection> {
-    #[cfg(feature = "shellnet")]
     if !mock_chain {
         intent.validate()?;
         preflight_buyer_pool_for_note(note_addr)?;
         let money_lock = buyer_money_lock_for_submit(false, note_addr)?
-            .ok_or_else(|| anyhow::anyhow!("real shellnet quote requires a money lock"))?;
+            .ok_or_else(|| anyhow::anyhow!("real {} quote requires a money lock", dexdo_core::params::current_network()))?;
         let submitted_escrow =
             escrow.unwrap_or_else(|| required_escrow_for_buy(ticks, max_price_per_tick));
         if let Some(selection) = pending_buyer_submit_selection(
@@ -4619,8 +5406,6 @@ async fn buyer_quote_selection_for_submit(
             return Ok(selection);
         }
     }
-    #[cfg(not(feature = "shellnet"))]
-    let _ = (mock_chain, note_addr, intent);
 
     buyer_quote_selection(chain, explicit_tc, ticks, max_price_per_tick, escrow)
         .await
@@ -4630,7 +5415,15 @@ async fn buyer_quote_selection_for_submit(
             };
             let next_command =
                 buyer_read_only_quote_command(args, frame_model, ticks, max_price_per_tick);
-            human_buyer_quote_error(error, &next_command)
+            human_buyer_quote_error(
+                error,
+                &next_command,
+                BuyRequest {
+                    model: frame_model,
+                    ticks,
+                    max_price_per_tick,
+                },
+            )
         })
 }
 
@@ -4784,10 +5577,10 @@ fn quote_selected_fields(
                 "order_id": machine::amount(fill.order_id),
                 "token_contract": fill.token_contract,
                 "ticks": machine::amount(fill.ticks),
-                "price_per_tick": machine::amount(fill.price_per_tick),
-                "cost_without_fee": machine::amount(cost_without_fee),
-                "platform_fee": machine::amount(fill.cost_with_fee.saturating_sub(cost_without_fee)),
-                "cost_with_fee": machine::amount(fill.cost_with_fee)
+                "price_per_tick": dexdo_core::shell_amount(fill.price_per_tick),
+                "cost_without_fee": dexdo_core::shell_amount(cost_without_fee),
+                "platform_fee": dexdo_core::shell_amount(fill.cost_with_fee.saturating_sub(cost_without_fee)),
+                "cost_with_fee": dexdo_core::shell_amount(fill.cost_with_fee)
             })
         })
         .collect::<Vec<_>>();
@@ -4796,12 +5589,12 @@ fn quote_selected_fields(
         "model_hash": model_hash_for(frame_model),
         "order_book": selection.order_book,
         "ticks": machine::amount(ticks),
-        "max_price_per_tick": machine::amount(max_price_per_tick),
-        "escrow": machine::amount(selection.escrow),
+        "max_price_per_tick": dexdo_core::shell_amount(max_price_per_tick),
+        "escrow": dexdo_core::shell_amount(selection.escrow),
         "quote_complete": selection.quote.complete,
         "wait_for_seller": selection.resting_buy,
         "filled_ticks": machine::amount(selection.quote.filled_ticks),
-        "total_with_fee": machine::amount(selection.quote.total_with_fee),
+        "total_with_fee": dexdo_core::shell_amount(selection.quote.total_with_fee),
         "fills": fills
     });
     // the row this quote FROZE, as the six fields `ensure_pre_submit_quote_unchanged` will
@@ -4815,7 +5608,7 @@ fn quote_selected_fields(
         fields["frozen_quote"] = json!({
             "order_id": machine::amount(quoted.order_id),
             "token_contract": quoted.token_contract,
-            "price_per_tick": machine::amount(quoted.price_per_tick),
+            "price_per_tick": dexdo_core::shell_amount(quoted.price_per_tick),
             "ticks": machine::amount(quoted.ticks),
             "deadline": quoted.deadline,
             "flags": quoted.flags
@@ -4836,8 +5629,8 @@ fn buyer_submit_event_fields(
         "frame_model": frame_model,
         "order_book": order_book,
         "ticks": machine::amount(ticks),
-        "max_price_per_tick": machine::amount(max_price_per_tick),
-        "escrow": machine::amount(escrow),
+        "max_price_per_tick": dexdo_core::shell_amount(max_price_per_tick),
+        "escrow": dexdo_core::shell_amount(escrow),
         "reconciled_ambiguous_submit": progress.reconciled_ambiguous_submit
     });
     if let Some(reconciliation) = progress.submit_reconciliation {
@@ -4952,8 +5745,35 @@ async fn render_inference_book(
 }
 
 /// After the book is shown, ask the operator for a numeric order parameter (how many ticks / the per-tick
-/// price ceiling). On a TTY it prompts -- empty input keeps the `[default]`(the CLI flag). Non-interactive
+/// price ceiling). On a TTY it prompts -- empty input keeps the `[default]` (the CLI flag). Non-interactive
 /// (piped / headless / daemon) returns the default silently, so automated runs keep working from flags.
+/// Ask for a per-tick price the way the command line takes it: in whole SHELL, and shown that way
+/// too. Typed straight through as raw units, an answer here would have meant a price a billion times
+/// the one the operator read in the prompt above it.
+fn prompt_price_shell(label: &str, default_raw: u128) -> u128 {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return default_raw;
+    }
+    let default_shell = dexdo_core::shell_amount(default_raw);
+    loop {
+        print!("{label} [{default_shell}]: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return default_raw;
+        }
+        let answer = line.trim();
+        if answer.is_empty() {
+            return default_raw;
+        }
+        match crate::cli::args::parse_price_shell(answer) {
+            Ok(raw) => return raw,
+            Err(why) => eprintln!("{why} (or Enter to keep {default_shell})"),
+        }
+    }
+}
+
 fn prompt_u128(label: &str, default: u128) -> u128 {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
@@ -5013,6 +5833,7 @@ async fn validate_reported_match_state(
 }
 
 /// The unix second at which the contract stops holding this deal open for the seller.
+
 /// `TokenContract.cleanupUnopened()` admits a funded-but-unopened deal once
 /// `block.timestamp >= _fundedTime + MATCH_OPEN_TIMEOUT`. That
 /// instant is a property of the deal, written on chain when it was funded -- not of the moment this
@@ -5058,7 +5879,7 @@ const ERR_NOT_OPEN_EXIT_CODE: i64 = 320;
 /// submit -- and with it every `validate_reported_match_state` call that guards a fresh buy. It then
 /// goes straight into the `DEAL_WAIT_SECS` handover wait. On a deal the seller never opened, that
 /// wait can only end on the deadline, five minutes after the answer was already readable on chain.
-/// Read the lifecycle flag first and fail closed with the contract's own `ERR_NOT_OPEN`(320) -- the
+/// Read the lifecycle flag first and fail closed with the contract's own `ERR_NOT_OPEN` (320) -- the
 /// exact code every stream call on such a deal reverts with
 /// (`contracts/airegistry/modifiers/errors.sol:17`). Read-only: no money moves on either branch. A
 /// backend that cannot report state keeps the previous behavior instead of inventing a verdict.
@@ -5214,6 +6035,27 @@ async fn apply_malformed_handover_policy(
     }
 }
 
+/// Every `policy_action` line the buyer produces goes through here, and here chooses the stream.
+
+/// 's second invariant: this is not a step, not the live line, not a result and not a
+/// refusal, so it is a record and belongs in the log. It also may not go to stdout for a second and
+/// harder reason. Stdout is this command's machine stream -- one JSON object per line -- and the
+/// proof that reads it parses every line it is handed. A prose line there does not degrade the
+/// report, it REPLACES it: the first one aborts the read with serde's message, so a run whose real
+/// cause was "matched, funded, and the seller never connected" was reported as
+/// `expected value at line 1 column 1`, and the failure class never arrived at all.
+
+/// The `state=` field is gone from every line routed through here, and its absence is deliberate.
+/// It was written into the format strings as the literal `funded/opened` while the three fields
+/// beside it were substituted, so it looked like a reading and was not one -- and at the moment it
+/// mattered it said "funded AND opened" about a deal that had been funded and NEVER opened. At each
+/// of these lines the `result=` token already fixes the state, and at three of them no state had
+/// been read at all. Where the state IS read it is still reported: the refusals in this file carry
+/// `state={matched_state_summary(..)}`, which is a measurement.
+fn record_policy_action(line: &str) {
+    tracing::info!("{line}");
+}
+
 async fn policy_cleanup_unopened_after_match_timeout(
     chain: &dyn ChainBackend,
     token_contract: &dexdo_core::TokenContract,
@@ -5239,22 +6081,22 @@ async fn policy_cleanup_unopened_after_match_timeout(
         let wait = remaining_secs
             .unwrap_or(MATCH_OPEN_TIMEOUT_SECS)
             .saturating_add(1);
-        println!(
+        record_policy_action(&format!(
             "policy_action failure_class=no_handover_after_match action={} token_contract={} \
-             state=funded/opened result=waiting_cleanup_ready wait_secs={wait}",
+             result=waiting_cleanup_ready wait_secs={wait}",
             policy_action.as_str(),
             token_contract_display
-        );
+        ));
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         let status = validate_reported_match_state(chain, token_contract).await?;
         match status {
             MatchedTokenContractStatus::Opened => {
-                println!(
+                record_policy_action(&format!(
                     "policy_action failure_class=no_handover_after_match action={} token_contract={} \
-                     state=funded/opened result=handover_opened_after_wait",
+                     result=handover_opened_after_wait",
                     policy_action.as_str(),
                     token_contract_display
-                );
+                ));
                 return Ok(PolicyCleanupOutcome::HandoverOpened);
             }
             MatchedTokenContractStatus::FundedNeverOpened {
@@ -5273,12 +6115,12 @@ async fn policy_cleanup_unopened_after_match_timeout(
         }
     }
     let settlement = chain.cleanup_unopened(token_contract).await?;
-    println!(
+    record_policy_action(&format!(
         "policy_action failure_class=no_handover_after_match action={} token_contract={} \
-         state=funded/opened result=cleanup_unopened_submitted settlement={settlement}",
+         result=cleanup_unopened_submitted settlement={settlement}",
         policy_action.as_str(),
         token_contract_display
-    );
+    ));
     Ok(PolicyCleanupOutcome::Cleaned(settlement))
 }
 
@@ -5348,14 +6190,14 @@ async fn apply_oneshot_dead_gateway_policy(
         .unwrap_or("retry_then_reclaim");
     if action == "retry_then_reclaim" && attempt == 1 {
         let token_contract = dexdo_core::address::display_self_dapp(token_contract);
-        println!(
+        record_policy_action(&format!(
             "policy_action failure_class=dead_gateway action=retry_then_reclaim \
-             token_contract={token_contract} state=funded/opened result=retrying_gateway attempt=2"
-        );
+             token_contract={token_contract} result=retrying_gateway attempt=2"
+        ));
         return OneShotStreamPolicyOutcome::RetryCurrent;
     }
     let heartbeat =
-        dexdo_core::chain::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        dexdo_core::market::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let submitted = session
         .settle_dead_gateway("dead-gateway", &heartbeat)
         .await;
@@ -5376,7 +6218,7 @@ async fn apply_oneshot_empty_stream_policy(
         .map(|policy| policy.empty_stream.as_str())
         .unwrap_or("reclaim");
     let heartbeat =
-        dexdo_core::chain::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        dexdo_core::market::HeartbeatGuard::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let submitted = session
         .settle_empty_stream("empty-stream", &heartbeat)
         .await;
@@ -5460,11 +6302,11 @@ async fn apply_no_handover_after_match_policy(
                     buyer_policy.total_spend_cap_shells
                 );
             }
-            println!(
+            record_policy_action(&format!(
                 "policy_action failure_class=no_handover_after_match action=next_seller \
-                 token_contract={token_contract_display} state=funded/opened result=placing_next_seller \
+                 token_contract={token_contract_display} result=placing_next_seller \
                  attempt={next_attempt}"
-            );
+            ));
             preflight_buyer_pool_for_note(pool_note_addr)?;
             let next = submit_buyer_monitor_next_deal(
                 chain,
@@ -5477,11 +6319,11 @@ async fn apply_no_handover_after_match_policy(
             )
             .await?;
             let next_display = dexdo_core::address::display_self_dapp(&next);
-            println!(
+            record_policy_action(&format!(
                 "policy_action failure_class=no_handover_after_match action=next_seller \
-                 token_contract={token_contract_display} state=funded/opened result=next_seller_matched \
+                 token_contract={token_contract_display} result=next_seller_matched \
                  next_token_contract={next_display}"
-            );
+            ));
             Ok(NoHandoverPolicyOutcome::RetryNext(next))
         }
     }
@@ -5620,14 +6462,16 @@ fn correlated_buy_token_contract(
          intended tokenContract {} ticks {} price_per_tick {}; refusing wrong-fill attribution",
         display_token_contract(&fill.token_contract),
         fill.ticks,
-        fill.price_per_tick,
+        dexdo_core::shell_amount(fill.price_per_tick),
         expected
             .map(|fill| display_token_contract(&fill.token_contract))
             .unwrap_or_else(|| "<backend-preflighted>".to_string()),
         expected.map(|fill| fill.ticks).unwrap_or(ticks),
-        expected
-            .map(|fill| fill.price_per_tick)
-            .unwrap_or(max_price_per_tick)
+        dexdo_core::shell_amount(
+            expected
+                .map(|fill| fill.price_per_tick)
+                .unwrap_or(max_price_per_tick)
+        )
     )))
 }
 
@@ -5667,7 +6511,6 @@ async fn submit_buyer_continuity_next_deal(
     escrow: u128,
 ) -> Result<dexdo_core::TokenContract> {
     let result = async {
-        #[cfg(feature = "shellnet")]
         if let Some(note_addr) = pool_note_addr {
             let selection = buyer_quote_selection_for_submit(
                 chain,
@@ -5698,8 +6541,6 @@ async fn submit_buyer_continuity_next_deal(
             .await?;
             return Ok(outcome.token_contract);
         }
-        #[cfg(not(feature = "shellnet"))]
-        let _ = (pool_note_addr, intent);
 
         let since_unix = unix_now_secs() as i64;
         let deadline = buy_order_deadline()?;
@@ -5747,6 +6588,17 @@ async fn submit_buyer_continuity_next_deal(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `spelling_diverged` is the `--resume` carve-out's boundary, and it is a PARAMETER so the compiler
+/// asks every call site for it.
+
+/// The carve-out lets a resume proceed when the registry holds the model under another spelling,
+/// because the deal already exists and refusing would lock the operator out of escrow already
+/// frozen. Renewal is the other thing entirely: `submit_buyer_continuity_next_deal` places a NEW
+/// deal with NEW escrow, on the book those same divergent bytes derive -- the book `provision` now
+/// refuses to create. And under the default `--continuity-mode proactive` it does that while idle,
+/// without a request to trigger it.
+
+/// So the carve-out was taken off the RUN when it belongs to the DEAL. Renewal stops here instead.
 fn spawn_buyer_service_renewal(
     chain: Arc<dyn ChainBackend>,
     buyer: Arc<dexdo::buyer::Buyer>,
@@ -5759,7 +6611,16 @@ fn spawn_buyer_service_renewal(
     content_check: dexdo::buyer::api::ContentCheck,
     models_cfg: Arc<dexdo::seller::ModelsConfig>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    spelling_diverged: bool,
 ) {
+    if spelling_diverged {
+        tracing::warn!(
+            "the ModelRegistry holds this model under a spelling other than the one this run was \
+             given; the deal already open is served to its end, and no renewal is started -- a \
+             renewal would place new escrow on a book `provision` refuses to create"
+        );
+        return;
+    }
     struct PendingRenewal {
         current: dexdo_core::TokenContract,
         next: Option<dexdo_core::TokenContract>,
@@ -6270,17 +7131,17 @@ fn spawn_buyer_service_renewal(
 }
 
 #[derive(Clone, Copy)]
-enum BuyerShellnetPreflight {
+enum BuyerChainPreflight {
     Production,
-    #[cfg(all(test, feature = "shellnet"))]
+    #[cfg(test)]
     OfflineTest,
 }
 
-impl BuyerShellnetPreflight {
+impl BuyerChainPreflight {
     fn should_run(self) -> bool {
         match self {
             Self::Production => true,
-            #[cfg(all(test, feature = "shellnet"))]
+            #[cfg(test)]
             Self::OfflineTest => false,
         }
     }
@@ -6291,7 +7152,7 @@ type BuyerShutdownSignal =
 
 struct BuyerCommandRuntime {
     backend: Option<ChainAndNote>,
-    shellnet_preflight: BuyerShellnetPreflight,
+    chain_preflight: BuyerChainPreflight,
     shutdown: BuyerShutdownSignal,
 }
 
@@ -6299,7 +7160,7 @@ impl BuyerCommandRuntime {
     fn production() -> Self {
         Self {
             backend: None,
-            shellnet_preflight: BuyerShellnetPreflight::Production,
+            chain_preflight: BuyerChainPreflight::Production,
             shutdown: Box::pin(operator_shutdown_signal()),
         }
     }
@@ -6312,22 +7173,21 @@ struct SubscriptionPlacePlan {
 }
 
 /// Lifecycle states the `dexdo subscription` commands report in their `--json` output.
+
 /// `expired` is never derived from `deadline_unix`. A passed deadline proves an order is ELIGIBLE
 /// for expiry; it proves neither that the book removed the row nor that the escrow came back, and
 /// those are the two facts that decide whether the order still holds a buyer's money. So the client
-/// reports `expired` only when it has observed both(see [`subscription_expiry_verdict`]), and
+/// reports `expired` only when it has observed both (see [`subscription_expiry_verdict`]), and
 /// otherwise leaves the weaker state standing and names the fact it is missing. Moving the clock
 /// comparison from the orchestrator into this client would not make the guess true, only
 /// authoritative-looking.
-/// The states and actions marked below are reachable only on the shellnet path: the mock backend
+/// The states and actions marked below are reachable only on the chain path: the mock backend
 /// has no fills, no durable phase and no ambiguous submit to reconcile. They stay listed here, with
 /// the rest of the vocabulary, so the whole set is read in one place.
 const SUBSCRIPTION_STATE_RESTING: &str = "resting";
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 const SUBSCRIPTION_STATE_MATCHED: &str = "matched";
 const SUBSCRIPTION_STATE_CANCELLED: &str = "cancelled";
 const SUBSCRIPTION_STATE_EXPIRED: &str = "expired";
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 const SUBSCRIPTION_STATE_TERMINAL: &str = "terminal";
 const SUBSCRIPTION_STATE_ABSENT: &str = "absent_without_authenticated_fill";
 
@@ -6342,6 +7202,7 @@ struct SubscriptionExpiryEvidence {
 }
 
 /// The one place `expired` is decided.
+
 /// Both facts, or neither verdict: with removal and refund observed this returns `expired`, and
 /// otherwise it returns `fallback` untouched together with the name of the fact that is missing.
 /// `refund` is checked first when both are missing, because an order still holding escrow is the
@@ -6353,7 +7214,7 @@ fn subscription_expiry_verdict(
     let expiry = machine::SubscriptionExpiry {
         removal_observed: evidence.removal_observed,
         refund_observed: evidence.refunded.is_some(),
-        refunded: evidence.refunded.map(machine::amount),
+        refunded: evidence.refunded.map(dexdo_core::shell_amount),
         missing_fact: match (evidence.removal_observed, evidence.refunded) {
             (true, Some(_)) => None,
             (_, None) => Some("refund"),
@@ -6369,13 +7230,13 @@ fn subscription_expiry_verdict(
 }
 
 const SUBSCRIPTION_ACTION_PLACED: &str = "placed";
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 const SUBSCRIPTION_ACTION_RECONCILED: &str = "reconciled";
 const SUBSCRIPTION_ACTION_READ: &str = "read";
 const SUBSCRIPTION_ACTION_CANCELLED: &str = "cancelled";
 
 /// The identity and terms every subscription machine object carries, in the units the chain holds.
-/// It is one borrowed bundle rather than a dozen positional arguments so that the mock and shellnet
+
+/// It is one borrowed bundle rather than a dozen positional arguments so that the mock and chain
 /// paths reach the SAME emitter: the mock has no `BuyerSubscriptionOrderRecord` to hand over, and a
 /// second emitter for it would be the fourth style of machine output exists to prevent.
 struct SubscriptionMachineFacts<'a> {
@@ -6394,6 +7255,7 @@ struct SubscriptionMachineFacts<'a> {
 }
 
 /// The single emitter for `subscription place`, `status` and `cancel`.
+
 /// Callers fill `removal_confirmed`, `refund`, `expiry` and `live` on the returned object where
 /// they have them; every one of those stays `null` otherwise, because a subscription command that
 /// did not observe a refund must not report a number that looks like one.
@@ -6420,11 +7282,11 @@ fn subscription_machine_response(
         order_id: machine::amount(facts.order_id),
         state,
         terms: machine::SubscriptionTerms {
-            max_price_per_tick: machine::amount(facts.max_price_per_tick),
+            max_price_per_tick: dexdo_core::shell_amount(facts.max_price_per_tick),
             ticks: machine::amount(facts.ticks),
-            deposit: machine::amount(facts.deposit),
-            buyer_bond: machine::amount(facts.buyer_bond),
-            escrow: machine::amount(facts.escrow),
+            deposit: dexdo_core::shell_amount(facts.deposit),
+            buyer_bond: dexdo_core::shell_amount(facts.buyer_bond),
+            escrow: dexdo_core::shell_amount(facts.escrow),
             flags: facts.flags,
             deadline_unix: facts.deadline,
         },
@@ -6459,7 +7321,7 @@ fn subscription_mock_mode(mock: &MockFlags) -> Result<bool> {
         (true, true) => Ok(true),
         _ => bail!(
             "subscription mock mode requires --mock-model and --mock-chain together; omit both \
-             flags for real shellnet"
+             flags for a real chain"
         ),
     }
 }
@@ -6499,8 +7361,9 @@ fn mock_subscription_target(args: &SubscriptionArgs) -> Result<(String, String)>
 }
 
 /// One subscription outcome in both renderings.
+
 /// They are built together, from the same facts, at the same moment, so a new outcome cannot ship
-/// with a human line and no machine object(or the reverse).
+/// with a human line and no machine object (or the reverse).
 struct SubscriptionCommandOutput {
     human: String,
     machine: machine::SubscriptionResponse,
@@ -6518,6 +7381,7 @@ fn emit_subscription(json: bool, output: &SubscriptionCommandOutput) -> Result<(
 }
 
 /// One already-terminal subscription order, reported rather than refused.
+
 /// The order left the book and THIS invocation did not move it -- `submitted=false` is exactly that
 /// distinction, the same one the rest of the buyer surface draws between a call that signed and a
 /// call that only read. Refusing here instead would throw away the fact the caller needs: not
@@ -6598,7 +7462,7 @@ fn mock_subscription_terminal_output(
             },
             order.order_id,
             owner_display,
-            terminal.refunded
+            dexdo_core::shell_amount(terminal.refunded)
         ),
         machine: machine_response,
     })
@@ -6649,11 +7513,11 @@ fn execute_mock_subscription_command(
                      resting=true matched_token_contract=-",
                     display_dexdo_address(&order.owner_note),
                     order.order_id,
-                    order.price_per_tick,
+                    dexdo_core::shell_amount(order.price_per_tick),
                     order.ticks,
-                    plan.reserve.deposit,
-                    plan.reserve.buyer_bond,
-                    order.escrow,
+                    dexdo_core::shell_amount(plan.reserve.deposit),
+                    dexdo_core::shell_amount(plan.reserve.buyer_bond),
+                    dexdo_core::shell_amount(order.escrow),
                     order.flags,
                     order.deadline
                 ),
@@ -6719,11 +7583,11 @@ fn execute_mock_subscription_command(
                      matched_token_contract=-",
                     order.order_id,
                     display_dexdo_address(&order.owner_note),
-                    order.price_per_tick,
+                    dexdo_core::shell_amount(order.price_per_tick),
                     order.ticks,
-                    reserve.deposit,
-                    reserve.buyer_bond,
-                    order.escrow,
+                    dexdo_core::shell_amount(reserve.deposit),
+                    dexdo_core::shell_amount(reserve.buyer_bond),
+                    dexdo_core::shell_amount(order.escrow),
                     order.flags,
                     order.deadline
                 ),
@@ -6787,8 +7651,8 @@ fn execute_mock_subscription_command(
             )?;
             // The mock book removes the row, so the removal IS confirmed. It keeps no note
             // balance, so there is nothing to read the credit BETWEEN: `refund` stays null rather
-            // than restating the row's escrow, which is the derived figure the shellnet path is
-            // forbidden to report(E2E-CXL-14).
+            // than restating the row's escrow, which is the derived figure the chain path is
+            // forbidden to report (E2E-CXL-14).
             response.removal_confirmed = Some(true);
             Ok(SubscriptionCommandOutput {
                 human: format!(
@@ -6796,7 +7660,7 @@ fn execute_mock_subscription_command(
                      order_book={order_book_display} order_id={} owner={} refund={}",
                     order.order_id,
                     display_dexdo_address(&order.owner_note),
-                    order.escrow
+                    dexdo_core::shell_amount(order.escrow)
                 ),
                 machine: response,
             })
@@ -6840,7 +7704,6 @@ fn run_mock_subscription(
     emit_subscription(args.json, &output)
 }
 
-#[cfg(feature = "shellnet")]
 fn ensure_subscription_note_balance(
     balance: Option<u128>,
     reserve: SubscriptionBuyReserve,
@@ -6853,17 +7716,17 @@ fn ensure_subscription_note_balance(
     })?;
     if balance < reserve.total_escrow {
         bail!(
-            "subscription place requires total escrow {} raw SHELL (= deposit {} + buyer bond {}), \
-             but PrivateNote.getDetails().balance[{SHELL_ECC_ID}] is {balance}",
-            reserve.total_escrow,
-            reserve.deposit,
-            reserve.buyer_bond
+            "subscription place requires total escrow {} SHELL (= deposit {} + buyer bond {}), \
+             but PrivateNote.getDetails().balance[{SHELL_ECC_ID}] is {} SHELL",
+            dexdo_core::shell_amount(reserve.total_escrow),
+            dexdo_core::shell_amount(reserve.deposit),
+            dexdo_core::shell_amount(reserve.buyer_bond),
+            dexdo_core::shell_amount(balance)
         );
     }
     Ok(balance)
 }
 
-#[cfg(feature = "shellnet")]
 async fn subscription_note_spendable_balance(
     chain: &dexdo_core::RealChainBackend,
     note: &dexdo_core::Address,
@@ -6871,7 +7734,6 @@ async fn subscription_note_spendable_balance(
     chain.private_note_shell_balance(note).await
 }
 
-#[cfg(feature = "shellnet")]
 fn subscription_target(args: &SubscriptionArgs) -> Result<BookTarget> {
     if let Some(market) = args.market.as_deref() {
         if args.model.is_some() {
@@ -6894,7 +7756,6 @@ fn subscription_target(args: &SubscriptionArgs) -> Result<BookTarget> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<dexdo_core::Address> {
     let note_addr = args
         .identity
@@ -6905,7 +7766,6 @@ fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<de
         .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))
 }
 
-#[cfg(feature = "shellnet")]
 fn require_subscription_keys(
     args: &SubscriptionArgs,
     action: &str,
@@ -6917,15 +7777,22 @@ fn require_subscription_keys(
                 "subscription {action}: pass --note-key only once; parent and place values differ"
             )
         }
-        (Some(parent), _) => parent,
-        (_, Some(child)) => child,
-        (None, None) => bail!("subscription {action} requires --note-key"),
+        (Some(parent), _) => Some(parent),
+        (_, Some(child)) => Some(child),
+        // Neither: the pool answers, by the note this subscription is on.
+        (None, None) => None,
     };
-    dexdo_core::KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-        .map_err(|error| anyhow::anyhow!("--note-key (SDK secret hex): {error:?}"))
+    let secret = crate::cli::support::note_owner_secret_for(
+        note_key,
+        args.identity.note_addr.as_deref().unwrap_or_default(),
+        None,
+        &format!("subscription {action}"),
+        "the note's owner key",
+    )?;
+    dexdo_core::KeyPair::from_secret_hex(secret.trim())
+        .map_err(|error| anyhow::anyhow!("note owner key (SDK secret hex): {error:?}"))
 }
 
-#[cfg(feature = "shellnet")]
 fn order_owned_by_note(order: &OrderBookOrder, note_addr: &str) -> bool {
     let expected = dexdo_core::normalize_wallet_address(note_addr)
         .unwrap_or_else(|_| note_addr.trim().to_string());
@@ -6934,7 +7801,6 @@ fn order_owned_by_note(order: &OrderBookOrder, note_addr: &str) -> bool {
         .unwrap_or_else(|_| order.owner_note.eq_ignore_ascii_case(&expected))
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_live_order<'a>(
     order_book: &str,
     order: Option<&'a OrderBookOrder>,
@@ -6975,7 +7841,6 @@ fn validate_subscription_live_order<'a>(
     Ok(order)
 }
 
-#[cfg(feature = "shellnet")]
 async fn read_subscription_book_summary(
     chain: &dexdo_core::RealChainBackend,
     target: &BookTarget,
@@ -6988,7 +7853,6 @@ async fn read_subscription_book_summary(
         .await
 }
 
-#[cfg(feature = "shellnet")]
 fn ensure_subscription_record_from_order(
     state: &mut BuyerSubscriptionState,
     snapshot: &OrderBookSnapshot,
@@ -7027,7 +7891,6 @@ fn ensure_subscription_record_from_order(
     Ok(record)
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_record_matches_live_order(
     record: &BuyerSubscriptionOrderRecord,
     snapshot: &OrderBookSnapshot,
@@ -7063,7 +7926,6 @@ fn validate_subscription_record_matches_live_order(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 async fn reconcile_existing_subscription_journal(
     chain: &dexdo_core::RealChainBackend,
     money_lock: &BuyerMoneyLock,
@@ -7098,7 +7960,6 @@ async fn reconcile_existing_subscription_journal(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn validate_subscription_journal_target(
     journal: &BuyerSubscriptionSubmitJournal,
     expected_book: &OrderBookSnapshot,
@@ -7127,7 +7988,6 @@ fn validate_subscription_journal_target(
     Ok(())
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone)]
 struct BuyerSubscriptionResumeSelection {
     record: BuyerSubscriptionOrderRecord,
@@ -7136,14 +7996,12 @@ struct BuyerSubscriptionResumeSelection {
 }
 
 enum BuyerSubscriptionResumeCandidate {
-    #[cfg(feature = "shellnet")]
     Active(Box<BuyerSubscriptionResumeSelection>),
     None,
 }
 
 impl BuyerSubscriptionResumeCandidate {
     fn is_active(&self) -> bool {
-        #[cfg(feature = "shellnet")]
         if matches!(self, Self::Active(_)) {
             return true;
         }
@@ -7151,7 +8009,6 @@ impl BuyerSubscriptionResumeCandidate {
     }
 }
 
-#[cfg(feature = "shellnet")]
 async fn resolve_buyer_subscription_resume(
     chain: &dyn ChainBackend,
     note_addr: &str,
@@ -7376,6 +8233,7 @@ struct BuyerSpotResumeSelection {
 }
 
 /// One durable candidate that is NOT the deal to resume, and the fact that decided it.
+
 /// Carried rather than logged so a refusal can name what it could not establish, per candidate,
 /// instead of collapsing to one generic "no match".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7412,10 +8270,11 @@ enum BuyerSpotResume {
 }
 
 /// The durable buyer deal handles this note holds for this model, newest first.
+
 /// This is the record an ordinary local-listen buyer already writes for every deal it serves
 /// ([`save_runtime_deal_handle`], called once the handover is in hand); until now nothing read it
 /// back on `--resume`.
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 fn buyer_spot_resume_candidates(
     deals_dir: Option<&std::path::Path>,
     note_addr: &str,
@@ -7425,7 +8284,7 @@ fn buyer_spot_resume_candidates(
         deals_dir,
         note_addr,
         frame_model,
-        dexdo_core::params::DEFAULT_DOCTOR_NETWORK,
+        dexdo_core::params::current_network(),
     )
 }
 
@@ -7436,7 +8295,7 @@ fn buyer_spot_resume_candidates_for_network(
     network: &str,
 ) -> Result<Vec<deals::DealHandle>> {
     let dir = deals::resolve_deals_dir(deals_dir)?;
-    let mut handles = deals::list_deal_handles(&dir)?
+    let mut handles = deals::list_deal_handles_strict(&dir)?
         .into_iter()
         .map(|(_, handle)| handle)
         .filter(|handle| {
@@ -7457,6 +8316,7 @@ fn buyer_spot_resume_candidates_for_network(
 }
 
 /// Why this durable candidate cannot be resumed, in the most specific terms the chain can give.
+
 /// On contracts 4.0.33/4.0.34 both `stop()` branches end in `_payOwedAndDie()`, so a closed deal is a
 /// DESTROYED account: `getState` has nothing left to answer with and the liveness check can only
 /// report "not active on-chain", which reads like a wrong address. The deal's own ext-out receipts
@@ -7472,24 +8332,29 @@ async fn buyer_spot_resume_rejection_fact(
     match chain.buyer_stop_settlement(token_contract).await {
         Ok(Some((to_seller, refund_to_buyer))) => format!(
             "terminal -- the deal settled and its account was destroyed \
-             (StreamStopped to_seller={to_seller} refund_to_buyer={refund_to_buyer})"
+             (StreamStopped to_seller={} refund_to_buyer={})",
+            dexdo_core::shell_amount(to_seller),
+            dexdo_core::shell_amount(refund_to_buyer)
         ),
         _ => format!("{liveness_error}"),
     }
 }
 
 /// The buyer's OWN book order id for a deal it is resuming.
+
 /// The deal handle cannot supply it and never could. A buyer's order id does not exist when it
 /// submits -- the book assigns it while processing the money message, which is exactly why
 /// removed the `order_id` that a preflight line was printing before the submit -- and the handle is
 /// written from `buyer_order_id`, which the ordinary model-only buy never sets. So every handle an
 /// ordinary buy has ever written carries `created_order_ids: []`. The TokenContract cannot supply it
-/// either: its getter set(`getState`/`getDeal`/`getParties`/`getSeller`/...) records the deal's terms
+/// either: its getter set (`getState`/`getDeal`/`getParties`/`getSeller`/...) records the deal's terms
 /// and parties, not the book order that produced it, so `assert_model_only_resume_target` -- the
 /// on-chain read this resume already does -- has nothing to hand back.
+
 /// The one authoritative source is the book: this note's own `InferenceFilledConfirmed` attribution,
 /// whose `buyerOrderId` is what the fill-event resume path reports too. It is read here rather than
 /// reconstructed, so a resumed deal reports the id the book actually assigned or none at all.
+
 /// The cursor is deliberately fresh and unbounded: a durable handle may name a deal far older than
 /// any lookback window, and the attribution is the only thing that ties it to a resting order.
 async fn buyer_spot_resume_order_id(
@@ -7525,6 +8390,7 @@ async fn buyer_spot_resume_order_id(
 }
 
 /// The spot counterpart of [`resolve_buyer_subscription_resume`].
+
 /// An ordinary deal keeps no order record of its own -- the subscription store is the subscription's,
 /// and the money journal is cleared the moment the deal is established. What an ordinary deal DOES
 /// leave behind is its deal handle, so that is what resume reads, and every candidate is then proved
@@ -7596,6 +8462,7 @@ async fn resolve_buyer_spot_resume(
 }
 
 /// The refusal an ordinary `--resume` gets when neither source could name a live deal.
+
 /// Fail closed, but never generically: the bounded event scan's own words AND what each durable
 /// candidate turned out to be, because "no fill event in the last 30 minutes" sends an operator to
 /// look at the seller when their deal is in fact settled, or is somebody else's.
@@ -7633,6 +8500,7 @@ enum BuyerSpotResumeTarget {
 }
 
 /// The durable half of "which deal does this ordinary `--resume` pick back up".
+
 /// Consulted BEFORE the bounded fill-event scan, which is why it is its own step: that scan is
 /// bounded to [`RESUME_LOOKBACK_SECS`] and blocks for [`DEAL_WAIT_SECS`] before admitting it found
 /// nothing, so a buyer that had been serving one ordinary deal for longer than the window -- the case
@@ -7655,10 +8523,12 @@ async fn buyer_durable_spot_resume(
 }
 
 /// The one verdict both `--resume` entry points reach, given what each source said.
+
 /// The durable handle wins when it names a live deal; otherwise the bounded fill-event scan is the
 /// fallback, because a deal whose handle was never written -- the crash landed between the fill and
 /// the handover -- is only knowable from the note's own events. If neither names a deal this refuses,
 /// carrying BOTH sources' facts, and never falls back to buying again.
+
 /// Neither source is trusted on its own word: whichever one names a deal, the caller only reaches
 /// the handover once the chain has confirmed it is funded, undisputed, unsettled and this buyer's.
 fn buyer_spot_resume_target(
@@ -7683,20 +8553,18 @@ fn buyer_spot_resume_target(
     }
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SubscriptionCancelOutcome {
     /// The order left the book and the note's balance moved to exactly `balance_before + escrow`.
     /// The payload is the balance this client READ, not the sum it expected: the credit reported to
     /// an operator is `balance_after - balance_before`, the same observed figure `orders cancel`
-    /// and `orders expire` report, never the order row's own escrow(E2E-CXL-14).
+    /// and `orders expire` report, never the order row's own escrow (E2E-CXL-14).
     Refunded { balance_after: u128 },
     Filled { token_contract: String },
     ContradictoryFill { token_contract: String },
     Unconfirmed { expected_balance: u128 },
 }
 
-#[cfg(feature = "shellnet")]
 fn subscription_cancel_outcome(
     active: bool,
     balance_before: u128,
@@ -7724,7 +8592,6 @@ fn subscription_cancel_outcome(
     Ok(SubscriptionCancelOutcome::Unconfirmed { expected_balance })
 }
 
-#[cfg(feature = "shellnet")]
 async fn reconcile_subscription_cancel<F, Fut>(
     wait: std::time::Duration,
     balance_before: u128,
@@ -7768,8 +8635,7 @@ where
     }
 }
 
-#[cfg(feature = "shellnet")]
-fn render_subscription_record(
+pub(crate) fn render_subscription_record(
     _snapshot: &OrderBookSnapshot,
     record: &BuyerSubscriptionOrderRecord,
     note_addr: &str,
@@ -7807,11 +8673,11 @@ fn render_subscription_record(
         dexdo_core::address::display(&record.order_book),
         record.order_id,
         dexdo_core::address::display(note_addr),
-        record.max_price_per_tick,
+        dexdo_core::shell_amount(record.max_price_per_tick),
         record.ticks,
-        record.deposit,
-        record.buyer_bond,
-        record.escrow,
+        dexdo_core::shell_amount(record.deposit),
+        dexdo_core::shell_amount(record.buyer_bond),
+        dexdo_core::shell_amount(record.escrow),
         price_improvement_refund,
         record.flags,
         record.deadline,
@@ -7820,13 +8686,17 @@ fn render_subscription_record(
         matched
     );
     if let Some((facts, quota)) = live {
+        // Every money figure here is SHELL, like the ones the record contributed above. The chain's
+        // escrow reading is `chain_deposit` rather than a second `deposit`: the line already
+        // carries the recorded one, and two fields of the same name in one line answer differently
+        // depending on which the reader's eye or parser reaches first.
         rendered.push_str(&format!(
             " probe_accepted={} week_index={} week_base_tokens={} tokens_per_week={} \
              tokens_final={} tokens_pending={} used_current_week={} \
-             remaining_current_week={} funded_tokens={} tokens_paid={} deposit={} probe_tick={} \
-             buyer_bond_held={} buyer_bond_required={} buyer_locked_total={} seller_bond_held={} \
-             seller_bond_required={} disputed={} terminal={} settlement_due={} \
-             recorded_week_expires_at_unix={}",
+             remaining_current_week={} funded_tokens={} tokens_paid={} chain_deposit={} \
+             probe_tick={} buyer_bond_held={} buyer_bond_required={} buyer_locked_total={} \
+             seller_bond_held={} seller_bond_required={} disputed={} terminal={} \
+             settlement_due={} recorded_week_expires_at_unix={}",
             facts.state.probe_accepted,
             facts.subscription.week_index,
             facts.subscription.week_base_tokens,
@@ -7837,13 +8707,13 @@ fn render_subscription_record(
             quota.remaining_current_week,
             facts.subscription.funded_tokens,
             facts.subscription.tokens_paid,
-            facts.state.deposit,
-            facts.state.probe_tick,
-            facts.buyer_bond.bond_held,
-            facts.buyer_bond.bond_required,
-            quota.buyer_locked_total,
-            facts.seller_bond.bond_held,
-            facts.seller_bond.bond_required,
+            dexdo_core::shell_amount(facts.state.deposit),
+            dexdo_core::shell_amount(facts.state.probe_tick),
+            dexdo_core::shell_amount(facts.buyer_bond.bond_held),
+            dexdo_core::shell_amount(facts.buyer_bond.bond_required),
+            dexdo_core::shell_amount(quota.buyer_locked_total),
+            dexdo_core::shell_amount(facts.seller_bond.bond_held),
+            dexdo_core::shell_amount(facts.seller_bond.bond_required),
             facts.state.disputed,
             facts.state.is_stopped(),
             // the operator must be able to see a week is owed from a command that spent
@@ -7856,9 +8726,9 @@ fn render_subscription_record(
 }
 
 /// The durable record's own view of the order, for the machine object.
+
 /// The record is the same one the human line renders, so `subscription place`'s confirmed and
 /// reconciled outcomes and every `subscription status` shape report one set of terms.
-#[cfg(feature = "shellnet")]
 fn subscription_facts_from_record<'a>(
     record: &'a BuyerSubscriptionOrderRecord,
     note_addr: &'a str,
@@ -7880,10 +8750,10 @@ fn subscription_facts_from_record<'a>(
 }
 
 /// The deal a fill produced, or `None` while the order still rests.
+
 /// `None` becomes `"matched": null` -- the absence IS the answer. The order id inside the fill is
 /// asserted equal to this order's own id by [`validate_subscription_match`] before the record is
 /// persisted, so no separate id is reported here.
-#[cfg(feature = "shellnet")]
 fn subscription_matched_from_record(
     record: &BuyerSubscriptionOrderRecord,
 ) -> Result<Option<machine::SubscriptionMatched>> {
@@ -7900,14 +8770,13 @@ fn subscription_matched_from_record(
         token_contract: matched.token_contract.clone(),
         deal_handle: matched.deal_handle.clone(),
         ticks: machine::amount(matched.ticks),
-        clearing_price: machine::amount(matched.clearing_price),
-        price_improvement_refund: machine::amount(price_improvement_refund),
+        clearing_price: dexdo_core::shell_amount(matched.clearing_price),
+        price_improvement_refund: dexdo_core::shell_amount(price_improvement_refund),
     }))
 }
 
 /// The live TokenContract block, carrying exactly the routing and capacity facts the human matched
 /// line already prints.
-#[cfg(feature = "shellnet")]
 fn subscription_live_from_facts(
     facts: &SubscriptionDealFacts,
     quota: &SubscriptionQuotaView,
@@ -7933,21 +8802,21 @@ fn subscription_live_from_facts(
         remaining_current_week: machine::amount(quota.remaining_current_week),
         funded_tokens: machine::amount(facts.subscription.funded_tokens),
         tokens_paid: machine::amount(facts.subscription.tokens_paid),
-        deposit: machine::amount(facts.state.deposit),
-        probe_tick: machine::amount(facts.state.probe_tick),
-        buyer_bond_held: machine::amount(facts.buyer_bond.bond_held),
-        buyer_bond_required: machine::amount(facts.buyer_bond.bond_required),
-        buyer_locked_total: machine::amount(quota.buyer_locked_total),
-        seller_bond_held: machine::amount(facts.seller_bond.bond_held),
-        seller_bond_required: machine::amount(facts.seller_bond.bond_required),
+        deposit: dexdo_core::shell_amount(facts.state.deposit),
+        probe_tick: dexdo_core::shell_amount(facts.state.probe_tick),
+        buyer_bond_held: dexdo_core::shell_amount(facts.buyer_bond.bond_held),
+        buyer_bond_required: dexdo_core::shell_amount(facts.buyer_bond.bond_required),
+        buyer_locked_total: dexdo_core::shell_amount(quota.buyer_locked_total),
+        seller_bond_held: dexdo_core::shell_amount(facts.seller_bond.bond_held),
+        seller_bond_required: dexdo_core::shell_amount(facts.seller_bond.bond_required),
     }
 }
 
 /// Emit the machine error for a subscription failure this command has already diagnosed, with the
 /// public identity it holds, and hand back the sentinel that stops `main` printing a second one.
+
 /// The classifier in `machine::classify_error` reads a message; these outcomes are known by
 /// construction, and a cancel that lost its race must carry the TokenContract it lost to.
-#[cfg(feature = "shellnet")]
 fn subscription_machine_error(
     network: &str,
     operation: &'static str,
@@ -7971,7 +8840,6 @@ fn subscription_machine_error(
 /// Report "this is not a resting order you own" as the one stable code an orchestrator can branch
 /// on. Without this the generic classifier reads the message, finds no rule that matches, and
 /// reports `INTERNAL` for an ordinary and expected outcome.
-#[cfg(feature = "shellnet")]
 fn subscription_order_not_found<'a>(
     json: bool,
     network: &'a str,
@@ -7995,13 +8863,13 @@ fn subscription_order_not_found<'a>(
 }
 
 /// What the book itself announced about one order id this note owns.
+
 /// Two facts, read separately because the book emits them separately and on purpose -- "An expiring
 /// bid emits this alongside `InferenceOrderExpired` -- the refund and the reason are separate facts"
 /// (`InferenceOrderBook.sol:387-393`). `InferenceOrderExpired` is the book saying it took the row
 /// out; `InferenceRefunded` is the book saying it paid the escrow back. Neither is inferred from
 /// the other, and neither is inferred from the order's absence, which says nothing about WHICH way
 /// an order left the book.
-#[cfg(feature = "shellnet")]
 async fn subscription_expiry_evidence(
     chain: &dexdo_core::RealChainBackend,
     order_book: &str,
@@ -8030,15 +8898,16 @@ async fn subscription_expiry_evidence(
 }
 
 /// A cancel this note already completed, re-asserted without submitting anything.
+
 /// The durable terminal record is written only after a cancel was CONFIRMED -- the book reported the
 /// order gone and the note's balance carried the refund -- so re-reading it is re-reading two facts
 /// that were observed, not restating a hope. `submitted=false` is the whole distinction between
 /// "this invocation signed" and "this was already so": retry until success, and a retry after a
 /// confirmed cancel IS success.
+
 /// `refund` stays null deliberately. The numbers in it are a credit read BETWEEN two balances, and
 /// this invocation read neither; repeating an earlier delta as though it had just been observed
 /// would be the placeholder the schema exists to keep out.
-#[cfg(feature = "shellnet")]
 fn subscription_already_cancelled_output(
     network: &str,
     snapshot: &OrderBookSnapshot,
@@ -8068,7 +8937,6 @@ fn subscription_already_cancelled_output(
     })
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     let mock_mode = subscription_mock_mode(&args.mock)?;
     let place_plan = match &args.command {
@@ -8078,10 +8946,27 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     if mock_mode {
         return run_mock_subscription(&args, place_plan);
     }
+    // the manifest path is read ONCE and the `--read-timeout` opened ONCE -- but BELOW the
+    // mock return, not above it. `manifest_path()` re-reads the environment and can fail on its
+    // own, so hoisting it over that return would make `--mock` refuse without `DEXDO_MANIFEST`,
+    // which is the one mode that never reaches a chain.
+
+    // There were seven `manifest_path()` calls in this function. And `direct_chain_read_with_
+    // timeout` bounds ONE read, so five reads each took a fresh full budget: `--read-timeout 30`
+    // could block for 150s+ on the money path. The bound is what the operator asked for, not what
+    // each read asks for.
+
+    // The budget covers READS, and only the time spent inside them. `reconcile_existing_
+    // subscription_journal` below waits for chain state to settle and takes its own
+    // `--read-timeout`-shaped wait; charging that to the budget made the next read refuse as a
+    // timeout while nothing was hung, which is why the budget counts spent time rather than a
+    // wall-clock deadline.
+    let manifest_path = crate::cli::commands::manifest_path()?;
+    let budget = crate::cli::commands::ReadBudget::new(args.read_timeout.read_timeout_secs);
     let chain = dexdo_core::RealChainBackend::connect(
-        args.contracts
+        manifest_path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+            .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?,
     )?;
     let network = chain.network().to_string();
     let note = require_subscription_note(&args, "command")?;
@@ -8092,7 +8977,7 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     let handle_note_addr = note_addr.clone();
     let handle_deals_dir = args.deals_dir.clone();
     let handle_market = args.market.clone();
-    let handle_contracts = args.contracts.clone();
+    let handle_contracts = manifest_path.clone();
     let handle_network = network.clone();
     let persist_handle: Arc<PersistSubscriptionHandle<'static>> =
         Arc::new(move |record, matched| {
@@ -8108,14 +8993,18 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
         });
 
     let registry_policy =
-        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &manifest_path)?;
     let initial_target = if registry_policy.is_some() && args.market.is_none() {
-        let requested_model = registry_requested_model(
-            &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
-        )?;
+        let requested_model = budget
+            .read(registry_requested_model(
+                &manifest_path,
+                None,
+                &args.models,
+                args.model.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("subscription without --market requires --model")
+                })?,
+            ))
+            .await?;
         BookTarget {
             model_hash: model_hash_for(&requested_model),
             frame_model: requested_model,
@@ -8127,18 +9016,45 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
         subscription_target(&args)?
     };
     let requested_model = initial_target.frame_model.clone();
-    let (target, snapshot) =
-        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+    // THE NAME IS RESOLVED HERE TOO, because this is a separate entry.
+
+    // `run_buyer_inner` got this check hoisted above its `--local-listen` branch; `subscription
+    // place` never goes through that function, so it reached the chain with whatever spelling it
+
+    // section 8 lists `subscription place` among the paths that require a resolved name, and
+    // section 3 requires the rule to be the same wherever money is placed.
+
+    // No opt-out is threaded in because `SubscriptionArgs` carries none: `--allow-unverified-model`
+    // is a `buyer`/`seller` flag. So an unreadable registry stops a subscription rather than
+    // downgrading it, which is the fail-closed side and the same default the buyer has.
+
+    // Inside `budget.read`, like the reads either side of it. `ReadBudget` puts a
+    // `tokio::time::timeout` on what is left of `--read-timeout` and charges what was spent; outside
+    // it, an unresponsive registry hangs `subscription place` instead of producing its own "chain
+    // read timed out" refusal, and the next read then gets a fuller budget than the operator asked
+    // for.
+    if !args.mock.mock_chain && matches!(&args.command, SubscriptionCommand::Place(_)) {
+        budget
+            .read(resolve_buyer_content_identity_model(
+                &manifest_path,
+                &requested_model,
+                false,
+                false,
+            ))
+            .await?;
+    }
+    let (target, snapshot) = budget
+        .read(async {
             preload_model_registry_policy(
                 RegistryRole::Buyer,
                 registry_policy.as_ref(),
-                &args.contracts,
+                &manifest_path,
             )
             .await?;
             let target = resolve_model_registry_target(
                 RegistryRole::Buyer,
                 registry_policy.as_ref(),
-                &args.contracts,
+                &manifest_path,
                 &requested_model,
                 initial_target,
             )
@@ -8149,7 +9065,7 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                     enforce_model_registry_policy(
                         RegistryRole::Buyer,
                         policy,
-                        &args.contracts,
+                        &manifest_path,
                         &target.frame_model,
                         &snapshot.order_book,
                         snapshot.active(),
@@ -8187,9 +9103,9 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                      total_escrow={} resting={} matched_token_contract={} no_second_boc=true",
                     record.order_id,
                     dexdo_core::address::display(&record.order_book),
-                    record.deposit,
-                    record.buyer_bond,
-                    record.escrow,
+                    dexdo_core::shell_amount(record.deposit),
+                    dexdo_core::shell_amount(record.buyer_bond),
+                    dexdo_core::shell_amount(record.escrow),
                     record.matched.is_none(),
                     record
                         .matched
@@ -8221,7 +9137,12 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
         &args.command,
         SubscriptionCommand::Place(_) | SubscriptionCommand::Cancel { .. }
     ) {
-        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+        budget
+            .read(chain_doctor_preflight(
+                &manifest_path,
+                args.market.as_deref(),
+            ))
+            .await?;
     }
     let live_order = match &args.command {
         SubscriptionCommand::Status { order_id, .. } | SubscriptionCommand::Cancel { order_id } => {
@@ -8232,11 +9153,9 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                         display_dexdo_address(&snapshot.order_book)
                     )
                 })?;
-            direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                chain.inference_orderbook_parsed_order(&order_book, *order_id),
-            )
-            .await?
+            budget
+                .read(chain.inference_orderbook_parsed_order(&order_book, *order_id))
+                .await?
         }
         SubscriptionCommand::Place(_) => None,
     };
@@ -8245,20 +9164,19 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
             let plan = place_plan.expect("place plan was validated before chain reads");
             let keys = require_subscription_keys(&args, "place", place.note_key.as_deref())?;
             preflight_buyer_pool_for_note(Some(&note_addr))?;
-            direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-                chain.assert_seller_note_current(&note).await?;
-                chain
-                    .assert_note_owner_matches("subscription place", &note, &keys)
-                    .await?;
-                chain.assert_note_can_place_inference_buy(&note).await?;
-                Ok(())
-            })
-            .await?;
-            let balance = direct_chain_read_with_timeout(
-                args.read_timeout.read_timeout_secs,
-                subscription_note_spendable_balance(&chain, &note),
-            )
-            .await?;
+            budget
+                .read(async {
+                    chain.assert_seller_note_current(&note).await?;
+                    chain
+                        .assert_note_owner_matches("subscription place", &note, &keys)
+                        .await?;
+                    chain.assert_note_can_place_inference_buy(&note).await?;
+                    Ok(())
+                })
+                .await?;
+            let balance = budget
+                .read(subscription_note_spendable_balance(&chain, &note))
+                .await?;
             ensure_subscription_note_balance(Some(balance), plan.reserve)?;
             let deadline = buy_order_deadline()?;
             let record = submit_subscription_with_journal(
@@ -8287,11 +9205,11 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                     dexdo_core::address::display(&snapshot.order_book),
                     dexdo_core::address::display(&note_addr),
                     record.order_id,
-                    record.max_price_per_tick,
+                    dexdo_core::shell_amount(record.max_price_per_tick),
                     record.ticks,
-                    record.deposit,
-                    record.buyer_bond,
-                    record.escrow,
+                    dexdo_core::shell_amount(record.deposit),
+                    dexdo_core::shell_amount(record.buyer_bond),
+                    dexdo_core::shell_amount(record.escrow),
                     record.flags,
                     record.deadline,
                     record.matched.is_none(),
@@ -8533,13 +9451,14 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
             ))?
             .clone();
             let keys = require_subscription_keys(&args, "cancel", None)?;
-            direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-                chain.assert_seller_note_current(&note).await?;
-                chain
-                    .assert_note_owner_matches("subscription cancel", &note, &keys)
-                    .await
-            })
-            .await?;
+            budget
+                .read(async {
+                    chain.assert_seller_note_current(&note).await?;
+                    chain
+                        .assert_note_owner_matches("subscription cancel", &note, &keys)
+                        .await
+                })
+                .await?;
             let mut state =
                 load_buyer_subscription_state(&money_lock.subscriptions_path, &note_addr)?;
             ensure_subscription_record_from_order(&mut state, &snapshot, &order)?;
@@ -8613,18 +9532,21 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                     )?;
                     machine_response.removal_confirmed = Some(true);
                     machine_response.refund = Some(machine::SubscriptionRefund {
-                        observed: machine::amount(refund),
-                        balance_before: machine::amount(balance_before),
-                        balance_after: machine::amount(balance_after),
+                        observed: dexdo_core::shell_amount(refund),
+                        balance_before: dexdo_core::shell_amount(balance_before),
+                        balance_after: dexdo_core::shell_amount(balance_after),
                     });
                     let output = SubscriptionCommandOutput {
                         human: format!(
                             "subscription cancel confirmed model={} order_book={} order_id={} owner={} \
-                             refund={refund} balance_before={balance_before} balance_after={balance_after}",
+                             refund={} balance_before={} balance_after={}",
                             snapshot.frame_model,
                             dexdo_core::address::display(&snapshot.order_book),
                             order_id,
                             dexdo_core::address::display(&note_addr),
+                            dexdo_core::shell_amount(refund),
+                            dexdo_core::shell_amount(balance_before),
+                            dexdo_core::shell_amount(balance_after),
                         ),
                         machine: machine_response,
                     };
@@ -8696,18 +9618,6 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
-    let mock_mode = subscription_mock_mode(&args.mock)?;
-    let place_plan = match &args.command {
-        SubscriptionCommand::Place(place) => Some(subscription_place_plan(place)?),
-        _ => None,
-    };
-    if mock_mode {
-        return run_mock_subscription(&args, place_plan);
-    }
-    bail!("subscription unavailable: build with `--features shellnet`")
-}
 
 pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
     let json_mode = args.json;
@@ -8720,6 +9630,34 @@ pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
         BuyerCommandRuntime::production(),
     )
     .await;
+    // An order already waiting is an answer, not a failure -- for a person. Nothing was sent and the
+    // command has nothing left to do, so the block is the result and the run ends successfully.
+
+    // For a machine it is neither: an orchestrator that reads exit 0 with no terminal event believes
+    // the buy it asked for was placed. It gets its own code instead, and the human block is not
+    // written at all -- stdout in machine mode is one NDJSON stream, and a multi-line block in it is
+    // corruption.
+    if let Some(resting) = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<BuyerAlreadyResting>())
+    {
+        let block = resting.0.clone();
+        match machine_events.as_mut() {
+            Some(events) => {
+                events.error(
+                    machine::OP_BUYER_START,
+                    machine::ErrorCode::BuyAlreadyResting,
+                    serde_json::json!({}),
+                )?;
+                return Err(machine::printed_error());
+            }
+            None => {
+                println!("{block}");
+                return Ok(());
+            }
+        }
+    }
     if let Err(err) = result {
         if machine::is_printed_error(&err) {
             return Err(err);
@@ -8731,7 +9669,7 @@ pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
                 let detail = format!("{err:#}").to_ascii_lowercase();
                 // An expired crossing ask is its own class: the book DID hold an ask this buy
                 // crosses, so reporting `no_executable_ask` would send the operator to raise a
-                // ceiling that is already high enough(E2E-ORD-02).
+                // ceiling that is already high enough (E2E-ORD-02).
                 if detail.contains(dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_REASON) {
                     machine_context.failure_class =
                         Some(dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS.to_string());
@@ -8829,7 +9767,7 @@ fn buyer_machine_error_fixture_from_env() -> Option<anyhow::Error> {
     let code = std::env::var("DEXDO_BUYER_JSON_ERROR_FIXTURE").ok()?;
     if code == "CHAIN_TRANSPORT" {
         return Some(anyhow::Error::new(ChainError::Transport(
-            "shellnet rpc transport fixture".to_string(),
+            "chain rpc transport fixture".to_string(),
         )));
     }
     let message = match code.as_str() {
@@ -8887,11 +9825,13 @@ async fn emit_shared_buyer_event(
 }
 
 /// One finished consumer request as JSONL fields.
+
 /// Token counts are decimal strings, like every other amount on this surface. The two flags are
 /// there so an integrator does not have to re-derive the interesting cases from the counts:
 /// `truncated_by_grant` is the answer being cut by THIS request's cap, and `ended_before_grant` is
 /// the stream stopping with part of the grant unspent - the shape a model that simply finished has,
 /// and also the shape a stream that died in flight has.
+
 /// `route_delivered_tokens` is the deal's cumulative ACCOUNTED delivery, which is the only figure a
 /// seller's claim may be reconciled against. It is deliberately not a count of rendered frames:
 /// tokens per chunk is the seller's choice and a chunk with no text emits no frame at all, so the
@@ -9124,7 +10064,6 @@ fn is_replay_protection_error(err: &anyhow::Error) -> bool {
 }
 
 fn buyer_deal_init_error(err: anyhow::Error) -> dexdo::buyer::api::DealInitError {
-    #[cfg(feature = "shellnet")]
     if let Some(error) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<DurableBuyerSubmitReconciliationError>())
@@ -9153,7 +10092,7 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-    shellnet_preflight: BuyerShellnetPreflight,
+    chain_preflight: BuyerChainPreflight,
 ) -> std::result::Result<dexdo::buyer::api::ApiDeal, dexdo::buyer::api::DealInitError> {
     let mut attempt = 1u64;
     loop {
@@ -9169,7 +10108,7 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
             api_failure_policy,
             events.clone(),
             raised_money.clone(),
-            shellnet_preflight,
+            chain_preflight,
         )
         .await;
         match result {
@@ -9206,7 +10145,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-    shellnet_preflight: BuyerShellnetPreflight,
+    chain_preflight: BuyerChainPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
     let raised_money = if args.mock.mock_chain {
         raised_money
@@ -9229,12 +10168,12 @@ async fn prepare_lazy_buyer_api_deal_once(
         .or(raised_money)
     };
     require_stream_buy_ticks(args.ticks)?;
-    if !args.mock.mock_chain && shellnet_preflight.should_run() {
-        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+    if !args.mock.mock_chain && chain_preflight.should_run() {
+        chain_doctor_preflight(&crate::cli::commands::manifest_path()?, args.market.as_deref()).await?;
         if let Some(policy) = load_enabled_model_registry_policy(
             RegistryRole::Buyer,
             &args.registry,
-            &args.contracts,
+            &crate::cli::commands::manifest_path()?,
         )? {
             reject_buyer_raw_token_contract_without_registry_book_proof(
                 args.market.as_deref(),
@@ -9246,17 +10185,17 @@ async fn prepare_lazy_buyer_api_deal_once(
             } else {
                 let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "real shellnet: --note-addr is required to derive the buyer order book"
+                        format!("real {}: --note-addr is required to derive the buyer order book", dexdo_core::params::current_network())
                     )
                 })?;
-                expected_order_book_for_note(&args.contracts, note_addr, &frame_model).await?
+                expected_order_book_for_note(&crate::cli::commands::manifest_path()?, note_addr, &frame_model).await?
             };
             let order_book_active =
-                order_book_active_from_contracts(&args.contracts, &expected_order_book).await?;
+                order_book_active_from_contracts(&crate::cli::commands::manifest_path()?, &expected_order_book).await?;
             enforce_model_registry_policy(
                 RegistryRole::Buyer,
                 &policy,
-                &args.contracts,
+                &crate::cli::commands::manifest_path()?,
                 &frame_model,
                 &expected_order_book,
                 order_book_active,
@@ -9270,19 +10209,11 @@ async fn prepare_lazy_buyer_api_deal_once(
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
-    #[cfg(feature = "shellnet")]
     let resumed_from_ordinary_journal = args.resume && raised_money.is_some();
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let mut buyer_order_id = None;
-    #[cfg(feature = "shellnet")]
     let mut subscription_route_budget = None;
-    #[cfg(not(feature = "shellnet"))]
-    let subscription_route_budget = Option::<SubscriptionRouteBudget>::default();
-    #[cfg(feature = "shellnet")]
     let mut preserve_subscription = false;
-    #[cfg(not(feature = "shellnet"))]
-    let preserve_subscription = false;
-    #[cfg(feature = "shellnet")]
     let mut historical_resume_fill = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         if args.resume {
@@ -9463,7 +10394,6 @@ async fn prepare_lazy_buyer_api_deal_once(
                     BuyerSpotResumeTarget::NoteFillEvent(fill) => {
                         let tc = fill.token_contract.clone();
                         buyer_order_id = Some(fill.order_id);
-                        #[cfg(feature = "shellnet")]
                         {
                             historical_resume_fill = Some(fill.clone());
                         }
@@ -9560,10 +10490,8 @@ async fn prepare_lazy_buyer_api_deal_once(
             }
         }
     };
-    #[cfg(feature = "shellnet")]
     let mut buy_ticks = buy_ticks;
 
-    #[cfg(feature = "shellnet")]
     if args.resume && !args.mock.mock_chain && !resumed_from_ordinary_journal {
         let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
             anyhow::anyhow!("subscription resume requires --note-addr for ownership validation")
@@ -9609,7 +10537,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                     "remaining_current_week": machine::amount(
                         subscription.quota.remaining_current_week
                     ),
-                    "buyer_locked_total": machine::amount(
+                    "buyer_locked_total": dexdo_core::shell_amount(
                         subscription.quota.buyer_locked_total
                     )
                 }),
@@ -9636,17 +10564,20 @@ async fn prepare_lazy_buyer_api_deal_once(
         // holds a funded-but-unopened deal for `MATCH_OPEN_TIMEOUT = 600s` before anyone may
         // `cleanupUnopened()` it, and until
         // that expires the deal is still one the seller may legitimately open.
+
         // This used to be `DEAL_WAIT_SECS`, which is the budget for the match AND the handover
         // together. Two consequences, both wrong: the seller was given less than the contract
         // grants it, and how much less depended on how long the match had taken -- measured on
-        // shellnet, a match that landed at 293s left the handover 7 seconds of its nominal 300.
+        // On the test chain, a match that landed at 293s left the handover 7 seconds of its nominal 300.
         // A buy was abandoned and settled while the deal it names was still openable for another
         // nine minutes.
+
         // The window is READ, not started: `_fundedTime` is written when the deal is funded, and the
         // buyer reaches this line only afterwards. Anchoring to `Instant::now()` here granted the
         // seller the observation delay on top of its window -- the submit, the fill read, the state
         // validation and, on `--resume`, everything between a crash and the restart. The deadline
         // below is the same unix second for every observer of one deal.
+
         // A retry re-enters this loop, so a `RetryNext` deal is measured against ITS funding, and a
         // retry of the SAME deal does not restart a window the contract is not restarting.
         let hv_deadline_unix =
@@ -9760,7 +10691,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             mock_note_addr.as_str()
         } else {
             args.identity.note_addr.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("real shellnet: --note-addr is required to save the deal handle")
+                anyhow::anyhow!(format!("real {}: --note-addr is required to save the deal handle", dexdo_core::params::current_network()))
             })?
         };
         let endpoint = args.local_listen.map(|addr| deals::DealEndpointInfo {
@@ -9775,7 +10706,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             frame_model: &frame_model,
             market: None,
             market_path: args.market.as_deref(),
-            contracts: &args.contracts,
+            contracts: &crate::cli::commands::manifest_path()?,
             endpoint,
             created_order_ids: buyer_order_id.into_iter().collect(),
         };
@@ -9859,7 +10790,7 @@ fn build_on_demand_buyer_api_state(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-    shellnet_preflight: BuyerShellnetPreflight,
+    chain_preflight: BuyerChainPreflight,
     pre_adopted_deal: Option<dexdo::buyer::api::ApiDeal>,
     recover_terminal_model_deal: bool,
 ) -> dexdo::buyer::api::ApiState {
@@ -9902,14 +10833,14 @@ fn build_on_demand_buyer_api_state(
                     api_failure_policy,
                     events,
                     raised_money,
-                    shellnet_preflight,
+                    chain_preflight,
                 )
                 .await
             }) as dexdo::buyer::api::DealInitFuture
         }) as dexdo::buyer::api::DealInitializer
     };
     // The whole purchase is a match and then a handover, and each has its own budget: the match is
-    // ours to bound(`DEAL_WAIT_SECS`), the handover is the contract's(`MATCH_OPEN_TIMEOUT`).
+    // ours to bound (`DEAL_WAIT_SECS`), the handover is the contract's (`MATCH_OPEN_TIMEOUT`).
     // Bounding the pair by the match's budget alone made the outer timeout fire while the inner
     // wait still had time it had been granted, and the caller was told the purchase timed out
     // when what it was waiting for was still due.
@@ -9949,6 +10880,47 @@ fn model_only_on_demand_recovery_enabled(
     !has_explicit_token_contract && !has_market_manifest
 }
 
+/// What the operator does now that the model is theirs.
+
+/// This is the last thing a buy prints and the only reason the command was run, so it answers the
+/// question a result has to answer: what do I do next. It used to be four `KEY=value` lines and
+/// nothing else -- three of them real environment variables, the fourth a description of a policy
+/// wearing the same shape, which an operator pasting the block into a shell would have set as a
+/// variable that means nothing to anything.
+
+/// Where the prompts go was not said at all: the endpoint was named, and how to send a request to it
+/// lived only in a skill document. So there is a command here, ready to paste, with this deal's own
+/// model in it.
+
+/// The three exported names keep their exact spelling, at the start of their own lines: whatever
+/// reads this output with `grep '^OPENAI_'` goes on working.
+/// The steps a buy walks, each as the pair the checklist declares: what it says while it runs, and
+/// what the tick says once it is behind.
+
+/// Named rather than written out at each site, because the two halves have to agree and nothing
+/// checks that they do: a step advanced by its `done` text matches no declared step, the cursor
+/// stays where it is, and every later step becomes unreachable. That is not a hypothesis -- it is
+/// what a live run found here, with `[3/4]` spinning under "a seller matched and funded the deal"
+/// for 1142 frames and `[4/4]` never printed.
+const BUYER_STEP_CHECKING: (&str, &str) =
+    ("checking the network and contracts", "network and contracts checked");
+const BUYER_STEP_PLACING: (&str, &str) = ("placing the buy", "buy placed");
+const BUYER_STEP_WAITING: (&str, &str) =
+    ("waiting for a seller", "a seller matched and funded the deal");
+const BUYER_STEP_ENDPOINT: (&str, &str) =
+    ("bringing the local endpoint up", "the model is ready to use");
+
+/// The checklist for one buy. The last step exists only where there is an endpoint to bring up: a
+/// one-shot buy streams and exits, and a list that ends one step short reads as a command that
+/// stopped early.
+fn buyer_progress_plan(has_local_endpoint: bool) -> Vec<(&'static str, &'static str)> {
+    let mut plan = vec![BUYER_STEP_CHECKING, BUYER_STEP_PLACING, BUYER_STEP_WAITING];
+    if has_local_endpoint {
+        plan.push(BUYER_STEP_ENDPOINT);
+    }
+    plan
+}
+
 fn render_local_openai_handoff(
     addr: std::net::SocketAddr,
     frame_model: &str,
@@ -9957,19 +10929,82 @@ fn render_local_openai_handoff(
     if !addr.ip().is_loopback() {
         return None;
     }
-    let continuity = match continuity_mode {
+    // Named as spending or not spending, because that is what the choice does to an operator's
+    // money -- "proactive" and "on-demand" are the flag's words, not an answer to "what will it do".
+    let idle = match continuity_mode {
         ContinuityModeArg::Proactive => {
-            "proactive: may keep a warm deal and spend while idle"
+            "keeps a deal warm and may spend while you are not asking; `--continuity on-demand` \
+             stops that"
         }
         ContinuityModeArg::OnDemand => {
-            "on-demand: does not spend while idle, but the first request after idle waits for purchase/handover"
+            "spends nothing while you are not asking; the first request after a pause waits for a \
+             fresh deal"
         }
     };
+    use crate::cli::style::{self, Palette, Role};
+    let palette = Palette::stdout();
+    let body = format!(
+        "{{\"model\":\"{frame_model}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+    );
+    // `spec.md`: the heading carries the success glyph, the fields line up in column twelve, and the
+    // one thing the operator is asked to DO is the colour that means "yours to act on". The three
+    // exported names keep their exact spelling at the start of their own lines -- `grep '^OPENAI_'`
+    // and `eval` are contracts of their own.
     Some(format!(
-        "OPENAI_BASE_URL=http://{addr}/v1\n\
+        "{ready}\n\
+         {endpoint}\n\
+         {try_it}\n\
+         {try_headers}\n\
+         {try_body}\n\
+         {idle_line}\n\
+         {stop_line}\n\
+         \n\
+         OPENAI_BASE_URL=http://{addr}/v1\n\
          OPENAI_MODEL={frame_model}\n\
-         OPENAI_API_KEY=dexdo-local\n\
-         CONTINUITY_MODE={continuity}"
+         OPENAI_API_KEY=dexdo-local",
+        ready = style::glyph_line(
+            palette,
+            style::OK,
+            Role::Ok,
+            &format!(
+                "model ready {} {}",
+                style::paint(palette, Role::Label, "\u{b7}"),
+                style::paint(palette, Role::Id, frame_model)
+            )
+        ),
+        endpoint = style::field(
+            palette,
+            "endpoint",
+            &format!("http://{addr}/v1  (OpenAI-compatible, key dexdo-local)"),
+            Role::Bold
+        ),
+        try_it = style::field(
+            palette,
+            "try it",
+            &style::paint(
+                palette,
+                Role::Wait,
+                &format!("curl http://{addr}/v1/chat/completions \\")
+            ),
+            Role::Text
+        ),
+        try_headers = style::field_continued(&style::paint(
+            palette,
+            Role::Wait,
+            "  -H 'content-type: application/json' \\"
+        )),
+        try_body = style::field_continued(&style::paint(
+            palette,
+            Role::Wait,
+            &format!("  -d '{body}'")
+        )),
+        idle_line = style::field(palette, "idle", idle, Role::Text),
+        stop_line = style::field(
+            palette,
+            "stop",
+            "Ctrl-C - what was delivered is settled before the client exits",
+            Role::Text
+        ),
     ))
 }
 
@@ -9980,13 +11015,17 @@ async fn run_buyer_on_demand_local_api(
     buyer: dexdo::buyer::Buyer,
     explicit_tc: Option<String>,
     frame_model: String,
+    // Carried from `run_buyer_inner`, where the registry was asked. `args.resume` is `false` by the
+    // time this runs, so the fact that the run took the resume carve-out cannot be
+    // recovered here -- it has to travel.
+    spelling_diverged: bool,
     content_check: dexdo::buyer::api::ContentCheck,
     models_cfg: Arc<dexdo::seller::ModelsConfig>,
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-    shellnet_preflight: BuyerShellnetPreflight,
+    chain_preflight: BuyerChainPreflight,
     shutdown: BuyerShutdownSignal,
 ) -> Result<()> {
     use dexdo::buyer::api;
@@ -10016,7 +11055,7 @@ async fn run_buyer_on_demand_local_api(
                 api_failure_policy,
                 events.clone(),
                 raised_money.clone(),
-                shellnet_preflight,
+                chain_preflight,
             )
             .await?,
         )
@@ -10076,7 +11115,7 @@ async fn run_buyer_on_demand_local_api(
         api_failure_policy,
         events.clone(),
         initializer_raised_money,
-        shellnet_preflight,
+        chain_preflight,
         pre_adopted_deal,
         recover_terminal_model_deal,
     );
@@ -10098,6 +11137,7 @@ async fn run_buyer_on_demand_local_api(
             content_check,
             models_cfg,
             api_failure_policy,
+            spelling_diverged,
         );
     }
     let (addr, task) = match api::serve(bind, state, args.anthropic_compat, shutdown).await {
@@ -10186,6 +11226,11 @@ async fn run_buyer_on_demand_local_api(
     if events.is_none() {
         if let Some(handoff) = render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
         {
+            // Everything the plan declared is behind, so the checklist ticks its last step and the
+            // live line goes: what follows is the result, and a result is never printed under a line
+            // that is still redrawing itself.
+            crate::cli::progress::step(BUYER_STEP_ENDPOINT.0);
+            crate::cli::progress::complete();
             println!("{handoff}");
         }
     }
@@ -10364,14 +11409,14 @@ async fn run_buyer_on_demand_local_api(
 }
 
 async fn run_buyer_inner(
-    args: BuyerArgs,
+    mut args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
     machine_context: &mut BuyerMachineErrorContext,
     runtime: BuyerCommandRuntime,
 ) -> Result<()> {
     let BuyerCommandRuntime {
         backend,
-        shellnet_preflight,
+        chain_preflight,
         shutdown,
     } = runtime;
     if args.wait_for_seller
@@ -10381,7 +11426,7 @@ async fn run_buyer_inner(
             || args.token_contract.is_some())
     {
         bail!(
-            "--wait-for-seller is only valid for a fresh real-shellnet model-only buy \
+            "--wait-for-seller is only valid for a fresh real-chain model-only buy \
              (--frame-model without --market/--token-contract/--resume/--mock-chain)"
         );
     }
@@ -10390,24 +11435,84 @@ async fn run_buyer_inner(
     // way to take delivery of a stream and skip the terminal that pays for it. Refused before any
     // money moves, rather than silently ignored, so an orchestrator that asked for a preserved deal
     // is never told it got one.
-    if args.preserve_deal_on_exit && args.local_listen.is_none() {
+
+    // Asked of the COMMAND LINE, not of the field, and asked BEFORE the default below fills it in.
+    // A default that runs first -- whether the parser's or this one's -- makes the answer always
+    // "an endpoint was named" and this guard unreachable, which is the whole defect twice over.
+    if args.preserve_deal_on_exit && !crate::cli::command_line::was_answered("local_listen") {
         bail!(
             "--preserve-deal-on-exit requires --local-listen: a one-shot buyer streams once and \
              exits, so it has no deal to hand to a restarted process and must settle what it received"
         );
     }
+    // The endpoint a real buy was typing every time -- and ONLY a run that has nowhere else to send
+    // its prompts. Where the one-shot path is still reachable, the absence of an endpoint is an
+    // answer rather than an omission and nothing may fill it in: `--mock-chain` selects that path on
+    // the practice market, and `--mock-model` is the one real-chain shape that can take it (
+    // refuses a promptless one-shot against a real provider, which is what a default would hide).
+    if args.local_listen.is_none() && !args.mock.mock_chain && !args.mock.mock_model {
+        // Parsed rather than `expect`ed: the money path takes no panics, and a canonical parameter
+        // that stops being an address is a refusal like any other.
+        args.local_listen = Some(
+            dexdo_core::params::DEFAULT_BUYER_LOCAL_LISTEN
+                .parse()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "the canonical buyer endpoint {} is not a socket address: {error}",
+                        dexdo_core::params::DEFAULT_BUYER_LOCAL_LISTEN
+                    )
+                })?,
+        );
+    }
     // this CLI path submits a limit BUY, so its max price must be a positive
-    // whole multiple of PRICE_STEP(1 SHELL), rejected before any submit/escrow. The contract's
+    // whole multiple of PRICE_STEP (1 SHELL), rejected before any submit/escrow. The contract's
     // separate FLAG_MARKET path is the sole price-less exception; this command does not claim it.
     super::support::validate_price_step(args.max_price_per_tick)?;
+    // Which note, settled ONCE -- and after the price check above, which refuses a ceiling that is
+    // not a whole PRICE_STEP before any file is touched. Asking the operator to choose a note in
+    // front of a refusal their own arguments had already earned is a question they should never see.
+
+    // Settled here rather than in each place that needs it -- the pool preflight, the money lock,
+    // the backend -- so it is asked once. On a terminal the pool's notes are offered; anywhere else
+    // this is the refusal that names `--note-addr`.
+    if args.identity.note_addr.is_none() && !args.mock.mock_chain {
+        args.identity.note_addr = Some(
+            // The endpoint is the manifest's: it names the network this run is on, and a second
+            // source for it here would be a second answer to the same question.
+            crate::cli::note_pick::ask_which_note(&crate::cli::commands::manifest_path()?, None).await?,
+        );
+    }
     preflight_buyer_pool_for_money_move(&args)?;
-    // Issue: token_contract + frame_model come from `--market`(a provision manifest) or the flags.
+    // The three layers asks for, on the command that spends the longest time silent.
+    // Measured on a live buy: minutes between the note being chosen and the buy resting, with the
+    // client saying nothing -- the preflight alone is seven sequential chain reads, and one trivial
+    // read on the chain took 6.1 seconds that evening.
+
+    // The steps are what a person is entitled to know: which part of the business is behind, which
+    // is running, and -- when the flow ends -- what they can do next. Everything else a buy has to
+    // say is a record.
+
+    // The last step exists only where there is an endpoint to bring up: a one-shot buy streams and
+    // exits, and a checklist that ends one short reads as a command that stopped early.
+
+    // On the practice market there is nothing to show: `--mock-chain` answers instantly, has no
+    // network to check and no seller to wait for, and its output is what several contracts read word
+    // for word. A checklist there would announce work that does not happen -- so the layers belong to
+    // the run that actually waits.
+    let _display = (!args.mock.mock_chain)
+        .then(|| {
+            crate::cli::progress::Status::with_plan(
+                BUYER_STEP_CHECKING.0,
+                buyer_progress_plan(args.local_listen.is_some()),
+            )
+        });
+    // Issue: token_contract + frame_model come from `--market` (a provision manifest) or the flags.
     // The buyer ignores the deal nonce: it places a buy, it does not post the offer.
     // Model-only buy: with neither
     // `--token-contract` nor `--market`, the buyer derives the per-model book from `--frame-model`, shows the
     // resting asks, places a model-wide buy, and learns the matched deal `TokenContract` from ITS OWN note's
     // `InferenceFilledConfirmed` event -- no seller hand-off. With `--token-contract`/`--market` the explicit
-    // deal address is used as before(back-compat).
+    // deal address is used as before (back-compat).
     let model_only = args.market.is_none() && args.token_contract.is_none();
     let (explicit_tc, requested_frame_model) = if model_only {
         let fm = args.frame_model.clone().ok_or_else(|| {
@@ -10427,27 +11532,26 @@ async fn run_buyer_inner(
             fm.ok_or_else(|| anyhow::anyhow!("provide --frame-model or --market <manifest>"))?;
         (Some(tc), fm)
     };
-    let registry_policy = if !args.mock.mock_chain && shellnet_preflight.should_run() {
-        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?
+    let registry_policy = if !args.mock.mock_chain && chain_preflight.should_run() {
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &crate::cli::commands::manifest_path()?)?
     } else {
         None
     };
-    #[cfg(feature = "shellnet")]
-    if !args.mock.mock_chain && shellnet_preflight.should_run() {
+    if !args.mock.mock_chain && chain_preflight.should_run() {
         preload_model_registry_policy(
             RegistryRole::Buyer,
             registry_policy.as_ref(),
-            &args.contracts,
+            &crate::cli::commands::manifest_path()?,
         )
         .await?;
         if args.local_listen.is_some() {
             // The existing content-policy path below decides whether a cached read error is strict
             // or downgraded by --allow-unverified-model.
-            let _ = preload_default_model_registry(&args.contracts).await;
+            let _ = preload_default_model_registry(&crate::cli::commands::manifest_path()?).await;
         }
     }
     let frame_model = if let Some(policy) = registry_policy.as_ref() {
-        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+        chain_doctor_preflight(&crate::cli::commands::manifest_path()?, args.market.as_deref()).await?;
         reject_buyer_raw_token_contract_without_registry_book_proof(
             args.market.as_deref(),
             args.token_contract.as_deref(),
@@ -10460,7 +11564,7 @@ async fn run_buyer_inner(
         let target = resolve_model_registry_target(
             RegistryRole::Buyer,
             Some(policy),
-            &args.contracts,
+            &crate::cli::commands::manifest_path()?,
             &requested_frame_model,
             BookTarget {
                 frame_model: selected_market
@@ -10486,17 +11590,17 @@ async fn run_buyer_inner(
         } else {
             let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "real shellnet: --note-addr is required to derive the buyer order book"
+                    format!("real {}: --note-addr is required to derive the buyer order book", dexdo_core::params::current_network())
                 )
             })?;
-            expected_order_book_for_note(&args.contracts, note_addr, &target.frame_model).await?
+            expected_order_book_for_note(&crate::cli::commands::manifest_path()?, note_addr, &target.frame_model).await?
         };
         let order_book_active =
-            order_book_active_from_contracts(&args.contracts, &expected_order_book).await?;
+            order_book_active_from_contracts(&crate::cli::commands::manifest_path()?, &expected_order_book).await?;
         enforce_model_registry_policy(
             RegistryRole::Buyer,
             policy,
-            &args.contracts,
+            &crate::cli::commands::manifest_path()?,
             &target.frame_model,
             &expected_order_book,
             order_book_active,
@@ -10507,26 +11611,40 @@ async fn run_buyer_inner(
     } else {
         requested_frame_model
     };
-    // Model-only discovery derives the order-book address from `sha256(frame_model)`, so the id MUST be the
-    // canonical `producer--model--version`(else it looks at the wrong book). Only enforce here: on the explicit
-    // `--token-contract`/`--market` path the deal address is given directly (frame_model is only B2/B7 there,
-    // where `family_of` matches by substring regardless of form), and the mock demo uses `dexdo-mock`.
-    if model_only && !args.mock.mock_chain && registry_policy.is_none() {
-        dexdo_core::validate_canonical_model_id(&frame_model).map_err(|e| anyhow::anyhow!(e))?;
+    // model-only discovery derives the order-book address from `sha256(frame_model)`, so the
+    // id has to be the EXACT bytes the seller listed the book under -- and the authority on those
+    // bytes is the ModelRegistry, resolved above, never a shape this client checks locally.
+
+    // `validate_canonical_model_id` stood here and required `producer--model--version`. It could
+    // not tell a right name from a wrong one: two operators spelling the same real model
+    // differently both pass it and land on two different books, which is the fragmentation
+    // was written about. What it COULD do is refuse a name the 4.0.36 catalog carries
+    // -- that catalog drops the producer and joins with `/` -- and it refused exactly those.
+
+    // What survives from it is the one property the derivation needs and no catalog can supply: a
+    // name that names something. `sha256("")` is a real hash and would send a model-wide buy at a
+    // book addressed by nothing at all, which is money placed where no seller is looking.
+    if model_only && !args.mock.mock_chain {
+        // ALWAYS `--frame-model`, because that is the only source this call can ever refuse.
+
+        // With `registry_policy` set, `frame_model` is `target.frame_model`, which
+        // `resolve_model_registry_target` sets to a candidate the registry answered `exists` for --
+        // an empty or padded name does not survive that resolution. So a second, registry-sourced
+        // wording would name a case no run can reach.
+        crate::cli::support::require_model_name(
+            &frame_model,
+            "--frame-model",
+            "Pass a name `dexdo markets` lists.",
+        )?;
     }
     let runtime_network = if args.mock.mock_chain {
         "mock".to_string()
     } else if let Some((chain, _)) = backend.as_ref() {
         chain.network().to_string()
     } else {
-        #[cfg(feature = "shellnet")]
-        {
-            dexdo_core::Deployed::load(&args.contracts)?.network
-        }
-        #[cfg(not(feature = "shellnet"))]
-        {
-            dexdo_core::params::DEFAULT_DOCTOR_NETWORK.to_string()
-        }
+        // The manifest is what says which network this run is on: there is no second answer to
+        // fall back to, and no build in which this line is absent.
+        dexdo_core::Deployed::load(&crate::cli::commands::manifest_path()?)?.network
     };
     machine_context.network = Some(runtime_network.clone());
     machine_context.frame_model = Some(frame_model.clone());
@@ -10539,13 +11657,13 @@ async fn run_buyer_inner(
     // Model-only `--resume` is supported (directive: the buyer recovers its deal from ITS OWN note's fill
     // event, never a hand-pasted `--token-contract`): it re-scans `InferenceFilledConfirmed` on this note over
     // a lookback window and connects to the freshly matched deal without placing a new buy. Handled below.
-    // fail closed BEFORE the on-chain buy if this is a one-shot real-upstream attempt(promptless) --
+    // fail closed BEFORE the on-chain buy if this is a one-shot real-upstream attempt (promptless) --
     // an actionable client-side error, not a deep gateway `InvalidArgument` after place_buy + handover.
     oneshot_real_upstream_guard(args.local_listen.is_some(), args.mock.mock_model)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if model_only && args.mock.mock_chain {
         bail!(
-            "model-only buy (no --token-contract/--market) discovers the book on real shellnet; on --mock-chain \
+            "model-only buy (no --token-contract/--market) discovers the book on a real chain; on --mock-chain \
              pass --token-contract 0:<deal> (the mock has no on-chain orderbook to discover)"
         );
     }
@@ -10567,8 +11685,48 @@ async fn run_buyer_inner(
     if let Some(err) = buyer_machine_error_fixture_from_env() {
         return Err(err);
     }
+    // THE NAME IS CHECKED ON EVERY MONEY PATH, not only under `--local-listen`.
+
+    // The registry-name refusal used to live entirely inside `build_buyer_content_policy`, which
+    // this branch calls only when a local endpoint was asked for. So `dexdo buyer` without
+    // `--local-listen`, and `subscription place`, placed escrow under whatever spelling they were
+
+    // resolved name. The check is hoisted here and its answer handed down, so the resolution still
+    // happens once: the registry answers 403 above three requests a second from one address, and a
+    // second walk for the same name would be a second chance to be rate-limited.
+    let content_identity_model = if args.mock.mock_chain {
+        None
+    } else {
+        match resolve_buyer_content_identity_model(
+            &crate::cli::commands::manifest_path()?,
+            &frame_model,
+            args.allow_unverified_model,
+            args.resume,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                machine_context.failure_class = Some("content_identity_preflight".to_string());
+                // Not `allow_unverified_model_or_models_data`: a spelling the registry holds
+                // differently is not fixed by either, and labelling it so sends an integrator to
+                // retry with a flag that produces the identical refusal.
+                machine_context.missing_or_unset = Some("registry_model_name".to_string());
+                return Err(err);
+            }
+        }
+    };
+    // The carve-out's fact, computed where the registry answered and carried from here.
+
+    // `--resume` let this run past a spelling the registry holds differently, because the deal it
+    // adopts already exists. Renewal is a NEW deal with NEW escrow, and by the time the renewal path
+    // is reached `args.resume` is false, so the fact has to travel rather than be re-derived.
+    let spelling_diverged = content_identity_model
+        .as_deref()
+        .is_some_and(|registry_model| registry_model != frame_model);
     let buyer_content_policy = if args.local_listen.is_some() {
-        match build_buyer_content_policy(&args, &frame_model).await {
+        match build_buyer_content_policy(&args, &frame_model, content_identity_model.clone()).await
+        {
             Ok(policy) => Some(policy),
             Err(err) => {
                 machine_context.failure_class = Some("content_identity_preflight".to_string());
@@ -10603,8 +11761,8 @@ async fn run_buyer_inner(
         );
         validate_buyer_runtime_surface_policy(policy, args.local_listen)?;
     }
-    // The chain is selected by a flag: `--mock-chain` -> mock(as in D1, also requires `--mock-model`), otherwise
-    // real shellnet(per-role buyer backend behind the `shellnet` feature; without the feature -> explicit failure).
+    // The chain is selected by a flag: `--mock-chain` -> mock (as in D1, also requires `--mock-model`), otherwise
+    // a real chain (per-role buyer backend behind a cargo feature that no longer exists; without the feature -> explicit failure).
     let (chain, note) = if let Some(backend) = backend {
         backend
     } else if args.mock.mock_chain {
@@ -10615,11 +11773,7 @@ async fn run_buyer_inner(
         buyer_real_backend(&args, &frame_model)?
     };
     let buyer = dexdo::buyer::Buyer::from_note(note);
-    #[cfg(feature = "shellnet")]
     let mut subscription_resume = BuyerSubscriptionResumeCandidate::None;
-    #[cfg(not(feature = "shellnet"))]
-    let subscription_resume = BuyerSubscriptionResumeCandidate::None;
-    #[cfg(feature = "shellnet")]
     if args.resume && !args.mock.mock_chain {
         let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
             anyhow::anyhow!("subscription resume requires --note-addr for durable ownership")
@@ -10635,7 +11789,7 @@ async fn run_buyer_inner(
         let handle_note_addr = money_lock.note_addr.clone();
         let handle_deals_dir = args.deals_dir.clone();
         let handle_market = args.market.clone();
-        let handle_contracts = args.contracts.clone();
+        let handle_contracts = crate::cli::commands::manifest_path()?;
         let handle_network = chain.network().to_string();
         let persist_handle = move |record: &BuyerSubscriptionOrderRecord,
                                    matched: &BuyerJournalMatch| {
@@ -10702,39 +11856,32 @@ async fn run_buyer_inner(
             buyer,
             explicit_tc,
             frame_model,
+            spelling_diverged,
             content_check,
             models_cfg,
             buyer_policy,
             api_failure_policy,
             events,
             raised_money,
-            shellnet_preflight,
+            chain_preflight,
             shutdown,
         )
         .await;
     }
-    if !args.mock.mock_chain && registry_policy.is_none() && shellnet_preflight.should_run() {
-        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+    if !args.mock.mock_chain && registry_policy.is_none() && chain_preflight.should_run() {
+        chain_doctor_preflight(&crate::cli::commands::manifest_path()?, args.market.as_deref()).await?;
     }
-    // Resolve the deal `TokenContract`: explicit(flag/manifest) or model-only (book -> choose -> buy -> fill
-    // event). `buy_ticks` is the chosen volume(the consumer-API token budget tracks it).
+    // Resolve the deal `TokenContract`: explicit (flag/manifest) or model-only (book -> choose -> buy -> fill
+    // event). `buy_ticks` is the chosen volume (the consumer-API token budget tracks it).
     let adopted_submit_identity = raised_money
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
-    #[cfg(feature = "shellnet")]
     let resumed_from_ordinary_journal = args.resume && raised_money.is_some();
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let mut buyer_order_id = None;
-    #[cfg(feature = "shellnet")]
     let mut subscription_route_budget = None;
-    #[cfg(not(feature = "shellnet"))]
-    let subscription_route_budget = Option::<SubscriptionRouteBudget>::default();
-    #[cfg(feature = "shellnet")]
     let mut preserve_subscription = false;
-    #[cfg(not(feature = "shellnet"))]
-    let preserve_subscription = false;
-    #[cfg(feature = "shellnet")]
     let mut historical_resume_fill = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         machine_context.set_token_contract(&outcome.token_contract);
@@ -10769,7 +11916,6 @@ async fn run_buyer_inner(
         }
         (outcome.token_contract, outcome.ticks)
     } else if subscription_resume.is_active() {
-        #[cfg(feature = "shellnet")]
         {
             let BuyerSubscriptionResumeCandidate::Active(resumed) = std::mem::replace(
                 &mut subscription_resume,
@@ -10816,13 +11962,13 @@ async fn run_buyer_inner(
                         "remaining_current_week": machine::amount(
                             resumed.quota.remaining_current_week
                         ),
-                        "buyer_bond_held": machine::amount(
+                        "buyer_bond_held": dexdo_core::shell_amount(
                             resumed.facts.buyer_bond.bond_held
                         ),
-                        "buyer_bond_required": machine::amount(
+                        "buyer_bond_required": dexdo_core::shell_amount(
                             resumed.facts.buyer_bond.bond_required
                         ),
-                        "buyer_locked_total": machine::amount(
+                        "buyer_locked_total": dexdo_core::shell_amount(
                             resumed.quota.buyer_locked_total
                         )
                     }),
@@ -10835,8 +11981,6 @@ async fn run_buyer_inner(
             }
             (tc, resumed.record.ticks)
         }
-        #[cfg(not(feature = "shellnet"))]
-        unreachable!("subscription resume is only built with shellnet")
     } else {
         match explicit_tc {
             Some(tc) => {
@@ -11028,7 +12172,6 @@ async fn run_buyer_inner(
                     BuyerSpotResumeTarget::NoteFillEvent(fill) => {
                         let tc = fill.token_contract.clone();
                         buyer_order_id = Some(fill.order_id);
-                        #[cfg(feature = "shellnet")]
                         {
                             historical_resume_fill = Some(fill.clone());
                         }
@@ -11075,20 +12218,39 @@ async fn run_buyer_inner(
                             args.ticks,
                             args.max_price_per_tick,
                         );
-                        human_buyer_quote_error(error, &next_command)
+                        human_buyer_quote_error(
+                            error,
+                            &next_command,
+                            BuyRequest {
+                                model: &frame_model,
+                                ticks: args.ticks,
+                                max_price_per_tick: args.max_price_per_tick,
+                            },
+                        )
                     })?;
+                    // Asked only where the operator did not already say. `--ticks 2` IS the answer
+                    // to "how many ticks", and asking again makes them answer twice with no way to
+                    // know which answer the buy used.
                     (
-                        prompt_u128("How many ticks to buy", args.ticks),
-                        prompt_u128(
-                            "Maximum price per tick (raw SHELL, 1000000000 = 1 SHELL)",
-                            args.max_price_per_tick,
-                        ),
+                        if crate::cli::command_line::was_answered("ticks") {
+                            args.ticks
+                        } else {
+                            prompt_u128("How many ticks to buy", args.ticks)
+                        },
+                        if crate::cli::command_line::was_answered("max_price_per_tick") {
+                            args.max_price_per_tick
+                        } else {
+                            prompt_price_shell(
+                                "Maximum price per tick, in SHELL",
+                                args.max_price_per_tick,
+                            )
+                        },
                     )
                 } else {
                     (args.ticks, args.max_price_per_tick)
                 };
                 super::support::validate_price_step(max_price)?;
-                // Escrow: an explicit `--escrow` wins(checked == required downstream); otherwise the exact
+                // Escrow: an explicit `--escrow` wins (checked == required downstream); otherwise the exact
                 // required for the CHOSEN order.
                 let escrow = args
                     .escrow
@@ -11096,7 +12258,12 @@ async fn run_buyer_inner(
                 service_renewal = Some((ticks, max_price, escrow));
                 require_stream_buy_ticks(ticks)?;
                 if machine_events.is_none() {
-                    println!("placing buy: {ticks} ticks at <= {max_price}/tick (escrow {escrow})");
+                    crate::cli::progress::step(BUYER_STEP_PLACING.0);
+                    // The block below says the same thing in the operator's units; this is the
+                    // raw-unit form, for a reconstruction.
+                    tracing::info!(
+                        "placing buy: {ticks} ticks at <= {max_price}/tick (escrow {escrow})"
+                    );
                 }
                 let selection = buyer_quote_selection_for_submit(
                     chain.as_ref(),
@@ -11180,13 +12347,36 @@ async fn run_buyer_inner(
                         }),
                     )?;
                 } else {
-                    println!(
+                    // A step, not a transcript. What an operator needs at this moment is one fact --
+                    // somebody took the buy and paid into a deal -- and the address of that deal is
+                    // 128 characters they neither read nor copy: the client carries it from here on
+                    // its own, and `dexdo status` prints it when it is asked to.
+
+                    // The address and the seven-field standing (`fundedTime`, `cleanup_after`,
+                    // `cleanup_ready`, `cleanup_wait_secs`...) are what a reconstruction needs, so
+                    // they are recorded rather than dropped. Both used to be printed at the moment
+                    // an operator was watching, where they answered no question anyone was asking.
+                    // The step that is now RUNNING, never the one that just finished: the checklist
+                    // advances by the label of what starts, and ticks what it passed on the way. It
+                    // was given the finished step's `done` text here, which matches no declared
+                    // step at all -- so the cursor never moved, `[3/4]` spun under a sentence in the
+                    // past tense for the rest of the run, and `[4/4]` was unreachable.
+
+                    // Where there is no endpoint to bring up -- a one-shot buy -- everything the plan
+                    // declared is behind, and the checklist finishes instead of pointing at a step
+                    // that does not exist.
+                    if args.local_listen.is_some() {
+                        crate::cli::progress::step(BUYER_STEP_ENDPOINT.0);
+                    } else {
+                        crate::cli::progress::complete();
+                    }
+                    tracing::info!(
                         "matched deal TokenContract: {}",
                         dexdo_core::address::display_self_dapp(&outcome.token_contract)
                     );
                 }
                 if machine_events.is_none() {
-                    println!(
+                    tracing::info!(
                         "{}",
                         matched_state_summary(&outcome.token_contract, &outcome.status)
                     );
@@ -11195,9 +12385,7 @@ async fn run_buyer_inner(
             }
         }
     };
-    #[cfg(feature = "shellnet")]
     let mut buy_ticks = buy_ticks;
-    #[cfg(feature = "shellnet")]
     if args.resume
         && !args.mock.mock_chain
         && !preserve_subscription
@@ -11247,7 +12435,7 @@ async fn run_buyer_inner(
                         "remaining_current_week": machine::amount(
                             subscription.quota.remaining_current_week
                         ),
-                        "buyer_locked_total": machine::amount(
+                        "buyer_locked_total": dexdo_core::shell_amount(
                             subscription.quota.buyer_locked_total
                         )
                     }),
@@ -11266,7 +12454,7 @@ async fn run_buyer_inner(
     record_buyer_token_contract_after_money_move(&args, &token_contract);
     tracing::info!("buy placed; awaiting handover");
     // Wait for the seller to open the stream and write the handover. Issue: fail-closed on the deadline instead of
-    // waiting forever; do not swallow the `resolve_endpoint` error(diagnostics for the operator).
+    // waiting forever; do not swallow the `resolve_endpoint` error (diagnostics for the operator).
     let mut handover_attempt = 1u64;
     let handover = 'handover: loop {
         // The seller's window to open a funded deal is the contract's, read from the deal itself --
@@ -11379,7 +12567,7 @@ async fn run_buyer_inner(
             mock_note_addr.as_str()
         } else {
             args.identity.note_addr.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("real shellnet: --note-addr is required to save the deal handle")
+                anyhow::anyhow!(format!("real {}: --note-addr is required to save the deal handle", dexdo_core::params::current_network()))
             })?
         };
         let endpoint = Some(deals::DealEndpointInfo {
@@ -11401,7 +12589,7 @@ async fn run_buyer_inner(
             frame_model: &frame_model,
             market: None,
             market_path: args.market.as_deref(),
-            contracts: &args.contracts,
+            contracts: &crate::cli::commands::manifest_path()?,
             endpoint,
             created_order_ids: buyer_order_id.into_iter().collect(),
         };
@@ -11422,7 +12610,7 @@ async fn run_buyer_inner(
         &token_contract,
     )?;
     // B19/B20: if `--local-listen` is set, bring up a local interface to
-    // the consumer(OpenAI-compatible + optional Anthropic transcoding) and serve requests.
+    // the consumer (OpenAI-compatible + optional Anthropic transcoding) and serve requests.
     if let Some(bind) = args.local_listen {
         use dexdo::buyer::api::{self, ApiState, Route};
         let continuity_mode = args.continuity_mode.as_planner_mode();
@@ -11492,6 +12680,7 @@ async fn run_buyer_inner(
                 renewal_content_check,
                 models_cfg.clone(),
                 api_failure_policy,
+                spelling_diverged,
             );
         }
         // SIGINT/SIGTERM drains in-flight responses and closes the listener. Ordinary deals retain the awaited
@@ -11545,6 +12734,12 @@ async fn run_buyer_inner(
         } else if let Some(handoff) =
             render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
         {
+            // The route the operator is on by default (`--continuity proactive`). The pair below
+            // existed only on the on-demand route, so on the ordinary run the result was printed
+            // straight onto the live line -- measured: `<spinner> [3/4]... 8sdeal_handle=deal-0-...`, and
+            // the ticker went on redrawing under the block for as long as the client ran.
+            crate::cli::progress::step(BUYER_STEP_ENDPOINT.0);
+            crate::cli::progress::complete();
             println!("{handoff}");
         }
         tracing::info!(%addr, anthropic_compat = args.anthropic_compat, "consumer API listening (loopback)");
@@ -11739,22 +12934,24 @@ async fn settle_completed_oneshot(session: &dexdo::buyer::api::SessionSettle) ->
     Ok(())
 }
 
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 #[path = "buyer/durable_deal_record_schema_version_1064.rs"]
 mod durable_deal_record_schema_version_1064;
 
 #[cfg(test)]
+#[path = "buyer/journal_closure_1474_tests.rs"]
+mod journal_closure_1474_tests;
+
+#[cfg(test)]
 mod tests {
-    #[cfg(feature = "shellnet")]
     use crate::cli::args::{NoteDeployArgs, RecoveryIdentityArgs};
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn handle_network_matches_client_network() {
         let dir = tempfile::tempdir().expect("deal handle fixture directory");
         let token_contract = format!("0:{}", "b".repeat(64));
         let note_addr = format!("0:{}", "a".repeat(64));
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let handle = crate::cli::deals::DealHandle {
             version: crate::cli::deals::DEAL_HANDLE_VERSION,
             handle: crate::cli::deals::make_handle_id(
@@ -11797,14 +12994,17 @@ mod tests {
         assert!(different.is_empty());
     }
 
-    #[cfg(feature = "shellnet")]
     include!("buyer/issue_1054_test.rs");
 
-    #[cfg(feature = "shellnet")]
     include!("buyer/issue_1105_test.rs");
 
-    #[cfg(feature = "shellnet")]
     include!("buyer/issue_1203_test.rs");
+
+    // the policy line is a record, and its `state=` field is a reading or absent.
+    // `include!` rather than a `mod` declaration because these tests drive the real policy path
+    // against `RecordingRecoveryChain`, which is private to this module. Not feature-gated: the
+    // policy surface and its mock compile in the default build.
+    include!("buyer/policy_stream_1497_test.rs");
 
     /// The `request_delivery` record an integrator parses is exactly what the machine contract
     /// promises: every documented key present, token counts as decimal strings like every
@@ -11867,7 +13067,6 @@ mod tests {
         assert_eq!(super::REQUEST_DELIVERY_EVENT, "request_delivery");
     }
 
-    #[cfg(feature = "shellnet")]
     fn ordinary_gateway_snapshot(
         ticks: u64,
     ) -> (dexdo_core::DealChainState, dexdo_core::DealSubscription) {
@@ -11921,31 +13120,138 @@ mod tests {
         assert!(err.contains("dexdo market-data"), "{err}");
     }
 
+    /// The checklist a buy walks reaches its last step.
+
+    /// Asserted as an OUTCOME, because the mechanism is what lied: every label was spelled
+    /// correctly, every call was in the right place, and the cursor still never moved -- the match
+    /// site advanced the plan by the finished step's `done` text, which matches no declared step.
+    /// A live run found it; reading the code did not, twice.
+
+    /// So this drives the plan with the labels the buy actually passes, in order, and requires the
+    /// ticks to end at `[4/4]`. Advance it by a `done` text again and the last tick never appears.
+    #[test]
+    fn the_buy_checklist_reaches_its_last_step() {
+        let mut plan = crate::cli::progress_plan::Plan::new(super::buyer_progress_plan(true));
+        let mut ticked: Vec<String> = Vec::new();
+        // The counter after each step is what the operator reads, so it is what is asserted -- and
+        // it is the exact thing the defect broke: advanced by a `done` text, the cursor stays where
+        // it was and every assertion about totals still passes.
+        for (running, expected) in [
+            (super::BUYER_STEP_PLACING.0, 2usize),
+            (super::BUYER_STEP_WAITING.0, 3),
+            (super::BUYER_STEP_ENDPOINT.0, 4),
+        ] {
+            ticked.extend(plan.advance_to(running));
+            assert_eq!(
+                plan.position().map(|(at, _)| at),
+                Some(expected),
+                "after `{running}` the checklist has to stand on step {expected}: {ticked:?}"
+            );
+        }
+        ticked.extend(plan.finish());
+
+        assert_eq!(
+            ticked.len(),
+            4,
+            "every declared step has to tick exactly once: {ticked:?}"
+        );
+        assert!(
+            ticked.last().is_some_and(|last| last.contains("[4/4]")
+                && last.contains(super::BUYER_STEP_ENDPOINT.1)),
+            "the checklist must end on its last step, in the past tense: {ticked:?}"
+        );
+        assert!(
+            plan.position().is_none(),
+            "nothing may still be running once the buy is done: {:?}",
+            plan.position()
+        );
+
+        // The signature of the defect itself: a step named by what it says once it is BEHIND moves
+        // nothing. Every label the buy passes has to be a step's running form.
+        let mut by_done = crate::cli::progress_plan::Plan::new(super::buyer_progress_plan(true));
+        assert!(
+            by_done.advance_to(super::BUYER_STEP_WAITING.1).is_empty()
+                && by_done.position().map(|(at, _)| at) == Some(1),
+            "a `done` text is not a step: the checklist must not move on it"
+        );
+
+        // A one-shot buy declares three, and the third is the wait -- so its checklist ends there
+        // rather than pointing at an endpoint it will never bring up.
+        let mut one_shot = crate::cli::progress_plan::Plan::new(super::buyer_progress_plan(false));
+        let mut ticked = one_shot.advance_to(super::BUYER_STEP_PLACING.0);
+        ticked.extend(one_shot.advance_to(super::BUYER_STEP_WAITING.0));
+        ticked.extend(one_shot.finish());
+        assert_eq!(ticked.len(), 3, "{ticked:?}");
+        assert!(ticked.last().is_some_and(|last| last.contains("[3/3]")), "{ticked:?}");
+    }
+
+    /// The match is a step; the address and the standing behind it are records.
+
+    /// Read from the source rather than from a live run, because the site is inside the buy's
+    /// match arm and a test that drove it would need a seller, a chain and a fill. What has to hold
+    /// is structural: neither marker may be written with `println!` again, which is how both got
+    /// onto an operator's screen in the first place -- 128 characters of address and seven fields of
+    /// standing, printed at the moment their money was moving.
+    #[test]
+    fn the_matched_deal_details_are_recorded_and_not_printed() {
+        let source = include_str!("buyer.rs");
+        for marker in ["\"matched deal TokenContract: {}\"", "matched_state_summary(&outcome"] {
+            let at = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("the site this test guards is gone: {marker}"));
+            // The call that carries it starts within the preceding few lines; that window is what
+            // decides whether this reaches the screen or the log.
+            let before = &source[at.saturating_sub(200)..at];
+            assert!(
+                before.contains("tracing::info!"),
+                "{marker} must be recorded, not printed:\n{before}"
+            );
+            assert!(
+                !before.contains("println!"),
+                "{marker} is on its way to the operator's screen again:\n{before}"
+            );
+        }
+    }
+
     #[test]
     fn local_openai_handoff_uses_actual_loopback_port_and_literal_fake_key() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind a dynamic loopback port");
         let addr = listener.local_addr().expect("read bound loopback address");
         assert_ne!(addr.port(), 0);
-        for (mode, continuity) in [
-            (
-                super::ContinuityModeArg::Proactive,
-                "proactive: may keep a warm deal and spend while idle",
-            ),
-            (
-                super::ContinuityModeArg::OnDemand,
-                "on-demand: does not spend while idle, but the first request after idle waits for purchase/handover",
-            ),
+        for (mode, idle) in [
+            (super::ContinuityModeArg::Proactive, "may spend while you are not asking"),
+            (super::ContinuityModeArg::OnDemand, "spends nothing while you are not asking"),
         ] {
-            let output = super::render_local_openai_handoff(addr, "qwen--qwen3--32b", mode)
+            let output = super::render_local_openai_handoff(addr, "Qwen3-32B", mode)
                 .expect("loopback handoff");
-            assert_eq!(
-                output,
-                format!(
-                    "OPENAI_BASE_URL=http://{addr}/v1\nOPENAI_MODEL=qwen--qwen3--32b\n\
-                     OPENAI_API_KEY=dexdo-local\nCONTINUITY_MODE={continuity}"
-                )
+
+            // The machine half, unchanged and at the start of its own line: whatever reads this with
+            // `grep '^OPENAI_'` or `eval` keeps working.
+            for exported in [
+                format!("\nOPENAI_BASE_URL=http://{addr}/v1"),
+                "\nOPENAI_MODEL=Qwen3-32B".to_string(),
+                "\nOPENAI_API_KEY=dexdo-local".to_string(),
+            ] {
+                assert!(output.contains(&exported), "{output}");
+            }
+
+            // The operator half: what this is, how to send a prompt to it, and what it costs while
+            // nobody is asking. The command has to carry THIS deal's model, or it is an example
+            // rather than something to paste.
+            // `spec.md`: the heading opens with the success glyph and names the model as an id.
+            assert!(
+                output.starts_with("\u{2714} model ready") && output.contains("Qwen3-32B"),
+                "{output}"
             );
+            assert!(output.contains(&format!("curl http://{addr}/v1/chat/completions")), "{output}");
+            assert!(output.contains(r#""model":"Qwen3-32B""#), "{output}");
+            assert!(output.contains(idle), "{output}");
+
+            // `CONTINUITY_MODE=` was never an environment variable -- it described a policy in the
+            // shape of one, inside a block an operator pastes into a shell.
+            assert!(!output.contains("CONTINUITY_MODE="), "{output}");
+
             for secret in ["sk-live-provider-secret", "owner_secret_key_hex"] {
                 assert!(!output.contains(secret), "{output}");
             }
@@ -11953,7 +13259,7 @@ mod tests {
         assert!(
             super::render_local_openai_handoff(
                 "192.0.2.1:8080".parse().unwrap(),
-                "qwen--qwen3--32b",
+                "Qwen3-32B",
                 super::ContinuityModeArg::Proactive,
             )
             .is_none(),
@@ -11961,7 +13267,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn transient_read_retries_with_backoff_not_hard_fail() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11990,7 +13295,6 @@ mod tests {
         assert!(started.elapsed() >= super::EXECUTABLE_READ_BACKOFF[0]);
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn seller_open_probe_close_hint_names_current_accept_and_stop_methods() {
         let target = super::DealTarget {
@@ -12019,7 +13323,7 @@ mod tests {
             dispute_time: 0,
         };
 
-        let hint = super::close_hint(&target, &summary, None, None);
+        let hint = super::close_hint(&target, &summary, None);
 
         assert!(
             hint.contains("next=seller_wait_delivery_then_accept_probe"),
@@ -12033,7 +13337,6 @@ mod tests {
         assert!(!hint.contains("wait_for_buyer_stop"), "{hint}");
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn seller_streaming_close_hint_names_current_claim_and_settlement_methods() {
         let target = super::DealTarget {
@@ -12062,7 +13365,7 @@ mod tests {
             dispute_time: 0,
         };
 
-        let hint = super::close_hint(&target, &summary, None, None);
+        let hint = super::close_hint(&target, &summary, None);
 
         assert!(
             hint.contains("next=seller_claim_finalize_or_settle_week_or_seller_stop"),
@@ -12269,7 +13572,7 @@ mod tests {
                         .to_string(),
                 )
             })?;
-            dexdo_core::chain::ensure_pre_submit_quote_unchanged(quoted_order, selected)?;
+            dexdo_core::market::ensure_pre_submit_quote_unchanged(quoted_order, selected)?;
             *cursor = dexdo_core::MatchWatchCursor::new(67);
             self.model_before_post_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12387,7 +13690,7 @@ mod tests {
         }
     }
 
-    /// the production real-shellnet seam returns one complete matcher row. Selection must retain
+    /// the production real-chain seam returns one complete matcher row. Selection must retain
     /// every field and must not reconstruct the durable identity through lossy offer discovery.
     #[tokio::test]
     async fn buyer_model_quote_preserves_full_submit_safe_order_without_offer_round_trip() {
@@ -12425,12 +13728,12 @@ mod tests {
         assert_eq!(
             chain.discover_calls.load(Ordering::SeqCst),
             0,
-            "real-shellnet model selection must never call mock_orders_from_offers"
+            "real-chain model selection must never call mock_orders_from_offers"
         );
         assert_eq!(
             chain.model_preflight_calls.load(Ordering::SeqCst),
             1,
-            "the canonical assertion must perform exactly one row-returning real-shellnet quote read"
+            "the canonical assertion must perform exactly one row-returning real-chain quote read"
         );
     }
 
@@ -12458,21 +13761,24 @@ mod tests {
         let provider_secret_path = "/tmp/provider-secret-do-not-print.json";
         let argv = format!(
             "dexdo buyer --note-key {secret_key_path} --note-addr {note_addr} \
-             --endpoints-file {provider_secret_path} --models /tmp/models.json \
-             --contracts /tmp/contracts.json"
+             --endpoints-file {provider_secret_path} --models /tmp/models.json"
         );
         let cli = crate::Cli::try_parse_from(argv.split_whitespace()).expect("parse buyer fixture");
         let crate::Command::Buyer(args) = cli.command else {
             panic!("buyer command");
         };
-        let command = super::buyer_read_only_quote_command(&args, "qwen--qwen3--32b", 2, 10);
+        // Ten SHELL a tick, in the raw units this function takes; the command it prints states
+        // the price the way the operator types it back.
+        let ceiling = dexdo_core::price_raw_from_shell(10).expect("ten SHELL is a price");
+        let command =
+            super::buyer_read_only_quote_command(&args, "Qwen3-32B", 2, ceiling);
 
         assert_eq!(
             command,
             format!(
-                "dexdo executable-book 'qwen--qwen3--32b' --ticks 2 \
+                "dexdo executable-book 'Qwen3-32B' --ticks 2 \
                  --max-price-per-tick 10 --note-addr '{note_addr}' \
-                 --models '/tmp/models.json' --contracts '/tmp/contracts.json'"
+                 --models '/tmp/models.json'"
             )
         );
         for secret in [secret_key_path, provider_secret_path] {
@@ -12490,7 +13796,7 @@ mod tests {
             vec![
                 "dexdo",
                 "executable-book",
-                "qwen--qwen3--32b",
+                "Qwen3-32B",
                 "--ticks",
                 "2",
                 "--max-price-per-tick",
@@ -12499,8 +13805,6 @@ mod tests {
                 note_addr.as_str(),
                 "--models",
                 "/tmp/models.json",
-                "--contracts",
-                "/tmp/contracts.json",
             ],
             "{command}"
         );
@@ -12510,8 +13814,7 @@ mod tests {
         // The same builder, with values a naive split would break on.
         let hostile = format!(
             "dexdo buyer --note-key {secret_key_path} --note-addr {note_addr} \
-             --endpoints-file {provider_secret_path} --models '/tmp/my models.json' \
-             --contracts /tmp/contracts.json"
+             --endpoints-file {provider_secret_path} --models '/tmp/my models.json'"
         );
         let hostile_cli = crate::Cli::try_parse_from(
             crate::cli::support::printed_commands::shell_split(&hostile)
@@ -12522,7 +13825,7 @@ mod tests {
             panic!("buyer command");
         };
         let hostile_command =
-            super::buyer_read_only_quote_command(&hostile_args, "qwen--qwen3--32b", 2, 10);
+            super::buyer_read_only_quote_command(&hostile_args, "Qwen3-32B", 2, ceiling);
         let hostile_argv = crate::cli::support::printed_commands::shell_split(&hostile_command)
             .expect("the quote command must survive a shell with hostile values");
         assert!(
@@ -12553,9 +13856,9 @@ mod tests {
                 &super::BuyerSubmitIntent::foreground(),
                 None,
                 2,
-                10,
+                ceiling,
                 None,
-                Some((&args, "qwen--qwen3--32b")),
+                Some((&args, "Qwen3-32B")),
             )
             .await
             .expect_err("non-matchable quote must fail before submit");
@@ -12597,19 +13900,48 @@ mod tests {
                 &super::BuyerSubmitIntent::foreground(),
                 Some("0:expected"),
                 2,
-                10,
+                ceiling,
                 None,
-                Some((&args, "qwen--qwen3--32b")),
+                Some((&args, "Qwen3-32B")),
             )
             .await
             .expect_err("explicit non-matchable quote must fail before submit");
-            assert_eq!(
-                format!("{error:#}"),
-                format!(
+            // The machine line is asserted whole and by prefix-bearing content; what precedes it is
+            // the operator's two lines, which put there and which are asserted for their
+            // ACTION in `refusal_1432_tests` rather than pinned as prose here.
+            let rendered = format!("{error:#}");
+            // The network is read from `current_network()` rather than spelled `chain` here. That
+            // literal is its FALLBACK -- what it answers when no manifest is readable -- so an
+            // assertion carrying it passes only in a shell with `DEXDO_MANIFEST` unset, and proves
+            // nothing about the substitution: it would hold identically against a hard-coded name.
+            // Asked the same way the code answers, this holds under any manifest and fails if the
+            // line ever stops being substituted at all.
+            let network = dexdo_core::params::current_network();
+            assert!(
+                rendered.contains(&format!(
                     "BUYER_PREFLIGHT matchable=false reason={reason} \
-                     detail=buyer explicit-token quote preflight: shellnet: {detail}\n\
+                     detail=buyer explicit-token quote preflight: {network}: {detail}\n\
                      next_command={command}"
-                )
+                )),
+                "{rendered}"
+            );
+            // Counted as content, not as a line start: the record now travels in the chain under the
+            // operator's two lines, so `{error:#}` joins them with `: ` and the machine line no
+            // longer begins one. What must not change is that it appears exactly once.
+            assert_eq!(
+                rendered.matches("BUYER_PREFLIGHT matchable=").count(),
+                1,
+                "the machine line stays single: {rendered}"
+            );
+            let shown = error
+                .downcast_ref::<crate::cli::refusal::OperatorRefusal>()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            // The market's answer opens with the warning glyph `spec.md` gives it; the client's own
+            // failure gets the error mark. Either way the record stays out of what is shown.
+            assert!(
+                shown.contains('\u{26a0}') && !shown.contains("BUYER_PREFLIGHT"),
+                "what the operator is shown is the two lines and nothing else: {shown}"
             );
             assert_eq!(
                 chain.explicit_money_submit_calls.load(Ordering::SeqCst),
@@ -12621,13 +13953,15 @@ mod tests {
 
     /// A `--mock-chain` buy must be pointed at a command *this build serves*, reading *the state
     /// that just failed*. `executable-book` is neither: the default binary rejects it as
-    /// shellnet-only, and a shellnet binary answers it from the real book rather than the mock one
+    /// chain-only, and a a chain build answers it from the real book rather than the mock one
     /// the buy ran against.
+
     /// The follow-up is parsed back with the shipped parser -- not compared to a string this test
     /// rebuilt -- and checked for the two things that decide whether an operator can actually run
-    /// it: `run_quote_mock` is reachable(`--mock-chain`), and it reads this run's own mock state
+    /// it: `run_quote_mock` is reachable (`--mock-chain`), and it reads this run's own mock state
     /// (`--endpoints-file`). `run_quote_mock` also demands exactly one of `--ticks`/`--budget`
     /// below clap, so a line missing that pairing would parse here and then fail for the operator.
+
     /// Every fixture value below is deliberately free of spaces and quotes, and that is asserted
     /// rather than assumed, so stripping the single quotes `shell_arg` adds is exact for these
     /// inputs. Proving the line survives a real shell with hostile values is issue 817's guarantee
@@ -12647,7 +13981,7 @@ mod tests {
         }
         let line = format!(
             "dexdo buyer --mock-chain --mock-model --note-addr {note_addr} \
-             --endpoints-file {endpoints} --models {models} --contracts /tmp/contracts.json"
+             --endpoints-file {endpoints} --models {models}"
         );
         let cli = crate::Cli::try_parse_from(line.split_whitespace())
             .expect("parse mock buyer fixture");
@@ -12658,7 +13992,7 @@ mod tests {
         let command = super::buyer_read_only_quote_command(&args, "dexdo-mock", 2, 10);
         assert!(
             !command.contains("executable-book"),
-            "a mock buy must not be sent to the shellnet-only reader: {command}"
+            "a mock buy must not be sent to the chain-only reader: {command}"
         );
 
         let argv: Vec<String> = command
@@ -13050,7 +14384,7 @@ mod tests {
         );
     }
 
-    /// Demo(run with `--nocapture`): render the model-only order book through the REAL `render_inference_book`
+    /// Demo (run with `--nocapture`): render the model-only order book through the REAL `render_inference_book`
     /// against a `MockChainBackend` seeded with a few asks -- shows exactly what the buyer sees before choosing.
     #[tokio::test]
     async fn demo_render_inference_book() {
@@ -13104,7 +14438,6 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn market_manifest_must_match_positional_model() {
         let dir = std::env::temp_dir().join(format!(
@@ -13123,7 +14456,7 @@ mod tests {
             r#"{
               "models": {
                 "qwen": {
-                  "frame_model": "qwen--qwen3--32b",
+                  "frame_model": "Qwen3-32B",
                   "base_url": "https://example.invalid/openai/v1",
                   "served_model": "qwen/qwen3-32b",
                   "api_key_env": "QWEN_KEY",
@@ -13143,34 +14476,35 @@ mod tests {
         )
         .unwrap();
         let manifest = dexdo_core::MarketManifest {
-            network: "shellnet".to_string(),
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            network: "net-a".to_string(),
+            frame_model: "Qwen3-32B".to_string(),
+            model_hash: dexdo_core::model_hash_for("Qwen3-32B"),
             inference_order_book: "0:book".to_string(),
             root_model: "0:root".to_string(),
             token_contract: "0:tc".to_string(),
             seller_note: "0:seller".to_string(),
             nonce: 7,
-            price_per_tick: 1000,
+            // A thousand SHELL a tick: the manifest carries whole SHELL.
+            price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 8,
         };
         let market = dir.join("market.json");
         std::fs::write(&market, manifest.to_json().unwrap()).unwrap();
 
-        assert!(super::target_from_market_for_model(&market, &models, "qwen").is_ok());
-        assert!(super::target_from_market_for_model(&market, &models, "qwen--qwen3--32b").is_ok());
-        let err = match super::target_from_market_for_model(&market, &models, "llama") {
+        assert!(super::target_from_market_for_model(&market, &models, "qwen", false).is_ok());
+        assert!(super::target_from_market_for_model(&market, &models, "Qwen3-32B", false).is_ok());
+        let err = match super::target_from_market_for_model(&market, &models, "llama", false) {
             Ok(_) => panic!("wrong positional model must fail closed"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("refusing to render the wrong market"), "{err}");
         assert!(err.contains("llama--llama3--8b"), "{err}");
-        assert!(err.contains("qwen--qwen3--32b"), "{err}");
+        assert!(err.contains("Qwen3-32B"), "{err}");
     }
 
     #[test]
     fn seller_offer_path_has_no_exact_tc_id_walk() {
-        let backend = include_str!("../../../core/src/shellnet/backends.rs");
+        let backend = include_str!("../../../core/src/chain/backends.rs");
         assert!(!backend.contains("ORDERBOOK_EXACT_TC_SCAN_TIMEOUT"));
         assert!(!backend.contains("active_sell_order_ids_for_exact_tc_bounded"));
         assert!(!backend.contains("duplicate active sell order preflight incomplete"));
@@ -13192,7 +14526,7 @@ mod tests {
             .find("let registry_policy =")
             .expect("registry policy load present");
         let doctor = body[policy..]
-            .find("shellnet_doctor_preflight(")
+            .find("chain_doctor_preflight(")
             .map(|offset| policy + offset)
             .expect("registry-enabled doctor present");
         let resolve = body[doctor..]
@@ -13203,9 +14537,6 @@ mod tests {
             .find("enforce_model_registry_policy(")
             .map(|offset| resolve + offset)
             .expect("registry hash/book enforcement present");
-        let shape = body
-            .find("validate_canonical_model_id(")
-            .expect("legacy shape check present");
         let backend = body
             .find("buyer_real_backend(")
             .expect("real backend construction present");
@@ -13217,49 +14548,82 @@ mod tests {
             policy < doctor
                 && doctor < resolve
                 && resolve < enforce
-                && enforce < shape
-                && shape < backend
+                && enforce < backend
                 && backend < money,
-            "registry membership/hash/book gate must finish before legacy shape, backend construction, or money raise"
+            "registry membership/hash/book gate must finish before backend construction or money raise"
+        );
+        // and there is no second gate behind it. The `producer--model--version` shape check
+        // used to sit between the registry gate and the backend; it refused names the on-chain
+        // catalog actually carries, so the buyer could not reach a market the seller had listed.
+        // The registry's answer is the only membership test this path runs.
+        assert!(
+            !body.contains("validate_canonical_model_id("),
+            "the legacy client-side model-name grammar is back on the buyer path; the registry is \
+             the authority on a model name"
         );
     }
 
     #[test]
     fn subscription_registry_getter_uses_existing_read_timeout_scope() {
         let source = include_str!("buyer.rs");
-        let start = source
-            .find("pub(crate) async fn run_subscription(args: SubscriptionArgs)")
-            .expect("shellnet subscription present");
-        let rest = &source[start..];
-        let end = rest[1..]
-            .find("\n#[cfg(")
-            .map(|offset| offset + 1)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        let timeout = body
-            .find("direct_chain_read_with_timeout(")
-            .expect("subscription read timeout present");
-        let resolution = body
-            .find("resolve_model_registry_target(")
-            .expect("subscription registry resolution present");
-
+        // `body_of`, not the next `#[cfg(`: that anchor was a neighbouring stub, and deleting the
+        // cargo features deleted it, turning ten order guards into assertions about nothing.
+        let body = crate::cli::source_probe::code_of(
+            source,
+            "pub(crate) async fn run_subscription(args: SubscriptionArgs)",
+        );
+        // CONTAINMENT, not order: `ReadBudget::new` is the first statement of `run_subscription`,
+        // so comparing offsets against it could never fail, and it did not while this same
+        // function made five reads outside any bound.
         assert!(
-            timeout < resolution,
-            "subscription registry getter must run inside the existing read timeout"
+            body.contains(".read(registry_requested_model("),
+            "the subscription registry getter must be read through the command's budget"
+        );
+        // The whole PRODUCTION half of the file, not just this body: moving the unbudgeted read
+        // into a helper called from here would put it outside the body and leave the guard green
+        // while the money path spent five budgets again. A helper in ANOTHER file still escapes
+        // this, and that is named in the PR rather than pretended away.
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            !production.contains("direct_chain_read_with_timeout("),
+            "a second full `--read-timeout` is back on the money path: that helper bounds ONE \
+             read, so five of them made `--read-timeout 30` block for 150s+"
+        );
+    }
+
+    /// `--mock` must not need `DEXDO_MANIFEST`, so the manifest read stays BELOW its return.
+
+    /// Hoisting `manifest_path()` to the top of the function -- the obvious way to stop re-reading
+    /// it seven times -- put an environment read that can fail on its own in front of the one mode
+    /// that never reaches a chain. `dexdo subscription --mock` would have started refusing without
+    /// a manifest it does not use. Caught by reading the diff, not by any test, which is why this
+    /// one exists.
+    #[test]
+    fn the_mock_return_comes_before_the_manifest_is_read() {
+        let body = crate::cli::source_probe::code_of(
+            include_str!("buyer.rs"),
+            "pub(crate) async fn run_subscription(args: SubscriptionArgs)",
+        );
+        let mock = body
+            .find("return run_mock_subscription(")
+            .expect("the mock branch returns early");
+        let manifest = body
+            .find("let manifest_path = crate::cli::commands::manifest_path()?;")
+            .expect("the manifest path is bound once");
+        assert!(
+            mock < manifest,
+            "`--mock` would refuse without DEXDO_MANIFEST: the manifest is read at {manifest}, \
+             before the mock return at {mock}"
         );
     }
 
     #[test]
     fn subscription_reconciles_before_doctor_and_doctor_precedes_fresh_money() {
         let source = include_str!("buyer.rs");
-        let start = source
-            .find("pub(crate) async fn run_subscription")
-            .expect("run_subscription present");
-        let end = source[start..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| start + offset)
-            .expect("shellnet run_subscription end marker present");
-        let body = &source[start..end];
+        let body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_subscription");
 
         let plan = body
             .find("subscription_place_plan(place)?")
@@ -13271,7 +14635,7 @@ mod tests {
             .find("reconcile_existing_subscription_journal(")
             .expect("durable subscription reconciliation present");
         let doctor = body
-            .find("shellnet_doctor_preflight(")
+            .find("chain_doctor_preflight(")
             .expect("subscription money doctor preflight present");
         let exact_order = body
             .find("inference_orderbook_parsed_order(")
@@ -13298,14 +14662,8 @@ mod tests {
     #[test]
     fn subscription_exact_order_lookup_is_independent_of_historical_order_ids() {
         let buyer = include_str!("buyer.rs");
-        let start = buyer
-            .find("pub(crate) async fn run_subscription")
-            .expect("run_subscription present");
-        let end = buyer[start..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| start + offset)
-            .expect("shellnet run_subscription end marker present");
-        let command = &buyer[start..end];
+        let command =
+            crate::cli::source_probe::code_of(buyer, "pub(crate) async fn run_subscription");
         assert!(!command.contains("read_book_target("));
         assert!(!command.contains("inference_orderbook_snapshot("));
         assert_eq!(
@@ -13313,7 +14671,7 @@ mod tests {
             1
         );
 
-        let backend = include_str!("../../../core/src/shellnet/backends.rs");
+        let backend = include_str!("../../../core/src/chain/backends.rs");
         let summary_start = backend
             .find("pub async fn inference_orderbook_summary")
             .expect("constant-cost summary reader present");
@@ -13429,7 +14787,7 @@ mod tests {
         let err = super::reject_buyer_raw_token_contract_without_registry_book_proof(
             None,
             Some("0:badtc"),
-            "qwen--qwen3--32b",
+            "Qwen3-32B",
         )
         .unwrap_err()
         .to_string();
@@ -13442,7 +14800,7 @@ mod tests {
             super::reject_buyer_raw_token_contract_without_registry_book_proof(
                 Some(market_path),
                 None,
-                "qwen--qwen3--32b",
+                "Qwen3-32B",
             )
             .is_ok()
         );
@@ -13450,7 +14808,7 @@ mod tests {
             super::reject_buyer_raw_token_contract_without_registry_book_proof(
                 None,
                 None,
-                "qwen--qwen3--32b",
+                "Qwen3-32B",
             )
             .is_ok()
         );
@@ -13463,18 +14821,12 @@ mod tests {
     #[test]
     fn content_identity_resolution_uses_embedded_model_registry_abi() {
         let source = include_str!("buyer.rs");
-        let start = source
-            .find("async fn resolve_content_identity_model")
-            .expect("content identity resolver present");
-        let end = source[start..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| start + offset)
-            .expect("resolver end marker present");
-        let body = &source[start..end];
+        let body =
+            crate::cli::source_probe::code_of(source, "async fn resolve_content_identity_model");
 
         assert!(
             body.contains(
-                "ShellnetModelRegistryReader::from_manifest(contracts, &registry_address)"
+                "ChainModelRegistryReader::from_manifest(contracts, &registry_address)"
             ),
             "resolver must use the embedded-ABI ModelRegistry reader"
         );
@@ -13488,10 +14840,248 @@ mod tests {
         );
     }
 
+    /// A run that took the `--resume` carve-out starts no renewal.
+
+    /// The carve-out belongs to the DEAL, not to the run. It exists because refusing at entry would
+    /// lock an operator out of escrow already frozen -- but `submit_buyer_continuity_next_deal`
+    /// places a NEW deal with NEW escrow, on the book the divergent bytes derive, which is the book
+    /// `provision` refuses to create. Under the default `--continuity-mode proactive` it does that
+    /// while idle, with no request to trigger it.
+
+    /// Held by source, on the two properties that make it true rather than on the wording: the
+    /// renewal takes the fact as a PARAMETER -- so the compiler asks every call site for it -- and
+    /// returns early on it before anything is spawned.
+    #[test]
+    fn a_diverged_spelling_starts_no_renewal() {
+        let source = include_str!("buyer.rs");
+        // The signature is read from the raw source, because `code_of` returns the BODY -- the
+        // parameter list is above it and would never be found there.
+        let at = source
+            .find("\nfn spawn_buyer_service_renewal(")
+            .expect("the renewal function is still declared here");
+        let signature = &source[at..at + 600];
+        assert!(
+            signature.contains("spelling_diverged: bool"),
+            "the renewal must take the carve-out's fact as a parameter, so no call site can omit \
+             it by construction"
+        );
+        let body = crate::cli::source_probe::code_of(source, "fn spawn_buyer_service_renewal(");
+        let guard = body
+            .find("if spelling_diverged")
+            .expect("the renewal must refuse on a diverged spelling");
+        let spawn = body
+            .find("tokio::spawn")
+            .expect("the renewal still spawns its task somewhere");
+        assert!(
+            guard < spawn,
+            "the refusal stands after the task is spawned, which is after the money it guards"
+        );
+    }
+
+    /// `subscription place` checks the name too, and it is a SEPARATE entry from `run_buyer_inner`.
+
+    /// The hoist above put the check on every path through `run_buyer_inner`. `subscription place`
+    /// does not go through it: it lives in `run_subscription`, which reaches the chain by its own
+    /// route. Measured while reviewing -- the only call to
+    /// `resolve_buyer_content_identity_model` was inside `run_buyer_inner`, so a subscription buy
+
+    /// section 8 lists `subscription place` among the paths that require a resolved name.
+
+    /// Held by order, like its sibling: the resolution must stand before
+    /// `resolve_model_registry_target`, which is where the book this money goes to is settled.
+    #[test]
+    fn subscription_place_resolves_the_registry_name_before_it_settles_a_book() {
+        let source = include_str!("buyer.rs");
+        let code = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = crate::cli::source_probe::code_of(
+            &code,
+            "pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {",
+        );
+        let resolution = body
+            .find("resolve_buyer_content_identity_model(")
+            .expect(
+                "`subscription place` does not resolve the registry name at all, so it places \
+                 escrow under a spelling nobody checked",
+            );
+        let settles = body
+            .find("resolve_model_registry_target(")
+            .expect("the subscription path still settles its book target here");
+        assert!(
+            resolution < settles,
+            "the name is resolved after the book target is settled, which is after the decision \
+             this check exists to make"
+        );
+    }
+
+    /// And that resolution spends the operator's `--read-timeout`, so it stands INSIDE `budget`.
+
+    /// The first revision of the check above called the resolver bare, and nothing was red: the
+    /// whole `dexdo` binary passed with the call outside the budget. `ReadBudget` puts a
+    /// `tokio::time::timeout` on what is left of `--read-timeout` and charges what was spent
+    /// (`commands.rs:187`); a read outside it has no deadline of its own, so an unresponsive
+    /// registry hangs `subscription place` where every read either side of it would have refused
+    /// with "chain read timed out" -- and the reads that follow are then handed a budget that was
+    /// never debited, which is more time than the operator asked for.
+
+    /// Held by nesting rather than by order, because order is what the sibling above already holds
+    /// and it is satisfied by a bare call. The resolver must sit inside the argument of a preceding
+    /// `.read(` with no `.await` between the two -- unwrap it and the nearest `.read(` becomes the
+    /// `registry_requested_model` read above, whose own `.await` then lands in the gap.
+    #[test]
+    fn the_subscription_name_check_spends_the_operator_s_read_budget() {
+        let source = include_str!("buyer.rs");
+        let code = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = crate::cli::source_probe::code_of(
+            &code,
+            "pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {",
+        );
+        let call = body
+            .find("resolve_buyer_content_identity_model(")
+            .expect("`subscription place` does not resolve the registry name at all");
+        let read = body[..call].rfind(".read(").expect(
+            "the registry read stands outside `budget`, so it has no `--read-timeout` of its own \
+             and charges nothing to the reads that follow it",
+        );
+        let between = &body[read + ".read(".len()..call];
+        assert!(
+            !between.contains(".await"),
+            "the nearest `.read(` before the resolution belongs to an earlier read that already \
+             awaited, so the resolution itself is unbudgeted; between them: {between:?}"
+        );
+    }
+
+    /// The name check is not gated on `--local-listen`, and that is the whole of's second
+    /// half on this side.
+
+    /// It used to live inside `build_buyer_content_policy`, which the entry calls only when a
+    /// local endpoint was asked for -- so `dexdo buyer` without `--local-listen`, and
+    /// `subscription place`, placed escrow under whatever spelling they were handed.
+
+    /// name.
+
+    /// A source guard because the alternative needs a chain, a note and a registry. It holds the
+    /// ORDER -- the resolution stands before the branch, not inside it -- which is the property
+    /// that was wrong, and it strips comments first so a call moved into one cannot satisfy it.
+    #[test]
+    fn the_registry_name_check_is_not_gated_on_local_listen() {
+        let source = include_str!("buyer.rs");
+        let code = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gate = code
+            .find("let buyer_content_policy = if args.local_listen.is_some()")
+            .expect("the local-listen branch is still where the content policy is built");
+        let resolution = code
+            .find("match resolve_buyer_content_identity_model(")
+            .expect("the buyer still resolves the registry name somewhere");
+        assert!(
+            resolution < gate,
+            "the registry-name resolution sits inside or after the `--local-listen` branch, so \
+             every other buyer money path places escrow under an unchecked spelling"
+        );
+    }
+
+    /// THE DEFECT, buyer side: a name the registry spells differently was accepted, and the
+    /// book was then derived from the operator's bytes.
+
+    /// `model_hash_for(frame_model)` keys the book, so buying under a name the registry holds
+    /// differently rests escrow on a book `provision` now refuses to create -- no seller will ever
+
+    /// sides: with only one of them refusing, the two still meet on different books.
+    #[test]
+    fn a_name_the_registry_spells_differently_is_refused_for_the_buyer_too() {
+        let error = super::buyer_content_identity_resolution_result(
+            "qwen--qwen3.8--27b",
+            false,
+            false,
+            Ok("Qwen3.8-27B".to_string()),
+        )
+        .expect_err("a name the registry spells differently must not place escrow");
+        let message = format!("{error:#}");
+        assert!(message.contains("Qwen3.8-27B"), "{message}");
+        assert!(message.contains("qwen--qwen3.8--27b"), "{message}");
+    }
+
+    /// And the opt-out does not cover it, exactly as on the seller side.
+    #[test]
+    fn the_buyer_opt_out_does_not_cover_a_misspelling() {
+        super::buyer_content_identity_resolution_result(
+            "qwen--qwen3.8--27b",
+            true,
+            false,
+            Ok("Qwen3.8-27B".to_string()),
+        )
+        .expect_err("the opt-out is about an unconfirmed model, not about a misspelled one");
+    }
+
+    /// RESUME IS NOT REFUSED, and this is the one place the buyer's rule must differ from the
+    /// seller's.
+
+    /// The check runs before the resume branch, so refusing here would lock an operator out of a
+    /// deal whose escrow is already frozen and whose ticks are already paid for -- and the opt-out
+    /// cannot reach that arm. The rule is about not putting NEW money on a book the registry does
+    /// not name; a resume puts none.
+    #[test]
+    fn a_resume_is_not_refused_over_a_spelling() {
+        let identity = super::buyer_content_identity_resolution_result(
+            "qwen--qwen3.8--27b",
+            false,
+            true,
+            Ok("Qwen3.8-27B".to_string()),
+        )
+        .expect("a deal that already exists is not re-litigated over its spelling");
+        assert_eq!(identity.as_deref(), Some("Qwen3.8-27B"));
+    }
+
+    /// A flagged name is not told to buy one without its flags -- the seller's rule, here too.
+    #[test]
+    fn a_flagged_name_is_not_told_to_buy_one_without_its_flags() {
+        let error = super::buyer_content_identity_resolution_result(
+            "qwen--qwen3--32b--w8k--tools",
+            false,
+            false,
+            Ok("Qwen3-32B".to_string()),
+        )
+        .expect_err("a flagged name whose base resolves elsewhere is still a refusal");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("w8k") && message.contains("tools"),
+            "the refusal must name the flags the suggestion would drop: {message}"
+        );
+        assert!(
+            !message.contains("Write `Qwen3-32B`"),
+            "and must not hand a name that buys a different, unflagged market: {message}"
+        );
+    }
+
+    /// The registered spelling passes through untouched.
+    #[test]
+    fn the_registered_spelling_passes_for_the_buyer() {
+        let identity = super::buyer_content_identity_resolution_result(
+            "Qwen3-32B",
+            false,
+            false,
+            Ok("Qwen3-32B".to_string()),
+        )
+        .expect("the registry's own spelling is the one name that must never be refused");
+        assert_eq!(identity.as_deref(), Some("Qwen3-32B"));
+    }
+
     #[test]
     fn buyer_content_identity_resolution_error_fails_closed_without_allow_flag() {
         let err = super::buyer_content_identity_resolution_result(
-            "qwen--qwen3--32b",
+            "Qwen3-32B",
+            false,
             false,
             Err(anyhow::anyhow!("registry unreachable")),
         )
@@ -13504,8 +15094,9 @@ mod tests {
     #[test]
     fn buyer_allow_unverified_model_degrades_resolution_error_to_name_only() {
         let identity = super::buyer_content_identity_resolution_result(
-            "qwen--qwen3--32b",
+            "Qwen3-32B",
             true,
+            false,
             Err(anyhow::anyhow!("registry unreachable")),
         )
         .expect("allow-unverified buyer may continue on name-only evidence");
@@ -13556,7 +15147,7 @@ mod tests {
     #[test]
     fn buyer_content_identity_preflight_error_names_operator_input() {
         let err = dexdo::buyer::api::content_check_policy(
-            "qwen--qwen3--32b",
+            "Qwen3-32B",
             None,
             false,
             false,
@@ -13579,7 +15170,100 @@ mod tests {
         assert!(err.contains("before buy"), "{err}");
     }
 
-    #[cfg(feature = "shellnet")]
+    /// The buyer's `models.json` exactly as the shipped one and the published buyer skill teach it:
+    /// keyed by the canonical frame model, with the 4.0.35 registry spelling declared as an
+    /// identity alias. `api_key_env` is `PATH` so `require_executable_reference` sees a set key --
+    /// the key requirement is not what these three ends are about.
+    fn issue_1706_prefix_keyed_models() -> dexdo::seller::ModelsConfig {
+        dexdo::seller::ModelsConfig::from_json(
+            r#"{ "models": { "qwen": {
+                "frame_model": "qwen--qwen3--32b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "qwen/qwen3-32b",
+                "api_key_env": "PATH",
+                "tokenizer_family": "qwen",
+                "price_per_tick": 1,
+                "identity_aliases": ["Qwen/Qwen3-32B"]
+            } } }"#,
+        )
+        .expect("issue 1706 prefix-keyed models config")
+    }
+
+    /// the 4.0.36 end, as the live gate produced it: the chain holds the model without its
+    /// producer, so `resolve_registered_model_identity` answers `Qwen3-32B` and the money-admission
+    /// lookup -- three exact comparisons, no normalization, deliberately -- found nothing under
+    /// that spelling and refused with `content_identity_preflight` before backend/quote/buy. The
+    /// seller had provisioned and was standing in the book the whole time.
+
+    /// The second assertion is the point of the fix: the exact comparison still refuses the
+    /// registry spelling on its own. Nothing in `buyer::verify` was loosened; the admission path is
+    /// handed the operator's own requested name as well, which the chain attested is the same
+    /// identity.
+    #[test]
+    fn issue_1706_producer_free_registry_name_admits_a_prefix_keyed_config() {
+        let cfg = issue_1706_prefix_keyed_models();
+
+        assert_eq!(
+            dexdo::buyer::verify::executable_reference_model_for("Qwen3-32B", &cfg),
+            None,
+            "the money-path comparison stays exact: the producer-free spelling is not in this config"
+        );
+        assert_eq!(
+            super::buyer_executable_reference_model("qwen--qwen3--32b", Some("Qwen3-32B"), &cfg),
+            Some("qwen--qwen3--32b"),
+            "a 4.0.36 registry name must still admit a config keyed by the prefixed form"
+        );
+    }
+
+    /// The other end of the same change, and the reason it is asserted rather than assumed: a fix
+    /// that chased only the 4.0.36 spelling would break the chains already in production. A 4.0.35
+    /// registry answers with the prefixed name, the config lists it as an identity alias, and
+    /// admission must bind on that FIRST -- on the registry spelling itself, before the requested
+    /// name is ever consulted.
+    #[test]
+    fn issue_1706_prefixed_registry_name_admits_the_same_config() {
+        let cfg = issue_1706_prefix_keyed_models();
+
+        assert_eq!(
+            dexdo::buyer::verify::executable_reference_model_for("Qwen/Qwen3-32B", &cfg),
+            Some("qwen--qwen3--32b"),
+            "the registry spelling binds on its own, so the fallback is never reached here"
+        );
+        assert_eq!(
+            super::buyer_executable_reference_model(
+                "qwen--qwen3--32b",
+                Some("Qwen/Qwen3-32B"),
+                &cfg
+            ),
+            Some("qwen--qwen3--32b"),
+            "a 4.0.35 registry name must keep admitting exactly as it did"
+        );
+    }
+
+    /// The guard, unchanged: a model the config does not carry in ANY form is still refused, and
+    /// the refusal is what the strict buyer turns into `content_identity_preflight`. `Qwen3.6-27B`
+    /// is the sibling the 4.0.36 catalogue actually holds next to `Qwen3-32B`, so this is the
+    /// nearest real neighbour a family-level match would have let through -- which is precisely
+    /// what `executable_reference_model_for` refuses to do for money. Neither the registry spelling
+    /// nor the requested name may admit it, and neither may their absence.
+    #[test]
+    fn issue_1706_a_name_absent_in_every_form_is_still_refused() {
+        let cfg = issue_1706_prefix_keyed_models();
+
+        for (frame_model, registry_model) in [
+            ("qwen--qwen3.6--27b", Some("Qwen3.6-27B")),
+            ("qwen--qwen3.6--27b", Some("Qwen/Qwen3.6-27B")),
+            ("qwen--qwen3.6--27b", None),
+        ] {
+            assert_eq!(
+                super::buyer_executable_reference_model(frame_model, registry_model, &cfg),
+                None,
+                "{frame_model} / {registry_model:?} is in this config under no spelling and must \
+                 not be admitted to the money path"
+            );
+        }
+    }
+
     // This test must serialize the process-global current directory for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -13621,8 +15305,13 @@ mod tests {
             !cwd_abi.exists(),
             "test cwd must not carry the ModelRegistry ABI file"
         );
-        let contracts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../contracts/deployed.shellnet.json");
+        let contracts = crate::cli::commands::committed_manifest_for_tests();
+        // The operator's own spelling, deliberately: this gate is about the EMBEDDED ABI being
+        // readable from a release-style cwd, and the resolver's job is to answer for a name the
+        // operator might type. The rename swept this input to `Qwen3-32B` and left the
+        // expectation at `Qwen/Qwen3-32B`, which no run can satisfy --
+        // `registry_identity_candidates("Qwen3-32B")` yields only `["Qwen3-32B", "qwen3-32b"]`,
+        // so no producer-prefixed candidate is ever generated.
         let identity = super::resolve_content_identity_model(&contracts, "qwen--qwen3--32b")
             .await
             .expect("resolve qwen content identity from embedded ModelRegistry ABI");
@@ -13633,7 +15322,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     #[ignore = "live -carry: bad ModelRegistry manifest fails strict and downgrades only with --allow-unverified-model"]
     async fn live_allow_unverified_model_downgrades_unreachable_registry_to_name_only() {
@@ -13648,8 +15336,7 @@ mod tests {
         std::fs::create_dir(&tmp).expect("create scratch manifest dir");
         let _cleanup = TempDirCleanup(tmp.clone());
 
-        let contracts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../contracts/deployed.shellnet.json");
+        let contracts = crate::cli::commands::committed_manifest_for_tests();
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&contracts).expect("read contracts manifest"))
                 .expect("parse contracts manifest");
@@ -13663,14 +15350,14 @@ mod tests {
         .expect("write scratch manifest");
 
         let strict =
-            super::resolve_buyer_content_identity_model(&scratch, "qwen--qwen3--32b", false)
+            super::resolve_buyer_content_identity_model(&scratch, "Qwen3-32B", false, false)
                 .await
                 .expect_err("strict buyer must fail closed when ModelRegistry is unreachable")
                 .to_string();
         assert!(strict.contains("ModelRegistry"), "{strict}");
 
         let allowed =
-            super::resolve_buyer_content_identity_model(&scratch, "qwen--qwen3--32b", true)
+            super::resolve_buyer_content_identity_model(&scratch, "Qwen3-32B", true, false)
                 .await
                 .expect("allow-unverified buyer may continue on name-only evidence");
         assert_eq!(allowed, None);
@@ -13682,7 +15369,7 @@ mod tests {
     }
 
     /// machine-mode model-only buy must not emit `quote_selected` from executable discovery alone when
-    /// the raw shellnet matcher cannot reach that ask.
+    /// the raw chain matcher cannot reach that ask.
     #[test]
     fn buyer_model_only_quote_selection_runs_submit_safe_preflight() {
         let source = include_str!("buyer.rs");
@@ -13841,7 +15528,6 @@ mod tests {
 
     /// re-review: the secret-bearing pool temp must be exclusive. A pre-created temp path
     /// (file or symlink) is not truncated/clobbered before the final atomic rename.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn write_pool_private_refuses_preexisting_temp_path() {
         let dir = std::env::temp_dir().join(format!(
@@ -13875,18 +15561,17 @@ mod tests {
 
     /// regression: writers using different symlinks to one pool must share the canonical lock and
     /// target. The second writer re-reads the first result, so neither recovery key is lost.
-    #[cfg(all(feature = "shellnet", unix))]
+    #[cfg(unix)]
     #[test]
     fn concurrent_note_pool_writers_via_symlinks_preserve_both_notes() {
         fn state(seed_byte: u8, address_byte: char) -> crate::cli::note::OnboardPnState {
             let secret = format!("{seed_byte:02x}").repeat(32);
             let public = crate::cli::note::derive_owner_pubkey_from_secret_hex(&secret).unwrap();
             crate::cli::note::OnboardPnState {
-                endpoint: "dd-shellnet.ackinacki.org".into(),
+                endpoint: "net-a.example".into(),
                 nominal: "N100".into(),
                 token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
-                ecc_shell_deposit: 100_000_000_000,
                 pn_address: Some(format!("0:{}", address_byte.to_string().repeat(64))),
                 deposit_identifier_hash: Some(address_byte.to_string().repeat(64)),
                 owner_public_key_hex: Some(public),
@@ -13980,12 +15665,23 @@ mod tests {
             3,
             "both concurrently added notes must survive"
         );
-        assert!(addresses.contains(format!("0:{}", "a".repeat(64)).as_str()));
-        assert!(addresses.contains(format!("0:{}", "b".repeat(64)).as_str()));
+        // Recorded canonically since: the pool stores `<dapp_id>::<account_id>`, and the
+        // legacy `0:<account_id>` these fixtures are built from belongs to an ABI-encoded contract
+        // parameter, not to storage. What this test is about -- that neither concurrent writer lost
+        // the other's note -- is unchanged; only the spelling it looks for is.
+        let recorded = |account_byte: char| {
+            format!(
+                "{}::{}",
+                dexdo_core::DEXDO_DAPP_ID,
+                account_byte.to_string().repeat(64)
+            )
+        };
+        assert!(addresses.contains(recorded('a').as_str()));
+        assert!(addresses.contains(recorded('b').as_str()));
     }
 
     /// negative regression: pool targets and lock sentinels must be regular files.
-    #[cfg(all(feature = "shellnet", unix))]
+    #[cfg(unix)]
     #[test]
     fn pool_and_lock_non_regular_sentinels_are_rejected() {
         let dir = std::env::temp_dir().join(format!(
@@ -14019,7 +15715,6 @@ mod tests {
 
     /// regression: `DEXDO_PN_POOL=<same existing file> dexdo note deploy --pool <same file>` is the
     /// reported footgun. Refuse before chain work, so a bad append cannot silently poison the active pool.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_rejects_same_file_env_pool_append() {
         let dir = std::env::temp_dir().join(format!(
@@ -14051,7 +15746,6 @@ mod tests {
     }
 
     /// PR347 review blocker regression: a stale active pool must fail before the money-moving model buy call.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -14111,7 +15805,6 @@ mod tests {
     }
 
     /// Owner currency regression: the real command entry must reject stale pool metadata before chain use.
-    #[cfg(feature = "shellnet")]
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn real_buyer_entry_rejects_bad_pool_currency_before_chain_or_post() {
@@ -14185,20 +15878,19 @@ mod tests {
                     continuity_mode: super::ContinuityModeArg::Proactive,
                     json: false,
                     anthropic_compat: false,
-                    frame_model: Some("qwen--qwen3--32b".to_string()),
+                    frame_model: Some("Qwen3-32B".to_string()),
                     allow_unverified_model: true,
                     models: dir.join("models.json"),
                     ticks: 1,
                     max_price_per_tick: dexdo_core::PRICE_STEP,
                     escrow: None,
-                    contracts: dir.join("must-not-read-contracts.json"),
                     policy: None,
                 },
                 &mut machine_events,
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((backend, note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::Production,
+                    chain_preflight: super::BuyerChainPreflight::Production,
                     shutdown: Box::pin(std::future::pending()),
                 },
             )
@@ -14238,7 +15930,6 @@ mod tests {
     }
 
     /// regression: a direct note identity without DEXDO_PN_POOL must fail before escrow moves.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -14315,7 +16006,6 @@ mod tests {
 
     /// residual: recovery/reclaim can be driven from the pool file alone once the buyer has recorded the
     /// matched TokenContract next to the note entry.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_can_use_pool_only() {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
@@ -14377,7 +16067,7 @@ mod tests {
 
     /// regression: pool-only recovery must retain the path resolved before STOP even if its symlink alias
     /// is retargeted before the recovery record is persisted.
-    #[cfg(all(feature = "shellnet", unix))]
+    #[cfg(unix)]
     #[test]
     fn pool_recovery_persists_to_the_initially_resolved_symlink_target() {
         let dir = std::env::temp_dir().join(format!(
@@ -14440,7 +16130,6 @@ mod tests {
     }
 
     /// recovery-key safety: a record changed after resolution must remain byte-for-byte untouched.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn pool_recovery_persistence_refuses_a_changed_key_record() {
         let dir = std::env::temp_dir().join(format!(
@@ -14484,7 +16173,6 @@ mod tests {
     }
 
     /// regression: buyer-only recovery ignores seller records while preserving legacy records without a role.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_select_buyer_role_and_keep_legacy_unknown() {
         let dir = std::env::temp_dir().join(format!(
@@ -14546,15 +16234,16 @@ mod tests {
     }
 
     /// a deal the pool recorded TWICE is one deal, and `recover`/`dispute` must reach it.
+
     /// Both rows agree on every recorded fact -- note, TokenContract, owner key, role and recorded
     /// time -- so they describe one deal written down twice, not two deals. Counting rows made that
     /// look ambiguous and refused with `pass --note-addr or --token-contract to disambiguate`; since
     /// both rows carry the SAME note and the SAME TokenContract, neither flag can separate them and
     /// the escrow behind that deal had no reachable path out.
+
     /// Asserting the resolved `pool_record` too, not just that some identity came back: `recover`
     /// writes this record to the pool after its STOP, so a resolution that could not name the row it
     /// came from would refuse at persist time and strand the money one step later instead.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_resolve_a_deal_the_pool_recorded_twice() {
         let dir = std::env::temp_dir().join(format!(
@@ -14626,12 +16315,12 @@ mod tests {
 
     /// when several DIFFERENT deals really are recorded, the refusal must name each one -- and
     /// the name it gives must actually work.
+
     /// Refusing is still correct here: one invocation acts on one deal, and fanning a buyer STOP or a
     /// bond-locking dispute across every recorded deal is a different money decision. What was wrong
     /// was telling the operator to narrow a set they could not see. The second half of this test is
     /// the part that matters: it takes a selector out of the refusal text and re-runs with it, so the
     /// advice is proven followable rather than merely printed.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_name_each_recorded_deal_and_the_name_selects_it() {
         let dir = std::env::temp_dir().join(format!(
@@ -14729,7 +16418,6 @@ mod tests {
     }
 
     /// negative: pool-only recovery must not guess when several note entries carry TokenContracts.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn recovery_inputs_reject_ambiguous_pool() {
         let dir = std::env::temp_dir().join(format!(
@@ -14783,7 +16471,6 @@ mod tests {
 
     /// regression: the recovery state and final pool are different JSON formats; first-run absent paths
     /// must still reject an accidental same path before any wallet spend.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_rejects_same_recovery_and_pool_path() {
         let dir = std::env::temp_dir().join(format!(
@@ -14810,46 +16497,40 @@ mod tests {
             .expect("separate recovery and pool paths are allowed");
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn note_endpoint_url_accepts_bare_host_or_url() {
         assert_eq!(
-            super::note_endpoint_url("dd-shellnet.ackinacki.org").unwrap(),
-            "https://dd-shellnet.ackinacki.org"
+            super::note_endpoint_url("net-a.example").unwrap(),
+            "https://net-a.example"
         );
         assert_eq!(
-            super::note_endpoint_url("https://dd-shellnet.ackinacki.org/").unwrap(),
-            "https://dd-shellnet.ackinacki.org"
+            super::note_endpoint_url("https://net-a.example/").unwrap(),
+            "https://net-a.example"
         );
         assert!(super::note_endpoint_url("  ").is_err());
     }
 
-    #[cfg(feature = "shellnet")]
     fn note_deploy_args(
-        multisig_key: Option<std::path::PathBuf>,
+        multisig_private_key: Option<std::path::PathBuf>,
         multisig_seed_file: Option<std::path::PathBuf>,
     ) -> NoteDeployArgs {
         NoteDeployArgs {
             json: false,
             multisig_address: Some(format!("0:{}", "1".repeat(64))),
-            multisig_key,
+            multisig_private_key,
             multisig_seed_file,
             nominal: "N100".into(),
             token_type: "shell".into(),
-            endpoint: "dd-shellnet.ackinacki.org".into(),
-            contracts: std::path::PathBuf::from("contracts/deployed.shellnet.json"),
             pool: Some(std::path::PathBuf::from("pn_pool.json")),
             recovery: None,
             simulate_interrupt_after_spend_before_pool: false,
             simulate_interrupt_after_deposit_voucher_submit: false,
             simulate_interrupt_after_deposit_voucher_event: false,
-            simulate_interrupt_after_shell_voucher_submit: false,
             simulate_interrupt_after_deploy_before_note_record: false,
             funding_timeout: None,
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn tvm_tonos_fixture_phrase() -> String {
         const WORD_INDICES: [u16; 12] = [
             1636, 1293, 905, 102, 1057, 1956, 1247, 1750, 597, 881, 1302, 3,
@@ -14861,7 +16542,6 @@ mod tests {
             .join(" ")
     }
 
-    #[cfg(feature = "shellnet")]
     fn pinned_tvm_sdk_default_key(phrase: &str) -> tvm_client::crypto::KeyPair {
         assert_eq!(
             tvm_client::crypto::default_hdkey_derivation_path(),
@@ -14882,7 +16562,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "shellnet")]
     /// both established credential flags resolve to the same direct funding key.
     #[test]
     fn note_deploy_seed_file_matches_key_file_input() {
@@ -14900,8 +16579,8 @@ mod tests {
         let _cleanup = TempDirCleanup(dir.clone());
         let key_path = dir.join("wallet.secret.hex");
         let seed_path = dir.join("wallet.seed");
-        std::fs::write(&key_path, &expected_key.secret).unwrap();
-        std::fs::write(&seed_path, phrase).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&key_path, &expected_key.secret);
+        crate::cli::support::write_owner_only_key_fixture(&seed_path, &phrase);
 
         let (key_source, key_secret) =
             super::note_deploy_multisig_secret_hex(&note_deploy_args(Some(key_path), None))
@@ -14910,7 +16589,7 @@ mod tests {
             super::note_deploy_multisig_secret_hex(&note_deploy_args(None, Some(seed_path)))
                 .unwrap();
 
-        assert_eq!(key_source, "--multisig-key");
+        assert_eq!(key_source, "--multisig-private-key");
         assert_eq!(seed_source, "--multisig-seed-file");
         assert!(
             key_secret == expected_key.secret,
@@ -14922,7 +16601,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     /// direct funding credential failures must not disclose seed input.
     #[test]
     fn note_deploy_seed_file_errors_do_not_echo_seed_input() {
@@ -14941,8 +16619,8 @@ mod tests {
         let invalid = std::iter::repeat_n("zzzz", 12)
             .collect::<Vec<_>>()
             .join(" ");
-        std::fs::write(&key_path, "00").unwrap();
-        std::fs::write(&seed_path, &invalid).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&key_path, "00");
+        crate::cli::support::write_owner_only_key_fixture(&seed_path, &invalid);
 
         let err = super::note_deploy_multisig_secret_hex(&note_deploy_args(
             Some(key_path),
@@ -15125,7 +16803,7 @@ mod tests {
             &self,
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
-            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+            heartbeat: &dexdo_core::market::HeartbeatGuard,
         ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
             // Simulate a legitimate claim landing between the decision to exit and the money POST.
             if let Some(deal) = self
@@ -15529,7 +17207,7 @@ mod tests {
                     token_contract: "tc-subscription".to_string(),
                     max_tokens: 1,
                 },
-                "qwen--qwen3--32b".to_string(),
+                "Qwen3-32B".to_string(),
                 session.clone(),
                 std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
             );
@@ -15756,7 +17434,7 @@ mod tests {
         );
         let state = dexdo::buyer::api::ApiState {
             buyer: buyer.clone(),
-            frame_model: "qwen--qwen3--32b".to_string(),
+            frame_model: "Qwen3-32B".to_string(),
             deals: routes.clone(),
             delivery_events: None,
         };
@@ -15772,6 +17450,9 @@ mod tests {
             dexdo::buyer::api::ContentCheck::Skip,
             std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
             policy,
+            // The fixture is about renewal behaviour, so the spelling is the registered one and the
+            // carve-out is not in play. `a_diverged_spelling_starts_no_renewal` covers the other side.
+            false,
         );
         (state, routes, session, init_calls)
     }
@@ -15815,14 +17496,12 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}={expected}"));
     }
 
-    #[cfg(feature = "shellnet")]
     #[derive(Clone, Copy)]
     enum Issue547ProviderBehavior {
         HangWithoutOutput,
         FailAfterTwoRequests,
     }
 
-    #[cfg(feature = "shellnet")]
     #[derive(Clone)]
     struct Issue547ProviderState {
         behavior: Issue547ProviderBehavior,
@@ -15830,7 +17509,6 @@ mod tests {
         failure_barrier: std::sync::Arc<tokio::sync::Barrier>,
     }
 
-    #[cfg(feature = "shellnet")]
     async fn issue_547_provider_response(
         axum::extract::State(state): axum::extract::State<Issue547ProviderState>,
     ) -> axum::response::Response {
@@ -15854,7 +17532,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     async fn start_issue_547_provider(
         behavior: Issue547ProviderBehavior,
     ) -> (
@@ -15881,7 +17558,6 @@ mod tests {
         (addr, calls, task)
     }
 
-    #[cfg(feature = "shellnet")]
     async fn start_issue_547_gateway(
         upstream: dexdo::seller::UpstreamConfig,
         buyer: &dexdo::buyer::Buyer,
@@ -15916,7 +17592,6 @@ mod tests {
         (seller, handover)
     }
 
-    #[cfg(feature = "shellnet")]
     async fn issue_547_http_request(
         client: reqwest::Client,
         api_addr: std::net::SocketAddr,
@@ -15927,7 +17602,7 @@ mod tests {
             (
                 "/v1/messages",
                 serde_json::json!({
-                    "model": "qwen--qwen3--32b",
+                    "model": "Qwen3-32B",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1,
                     "stream": false
@@ -15937,7 +17612,7 @@ mod tests {
             (
                 "/v1/chat/completions",
                 serde_json::json!({
-                    "model": "qwen--qwen3--32b",
+                    "model": "Qwen3-32B",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1,
                     "stream": false
@@ -15952,7 +17627,6 @@ mod tests {
             .unwrap_or_else(|error| panic!("{path} request failed: {error}"))
     }
 
-    #[cfg(feature = "shellnet")]
     async fn wait_for_issue_547_terminal(session: &dexdo::buyer::api::SessionSettle) {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while !session.is_settled() {
@@ -16031,7 +17705,7 @@ mod tests {
         let (routes, session, init_calls) =
             start_on_demand_recovery_monitor(chain.clone(), "tc-dead");
 
-        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+        let heartbeat = dexdo_core::market::HeartbeatGuard::new(std::sync::Arc::new(
             std::sync::atomic::AtomicU64::new(0),
         ));
         assert!(
@@ -16169,7 +17843,7 @@ mod tests {
         let (_routes, session, init_calls) =
             start_on_demand_recovery_monitor(chain.clone(), "tc-ambiguous");
 
-        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+        let heartbeat = dexdo_core::market::HeartbeatGuard::new(std::sync::Arc::new(
             std::sync::atomic::AtomicU64::new(0),
         ));
         assert!(
@@ -16224,7 +17898,7 @@ mod tests {
             .store(true, Ordering::SeqCst);
         let (_routes, session, init_calls) =
             start_on_demand_recovery_monitor(chain.clone(), "tc-ambiguous-open");
-        let heartbeat = dexdo_core::chain::HeartbeatGuard::new(std::sync::Arc::new(
+        let heartbeat = dexdo_core::market::HeartbeatGuard::new(std::sync::Arc::new(
             std::sync::atomic::AtomicU64::new(0),
         ));
 
@@ -16266,7 +17940,6 @@ mod tests {
         assert_eq!(init_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn issue_547_silent_openai_and_anthropic_requests_do_not_auto_stop_or_replace() {
         use std::sync::atomic::Ordering;
@@ -16277,7 +17950,7 @@ mod tests {
             start_issue_547_provider(Issue547ProviderBehavior::HangWithoutOutput).await;
         let upstream = dexdo::seller::OpenAiConfig {
             base_url: format!("http://{provider_addr}/v1"),
-            frame_model: "qwen--qwen3--32b".to_string(),
+            frame_model: "Qwen3-32B".to_string(),
             api_key_env: KEY_ENV.to_string(),
             ..Default::default()
         };
@@ -16401,7 +18074,6 @@ mod tests {
         fresh_seller.server_task.abort();
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn issue_547_handler_ambiguity_is_fact_confirmed_for_concurrent_http_requests() {
         use std::sync::atomic::Ordering;
@@ -16416,7 +18088,7 @@ mod tests {
             start_issue_547_provider(Issue547ProviderBehavior::FailAfterTwoRequests).await;
         let upstream = dexdo::seller::OpenAiConfig {
             base_url: format!("http://{provider_addr}/v1"),
-            frame_model: "qwen--qwen3--32b".to_string(),
+            frame_model: "Qwen3-32B".to_string(),
             api_key_env: KEY_ENV.to_string(),
             ..Default::default()
         };
@@ -16718,7 +18390,7 @@ mod tests {
     }
 
     /// (E2E-PROBE-08): `--resume` on a funded-never-opened deal must refuse with the contract's
-    /// own exact `ERR_NOT_OPEN`(320) instead of waiting `DEAL_WAIT_SECS` for a handover that cannot
+    /// own exact `ERR_NOT_OPEN` (320) instead of waiting `DEAL_WAIT_SECS` for a handover that cannot
     /// arrive -- and the refusal must reach the operator as a `CHAIN_REVERT` machine error even after
     /// the on-demand deal initializer flattens the typed `ChainError` into a string.
     #[test]
@@ -16770,7 +18442,7 @@ mod tests {
         assert_eq!(deadline, funded_time + super::MATCH_OPEN_TIMEOUT_SECS);
 
         // Every delay between the funding and this buyer's first look: a fast local match, the 7 s
-        // measured on shellnet behind a 293 s match, and a `--resume` that restarted after the
+        // measured on the chain behind a 293 s match, and a `--resume` that restarted after the
         // window had already closed. The observation-anchored rule this replaces would have granted
         // each of them a different deadline, all of them later than the contract's.
         for observed_at in [funded_time, funded_time + 7, funded_time + 293, deadline + 60] {
@@ -17475,15 +19147,13 @@ mod tests {
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 0);
     }
 
-    // With shellnet enabled, this test serializes process-global DEXDO_PN_POOL for the full async scenario.
-    #[cfg_attr(feature = "shellnet", allow(clippy::await_holding_lock))]
+    // With the chain backend enabled, this test serializes process-global DEXDO_PN_POOL for the full async scenario.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn policy_no_handover_next_seller_cleans_then_places_next_buy() {
         use std::sync::atomic::Ordering;
 
-        #[cfg(feature = "shellnet")]
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
-        #[cfg(feature = "shellnet")]
         let dir = std::env::temp_dir().join(format!(
             "dexdo-next-seller-pool-test-{}-{}",
             std::process::id(),
@@ -17492,15 +19162,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        #[cfg(feature = "shellnet")]
         std::fs::create_dir(&dir).unwrap();
-        #[cfg(feature = "shellnet")]
         let _cleanup = TempDirCleanup(dir.clone());
-        #[cfg(feature = "shellnet")]
         let pool = dir.join("pn_pool.json");
-        #[cfg(feature = "shellnet")]
         let buyer_note = format!("0:{}", "3".repeat(64));
-        #[cfg(feature = "shellnet")]
         std::fs::write(
             &pool,
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -17513,14 +19178,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        #[cfg(feature = "shellnet")]
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
-        #[cfg(feature = "shellnet")]
         let pool_note_addr = Some(buyer_note.as_str());
-        #[cfg(not(feature = "shellnet"))]
-        let pool_note_addr = None;
 
-        #[cfg(feature = "shellnet")]
         let expected_journal_path = {
             let path = super::BuyerMoneyLock::open(pool_note_addr.unwrap())
                 .unwrap()
@@ -17528,8 +19188,6 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             Some(path)
         };
-        #[cfg(not(feature = "shellnet"))]
-        let expected_journal_path = None;
 
         let chain = RecordingRecoveryChain {
             expected_journal_path,
@@ -17566,7 +19224,6 @@ mod tests {
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn policy_no_handover_successful_submit_unknown_retains_journal_without_fresh_buy() {
@@ -18126,7 +19783,6 @@ mod tests {
         assert!(!super::is_replay_protection_error(&err));
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_wallet_busy_error_is_actionable() {
         let raw = anyhow::anyhow!(
@@ -18139,17 +19795,14 @@ mod tests {
         assert!(!err.contains("TVM_ERROR"), "{err}");
     }
 
-    #[cfg(feature = "shellnet")]
     struct TempDirCleanup(std::path::PathBuf);
 
-    #[cfg(feature = "shellnet")]
     impl Drop for TempDirCleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn buyer_journal_test_dir(label: &str) -> (std::path::PathBuf, TempDirCleanup) {
         let dir = std::env::temp_dir().join(format!(
             "dexdo-{label}-{}-{}",
@@ -18163,7 +19816,6 @@ mod tests {
         (dir.clone(), TempDirCleanup(dir))
     }
 
-    #[cfg(feature = "shellnet")]
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SubscriptionSubmitCall {
         order_book: String,
@@ -18175,7 +19827,6 @@ mod tests {
         deadline: u64,
     }
 
-    #[cfg(feature = "shellnet")]
     struct FakeSubscriptionOps {
         calls: std::sync::Mutex<Vec<SubscriptionSubmitCall>>,
         placements: std::sync::Mutex<Vec<dexdo_core::InferenceSubscriptionPlacement>>,
@@ -18188,7 +19839,6 @@ mod tests {
         week_bookings: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     impl FakeSubscriptionOps {
         fn new(order_id_floor: u128) -> Self {
             Self {
@@ -18204,7 +19854,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::SubscriptionOrderOps for FakeSubscriptionOps {
         async fn submit_subscription_order(
@@ -18303,7 +19952,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct SubscriptionResumeChain {
         order_book: String,
         snapshot: dexdo_core::DealChainSnapshot,
@@ -18314,7 +19962,7 @@ mod tests {
         due_boundaries: std::sync::Mutex<u8>,
         settle_bookings: std::sync::atomic::AtomicUsize,
         attributed_fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
-        /// BUY submissions only(`place_buy`/`place_buy_by_model`). It says nothing about value
+        /// BUY submissions only (`place_buy`/`place_buy_by_model`). It says nothing about value
         /// that MOVES: a boundary booking charges weeks the term already owes out of escrow. What
         /// zero here proves is that resume posted no second BUY.
         buy_posts: std::sync::atomic::AtomicUsize,
@@ -18322,7 +19970,6 @@ mod tests {
         target_checks: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SubscriptionResumeChain {
         /// The permissionless boundary booking, as the contract implements it: it settles only what
@@ -18495,22 +20142,194 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
+    /// the two cancel surfaces share one journal, and the journal says what it is worth.
+
+    /// A subscription is an ORDINARY buy order on chain, so `orders cancel` cancels one exactly as
+    /// it cancels anything else -- while the record of what that subscription is doing lives in the
+    /// buyer's journal, which `orders` had never heard of. Not a decision to keep them apart: the
+    /// two concepts were merged on chain and the two surfaces were never brought together after.
+    mod issue_1547_both_cancel_surfaces_share_the_journal {
+        fn resting_record(order_id: u128) -> super::super::BuyerSubscriptionOrderRecord {
+            let frame_model = "Qwen3-32B".to_string();
+            // The exact figures come from the client's own reserve arithmetic rather than from
+            // numbers typed here: the journal validates escrow against it, and a fixture that
+            // restated the formula would pass while disagreeing with the code it stands for.
+            let ticks = 4;
+            let price = 3 * dexdo_core::params::SHELL_UNIT;
+            let reserve = dexdo_core::subscription_buy_reserve(ticks, price)
+                .expect("the canonical reserve for this shape");
+            super::super::BuyerSubscriptionOrderRecord {
+                order_book: super::subscription_test_book(),
+                model_hash: dexdo_core::model_hash_for(&frame_model),
+                frame_model,
+                order_id,
+                max_price_per_tick: price,
+                ticks,
+                deposit: reserve.deposit,
+                buyer_bond: reserve.buyer_bond,
+                escrow: reserve.total_escrow,
+                flags: dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION,
+                deadline: 2_000,
+                fill_cursor: dexdo_core::MatchWatchCursor::new(0),
+                phase: super::super::BuyerSubscriptionPhase::Resting,
+                matched: None,
+            }
+        }
+
+        fn write_state(
+            path: &std::path::Path,
+            records: Vec<super::super::BuyerSubscriptionOrderRecord>,
+        ) {
+            let state = super::super::BuyerSubscriptionState {
+                schema: super::super::BUYER_SUBSCRIPTION_STATE_SCHEMA.to_string(),
+                note_addr: super::subscription_test_note(),
+                orders: records,
+            };
+            super::super::write_buyer_subscription_state(path, &state).expect("write journal");
+        }
+
+        /// The reported case: the order is gone from the book and the escrow is back, and the
+        /// journal must not still call it resting.
+        #[test]
+        fn a_confirmed_cancellation_closes_the_record_it_invalidated() {
+            let dir = tempfile::tempdir().expect("journal dir");
+            let path = dir.path().join("subscriptions.json");
+            write_state(&path, vec![resting_record(7)]);
+
+            let closed = super::super::mark_cancelled_subscription_order_terminal_at(
+                &path,
+                &super::subscription_test_note(),
+                &super::subscription_test_book(),
+                7,
+            )
+            .expect("a confirmed cancellation closes its record");
+            assert!(closed, "the record was resting and is now closed");
+
+            let state = super::super::load_buyer_subscription_state(
+                &path,
+                &super::subscription_test_note(),
+            )
+            .expect("read back");
+            let record =
+                super::super::subscription_order_record(&state, &super::subscription_test_book(), 7)
+                    .expect("the record survives, closed");
+            assert_ne!(
+                record.phase,
+                super::super::BuyerSubscriptionPhase::Resting,
+                "after a confirmed cancellation the journal must not claim the order is resting"
+            );
+        }
+
+        /// The same requirement for the surface that already had it, so it cannot drift back.
+        #[test]
+        fn the_subscription_surface_closes_its_record_too() {
+            let dir = tempfile::tempdir().expect("journal dir");
+            let path = dir.path().join("subscriptions.json");
+            write_state(&path, vec![resting_record(9)]);
+
+            super::super::mark_cancelled_subscription_order_terminal_at(
+                &path,
+                &super::subscription_test_note(),
+                &super::subscription_test_book(),
+                9,
+            )
+            .expect("close");
+            let state = super::super::load_buyer_subscription_state(
+                &path,
+                &super::subscription_test_note(),
+            )
+            .expect("read back");
+            assert_ne!(
+                super::super::subscription_order_record(
+                    &state,
+                    &super::subscription_test_book(),
+                    9
+                )
+                .expect("record")
+                .phase,
+                super::super::BuyerSubscriptionPhase::Resting
+            );
+        }
+
+        /// What no surface can repair, the file says out loud.
+
+        /// The journal is one instance's; the order is the chain's. A cancel made with this note's
+        /// key somewhere else never reaches this file, so `resting` here can be stale no matter how
+        /// many surfaces write it -- and the reader is told so in the file itself, because the file
+        /// is what gets opened first and it gets opened without us.
+        #[test]
+        fn the_file_states_that_its_phase_is_a_belief_and_names_the_authority() {
+            let dir = tempfile::tempdir().expect("journal dir");
+            let path = dir.path().join("subscriptions.json");
+            write_state(&path, vec![resting_record(11)]);
+
+            let raw = std::fs::read_to_string(&path).expect("the journal is read as a file");
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            let authority = value
+                .get(super::super::PHASE_AUTHORITY_KEY)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("the journal must carry its own caveat: {raw}"));
+            assert!(
+                authority.contains("last belief") && authority.contains("not the chain's answer"),
+                "the caveat has to say the phase is a belief: {authority}"
+            );
+            assert!(
+                authority.contains("dexdo subscription status"),
+                "and name what does answer: {authority}"
+            );
+
+            // The statement is for the reader, never for the decoder: the strict struct still round
+            // trips, which is what keeps it a sentence rather than a field something computes on.
+            super::super::load_buyer_subscription_state(&path, &super::subscription_test_note())
+                .expect("the statement must not break the strict decode");
+        }
+
+        /// The repair must not cost the cancel. `orders cancel` cancels any resting order and almost
+        /// none are subscriptions, so it looks before it locks: with no journal for this note there
+        /// is nothing of ours to write and no lock is taken -- which is what keeps cancelling an
+        /// ordinary order working while a buyer holds that lock on the same note.
+        #[test]
+        fn a_note_with_no_journal_is_left_alone_without_taking_the_lock() {
+            let production = include_str!("buyer.rs")
+                .split_once("#[cfg(test)]\nmod tests")
+                .expect("buyer unit-test module boundary")
+                .0;
+            let body = production
+                .split_once("pub(crate) fn mark_cancelled_subscription_order_terminal")
+                .expect("the shared entry point")
+                .1;
+            let end = body.find("\n}\n").expect("its end");
+            let body = &body[..end];
+
+            let exists_at = body
+                .find("subscriptions_path.exists()")
+                .expect("it checks whether this note has a journal at all");
+            let record_at = body
+                .find("subscription_journal_names_order(")
+                .expect("and whether that journal holds this order");
+            let acquire_at = body
+                .find("try_acquire()")
+                .expect("only then does it take the buyer's money lock");
+            assert!(
+                exists_at < acquire_at && record_at < acquire_at,
+                "the lock must be taken after both checks, or cancelling an ordinary order starts \
+                 failing whenever a buyer is running on the same note"
+            );
+        }
+    }
+
     fn subscription_test_note() -> String {
         format!("0:{}", "1".repeat(64))
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_book() -> String {
         format!("0:{}", "2".repeat(64))
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_tc(digit: char) -> String {
         format!("0:{}", digit.to_string().repeat(64))
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_reserve(
         ticks: u128,
         price_per_tick: u128,
@@ -18518,7 +20337,6 @@ mod tests {
         dexdo_core::subscription_buy_reserve(ticks, price_per_tick).unwrap()
     }
 
-    #[cfg(feature = "shellnet")]
     fn persist_subscription_test_handle(
         _order: &super::BuyerSubscriptionOrderRecord,
         matched: &super::BuyerJournalMatch,
@@ -18529,7 +20347,6 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_facts(
         order: &super::BuyerSubscriptionOrderRecord,
         expected_note_addr: &str,
@@ -18582,7 +20399,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_snapshot(
         order: &super::BuyerSubscriptionOrderRecord,
         expected_note_addr: &str,
@@ -18598,7 +20414,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_placement(
         order_id: u128,
         deadline: u64,
@@ -18614,12 +20429,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_journal(
         order_id_floor: u128,
         deadline: u64,
     ) -> super::BuyerSubscriptionSubmitJournal {
-        let frame_model = "qwen--qwen3--32b".to_string();
+        let frame_model = "Qwen3-32B".to_string();
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
         let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
         super::BuyerSubscriptionSubmitJournal {
@@ -18642,7 +20456,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn subscription_test_record(order_id: u128) -> super::BuyerSubscriptionOrderRecord {
         let deadline = 2_000;
         let journal = subscription_test_journal(order_id, deadline);
@@ -18653,7 +20466,6 @@ mod tests {
             .expect("canonical placement")
     }
 
-    #[cfg(feature = "shellnet")]
     fn write_test_private_json(path: &std::path::Path, value: &serde_json::Value) {
         let bytes = serde_json::to_vec_pretty(value).unwrap();
         super::write_pool_private(path, &bytes).unwrap();
@@ -18709,7 +20521,7 @@ mod tests {
         );
         let note = dexdo_core::LocalNote::from_seed(&[61; 32]);
         let other_note = dexdo_core::LocalNote::from_seed(&[62; 32]);
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let order_book = format!(
             "0:{}",
             dexdo_core::model_hash_for(frame_model)
@@ -18759,9 +20571,11 @@ mod tests {
         .human;
         assert!(placed.contains("network=mock"));
         assert!(placed.contains("order_id=1"));
-        assert!(placed.contains(&format!("deposit={}", plan.reserve.deposit)));
-        assert!(placed.contains(&format!("buyer_bond={}", plan.reserve.buyer_bond)));
-        assert!(placed.contains(&format!("total_escrow={}", plan.reserve.total_escrow)));
+        // The line states money in SHELL, so the expectation reads it the same way.
+        let shell = dexdo_core::shell_amount;
+        assert!(placed.contains(&format!("deposit={}", shell(plan.reserve.deposit))));
+        assert!(placed.contains(&format!("buyer_bond={}", shell(plan.reserve.buyer_bond))));
+        assert!(placed.contains(&format!("total_escrow={}", shell(plan.reserve.total_escrow))));
 
         let reloaded = dexdo_core::MockChainBackend::new(
             endpoints,
@@ -18792,7 +20606,7 @@ mod tests {
         .unwrap()
         .human;
         assert!(rendered.contains("resting=true"));
-        assert!(rendered.contains(&format!("total_escrow={}", plan.reserve.total_escrow)));
+        assert!(rendered.contains(&format!("total_escrow={}", shell(plan.reserve.total_escrow))));
 
         let cancel = crate::cli::args::SubscriptionCommand::Cancel { order_id: 1 };
         let cancelled = super::execute_mock_subscription_command(
@@ -18805,7 +20619,7 @@ mod tests {
         )
         .unwrap()
         .human;
-        assert!(cancelled.contains(&format!("refund={}", plan.reserve.total_escrow)));
+        assert!(cancelled.contains(&format!("refund={}", shell(plan.reserve.total_escrow))));
         // CHANGED CONTRACT: this leg used to require the read to FAIL. That was the defect
         // the reopened report named -- a terminal a consumer cannot re-read is one it cannot
         // reconcile against -- so the read now succeeds and NAMES the terminal it reached. The claim
@@ -18838,7 +20652,8 @@ mod tests {
 
     /// the exact machine object each subscription command emits, field by field, on the
     /// backend that needs no chain -- so the contract is pinned in the DEFAULT-feature build the
-    /// workspace gate runs, not only under `--features shellnet`.
+    /// workspace gate runs, not only under the removed chain feature.
+
     /// The absences are the point. A resting place has no fill, so `matched` is `null`; a place and
     /// a status observe no note credit, so `refund` is `null`; nothing here has a TokenContract, so
     /// `live` is `null`. None of them is omitted, and none is a zero standing in for a fact this
@@ -18858,7 +20673,7 @@ mod tests {
             dexdo_core::DobParams::canonical(),
         );
         let note = dexdo_core::LocalNote::from_seed(&[63; 32]);
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let order_book = format!("0:{}", "c".repeat(64));
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
         let place_args = crate::cli::args::SubscriptionPlaceArgs {
@@ -18884,7 +20699,7 @@ mod tests {
         };
 
         let placed = emitted(&place, Some(plan));
-        assert_eq!(placed["schema"], "dexdo.subscription.v1");
+        assert_eq!(placed["schema"], "dexdo.subscription.v2");
         assert_eq!(placed["operation"], "subscription_place");
         assert_eq!(placed["network"], "mock");
         assert_eq!(placed["action"], "placed");
@@ -18895,18 +20710,22 @@ mod tests {
         assert_eq!(placed["model_hash"], dexdo_core::model_hash_for(frame_model));
         assert_eq!(placed["order_book"], order_book);
         assert_eq!(placed["terms"]["ticks"], ticks.to_string());
+        // Every money field of this object is SHELL, prices included: one SHELL a tick reads `1`.
         assert_eq!(
             placed["terms"]["max_price_per_tick"],
-            dexdo_core::PRICE_STEP.to_string()
+            dexdo_core::shell_amount(dexdo_core::PRICE_STEP)
         );
-        assert_eq!(placed["terms"]["deposit"], plan.reserve.deposit.to_string());
+        assert_eq!(
+            placed["terms"]["deposit"],
+            dexdo_core::shell_amount(plan.reserve.deposit)
+        );
         assert_eq!(
             placed["terms"]["buyer_bond"],
-            plan.reserve.buyer_bond.to_string()
+            dexdo_core::shell_amount(plan.reserve.buyer_bond)
         );
         assert_eq!(
             placed["terms"]["escrow"],
-            plan.reserve.total_escrow.to_string()
+            dexdo_core::shell_amount(plan.reserve.total_escrow)
         );
         assert_eq!(placed["terms"]["flags"], 0x60);
         assert!(placed["terms"]["deadline_unix"].is_u64());
@@ -18978,6 +20797,7 @@ mod tests {
     }
 
     /// `expired` needs BOTH facts, and half the evidence names the missing half.
+
     /// The reopened report was exact about why a clock will not do: a passed deadline proves the
     /// row is ELIGIBLE for expiry, not that the book removed it and not that the refund happened.
     /// Those are three different things. So this asserts the two partial cases as hard as the
@@ -18995,7 +20815,8 @@ mod tests {
         );
         assert_eq!(both.0, "expired");
         assert!(both.1.removal_observed && both.1.refund_observed);
-        assert_eq!(both.1.refunded.as_deref(), Some("6100000000"));
+        // The refund is money, so it reads in SHELL beside the escrow it returns.
+        assert_eq!(both.1.refunded.as_deref(), Some("6.1"));
         assert_eq!(both.1.missing_fact, None);
 
         let removed_only = super::subscription_expiry_verdict(
@@ -19031,17 +20852,16 @@ mod tests {
         assert_eq!(neither.1.missing_fact, Some("refund"));
     }
 
-    /// on the shellnet path the object is built from the durable record, and a fill turns
+    /// on the chain path the object is built from the durable record, and a fill turns
     /// `matched` from `null` into the deal identity an orchestrator needs -- TokenContract, the
     /// deterministic buyer handle, matched volume and clearing price -- and nothing else.
-    #[cfg(feature = "shellnet")]
     #[test]
-    fn shellnet_subscription_machine_object_reports_the_record_and_its_fill() {
+    fn chain_subscription_machine_object_reports_the_record_and_its_fill() {
         let record = subscription_test_record(7);
         let note_addr = subscription_test_note();
         let resting = super::subscription_machine_response(
             crate::cli::machine::OP_SUBSCRIPTION_PLACE,
-            "shellnet",
+            "net-a",
             super::SUBSCRIPTION_ACTION_PLACED,
             true,
             &super::subscription_facts_from_record(&record, &note_addr),
@@ -19050,13 +20870,13 @@ mod tests {
         )
         .unwrap();
         let resting = serde_json::to_value(&resting).unwrap();
-        assert_eq!(resting["schema"], "dexdo.subscription.v1");
-        assert_eq!(resting["network"], "shellnet");
+        assert_eq!(resting["schema"], "dexdo.subscription.v2");
+        assert_eq!(resting["network"], "net-a");
         assert_eq!(resting["order_id"], "7");
         assert_eq!(resting["note_addr"], note_addr);
         assert_eq!(resting["order_book"], record.order_book);
         assert_eq!(resting["model_hash"], record.model_hash);
-        assert_eq!(resting["terms"]["escrow"], record.escrow.to_string());
+        assert_eq!(resting["terms"]["escrow"], dexdo_core::shell_amount(record.escrow));
         assert_eq!(resting["terms"]["flags"], record.flags);
         // No fill yet: the book has answered, and its answer is "nothing".
         assert_eq!(resting["matched"], serde_json::Value::Null);
@@ -19075,7 +20895,7 @@ mod tests {
         });
         let matched = super::subscription_machine_response(
             crate::cli::machine::OP_SUBSCRIPTION_STATUS,
-            "shellnet",
+            "net-a",
             super::SUBSCRIPTION_ACTION_READ,
             false,
             &super::subscription_facts_from_record(&matched_record, &note_addr),
@@ -19099,7 +20919,7 @@ mod tests {
         assert_eq!(matched["matched"]["ticks"], record.ticks.to_string());
         assert_eq!(
             matched["matched"]["clearing_price"],
-            record.max_price_per_tick.to_string()
+            dexdo_core::shell_amount(record.max_price_per_tick)
         );
         // Cleared at the ceiling, so nothing comes back for price improvement -- and the field says
         // zero because it was computed, not because it was unknown.
@@ -19131,9 +20951,8 @@ mod tests {
 
     /// a confirmed cancel reports the credit it READ between two balances it also reports,
     /// never the order row's escrow. Here they differ, so a derived figure cannot pass.
-    #[cfg(feature = "shellnet")]
     #[test]
-    fn shellnet_subscription_cancel_refund_is_the_observed_note_credit() {
+    fn chain_subscription_cancel_refund_is_the_observed_note_credit() {
         let record = subscription_test_record(7);
         let note_addr = subscription_test_note();
         let balance_before = 1_000u128;
@@ -19152,7 +20971,7 @@ mod tests {
         );
         let mut response = super::subscription_machine_response(
             crate::cli::machine::OP_SUBSCRIPTION_CANCEL,
-            "shellnet",
+            "net-a",
             super::SUBSCRIPTION_ACTION_CANCELLED,
             true,
             &super::subscription_facts_from_record(&record, &note_addr),
@@ -19162,28 +20981,27 @@ mod tests {
         .unwrap();
         response.removal_confirmed = Some(true);
         response.refund = Some(crate::cli::machine::SubscriptionRefund {
-            observed: crate::cli::machine::amount(balance_after - balance_before),
-            balance_before: crate::cli::machine::amount(balance_before),
-            balance_after: crate::cli::machine::amount(balance_after),
+            observed: dexdo_core::shell_amount(balance_after - balance_before),
+            balance_before: dexdo_core::shell_amount(balance_before),
+            balance_after: dexdo_core::shell_amount(balance_after),
         });
         let response = serde_json::to_value(&response).unwrap();
         assert_eq!(response["state"], "cancelled");
         assert_eq!(response["removal_confirmed"], true);
         assert_eq!(
             response["refund"]["observed"],
-            (balance_after - balance_before).to_string()
+            dexdo_core::shell_amount(balance_after - balance_before)
         );
         assert_eq!(
             response["refund"]["balance_before"],
-            balance_before.to_string()
+            dexdo_core::shell_amount(balance_before)
         );
         assert_eq!(
             response["refund"]["balance_after"],
-            balance_after.to_string()
+            dexdo_core::shell_amount(balance_after)
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_term_and_balance_guards_fail_closed() {
         assert_eq!(super::subscription_order_flags(), 0x60);
@@ -19253,7 +21071,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_preflight_requires_exact_total_and_rejects_market_semantics() {
         let price = dexdo_core::PRICE_STEP;
@@ -19313,7 +21130,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_journal_rejects_every_money_field_mutation() {
         let journal = subscription_test_journal(30, 2_000);
@@ -19330,7 +21146,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_lower_clearing_renders_exact_limit_remainder_refund() {
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
@@ -19338,7 +21153,7 @@ mod tests {
         let clearing = dexdo_core::PRICE_STEP;
         let reserve = subscription_test_reserve(ticks, limit);
         let refund = dexdo_core::subscription_buy_clearing_refund(ticks, limit, clearing).unwrap();
-        let frame_model = "qwen--qwen3--32b".to_string();
+        let frame_model = "Qwen3-32B".to_string();
         let fill = super::BuyerJournalMatch {
             token_contract: subscription_test_tc('3'),
             order_id: 31,
@@ -19362,8 +21177,8 @@ mod tests {
             matched: Some(super::BuyerSubscriptionMatch::from_fill(&fill)),
         };
         let snapshot = dexdo_core::OrderBookSnapshot {
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            frame_model: "Qwen3-32B".to_string(),
+            model_hash: dexdo_core::model_hash_for("Qwen3-32B"),
             order_book: record.order_book.clone(),
             stats: None,
             orders: Vec::new(),
@@ -19376,13 +21191,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(rendered.contains(&format!("deposit={}", reserve.deposit)));
-        assert!(rendered.contains(&format!("buyer_bond={}", reserve.buyer_bond)));
-        assert!(rendered.contains(&format!("total_escrow={}", reserve.total_escrow)));
+        assert!(rendered.contains(&format!("deposit={}", dexdo_core::shell_amount(reserve.deposit))));
+        assert!(rendered.contains(&format!("buyer_bond={}", dexdo_core::shell_amount(reserve.buyer_bond))));
+        assert!(rendered.contains(&format!("total_escrow={}", dexdo_core::shell_amount(reserve.total_escrow))));
         assert!(rendered.contains(&format!("price_improvement_refund={refund}")));
     }
 
-    #[cfg(feature = "shellnet")]
     proptest::proptest! {
         #[test]
         fn every_accepted_subscription_volume_is_four_equal_weeks(
@@ -19421,8 +21235,9 @@ mod tests {
 
         /// The status pair over CONTRACT-REACHABLE books only, proved reachable by the exact getter
         /// decoders rather than asserted to be.
+
         /// Every figure is derived from one canonical shape: the volume is a whole number of ticks
-        /// divisible by `SUB_WEEKS`(`InferenceOrderBook.sol:1309`), `fundedTokens` is exactly
+        /// divisible by `SUB_WEEKS` (`InferenceOrderBook.sol:1309`), `fundedTokens` is exactly
         /// `tokensPerWeek * SUB_WEEKS`, the claim pipeline is monotonic and never below the tick
         /// `acceptProbe` seeded, and the cumulative claim never passes the week's `_claimCap`. A
         /// generator free to violate those relations proves arithmetic about a chain that cannot
@@ -19530,7 +21345,6 @@ mod tests {
         assert_eq!(super::subscription_oneshot_budget(64, None).unwrap(), 64);
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_quota_rejects_underflow_over_quota_and_locked_exposure_overflow() {
         let order = subscription_test_record(39);
@@ -19561,7 +21375,6 @@ mod tests {
             .contains("overflows u128"));
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn terminal_subscription_has_zero_usable_week_quota_but_reports_locked_exposure() {
         let order = subscription_test_record(39);
@@ -19578,7 +21391,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn open_subscription_in_final_claim_grace_has_no_additional_week_quota() {
         let order = subscription_test_record(39);
@@ -19598,7 +21410,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_submit_posts_exact_shape_once_and_persists_resting_order() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-exact-submit");
@@ -19616,7 +21427,7 @@ mod tests {
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
         let reserve = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP);
         let escrow = reserve.total_escrow;
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let model_hash = dexdo_core::model_hash_for(frame_model);
 
         let record = super::submit_subscription_with_journal(
@@ -19667,17 +21478,19 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-GUARD-11/L0
+
     /// The fifth production buy-submit path, and the one no test in `dexdo-core` can reach.
+
     /// `placeInferenceBuy` is also submitted from this crate, by
     /// `SubscriptionOrderOps::submit_subscription_order`, and that function does NOT validate the
     /// deadline it is handed -- the guard lives two frames up, in `validate_subscription_order_terms`
     /// called by `submit_subscription_with_journal`. A guard in a caller is still a guard, but only
     /// if the caller is on the path, so this drives the entry point the CLI drives and observes
     /// whether the money write was DISPATCHED at all.
+
     /// `FakeSubscriptionOps::submit_subscription_order` IS the money write here: it records every
     /// call. An empty record is the proof -- no BOC prepared, no POST, and no durable money journal
     /// left behind claiming one might have landed.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn guard_11_a_subscription_buy_submit_is_never_dispatched_without_a_finite_deadline() {
         let (dir, _cleanup) = buyer_journal_test_dir("guard11-subscription-deadline");
@@ -19687,7 +21500,7 @@ mod tests {
         let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
         let escrow = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP).total_escrow;
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let model_hash = dexdo_core::model_hash_for(frame_model);
 
         let submit = async |ops: &FakeSubscriptionOps, deadline: u64| {
@@ -19736,7 +21549,7 @@ mod tests {
         }
 
         // The control: the same call, the same harness, only the deadline is a finite future time.
-        // Reconciliation fails afterwards(this `ops` has no placement to find) and that is fine --
+        // Reconciliation fails afterwards (this `ops` has no placement to find) and that is fine --
         // what is asserted is that the money write WAS dispatched, so the empty records above are a
         // fact about the guard and not about a harness that never submits.
         let ops = FakeSubscriptionOps::new(40);
@@ -19748,7 +21561,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_submit_accepts_one_immediate_full_fill() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-immediate-fill");
@@ -19775,7 +21587,7 @@ mod tests {
             },
         ));
         let escrow = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP).total_escrow;
-        let model = "qwen--qwen3--32b";
+        let model = "Qwen3-32B";
         let record = super::submit_subscription_with_journal(
             &ops,
             &note,
@@ -19802,7 +21614,6 @@ mod tests {
         assert!(!journal_path.exists());
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn lost_subscription_response_reconciles_without_second_boc() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-lost-response");
@@ -19818,7 +21629,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
         let escrow = subscription_test_reserve(ticks, dexdo_core::PRICE_STEP).total_escrow;
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let model_hash = dexdo_core::model_hash_for(frame_model);
 
         let error = super::submit_subscription_with_journal(
@@ -19871,7 +21682,6 @@ mod tests {
         assert!(!journal_path.exists());
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_submit_reconciliation_coalesces_identical_placement_duplicates() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-identical-placements");
@@ -19906,7 +21716,6 @@ mod tests {
         assert_eq!(state.orders.len(), 1);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_submit_reconciliation_rejects_conflicting_same_id_and_retains_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-conflicting-placements");
@@ -19947,7 +21756,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_match_crash_after_handle_keeps_journal_and_retry_converges() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-match-crash-order");
@@ -20034,7 +21842,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_fill_reconciliation_accepts_one_full_seller_only() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-fill-shape");
@@ -20118,7 +21925,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_fill_rejects_wrong_order_owner_model_flags_and_funded_volume() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-fill-facts");
@@ -20220,16 +22026,17 @@ mod tests {
     }
 
     /// reading a subscription must not sign, and must still say a week is owed.
+
     /// `refresh_subscription_match` booked the due week unconditionally, so `dexdo subscription
     /// status` signed and spent whenever it happened to be called across a boundary. An
     /// orchestrator polling on a timer paid for every boundary its poll crossed. Visibility was
     /// the old remedy -- the response carried `submitted` -- but telling a consumer that a read
     /// spent his money is not the same as not spending it.
+
     /// Both directions are asserted, because a read-only status that reported nothing would just
     /// trade a spend hazard for a silent stall: the subscription stops advancing and nobody learns
     /// until money is late. So the read must book NOTHING and still report `settlement_due`, and
     /// the explicit settle must book exactly once.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn reading_a_subscription_books_nothing_but_still_reports_the_week_it_owes() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-status-read-only");
@@ -20299,7 +22106,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_deal_identity_requires_exact_order_and_contract_flags() {
         let note_addr = subscription_test_note();
@@ -20349,7 +22155,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn matched_unopened_subscription_accepts_zero_unfunded_seller_bond() {
         let note_addr = subscription_test_note();
@@ -20370,7 +22175,6 @@ mod tests {
             .expect("matched unopened subscription legitimately has no seller bond yet");
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn explicit_and_historical_subscription_resume_share_quota_and_identity_checks() {
         use std::sync::atomic::Ordering;
@@ -20429,7 +22233,6 @@ mod tests {
     /// stored getter still remembers. `weekBaseTokens`/`weekIndex` move when a week is BOOKED; a
     /// restart that lands after a boundary and before anyone settles reads week one's books and would
     /// otherwise resume onto a quota that was already spent -- permanently, for the rest of the term.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn restart_after_an_unbooked_boundary_reconstructs_the_new_week_allowance() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-restart-weekly-allowance");
@@ -20530,7 +22333,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn historical_subscription_terminal_is_rejected_before_active_target_check() {
         use std::sync::atomic::Ordering;
@@ -20576,7 +22378,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_status_and_cancel_validate_exact_owned_resting_buy() {
         let owner = subscription_test_note();
@@ -20595,8 +22396,8 @@ mod tests {
             timestamp: 100,
         };
         let snapshot = |order: dexdo_core::OrderBookOrder| dexdo_core::OrderBookSnapshot {
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            frame_model: "Qwen3-32B".to_string(),
+            model_hash: dexdo_core::model_hash_for("Qwen3-32B"),
             order_book: subscription_test_book(),
             stats: Some(dexdo_core::OrderBookStats {
                 next_order_id: 71,
@@ -20662,7 +22463,6 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_status_rejects_durable_terms_that_contradict_live_row() {
         let owner = subscription_test_note();
@@ -20681,8 +22481,8 @@ mod tests {
             timestamp: 100,
         };
         let snapshot = dexdo_core::OrderBookSnapshot {
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: dexdo_core::model_hash_for("qwen--qwen3--32b"),
+            frame_model: "Qwen3-32B".to_string(),
+            model_hash: dexdo_core::model_hash_for("Qwen3-32B"),
             order_book: subscription_test_book(),
             stats: None,
             orders: vec![order.clone()],
@@ -20734,7 +22534,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_cancel_requires_refund_and_fill_race_loses_closed() {
         assert_eq!(
@@ -20775,7 +22574,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_cancel_polls_stale_read_until_refund_is_visible() {
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -20806,7 +22604,6 @@ mod tests {
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_cancel_polls_stale_read_until_delayed_fill_wins() {
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -20849,7 +22646,6 @@ mod tests {
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn legacy_and_corrupt_subscription_state_are_rejected_explicitly() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-state-schemas");
@@ -20896,7 +22692,6 @@ mod tests {
         assert!(error.to_string().contains("unknown field"), "{error:#}");
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn explicit_terminal_confirmation_marks_durable_subscription_exactly_once() {
         let note_addr = format!("0:{}", "a".repeat(64));
@@ -20934,7 +22729,6 @@ mod tests {
         let _ = std::fs::remove_file(&money_lock.subscriptions_path);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn subscription_confirmed_pre_match_cancel_becomes_terminal_without_fallback_or_payment()
     {
@@ -21013,7 +22807,6 @@ mod tests {
         assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_subscription_resume_precedes_lookback_and_never_pays_again() {
         use std::sync::atomic::Ordering;
@@ -21142,7 +22935,6 @@ mod tests {
         assert_eq!(chain.lookback_reads.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_subscription_resume_never_falls_back_while_order_is_resting() {
         use std::sync::atomic::Ordering;
@@ -21196,7 +22988,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_subscription_resume_rejects_ambiguous_candidate_handles() {
         let (dir, _cleanup) = buyer_journal_test_dir("subscription-ambiguous-resume");
@@ -21284,7 +23075,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_subscription_resume_refreshes_all_matches_before_ambiguity() {
         use std::sync::atomic::Ordering;
@@ -21389,7 +23179,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn subscription_terminal_wiring_exposes_no_removed_reclaim_selector_or_state() {
         let recover = include_str!("recover.rs");
@@ -21409,14 +23198,20 @@ mod tests {
                 );
             }
         }
-        let reclaim_start = recover
-            .find("pub(crate) async fn run_reclaim(args:")
-            .expect("current reclaim command");
-        let reclaim_end = recover[reclaim_start..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| reclaim_start + offset)
-            .expect("end current reclaim command");
-        let reclaim = &recover[reclaim_start..reclaim_end];
+        // The reclaim path is two items, and this test always meant both: the command, and the
+        // implementation of `ReclaimChain` it runs against on a real chain -- `stream_cleanup` is
+        // called from the second, never from the first. It used to get both by accident, by
+        // slicing from the command to a `#[cfg(not(feature = "net-a"))]` stub that happened to
+        // sit after the impl block. Naming them is the same span, minus the accident.
+        let reclaim = format!(
+            "{}{}",
+            crate::cli::source_probe::code_of(recover, "pub(crate) async fn run_reclaim(args:"),
+            crate::cli::source_probe::code_of(
+                recover,
+                "impl ReclaimChain for dexdo_core::RealChainBackend"
+            ),
+        );
+        let reclaim = reclaim.as_str();
         for removed in ["streamReclaim", "reclaimOnTimeout", "lastAdvance"] {
             assert!(
                 !reclaim.contains(removed),
@@ -21569,7 +23364,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn buyer_submit_test_journal() -> super::BuyerSubmitJournal {
         let note_addr = format!("0:{}", "1".repeat(64));
         let order_book = format!("0:{}", "2".repeat(64));
@@ -21619,7 +23413,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn buyer_submit_test_quoted(
         journal: &super::BuyerSubmitJournal,
     ) -> &dexdo_core::OrderBookOrder {
@@ -21629,7 +23422,6 @@ mod tests {
             .expect("ordinary fixture has an executable quote")
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn wait_for_seller_journal_records_no_invented_ask() {
         let mut journal = buyer_submit_test_journal();
@@ -21658,9 +23450,9 @@ mod tests {
     /// restart the fill's `orderId -> TokenContract` fact and the same order's terminal absence
     /// must be reconciled before any replacement BUY. Unknown, contradictory, and wrong-order
     /// facts are the adversaries and must leave the journal untouched.
+
     /// E2E-BUY-08, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-BUY-08/L0
-    #[cfg(feature = "shellnet")]
     #[ignore = "EXPECTED TO FAIL until ordinary buyer journals retain the assigned BUY order id and reconcile a partial fill plus residual cancellation"]
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -21834,7 +23626,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PreviousBuyerSubmitJournalV2 {
@@ -21857,7 +23648,6 @@ mod tests {
         resolved_matches: Vec<super::BuyerJournalMatch>,
     }
 
-    #[cfg(feature = "shellnet")]
     impl From<&super::BuyerSubmitJournal> for PreviousBuyerSubmitJournalV2 {
         fn from(journal: &super::BuyerSubmitJournal) -> Self {
             Self {
@@ -21884,12 +23674,15 @@ mod tests {
     }
 
     /// the quote's evidence names the six fields the pre-submit guard freezes it by.
+
     /// `fills` is the rendered price of the trade and carries four of them. `deadline` and `flags`
     /// appear nowhere else in anything the buyer emits, so without this the guard's own subject
     /// could not be read off a real run -- which is exactly what E2E-ORD-23 could not prove.
+
     /// The frozen row deliberately carries a non-zero deadline AND non-zero flags: a `frozen_quote`
     /// built from defaults would satisfy "the keys are present" while reporting nothing, the same
     /// shape found on the orders row.
+
     /// The wait-for-seller arm is asserted in the same test because it is the adversary: that
     /// selection rests a bid and re-checks no ask, so a `frozen_quote` there would report a guard
     /// that never ran. An unconditional field passes the first half and fails this one.
@@ -21934,7 +23727,7 @@ mod tests {
             frozen["token_contract"].as_str(),
             Some(token_contract.as_str())
         );
-        assert_eq!(frozen["price_per_tick"].as_str(), Some("1000000"));
+        assert_eq!(frozen["price_per_tick"].as_str(), Some("0.001"));
         assert_eq!(frozen["ticks"].as_str(), Some("4"));
         assert_eq!(
             frozen["deadline"].as_u64(),
@@ -21962,7 +23755,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     fn issue67_real_like_order() -> dexdo_core::OrderBookOrder {
         dexdo_core::OrderBookOrder {
             order_id: 154,
@@ -21978,7 +23770,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn issue67_pipeline_chain(
         quoted_order: &dexdo_core::OrderBookOrder,
         fresh_order: Option<dexdo_core::OrderBookOrder>,
@@ -21996,7 +23787,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     async fn issue67_select_and_submit(
         chain: &QuotePreflightChain,
         journal_path: &std::path::Path,
@@ -22034,7 +23824,6 @@ mod tests {
 
     /// an unchanged real matcher row is rendered, persisted before POST, and submitted exactly once
     /// without ever entering the mock offer-reconstruction path.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn buyer_real_quote_identity_reaches_journal_and_money_submit_once() {
         use std::sync::atomic::Ordering;
@@ -22050,25 +23839,30 @@ mod tests {
                 + 7;
         chain.note_shell_balance = Some(note_shell_balance);
 
-        let selection = issue67_select_and_submit(&chain, &journal_path, Some("qwen--qwen3--32b"))
+        let selection = issue67_select_and_submit(&chain, &journal_path, Some("Qwen3-32B"))
             .await
             .expect("unchanged real matcher row submits");
         let line = super::render_buyer_human_preflight(
-            "qwen--qwen3--32b",
+            "Qwen3-32B",
             &selection,
             2,
             order.price_per_tick,
             selection.escrow,
             note_shell_balance,
         );
-        let fee = selection.quote.fills[0].cost_with_fee
-            - selection.quote.fills[0].ticks * selection.quote.fills[0].price_per_tick;
+        // The line states money in SHELL, so the pin computes its expectations the same way the
+        // reader sees them.
+        let fee = dexdo_core::shell_amount(
+            selection.quote.fills[0].cost_with_fee
+                - selection.quote.fills[0].ticks * selection.quote.fills[0].price_per_tick,
+        );
+        let note_shell_balance = dexdo_core::shell_amount(note_shell_balance);
         assert_eq!(
             line,
             format!(
                 // the line now closes with what the probe tick costs, and this pin carries
                 // it so the disclosure cannot be dropped without a red test.
-                "BUYER_PREFLIGHT model=qwen--qwen3--32b requested_ticks=2 minimum_ticks={} \
+                "BUYER_PREFLIGHT model=Qwen3-32B requested_ticks=2 minimum_ticks={} \
                  best_ask={} max_price_per_tick={} escrow={} fee={fee} \
                  note_shell_balance={note_shell_balance} matched_ask_order_id={} \
                  matched_ask_token_contract={matched_tc} balance_sufficient=true \
@@ -22077,9 +23871,9 @@ mod tests {
                  note=one of the 2 ticks you pay for is the probe, billed whole even if it \
                  delivers less; 1 tick(s) remain for streaming",
                 dexdo_core::params::MIN_STREAM_BUY_TICKS,
-                order.price_per_tick,
-                order.price_per_tick,
-                selection.escrow,
+                dexdo_core::shell_amount(order.price_per_tick),
+                dexdo_core::shell_amount(order.price_per_tick),
+                dexdo_core::shell_amount(selection.escrow),
                 order.order_id,
                 // the preflight line names a per-deal TokenContract canonically, and a
                 // TokenContract is a self-DApp account, so its DApp half is its own account id.
@@ -22114,14 +23908,17 @@ mod tests {
         let error = issue67_select_and_submit(
             &insufficient,
             &insufficient_journal,
-            Some("qwen--qwen3--32b"),
+            Some("Qwen3-32B"),
         )
         .await
         .expect_err("insufficient live Note balance must block escrow POST");
         assert!(
+            // The refusal names the escrow apart from the bond: the old line repeated the escrow
+            // figure under a second name, and this row read that repetition.
             error.to_string().contains(&format!(
-                "required={} available={available}",
-                selection.escrow
+                "available={} SHELL; ordinary BUY requires escrow {} SHELL",
+                dexdo_core::shell_amount(available),
+                dexdo_core::shell_amount(selection.escrow)
             )),
             "{error:#}"
         );
@@ -22136,21 +23933,22 @@ mod tests {
         );
     }
 
-    /// by-fact on shellnet. `BUYER_PREFLIGHT` is the last thing an operator reads before the
+    /// by-fact on the chain. `BUYER_PREFLIGHT` is the last thing an operator reads before the
     /// escrow leaves, nothing parses it, and two of its fields were wrong in ways the line itself
     /// could not reveal:
+
     /// - it printed `order_id=11` -- the SELLER's chosen ask -- while the book numbered our bid 12,
     /// and `dexdo orders show` on order 11 then refused it as not owned by our note, at the one moment
     /// the money is frozen in the book and has to be got back;
     /// - it printed `matchable=true` while that ask had been expired for thirteen minutes; the
     /// escrow went out, no deal happened and the bid rested.
+
     /// So the assertion is on the WHOLE rendered line, not on a substring: a field named
     /// `order_id` may not carry a number the buyer does not have (the book assigns ours only after
     /// the money message -- the journal written beside this render records `order_id: None`), the
     /// counterparty's ask is carried under a name that says whose it is, and no `matchable` is
     /// asserted where executability is not determined here. Every other field is unchanged, which
     /// is's own regression requirement.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn issue_899_preflight_claims_no_foreign_order_id_and_no_constant_matchable() {
         let ask_tc_account = "d0".repeat(32);
@@ -22190,8 +23988,8 @@ mod tests {
             line,
             format!(
                 "BUYER_PREFLIGHT model=openai--gpt-4o-mini--2024-07-18 requested_ticks=2 \
-                 minimum_ticks={} best_ask=3000000000 max_price_per_tick=3000000000 \
-                 escrow=6000000000 fee=150000000 note_shell_balance=6000000000 \
+                 minimum_ticks={} best_ask=3 max_price_per_tick=3 \
+                 escrow=6 fee=0.15 note_shell_balance=6 \
                  matched_ask_order_id=11 matched_ask_token_contract={ask_token_contract_rendered} \
                  balance_sufficient=true probe_tick_charged_tokens=1000000 billable_ticks=2 \
                  streaming_ticks_after_probe=1 streaming_tokens_after_probe=1000000 \
@@ -22212,10 +24010,12 @@ mod tests {
     }
 
     /// 's other half: when the buyer refuses, the reason has to say WHICH state the book is in.
+
     /// The four states names need four answers because the operator's next step differs in
     /// each: raise the ceiling, buy fewer ticks, wait for the seller to repost, wait for a seller at
     /// all. Three of them shared the name `no_executable_ask`, which reads as "raise your ceiling"
     /// -- advice that is wrong for two of the three and impossible for the third.
+
     /// Driven through `run_buyer_inner`, the command entry, for both new states, because the
     /// classification is only worth anything if the entry reaches it: an undersized head ask on the
     /// explicit-`--token-contract` buy -- which before this change reached `human_buyer_quote_error`
@@ -22223,7 +24023,6 @@ mod tests {
     /// buy. The ceiling case rides along as the control that the two new names did not swallow the
     /// old one. Every case asserts zero money posts, because a refusal that still sends escrow is
     /// the incident was filed on.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -22234,7 +24033,7 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-899-refusal-reasons");
         let note_addr = format!("0:{}", "7".repeat(64));
         let token_contract = format!("0:{}", "8".repeat(64));
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let pool_path = dir.join("pool.json");
         std::fs::write(
             &pool_path,
@@ -22249,12 +24048,12 @@ mod tests {
 
         // The wording of each refusal belongs to the chain side and is pinned there
         // (`the_buy_refusal_names_an_empty_book_and_an_undersized_head_apart_from_a_plain_no_match`,
-        // crates/core/src/shellnet/backends.rs). What is injected here is the one literal each
+        // crates/core/src/chain/backends.rs). What is injected here is the one literal each
         // verdict is carried by, taken from the same constant the producer formats with, so a
         // rewording cannot leave this test green against a chain that no longer says it.
         let undersized_head = format!(
             "buyer target preflight failed for InferenceOrderBook 0:book: {} order  \
-             tokenContract {token_contract} has only 1 ticks, buyer requested 2. Current shellnet \
+             tokenContract {token_contract} has only 1 ticks, buyer requested 2. Current chain \
              submit is accepted only when the price/time head ask alone covers the request.",
             dexdo_core::params::INSUFFICIENT_HEAD_ASK_REASON
         );
@@ -22290,7 +24089,7 @@ mod tests {
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((backend, note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
                     shutdown: Box::pin(std::future::pending()),
                 },
             )
@@ -22343,7 +24142,7 @@ mod tests {
             &mut machine_context,
             super::BuyerCommandRuntime {
                 backend: Some((backend, note)),
-                shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                chain_preflight: super::BuyerChainPreflight::OfflineTest,
                 shutdown: Box::pin(std::future::pending()),
             },
         )
@@ -22393,7 +24192,6 @@ mod tests {
         assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     fn issue_899_refusal_args(
         dir: &std::path::Path,
         note_addr: &str,
@@ -22461,14 +24259,12 @@ mod tests {
             ticks: 2,
             max_price_per_tick: dexdo_core::PRICE_STEP,
             escrow: None,
-            contracts: dir.join("offline-contracts.json"),
             policy: Some(policy_path),
         }
     }
 
     /// a benign metadata difference on the fresh non-atomic book read preserves the quoted
     /// order identity/terms and reaches escrow submission.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn buyer_valid_quote_with_benign_reread_diff_reaches_money_submit() {
         use std::sync::atomic::Ordering;
@@ -22508,7 +24304,6 @@ mod tests {
 
     /// negative: every matcher-relevant quote-to-submit mutation fails before durable journal POST
     /// and before the money submit.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn buyer_real_quote_identity_change_fails_before_journal_and_escrow() {
         use std::sync::atomic::Ordering;
@@ -22572,7 +24367,6 @@ mod tests {
 
     /// negative: a quote that disappears or becomes non-executable on the fresh pre-submit read
     /// cannot create a journal or attempt escrow.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn buyer_disappeared_real_quote_fails_before_journal_and_escrow() {
         use std::sync::atomic::Ordering;
@@ -22600,10 +24394,10 @@ mod tests {
     /// adjacent raw-unit under/over values while its journal callback is still ahead of the money
     /// POST. The existing quote fixture records the exact order, debit, and POST reached by the
     /// accepted control, so a helper-only arithmetic check cannot satisfy this row.
+
     /// E2E-ESC-02, `tests/e2e/test-specification.md` at matrix head
     /// `40f8aae352a4e1aa19508c68b8f54c9ca2b6c676`.
     /// E2E-ROW: E2E-ESC-02/L0
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn esc_02_noncanonical_deposit_stops_before_journal_and_money() {
         use std::sync::atomic::Ordering;
@@ -22665,9 +24459,13 @@ mod tests {
                 );
             } else {
                 let error = result.expect_err("non-canonical escrow must fail before POST");
+                // The refusal states the escrow in SHELL, which is the unit `--escrow` takes;
+                // asserting on the raw figure would pass on a line no operator can act on.
                 assert!(
                     error.to_string().contains("escrow")
-                        && error.to_string().contains(&required.to_string()),
+                        && error
+                            .to_string()
+                            .contains(&dexdo_core::shell_amount(required)),
                     "{label}: {error:#}"
                 );
                 assert!(!journal_path.exists(), "{label}: no durable POST claim");
@@ -22681,10 +24479,10 @@ mod tests {
     /// An already-expired submit-safe row is driven through the real quote and journal-to-POST
     /// path. The refusal must name its authoritative deadline; unknown/stale identity mutation is
     /// the adjacent adversary and neither arm may create an order, journal, debit, or money POST.
+
     /// E2E-ORD-02, `tests/e2e/test-specification.md` at matrix head
     /// `40f8aae352a4e1aa19508c68b8f54c9ca2b6c676`.
     /// E2E-ROW: E2E-ORD-02/L0
-    #[cfg(feature = "shellnet")]
     #[ignore = "EXPECTED TO FAIL until the production buyer rejects a submit-safe ask whose deadline is already past"]
     #[tokio::test]
     async fn ord_02_expired_ask_exits_before_order_journal_debit_or_escrow() {
@@ -22740,7 +24538,6 @@ mod tests {
     /// row, the real journal-to-money boundary sends escrow only against that row's exact order id
     /// and TokenContract. The selector half lives beside `selected_model_buy_ask` in core.
     /// E2E-ROW: E2E-ORD-03/L0
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn ord_03_selected_live_row_is_the_only_escrow_target() {
         use std::sync::atomic::Ordering;
@@ -22784,10 +24581,10 @@ mod tests {
     /// Raw heads remain candidates until the production quote/pre-submit path validates their
     /// deadline and executable deal state. Expired and explicitly incompatible heads must stop
     /// before journal/debit/POST, while the adjacent live re-read targets one exact row.
+
     /// E2E-ORD-20, `tests/e2e/test-specification.md` at matrix head
     /// `40f8aae352a4e1aa19508c68b8f54c9ca2b6c676`.
     /// E2E-ROW: E2E-ORD-20/L0
-    #[cfg(feature = "shellnet")]
     #[ignore = "EXPECTED TO FAIL until the buyer validates a raw head's deadline before executable labeling and submit"]
     #[tokio::test]
     async fn ord_20_raw_expired_or_incompatible_head_never_reaches_submit() {
@@ -22871,7 +24668,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     struct JournalPipelineChain {
         submit_error: Option<&'static str>,
         fill: Option<dexdo_core::MatchedFill>,
@@ -22885,7 +24681,6 @@ mod tests {
         order_facts: Vec<dexdo_core::BuyerOrderFact>,
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for JournalPipelineChain {
         async fn claim_tokens(
@@ -23054,11 +24849,19 @@ mod tests {
             unimplemented!()
         }
 
+        /// No handover published, which is the truth for every deal this mock drives.
+
+        /// It was `unimplemented!()` until, and that was not caught because the test that
+        /// reaches it never ran: this whole module sat behind `#[cfg(feature = "net-a")]`, and
+        /// CI compiled that feature without ever executing it (`--no-run`). Removing the features
+        /// executed it for the first time, and the panic landed while the test held
+        /// `dexdo_pn_pool_env_lock()` -- which poisoned that process-wide mutex and took nine
+        /// unrelated buyer tests down with it. One missing mock arm, ten red tests.
         async fn read_handover(
             &self,
             _token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
-            unimplemented!()
+            Ok(None)
         }
 
         async fn deal_state(
@@ -23076,7 +24879,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct ResumeCommandChain {
         fill: dexdo_core::MatchedFill,
         handover: Vec<u8>,
@@ -23086,7 +24888,6 @@ mod tests {
         deal_state_count: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for ResumeCommandChain {
         async fn claim_tokens(
@@ -23216,7 +25017,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct SubscriptionResumeCommandChain {
         order_book: String,
         placement: dexdo_core::InferenceSubscriptionPlacement,
@@ -23234,7 +25034,6 @@ mod tests {
         deal_state_count: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SubscriptionResumeCommandChain {
         async fn claim_tokens(
@@ -23477,7 +25276,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct SameTcMockSubscriptionChain {
         chain: std::sync::Arc<dexdo_core::MockChainBackend>,
         buyer_note: std::sync::Arc<dexdo_core::LocalNote>,
@@ -23496,7 +25294,6 @@ mod tests {
         receipt_reads: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     impl SameTcMockSubscriptionChain {
         fn new(
             chain: std::sync::Arc<dexdo_core::MockChainBackend>,
@@ -23637,7 +25434,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::SubscriptionOrderOps for SameTcMockSubscriptionChain {
         async fn submit_subscription_order(
@@ -23781,7 +25577,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SameTcMockSubscriptionChain {
         async fn discover_offers(
@@ -24020,7 +25815,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn journal_pipeline_selection() -> super::BuyerQuoteSelection {
         let journal = buyer_submit_test_journal();
         super::BuyerQuoteSelection {
@@ -24032,7 +25826,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     async fn journal_pipeline_place(
         chain: &JournalPipelineChain,
         journal_path: &std::path::Path,
@@ -24059,7 +25852,6 @@ mod tests {
         (note_addr, selection, result)
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_journals_before_single_post_and_retains_ambiguity() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-pipeline-ambiguous");
@@ -24102,7 +25894,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -24164,13 +25955,12 @@ mod tests {
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: false,
             anthropic_compat: false,
-            frame_model: Some("qwen--qwen3--32b".to_string()),
+            frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
             max_price_per_tick: fixture.max_price_per_tick,
             escrow: Some(fixture.escrow),
-            contracts: dir.join("offline-contracts.json"),
             policy: None,
         });
         let state = super::build_on_demand_buyer_api_state(
@@ -24178,14 +25968,14 @@ mod tests {
             buyer,
             args,
             None,
-            "qwen--qwen3--32b".to_string(),
+            "Qwen3-32B".to_string(),
             dexdo::buyer::api::ContentCheck::Skip,
             std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
             None,
             dexdo::buyer::api::BuyerApiFailurePolicy::default(),
             None,
             None,
-            super::BuyerShellnetPreflight::OfflineTest,
+            super::BuyerChainPreflight::OfflineTest,
             None,
             true,
         );
@@ -24209,7 +25999,7 @@ mod tests {
             let response = client
                 .post(format!("http://{addr}/v1/chat/completions"))
                 .json(&serde_json::json!({
-                    "model": "qwen--qwen3--32b",
+                    "model": "Qwen3-32B",
                     "messages": [{"role": "user", "content": format!("issue 61 request {request}")}],
                     "max_tokens": 1,
                     "stream": false
@@ -24277,7 +26067,7 @@ mod tests {
         let expected = reconciliation.clone();
         let state = dexdo::buyer::api::ApiState::lazy(
             std::sync::Arc::new(dexdo::buyer::Buyer::generate()),
-            "qwen--qwen3--32b".to_string(),
+            "Qwen3-32B".to_string(),
             std::sync::Arc::new(move || {
                 let reconciliation = reconciliation.clone();
                 Box::pin(async move {
@@ -24300,7 +26090,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("http://{addr}/v1/messages"))
             .json(&serde_json::json!({
-                "model": "qwen--qwen3--32b",
+                "model": "Qwen3-32B",
                 "messages": [{"role": "user", "content": "resume"}],
                 "max_tokens": 1,
                 "stream": false
@@ -24336,7 +26126,6 @@ mod tests {
         task.await.expect("Anthropic router joins");
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -24493,13 +26282,12 @@ mod tests {
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
             anthropic_compat: false,
-            frame_model: Some("qwen--qwen3--32b".to_string()),
+            frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
             max_price_per_tick: fixture.max_price_per_tick,
             escrow: Some(fixture.escrow),
-            contracts: dir.join("offline-contracts.json"),
             policy: Some(policy_path),
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -24516,7 +26304,7 @@ mod tests {
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((command_chain, command_note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
                     shutdown: Box::pin(async move {
                         let _ = shutdown_rx.await;
                     }),
@@ -24581,7 +26369,7 @@ mod tests {
         let response = client
             .post(format!("http://{api_addr}/v1/chat/completions"))
             .json(&serde_json::json!({
-                "model": "qwen--qwen3--32b",
+                "model": "Qwen3-32B",
                 "messages": [{"role": "user", "content": "resume through the real command"}],
                 "max_tokens": 1,
                 "stream": true
@@ -24727,7 +26515,6 @@ mod tests {
         seller.server_task.abort();
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -24878,7 +26665,6 @@ mod tests {
             ticks: journal.ticks,
             max_price_per_tick: journal.max_price_per_tick,
             escrow: Some(journal.escrow),
-            contracts: dir.join("offline-contracts.json"),
             policy: Some(policy_path),
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -24895,7 +26681,7 @@ mod tests {
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((command_chain, command_note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
                     shutdown: Box::pin(async move {
                         let _ = shutdown_rx.await;
                     }),
@@ -25109,7 +26895,6 @@ mod tests {
         seller.server_task.abort();
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn one_mock_subscription_tc_reaches_restart_gateway_claim_finalize_and_stop_receipt() {
         use std::sync::atomic::Ordering;
@@ -25138,7 +26923,7 @@ mod tests {
         let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
         let token_contract = subscription_test_tc('7');
         let order_book = subscription_test_book();
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let model_hash = dexdo_core::model_hash_for(frame_model);
         let initial = SameTcMockSubscriptionChain::new(
             chain,
@@ -25436,7 +27221,6 @@ mod tests {
     /// The chain an ordinary `--resume` faces after its buyer has been up longer than the fill-event
     /// window: the note's own `InferenceFilledConfirmed` scan has nothing left to find, and
     /// the deal is only knowable from the durable handle the buyer wrote for it.
-    #[cfg(feature = "shellnet")]
     struct SpotHandleResumeChain {
         token_contract: String,
         handover: Vec<u8>,
@@ -25456,7 +27240,6 @@ mod tests {
         stop_posts: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     impl SpotHandleResumeChain {
         fn new(token_contract: &str, handover: Vec<u8>, book_order_id: Option<u128>) -> Self {
             Self {
@@ -25475,7 +27258,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SpotHandleResumeChain {
         async fn claim_tokens(
@@ -25693,17 +27475,16 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     const SPOT_RESUME_TEST_TICKS: u128 = 4;
 
     /// The durable record an ordinary local-listen buyer writes for every deal it serves
     /// ([`super::save_runtime_deal_handle`]), reproduced as it lands on disk.
+
     /// `created_order_ids` is EMPTY, and that is not a shortcut in the fixture -- it is what an
     /// ordinary model-only buy really writes. The handle is built from `buyer_order_id`, which that
     /// path never sets, because the buyer's own order id does not exist until the book has processed
     /// the money message. A fixture that seeded an id here would be testing a handle shape no
     /// buyer has ever produced, and would hide exactly the defect's live row found.
-    #[cfg(feature = "shellnet")]
     fn write_spot_resume_deal_handle(
         deals_dir: &std::path::Path,
         note_addr: &str,
@@ -25714,7 +27495,11 @@ mod tests {
             version: super::deals::DEAL_HANDLE_VERSION,
             handle: super::deals::make_handle_id(token_contract, super::deals::DealHandleRole::Buyer),
             role: super::deals::DealHandleRole::Buyer,
-            network: "shellnet".to_string(),
+            // `"mock"` is what an offline backend reports for itself (`ChainBackend::network`'s
+            // default). `resolve_buyer_spot_resume` filters handles by `chain.network()`, so a
+            // record naming anything else is one this run must ignore -- which is the point of the
+            // field, and was invisible while the default returned a real chain's name.
+            network: "mock".to_string(),
             token_contract: token_contract.to_string(),
             note_addr: note_addr.to_string(),
             frame_model: frame_model.to_string(),
@@ -25734,7 +27519,6 @@ mod tests {
         handle.handle
     }
 
-    #[cfg(feature = "shellnet")]
     fn spot_resume_buyer_args(
         dir: &std::path::Path,
         note_addr: &str,
@@ -25795,12 +27579,10 @@ mod tests {
                 SPOT_RESUME_TEST_TICKS,
                 dexdo_core::PRICE_STEP,
             )),
-            contracts: dir.join("offline-contracts.json"),
             policy: Some(policy_path),
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn write_spot_resume_pool(dir: &std::path::Path, note_addr: &str) -> std::path::PathBuf {
         let pool_path = dir.join("pool.json");
         std::fs::write(
@@ -25816,19 +27598,20 @@ mod tests {
     }
 
     /// `dexdo buyer --resume` picks an ORDINARY deal back up.
+
     /// Subscriptions have had a durable resume for a while; an ordinary deal had two sources and
     /// neither was durable -- an explicit `--token-contract` (refused outright once
     /// `buyer.check_model_registry` is on) and a scan of the note's own fill events bounded to
     /// `RESUME_LOOKBACK_SECS`. A `--local-listen` buyer that has been serving one deal for longer
     /// than that window is exactly the case in the report, and it had nothing: the scan blocks for
     /// `DEAL_WAIT_SECS` and then blames the seller for never matching, about a deal that is live.
+
     /// This drives the real entry -- `run_buyer_inner` with `--resume`, against a chain whose fill
     /// scan fails the way production's does -- so what is proved is that the ordinary branch is
     /// DISPATCHED, not that a helper would have returned the right address. The deal is adopted from
     /// the handle the buyer itself wrote, the endpoint comes from the on-chain handover, the local
     /// gateway is rebound, and a request is served through it. No second BUY is submitted, and the
     /// fill-event scan is never consulted, because the durable record answered first.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -25837,7 +27620,7 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-1000-spot-resume");
         let note_addr = format!("0:{}", "a".repeat(64));
         let token_contract = format!("0:{}", "b".repeat(64));
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         // The id the BOOK assigned this buyer's order. It is nowhere in the handle, by construction.
         let book_order_id = 4_242_u128;
         let deals_dir = dir.join("deals");
@@ -25900,7 +27683,7 @@ mod tests {
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((command_chain, command_note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
                     shutdown: Box::pin(async move {
                         let _ = shutdown_rx.await;
                     }),
@@ -26006,13 +27789,13 @@ mod tests {
     }
 
     /// the other half: a resume that cannot establish the deal says WHICH fact it could not.
+
     /// On contracts 4.0.33/4.0.34 both `stop()` branches end in `_payOwedAndDie()`, so the deal an
     /// operator is trying to resume after a planned restart may be a destroyed account. The liveness
     /// read can only report "not active on-chain", which reads like a typo'd address, and the
     /// fill-event scan on top of it reports that the seller never matched. Neither is what happened.
     /// The deal's ext-out receipts outlive the account, so the refusal carries the terminal receipt
     /// and names the handle it came from -- and still refuses, rather than buying again.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -26021,7 +27804,7 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-1000-spot-resume-terminal");
         let note_addr = format!("0:{}", "c".repeat(64));
         let token_contract = format!("0:{}", "d".repeat(64));
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let deals_dir = dir.join("deals");
         std::fs::create_dir_all(&deals_dir).unwrap();
         let deal_handle =
@@ -26050,7 +27833,7 @@ mod tests {
             &mut machine_context,
             super::BuyerCommandRuntime {
                 backend: Some((command_chain, command_note)),
-                shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                chain_preflight: super::BuyerChainPreflight::OfflineTest,
                 shutdown: Box::pin(std::future::pending()),
             },
         )
@@ -26073,8 +27856,8 @@ mod tests {
             "the refusal must say the deal settled, not that the address is unknown: {refusal}"
         );
         assert!(
-            refusal.contains("3000000000") && refusal.contains("1000000000"),
-            "the terminal receipt is the fact that explains it: {refusal}"
+            refusal.contains("to_seller=3") && refusal.contains("refund_to_buyer=1"),
+            "the terminal receipt is the fact that explains it, in SHELL: {refusal}"
         );
         assert_eq!(
             resumed
@@ -26099,14 +27882,14 @@ mod tests {
     }
 
     /// a deal whose resting order the book will not name is not adopted silently.
+
     /// This is the shape the live row caught, isolated. The deal is live and provably this buyer's --
-    /// the liveness read passes -- but the handle carries no order id(none ever has) and the book's
+    /// the liveness read passes -- but the handle carries no order id (none ever has) and the book's
     /// attribution names none either, so the resume has no way to say WHICH order became this deal.
     /// The row's whole subject is that a resting order keeps its identity through settlement, so
     /// adopting it anyway and reporting `order_id: null` is the failure, not the fallback. It is a
     /// rejection rather than a hard stop, because the fill-event scan reads the same `buyerOrderId`
     /// and may still be able to answer; when it cannot either, the refusal names both.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -26115,7 +27898,7 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-1000-spot-resume-unnamed-order");
         let note_addr = format!("0:{}", "e".repeat(64));
         let token_contract = format!("0:{}", "f".repeat(64));
-        let frame_model = "qwen--qwen3--32b";
+        let frame_model = "Qwen3-32B";
         let deals_dir = dir.join("deals");
         std::fs::create_dir_all(&deals_dir).unwrap();
         let deal_handle =
@@ -26143,7 +27926,7 @@ mod tests {
             &mut machine_context,
             super::BuyerCommandRuntime {
                 backend: Some((command_chain, command_note)),
-                shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                chain_preflight: super::BuyerChainPreflight::OfflineTest,
                 shutdown: Box::pin(std::future::pending()),
             },
         )
@@ -26182,7 +27965,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_clean_rejection_clears_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-pipeline-rejected");
@@ -26218,7 +28000,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_pre_post_failure_clears_but_unclassified_failure_retains() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-pipeline-preparation");
@@ -26264,7 +28045,6 @@ mod tests {
         assert!(journal_path.exists());
     }
 
-    #[cfg(feature = "shellnet")]
     fn journal_outcome_chain(
         journal_path: &std::path::Path,
         order_facts: Vec<dexdo_core::BuyerOrderFact>,
@@ -26286,7 +28066,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn placed_fact(
         journal: &super::BuyerSubmitJournal,
         created_at: i64,
@@ -26305,7 +28084,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn book_fact(
         journal: &super::BuyerSubmitJournal,
         created_at: i64,
@@ -26319,13 +28097,11 @@ mod tests {
     }
 
     /// The far side of the buyer's finite BUY deadline: a resting order that has not gone stale.
-    #[cfg(feature = "shellnet")]
     const LIVE_DEADLINE: u64 = 4_000_000_000;
 
     /// by-fact: our order 12 was cancelled, the escrow came back, and every later `dexdo buyer` run
     /// died on `ambiguous submit... unresolved` because only a fill could close the record. A cancellation
     /// is a terminal outcome proven by the book, so it closes the record and the client is usable again.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_cancelled_order_closes_the_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-cancelled");
@@ -26369,7 +28145,6 @@ mod tests {
 
     /// a fill is terminal too, and closing on it is the behaviour cancellation and rejection now
     /// join. This is the regression that keeps the fill path closing the record and handing back its deal.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -26427,7 +28202,6 @@ mod tests {
 
     /// the book refused the order outright, so no order id was ever assigned and the escrow never
     /// left. There is nothing to resolve and nothing that could be paid twice -- the record closes.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_rejected_order_closes_the_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-rejected");
@@ -26467,7 +28241,6 @@ mod tests {
     /// past its deadline can still be matched and then settled, and the sweep only proves the deadline was
     /// reached -- neither proves where the escrow ended up. Closing on the clock would discard a record that
     /// still has money behind it, so both shapes keep it.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_expiry_alone_never_closes_the_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-expired");
@@ -26542,7 +28315,6 @@ mod tests {
     /// requirements 3 and 4: a resting order is the one honestly unresolved case, and blocking is
     /// right there -- but the record must name the order rather than call it ambiguous, and it must keep
     /// this note's own order id so the next run can attribute the outcome across a restart.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_resting_order_is_named_and_its_order_id_survives_restart() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-resting");
@@ -26583,7 +28355,6 @@ mod tests {
     /// money safety: attribution is by fact, and a fact that cannot be tied to THIS record proves
     /// nothing. A placement made before this record was written belongs to an earlier order, and two
     /// candidate placements are a guess -- both keep the record instead of closing it.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_buy_unattributable_outcomes_keep_the_journal() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-unattributable");
@@ -26652,7 +28423,6 @@ mod tests {
         assert!(ambiguous_path.exists(), "the record survives");
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -26714,9 +28484,9 @@ mod tests {
     }
 
     /// A pid this machine really has no process for, found with the probe production decides on.
+
     /// Scanned rather than hard-coded, and scanned downward from the top of the range where the
     /// kernel has not wrapped to yet, so the fixture cannot accidentally name something running.
-    #[cfg(feature = "shellnet")]
     fn a_pid_no_process_bears() -> u32 {
         (2..100_000_u32)
             .rev()
@@ -26726,7 +28496,6 @@ mod tests {
 
     /// every sentinel written by this build binds its pid to the host whose process table
     /// gives that pid meaning, and a dead holder on that same host remains recoverable.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn lock_host_identity_1030_same_host_dead_pid_is_reclaimed() {
         let dir = tempfile::tempdir().expect("pool fixture directory");
@@ -26772,7 +28541,6 @@ mod tests {
 
     /// an unlocked sentinel and an absent pid are both local signals. They must not reclaim
     /// a holder from another host, and the refusal must tell the operator which signal is unusable.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn lock_host_identity_1030_foreign_host_refuses_local_lock_and_pid_signals() {
         let dir = tempfile::tempdir().expect("pool fixture directory");
@@ -26815,7 +28583,6 @@ mod tests {
 
     /// compatibility: a pid-only sentinel predates host identity. It keeps the exact
     /// two-local-signal fallback instead of being silently reclassified as foreign or malformed.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn lock_host_identity_1030_legacy_pid_only_sentinel_keeps_fallback() {
         let dir = tempfile::tempdir().expect("pool fixture directory");
@@ -26837,18 +28604,20 @@ mod tests {
     }
 
     /// regression: a buyer that crashed mid-submit can `--resume`, and only `--resume` can.
+
     /// Observed on disk: the buyer pool lock held pid 58043 with that process gone, and every
     /// attempt -- including `--resume`, the one command that exists to recover from exactly this --
     /// was refused with "already has another money submission awaiting by-fact reconciliation", exit
     /// 256. The lock is taken across `complete_buyer_submit_with_journal`'s fill wait, SIGKILL
     /// bypasses `Drop`, and nothing reclaimed it, so the refusal was permanent.
+
     /// A crashed holder is reproduced the way one really looks: a sentinel file on disk with a pid
     /// line and no live process behind it. What must NOT change is the ordinary refusal, so both
     /// halves are asserted against the same sentinel.
+
     /// The pid written is one this machine really has no process for, established with the same
     /// probe production uses -- 58043 was the observed one, but a fixed number is a process that
     /// might exist on the machine running this, which is the whole reason the pid is not evidence.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn a_crashed_holders_lock_refuses_an_ordinary_submit_and_is_reclaimed_only_by_recovery() {
         let note_addr = format!("0:{}", "5".repeat(64));
@@ -26916,16 +28685,17 @@ mod tests {
 
     /// the branch that could fail OPEN, and the only one: an unlocked sentinel whose holder
     /// is alive.
+
     /// The advisory lock answers "is the holder running" for every sentinel a lock-taking build
     /// wrote. It answers it WRONG for one written by a build that did not take the lock: that
     /// sentinel carries no lock while its holder is alive and well, so lock-absence alone reports a
     /// live holder as gone. Every other refusal in this path fails closed; a money-safety check that
     /// an upgrade quietly disables is worse than one that is absent, because nobody goes looking for
     /// it.
+
     /// So an unlocked sentinel is not evidence on its own. The recorded process must also not be
     /// running, and this pins both directions of that: OUR OWN pid is the live holder no build ever
     /// took a lock for, and it must be refused as undecidable rather than reclaimed.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn an_unlocked_sentinel_whose_recorded_process_is_alive_is_undecidable_not_reclaimable() {
         let note_addr = format!("0:{}", "6".repeat(64));
@@ -26982,12 +28752,12 @@ mod tests {
     }
 
     /// the other half: reclaiming is not forgetting.
+
     /// The lock guards a submission whose outcome is unknown, so taking it over may not be a way
     /// past the by-fact reconciliation -- it is what lets that reconciliation run at all. Shape,
     /// because the reconciliation itself is a chain round trip: what is pinned is that the recovery
     /// flag decides ONLY which acquire is used, that both land in the same function, and that the
     /// journal load and `start_durable_buyer_submit` follow it on either path.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn reclaiming_the_lock_still_reconciles_before_any_second_submission() {
         let source = include_str!("buyer.rs");
@@ -27023,11 +28793,11 @@ mod tests {
     }
 
     /// the FIRST lock `--resume` takes is the one that has to be able to reclaim.
+
     /// The entry seam above is not the first acquire on the resume path. `run_buyer`'s
     /// subscription-resume classifier takes the SAME note's money lock before it, under
     /// `if args.resume`, so a fix that reached only the entry seam would have left `--resume`
     /// refused exactly as reported. Shape, because reaching that line needs a real backend.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn the_first_money_lock_on_the_resume_path_is_the_reclaiming_one() {
         let source = include_str!("buyer.rs");
@@ -27046,10 +28816,10 @@ mod tests {
     }
 
     /// The sentinel path production will look at for one locked file, derived the way it derives it.
+
     /// `pool_write_lock_paths` resolves the target before appending `.lock`, so a fixture that just
     /// concatenates could write its crashed holder somewhere production never reads and pass while
     /// proving nothing.
-    #[cfg(feature = "shellnet")]
     fn crashed_holder_sentinel_for(path: &std::path::Path) -> std::path::PathBuf {
         let resolved = crate::cli::note::resolve_private_file_path(path, "crashed holder fixture")
             .expect("the fixture path production locks must resolve");
@@ -27060,29 +28830,33 @@ mod tests {
 
     /// through the real command: a buyer that crashed mid-submit resumes past every lock it
     /// left behind.
+
     /// The existing regressions call `BuyerMoneyLock` directly or read this file as text. Both
     /// are worth having and neither proves a user can get out of the state, because neither runs
     /// `--resume`. This one does: it puts on disk exactly what a SIGKILLed buyer leaves and then
     /// starts the real command over it.
+
     /// What a buyer killed inside `execute_buyer_quote_submit` leaves is three sentinels, not one.
     /// It holds the MONEY lock for the whole submit; inside that hold it writes the journal
     /// (`write_buyer_submit_journal` -> `with_pool_write_lock`) and it preflights the pool
     /// (`preflight_buyer_pool_for_note` -> `with_pool_write_lock`). `Drop` never runs, so whichever
     /// it was inside stays locked too. Each one alone is fatal to recovery, and they fail at
     /// different points:
+
     /// * the POOL sentinel is hit by `run_buyer_inner`'s FIRST statement,
     /// `preflight_buyer_pool_for_money_move`, ahead of every reclaim seam the money lock has --
     /// `--resume` never even reaches them;
     /// * the MONEY sentinel is hit next, by the subscription-resume classifier;
     /// * the JOURNAL sentinel is hit last, by the by-fact reconciliation's own journal write,
     /// after the money lock has already been reclaimed.
+
     /// The pids are ones this machine really has no process for, found with the probe production
     /// decides with. The journal is written BEFORE the sentinels so the fixture is built by the
     /// ordinary path and cannot depend on the behaviour under test.
+
     /// The end state asserted is the user-visible one: the resumed deal streams and settles, no
     /// second money POST is sent, the retained journal is reconciled exactly once, and every
     /// sentinel is gone -- released normally, so the next run takes its lock the ordinary way.
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -27215,13 +28989,12 @@ mod tests {
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
             anthropic_compat: false,
-            frame_model: Some("qwen--qwen3--32b".to_string()),
+            frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
             max_price_per_tick: fixture.max_price_per_tick,
             escrow: Some(fixture.escrow),
-            contracts: dir.join("offline-contracts.json"),
             policy: Some(policy_path),
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -27238,7 +29011,7 @@ mod tests {
                 &mut machine_context,
                 super::BuyerCommandRuntime {
                     backend: Some((command_chain, command_note)),
-                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
                     shutdown: Box::pin(async move {
                         let _ = shutdown_rx.await;
                     }),
@@ -27280,7 +29053,7 @@ mod tests {
         let response = client
             .post(format!("http://{api_addr}/v1/chat/completions"))
             .json(&serde_json::json!({
-                "model": "qwen--qwen3--32b",
+                "model": "Qwen3-32B",
                 "messages": [{"role": "user", "content": "resume after a crash"}],
                 "max_tokens": 1,
                 "stream": true
@@ -27323,7 +29096,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -27529,7 +29301,6 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -27643,13 +29414,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn on_demand_attempt_two_reconciles_before_failing_fresh_preflight() {
         // run_buyer_inner constructs its real backend at the command boundary. Its coverage is
-        // intentionally deferred to the live shellnet proof; do not replace it with a fake
+        // intentionally deferred to the a live chain proof; do not replace it with a fake
         // command-boundary test.
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-on-demand-attempt-two");
@@ -27693,6 +29463,17 @@ mod tests {
             order_facts: Vec::new(),
         });
         let missing_contracts = dir.join("missing-contracts.json");
+        // The trap this test is built on: a manifest that cannot be read, so the FRESH preflight
+        // fails and the assertion below can name the path. It used to arrive as `--contracts`;
+        // removed the flag, and the path was left constructed but wired to nothing -- which
+        // let the run sail past the preflight into a 600s handover wait it was never about.
+
+        // Aimed by the THREAD-LOCAL and not by `DEXDO_MANIFEST`. The variable was the second way to
+        // be wired to nothing, and it disarmed this test twice over: a unit-test build no longer
+        // consults the environment at all, so the guard set a variable nobody reads -- and when it
+        // WAS read, it was process-wide, so this deliberately unreadable fixture became the
+        // manifest of every other test running beside it.
+        let _manifest = crate::cli::commands::manifest_for_this_thread(&missing_contracts);
         let args = std::sync::Arc::new(super::BuyerArgs {
             mock: super::MockFlags {
                 mock_model: false,
@@ -27716,13 +29497,12 @@ mod tests {
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: false,
             anthropic_compat: false,
-            frame_model: Some("qwen--qwen3--32b".to_string()),
+            frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
             max_price_per_tick: fixture.max_price_per_tick,
             escrow: Some(fixture.escrow),
-            contracts: missing_contracts.clone(),
             policy: None,
         });
         let error = super::prepare_lazy_buyer_api_deal_with_replay_backoff(
@@ -27730,14 +29510,14 @@ mod tests {
             std::sync::Arc::new(dexdo::buyer::Buyer::generate()),
             args,
             fixture.expected_token_contract.clone(),
-            "qwen--qwen3--32b".to_string(),
+            "Qwen3-32B".to_string(),
             dexdo::buyer::api::ContentCheck::Skip,
             std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
             None,
             dexdo::buyer::api::BuyerApiFailurePolicy::default(),
             None,
             None,
-            super::BuyerShellnetPreflight::Production,
+            super::BuyerChainPreflight::Production,
         )
         .await
         .err()
@@ -27775,7 +29555,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -27881,11 +29660,24 @@ mod tests {
             stored.resolved_matches[0].token_contract,
             fill.token_contract
         );
-        let pool = std::fs::read_to_string(&pool_path).unwrap();
-        assert!(pool.contains(&fill.token_contract));
+        // The pool records a TokenContract in its canonical self-DApp form since, so the
+        // recorded string is not the workchain one this fixture is built from. Compared as a FIELD
+        // against a literal, not searched for as a substring of the file: a substring search over
+        // the whole pool passes on any occurrence anywhere, and it was the weaker assertion that
+        // let the spelling change go unnoticed in the first place.
+        let pool: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pool_path).unwrap()).unwrap();
+        let account = fill
+            .token_contract
+            .strip_prefix("0:")
+            .expect("the fixture TokenContract is the workchain form");
+        assert_eq!(
+            pool["notes"][0]["token_contract"],
+            serde_json::json!(format!("{account}::{account}")),
+            "the deal is not recorded on the note in the canonical self-DApp form: {pool}"
+        );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_recovery_rejects_cross_kind_before_chain_read_or_post() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-cross-kind");
@@ -27931,7 +29723,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn durable_recovery_rejects_wrong_continuity_generation_before_chain_read_or_post() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-wrong-generation");
@@ -27987,7 +29778,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_money_journal_schema_first_load_dispatches_v1_and_v2() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-schema");
@@ -28038,7 +29828,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_submit_journal_v1_conversion_marks_legacy_unknown() {
         let journal = buyer_submit_test_journal();
@@ -28067,7 +29856,6 @@ mod tests {
         assert!(converted.intent.predecessor_token_contract.is_none());
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_submit_journal_round_trip_write_load() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-roundtrip");
@@ -28084,7 +29872,6 @@ mod tests {
     /// the previous head must still load and reconcile here, the v3 shape is pinned to exactly the v2
     /// fields plus that id, and the new schema name is what makes an older head refuse a v3 record outright
     /// instead of misreading a record whose meaning it does not know.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_submit_journal_v3_loads_a_previous_v2_record_and_pins_its_own_shape() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-v2-upgrade");
@@ -28149,10 +29936,10 @@ mod tests {
     /// `null` on disk. A v2 reader that demands the ask refuses that record, and refusing a pending
     /// record is precisely the `ambiguous submit... unresolved` dead end removes: the owner is
     /// locked out of their own client by an upgrade, with the record still holding their money.
+
     /// The file is written as bytes rather than through a mirror struct, because the mirror is the
     /// thing under test -- a Rust type cannot prove what a released client left on disk.
     /// E2E-ROW: E2E-BUY-09/L0
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_submit_journal_v3_loads_a_previous_v2_record_that_quoted_no_single_ask() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-v2-no-quoted-order");
@@ -28215,7 +30002,6 @@ mod tests {
         assert_eq!(omitted, loaded, "both absent forms read as the same record");
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn buyer_money_lock_acquire_and_try_acquire_serialize() {
         use sha2::Digest;
@@ -28244,7 +30030,7 @@ mod tests {
         second.try_acquire().unwrap();
     }
 
-    #[cfg(all(feature = "shellnet", unix))]
+    #[cfg(unix)]
     #[test]
     fn non_regular_buyer_journal_path_is_rejected() {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-journal-nonregular");
@@ -28257,13 +30043,14 @@ mod tests {
         assert!(error.contains("regular file"), "{error}");
     }
 
-    #[cfg(feature = "shellnet")]
     /// the LIFECYCLE stream, with observation events filtered out.
+
     /// `probe_observed`, `claim_observed` and `request_delivery` are measurement, added by PR1118
     /// for, and they appear wherever a request is served. A test about preservation or about
     /// settlement is not about how many counters we publish, so comparing the raw transcript made
     /// adding a counter able to fail it -- which is exactly what happened: both of these assertions
-    /// were red in the `--features shellnet` binary tier that no gate ran, and stayed red unseen.
+    /// were red in the removed feature's binary tier that no gate ran, and stayed red unseen.
+
     /// What each test still pins is the lifecycle order itself, and the events it forbids are
     /// asserted separately and by name.
     fn lifecycle_event_names(events: &[serde_json::Value]) -> Vec<&str> {
@@ -28284,13 +30071,11 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    #[cfg(feature = "shellnet")]
     struct EnvVarGuard {
         key: &'static str,
         old: Option<std::ffi::OsString>,
     }
 
-    #[cfg(feature = "shellnet")]
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
             let old = std::env::var_os(key);
@@ -28305,7 +30090,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.old.take() {
@@ -28317,18 +30101,19 @@ mod tests {
 
     /// Regression: a finished test process must leave NOTHING behind in the system temp
     /// directory.
+
     /// `buyer_submit_state_dir` memoises its test-side answer in a `static`, and a `static`
     /// is never dropped, so nothing inside the process - not a `Drop` guard, not a
     /// `tempfile::TempDir` - can remove that directory when the process exits. For as long
     /// as the path was built from `std::env::temp_dir()`, every single invocation of a test
     /// binary therefore left one `dexdo-buyer-submits-tests-<pid>-<nanos>` directory in
     /// `/tmp` forever, and they accumulated into thousands on a developer machine.
+
     /// Asserting that the helper returns a path would not have caught that: the leaked
     /// directory only becomes observable once its owning process is gone. So the proof has
     /// to outlive a process. This re-execs the running test binary with its temp directory
     /// pointed at an empty sandbox, waits for that child to exit, and then requires the
     /// sandbox to still be empty.
-    #[cfg(feature = "shellnet")]
     mod buyer_submit_state_dir_leaves_no_litter {
         /// Set by the parent on the re-exec, and only there: it is what turns the probe
         /// below from a no-op into the child half of the test.

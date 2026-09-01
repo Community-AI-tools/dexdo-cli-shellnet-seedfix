@@ -13,7 +13,7 @@ impl Issue1057Pool {
     fn context(&self) -> SellerPoolContext<'_> {
         SellerPoolContext {
             deals_dir: Some(self.root.path()),
-            contracts: std::path::Path::new("contracts/deployed.shellnet.json"),
+            contracts: std::path::Path::new("manifest/deployed.manifest.json"),
             note_addr: &self.note_addr,
             frame_model: self.frame_model,
             gateway_advertise: &self.gateway,
@@ -104,7 +104,7 @@ fn issue_1057_market(
     successor: Arc<PoolTestBackend>,
 ) -> (dexdo_core::MarketManifest, Arc<dyn ChainBackend>) {
     let market = dexdo_core::MarketManifest {
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         model_hash: dexdo_core::model_hash_for(&model),
         frame_model: model,
         inference_order_book: format!("0:{}", "d".repeat(64)),

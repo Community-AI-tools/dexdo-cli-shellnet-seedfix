@@ -1,23 +1,20 @@
-//! Markets list/discovery command handler(Track C11, move-only).
+//! Markets list/discovery command handler (Track C11, move-only).
 
-use crate::cli::args::MarketsArgs;
+use crate::cli::args::MarketsAddressArgs;
+use crate::cli::args::{MarketsArgs, MarketsCommand};
 use crate::cli::commands::{
     declared_model_flags, mock_chain_for_machine, render_model_flags_field,
 };
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
     direct_chain_read_with_timeout, enforce_model_registry_policy,
     load_enabled_model_registry_policy, preload_model_registry_policy, read_executable_book_target,
-    resolve_model_registry_target, target_from_market, BookTarget,
+    resolve_model_registry_target, resolve_registry_content_identity, target_from_market, BookTarget,
 };
 use crate::cli::machine;
-#[cfg(not(feature = "shellnet"))]
-use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
-#[cfg(feature = "shellnet")]
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryBookAction, RegistryRole};
 use dexdo_core::address as addr;
-#[cfg(feature = "shellnet")]
 use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{model_hash_for, ChainBackend, DobParams, MockChainBackend};
 
@@ -38,7 +35,7 @@ async fn mock_market_entry(
         order_count: offers.len() as u128,
         ask_count: offers.len() as u128,
         depth_ticks: machine::amount(depth_ticks),
-        best_ask: best_ask.map(machine::amount),
+        best_ask: best_ask.map(dexdo_core::shell_amount),
         min_liquidity: machine::amount(0u8),
         tick_size: machine::amount(DobParams::canonical().tick_size),
         source: "mock_chain".to_string(),
@@ -73,13 +70,14 @@ async fn run_markets_mock(args: MarketsArgs) -> Result<()> {
 /// the totals a buyer reads off `dexdo markets` are a liquidity claim, so they count only asks
 /// that are still reachable at `now_unix` -- the deadline-blind `resting_asks()` shape filter is not
 /// enough here.
+
 /// The clock belongs to the caller, sampled AFTER the chain reads rather than once per command. Each
 /// target in `run_markets` costs its own book read plus a registry getter, so the snapshot that
 /// produced these rows can be minutes old by the time they print; a deadline crossed in between is
 /// exactly the incident, where 956 ticks were advertised at a price no buy could obtain.
+
 /// `order_count` stays the book's own `getStats` number and is deliberately NOT filtered: it is the
 /// contract's count of everything the book holds, not a claim about what a buyer can reach.
-#[cfg(feature = "shellnet")]
 fn market_entry_from_snapshot(
     snapshot: &OrderBookSnapshot,
     root_model: Option<String>,
@@ -105,24 +103,31 @@ fn market_entry_from_snapshot(
         order_count,
         ask_count: snapshot.live_resting_asks_at(now_unix).count() as u128,
         depth_ticks: machine::amount(depth_ticks),
-        best_ask: best_ask.map(machine::amount),
+        best_ask: best_ask.map(dexdo_core::shell_amount),
         min_liquidity: machine::amount(0u8),
         tick_size: machine::amount(DobParams::canonical().tick_size),
         source: source.to_string(),
     }
 }
 
-#[cfg(feature = "shellnet")]
-pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
+pub(crate) async fn run_markets(mut args: MarketsArgs) -> Result<()> {
+    if let Some(MarketsCommand::Address(address)) = args.command.take() {
+        return run_markets_address(address).await;
+    }
     if args.mock_chain {
         return run_markets_mock(args).await;
     }
+    // read ONCE -- but BELOW the two early returns, not above them. Each call re-reads the
+    // environment and can fail on its own, so hoisting it to the top of the function would make
+    // `--mock-chain` and the `address` subcommand refuse without `DEXDO_MANIFEST`, which neither of
+    // them needs: one never touches a chain and the other reads the manifest itself.
+    let manifest_path = crate::cli::commands::manifest_path()?;
     let registry_policy =
-        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &manifest_path)?;
     let chain = dexdo_core::RealChainBackend::connect(
-        args.contracts
+        manifest_path
             .to_str()
-            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+            .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?,
     )?;
     let targets = if args.market.is_empty() {
         let note_addr = args.note_addr.clone().ok_or_else(|| {
@@ -151,7 +156,7 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
         preload_model_registry_policy(
             RegistryRole::Buyer,
             registry_policy.as_ref(),
-            &args.contracts,
+            &manifest_path,
         )
         .await?;
         let mut resolved_targets = Vec::with_capacity(targets.len());
@@ -161,7 +166,7 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
                 resolve_model_registry_target(
                     RegistryRole::Buyer,
                     registry_policy.as_ref(),
-                    &args.contracts,
+                    &manifest_path,
                     &requested_model,
                     target,
                 )
@@ -181,7 +186,7 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
                 let action = enforce_model_registry_policy(
                     RegistryRole::Buyer,
                     policy,
-                    &args.contracts,
+                    &manifest_path,
                     &target.frame_model,
                     &snapshot.order_book,
                     snapshot.active(),
@@ -228,7 +233,7 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
                 snapshot.live_resting_asks_at(as_of).count(),
                 depth_ticks,
                 best_ask
-                    .map(|v| v.to_string())
+                    .map(dexdo_core::shell_amount)
                     .unwrap_or_else(|| "-".to_string())
             );
         }
@@ -237,30 +242,130 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
     .await
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
-    if args.mock_chain {
-        return run_markets_mock(args).await;
+/// name one model's canonical order-book address, without a note and without spending.
+
+/// Every step is a path this client already runs; nothing here derives an address a second way.
+
+/// * `resolve_registry_content_identity` asks the on-chain `ModelRegistry` which spelling of the
+/// name it actually holds. It is the same lookup, the same candidate order and the same refusal
+/// text the buyer's content-identity preflight produces, so a name refused here is a name a buy
+/// would refuse later. The registry account is downloaded once and every getter then runs locally
+/// against that snapshot: nothing is signed, nothing is submitted, no note is read.
+/// * `canonical_inference_orderbook_address` derives the address OFFLINE from the
+/// `InferenceOrderBook` code image this binary carries and the model hash. That is the same
+/// arithmetic `ModelRegistry._orderBook` performs on chain -- `abi.stateInitHash` over the pinned
+/// code hash and depth -- so the derived address IS the registry's answer, not a second opinion
+/// about it.
+
+/// The listing form of `markets` gets the same address by running `getInferenceOrderBookAddress` on
+/// a NOTE, passing that same carried code image in as an argument. The note contributes nothing to
+/// the result; it only has to be alive to execute the getter. That is the cost reported, and
+/// the reason this question is asked on its own.
+
+/// The candidate walk is why the requested spelling is reported next to the registry's own: 4.0.36
+/// seeded the catalogue WITHOUT producers, so `openai/gpt-5.2-pro` is answered about
+/// `gpt-5.2-pro`, and the model hash -- and with it the address -- belongs to the name the registry
+/// holds, not to the one that was typed.
+pub(crate) async fn run_markets_address(args: MarketsAddressArgs) -> Result<()> {
+    // The manifest names the network without contacting it; `Deployed::load` is a file read.
+    let manifest = crate::cli::commands::manifest_path()?;
+    let network = dexdo_core::Deployed::load(&manifest)
+        .with_context(|| {
+            format!("read the deployed-contracts manifest {}", manifest.display())
+        })?
+        .network;
+    // step 6: a direct chain read ends inside the configured bound, never hangs.
+    let registry_model = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        resolve_registry_content_identity(RegistryRole::Buyer, &manifest, None, &args.model)
+            .await
+    })
+    .await?;
+
+    let model_hash = model_hash_for(&registry_model);
+    let order_book = addr::display(
+        &dexdo_core::RealChainBackend::canonical_inference_orderbook_address(&model_hash)?
+            .with_workchain(),
+    );
+
+    if args.json {
+        return machine::print_json(&machine::MarketsAddressResponse {
+            schema: machine::MARKETS_ADDRESS_SCHEMA,
+            network,
+            requested_model: args.model.clone(),
+            registry_model,
+            model_hash,
+            order_book,
+        });
     }
-    bail!("markets unavailable: build with `--features shellnet`")
+    // stdout carries the ADDRESS and nothing else, so the answer substitutes straight into
+    // the next command. Everything explanatory goes to stderr, which a pipe does not carry: a
+    // reading command whose output cannot be piped is half a command. `--json` above is the other
+    // consumer shape, and there the whole document IS the answer.
+    eprintln!(
+        "model={registry_model} requested={} model_hash={model_hash}",
+        args.model
+    );
+    println!("{order_book}");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// one bounded read per command here, and a guard so it stays that way.
+
+    /// `markets.rs` was checked for the read multiplier and correctly left alone: both commands
+    /// wrap everything in ONE `direct_chain_read_with_timeout`, so there is no second budget to
+    /// share. But `buyer.rs` and `market_views.rs` carry a guard forbidding a second call and this
+    /// file did not, which means the day someone adds one the doubling comes back in silence. The
+    /// class is only closed when the file that has nothing to fix is guarded too.
+    #[test]
+    fn each_command_here_makes_at_most_one_bounded_read() {
+        let source = include_str!("markets.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .map_or(source, |(before, _)| before);
+        let calls = production.matches("direct_chain_read_with_timeout(").count();
+        assert_eq!(
+            calls, 2,
+            "one per command and no more. Two commands live here; a third call means one of them \
+             now takes two full `--read-timeout` budgets, which is the defect  removed from \
+             `market_views.rs`, `buyer.rs` and `orders.rs`. Share a `ReadBudget` instead"
+        );
+    }
+
+    /// `--mock-chain` and the `address` subcommand must not need `DEXDO_MANIFEST`.
+
+    /// Same defect as in `run_subscription`, same cause: hoisting the manifest read to the top of
+    /// the function to stop re-reading it put it in front of two early returns that never touch a
+    /// chain. `run_markets_address` reads the manifest itself; the mock path reads nothing.
+    #[test]
+    fn the_early_returns_come_before_the_manifest_is_read() {
+        let body = crate::cli::source_probe::code_of(
+            include_str!("markets.rs"),
+            "pub(crate) async fn run_markets(mut args: MarketsArgs)",
+        );
+        let manifest = body
+            .find("let manifest_path = crate::cli::commands::manifest_path()?;")
+            .expect("the manifest path is bound once");
+        for early in ["return run_markets_address(", "return run_markets_mock("] {
+            let at = body
+                .find(early)
+                .unwrap_or_else(|| panic!("`{early}` is an early return in this command"));
+            assert!(
+                at < manifest,
+                "`{early}` would refuse without DEXDO_MANIFEST: the manifest is read at \
+                 {manifest}, before the return at {at}"
+            );
+        }
+    }
+
     /// `dexdo markets` is a discovery/listing path. With buyer registry validation enabled, a
-    /// registered model whose canonical book is missing is hidden from the available list instead of rendered as
-    /// buyable.
+    /// registered model whose canonical book is missing is hidden from the available list instead
+    /// of rendered as buyable.
     #[test]
     fn buyer_markets_hides_missing_canonical_book() {
         let source = include_str!("markets.rs");
-        let start = source
-            .find("pub(crate) async fn run_markets")
-            .expect("run_markets present");
-        let end = source[start + 1..]
-            .find("\npub(crate) async fn run_market")
-            .map(|offset| start + 1 + offset)
-            .expect("run_markets end marker present");
-        let body = &source[start..end];
+        let body = crate::cli::source_probe::code_of(source, "pub(crate) async fn run_markets");
 
         let hide_policy = body
             .find("BuyerMissingBookPolicy::HideFromAvailableList")
@@ -297,13 +402,14 @@ mod tests {
     /// E2E-ORD-26 /: `markets` reads each book, then runs a registry getter per target, then
     /// prints. A snapshot is therefore already older than the print, and the deadline it was filtered
     /// against is the READ's, not the print's.
+
     /// This is the live incident's shape: SELL 11 rested 956 ticks at 5 SHELL/tick with deadline
     /// 1785678525 and was still being advertised at 1785679304, 779 seconds later -- the cheapest ask
     /// in the book, so a deadline-blind `min()` publishes a `best_ask` no buy can obtain.
+
     /// The lapsed row and the live row are priced apart and sized apart, so no single number can pass
     /// by accident: `ask_count` distinguishes them by row, `depth_ticks` by size, `best_ask` by price.
     /// E2E-ROW: E2E-ORD-26/L0
-    #[cfg(feature = "shellnet")]
     #[test]
     fn market_totals_exclude_an_ask_that_lapsed_between_the_read_and_the_print() {
         use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
@@ -359,7 +465,7 @@ mod tests {
         );
         assert_eq!(
             entry.best_ask,
-            Some(crate::cli::machine::amount(7_000_000_000u128)),
+            Some(dexdo_core::shell_amount(7_000_000_000u128)),
             "the lapsed ask was the cheapest row and must not set the advertised price"
         );
     }
@@ -368,7 +474,6 @@ mod tests {
     /// `deadline != 0 && block.timestamp >= deadline`
     /// (`contracts/airegistry/InferenceOrderBook.sol:1115-1117`). The advertised totals must not be
     /// one second more generous than the matcher.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn market_totals_drop_an_ask_on_the_deadline_second_itself() {
         use dexdo_core::{OrderBookOrder, OrderBookSnapshot};

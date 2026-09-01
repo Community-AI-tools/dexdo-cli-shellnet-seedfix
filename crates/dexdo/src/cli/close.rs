@@ -1,26 +1,20 @@
-//! Deal-close command handlers(Track C7, move-only).
+//! Deal-close command handlers (Track C7, move-only).
 
 use crate::cli::args::{CloseArgs, DealRoleArg};
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{close_guidance, status_command};
-#[cfg(feature = "shellnet")]
 use crate::cli::commands::{
-    close_hint, deal_contracts_path, load_deal_target, shellnet_doctor_preflight_market,
+    close_hint, deal_contracts_path, load_deal_target, chain_doctor_preflight_market,
 };
 use crate::cli::commands::{
     mock_chain_for_machine, require_close_target_identity, resolve_mock_deal_target, role_arg_str,
 };
-#[cfg(feature = "shellnet")]
 use crate::cli::deals;
 use crate::cli::machine;
-#[cfg(feature = "shellnet")]
 use crate::cli::recover::check_reclaimable_state;
-#[cfg(feature = "shellnet")]
 use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
 use dexdo_core::ChainBackend;
 
-#[cfg(feature = "shellnet")]
 async fn submit_then_observe_cleanup<S, SF, O, OF>(submit: S, observe: O) -> Result<()>
 where
     S: FnOnce() -> SF,
@@ -63,7 +57,6 @@ fn close_response(
     })
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn with_last_observed_promotion(
     mut response: machine::CloseResponse,
     observation: Option<crate::cli::deals::LastObservedPromotion>,
@@ -72,7 +65,6 @@ fn with_last_observed_promotion(
     response
 }
 
-#[cfg(feature = "shellnet")]
 fn last_observed_promotion_text(
     observation: Option<crate::cli::deals::LastObservedPromotion>,
 ) -> String {
@@ -85,7 +77,6 @@ fn last_observed_promotion_text(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn load_close_deal_record(
     input: &str,
     deals_dir: Option<&std::path::Path>,
@@ -125,7 +116,6 @@ fn confirmed_buyer_stop_response(
     Ok(response)
 }
 
-#[cfg(feature = "shellnet")]
 fn confirmed_buyer_stop_followup_error(
     step: &str,
     receipt: &dexdo_core::SettlementActionReceipt,
@@ -137,7 +127,6 @@ fn confirmed_buyer_stop_followup_error(
     )
 }
 
-#[cfg(feature = "shellnet")]
 fn apply_confirmed_buyer_stop_marker<T>(
     receipt: &dexdo_core::SettlementActionReceipt,
     marker: impl FnOnce() -> Result<T>,
@@ -147,7 +136,6 @@ fn apply_confirmed_buyer_stop_marker<T>(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn apply_prior_stop_marker<T>(confirmation: &str, marker: impl FnOnce() -> Result<T>) -> Result<T> {
     marker().map_err(|error| {
         anyhow::anyhow!(
@@ -157,7 +145,6 @@ fn apply_prior_stop_marker<T>(confirmation: &str, marker: impl FnOnce() -> Resul
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn confirmed_seller_stop_response(
     network: &str,
     handle: Option<String>,
@@ -181,7 +168,6 @@ fn confirmed_seller_stop_response(
     Ok(response)
 }
 
-#[cfg(feature = "shellnet")]
 fn confirmed_seller_stop_text(
     handle: Option<&str>,
     token_contract: &str,
@@ -197,7 +183,6 @@ fn confirmed_seller_stop_text(
     )
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait SellerStopChain: Sync {
     async fn seller_pubkey(&self, token_contract: &dexdo_core::Address) -> Result<Option<String>>;
@@ -209,7 +194,6 @@ trait SellerStopChain: Sync {
     ) -> Result<dexdo_core::SettlementActionReceipt>;
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl SellerStopChain for dexdo_core::RealChainBackend {
     async fn seller_pubkey(&self, token_contract: &dexdo_core::Address) -> Result<Option<String>> {
@@ -225,7 +209,6 @@ impl SellerStopChain for dexdo_core::RealChainBackend {
     }
 }
 
-#[cfg(feature = "shellnet")]
 async fn submit_seller_stop(
     chain: &dyn SellerStopChain,
     role: deals::DealHandleRole,
@@ -292,10 +275,10 @@ async fn submit_seller_stop(
 }
 
 /// The chain surface an UNSOLD-deal close needs.
+
 /// Same seam, and for the same reason, as [`SellerStopChain`] above: the defect being fixed here is
 /// "the door exists on the contract and nothing in the client knocks on it", and the only way to
 /// prove a client invokes something is to make the invocation observable offline.
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 trait CloseUnsoldDealChain: Sync {
     async fn offer_latch(
@@ -314,7 +297,6 @@ trait CloseUnsoldDealChain: Sync {
     async fn wait_deal_destroyed(&self, token_contract: &dexdo_core::Address) -> Result<()>;
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait]
 impl CloseUnsoldDealChain for dexdo_core::RealChainBackend {
     async fn offer_latch(
@@ -344,7 +326,6 @@ impl CloseUnsoldDealChain for dexdo_core::RealChainBackend {
 
 /// What the seller note was worth on either side of the close. Both figures are printed, and the
 /// refund is their difference -- never a bond amount read out of a getter.
-#[cfg(feature = "shellnet")]
 struct ClosedUnsoldDeal {
     refund: u128,
     balance_before: u128,
@@ -353,7 +334,6 @@ struct ClosedUnsoldDeal {
 
 /// Everything that must be true before `TokenContract.close()` is worth sending, checked with reads
 /// only. Nothing here spends, and every refusal names the state that was found.
-#[cfg(feature = "shellnet")]
 async fn refuse_close_unless_unsold(
     chain: &dyn CloseUnsoldDealChain,
     role: deals::DealHandleRole,
@@ -387,14 +367,16 @@ async fn refuse_close_unless_unsold(
         );
     }
     // WHICH BRANCH WILL `close()` TAKE? Ask the deal's own latch, not a folded book view.
-    // `_offerPosted` is set when the TC places its ask(`TokenContract.sol:734`) and cleared in
-    // exactly one place, `onSellClosed`(`TokenContract.sol:758`), which is guarded to the canonical
-    // InferenceOrderBook(`TokenContract.sol:752-755`). So `offerPosted == false` IS the book's own
+
+    // `_offerPosted` is set when the TC places its ask (`TokenContract.sol:734`) and cleared in
+    // exactly one place, `onSellClosed` (`TokenContract.sol:758`), which is guarded to the canonical
+    // InferenceOrderBook (`TokenContract.sol:752-755`). So `offerPosted == false` IS the book's own
     // announcement that the ask left, relayed on chain by the book itself -- and it is the same
     // answer whether the ask was cancelled or expired.
+
     // Looking instead for the row's absence from a folded book view would be wrong in a way that
     // never recovers: `InferenceOrderExpired` is deliberately NOT terminal to that fold and the row
-    // STAYS(`crates/core/src/shellnet/book_events.rs`), so an expired ask would keep a deal
+    // STAYS (`crates/core/src/chain/book_events.rs`), so an expired ask would keep a deal
     // unclosable forever while its bond sat inside.
     let Some(latch) = chain.offer_latch(token_contract).await? else {
         bail!(
@@ -419,10 +401,10 @@ async fn refuse_close_unless_unsold(
 }
 
 /// Send `TokenContract.close()` and report only what was observed.
+
 /// The deal returns the seller bond to its own stored `_sellerNote` and self-destructs in this one
-/// transaction(`contracts/airegistry/TokenContract.sol:816-820`), so the destruct is the proof the
+/// transaction (`contracts/airegistry/TokenContract.sol:816-820`), so the destruct is the proof the
 /// close happened and the note's balance on either side of it is the proof of what came back.
-#[cfg(feature = "shellnet")]
 async fn submit_close_unsold(
     chain: &dyn CloseUnsoldDealChain,
     token_contract: &dexdo_core::Address,
@@ -442,7 +424,6 @@ async fn submit_close_unsold(
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn closed_unsold_deal_response_for_network(
     network: &str,
     handle: Option<String>,
@@ -470,7 +451,7 @@ fn closed_unsold_deal_response_for_network(
     Ok(response)
 }
 
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 fn closed_unsold_deal_response(
     handle: Option<String>,
     token_contract: String,
@@ -478,7 +459,7 @@ fn closed_unsold_deal_response(
     closed: &ClosedUnsoldDeal,
 ) -> Result<machine::CloseResponse> {
     closed_unsold_deal_response_for_network(
-        dexdo_core::params::DEFAULT_DOCTOR_NETWORK,
+        dexdo_core::params::current_network(),
         handle,
         token_contract,
         state_before,
@@ -486,7 +467,6 @@ fn closed_unsold_deal_response(
     )
 }
 
-#[cfg(feature = "shellnet")]
 fn closed_unsold_deal_text(
     token_contract: &str,
     note: &dexdo_core::Address,
@@ -497,7 +477,9 @@ fn closed_unsold_deal_text(
     format!(
         "close confirmed role=seller action=close token_contract={token_contract} note={note} \
          refund={} balance_before={} balance_after={}",
-        closed.refund, closed.balance_before, closed.balance_after
+        dexdo_core::shell_amount(closed.refund),
+        dexdo_core::shell_amount(closed.balance_before),
+        dexdo_core::shell_amount(closed.balance_after)
     )
 }
 
@@ -644,7 +626,6 @@ async fn run_close_mock(args: CloseArgs) -> Result<()> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     if args.mock_chain {
         return run_close_mock(args).await;
@@ -664,14 +645,15 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     let mut last_observed_promotion = close_record
         .as_ref()
         .and_then(|(_, record)| record.last_observed_promotion);
-    let contracts_path = deal_contracts_path(args.contracts.as_deref(), &target);
-    shellnet_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
-    let contracts = args
-        .contracts
-        .as_deref()
-        .unwrap_or(&contracts_path)
+    let contracts_path = deal_contracts_path(&target)?;
+    chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
+    // The handle's own manifest, and nothing that could override it: the flag that used to sit
+    // here is gone. A deal is settled against the chain it was made on, which the handle
+    // recorded -- letting a later run point it somewhere else was a way to answer about one chain
+    // using another's pins.
+    let contracts = contracts_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
+        .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?;
     let chain = RealChainBackend::connect(contracts)?;
     let tc = dexdo_core::address::parse_chain_address(&target.token_contract)
         .map_err(|e| anyhow::anyhow!("token_contract {}: {e}", target.token_contract))?;
@@ -754,19 +736,21 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 bail!(
                     "close: seller deal {} is disputed. Next: {}.",
                     tc_display,
-                    crate::cli::support::release_dispute_guidance(
-                        &target.token_contract,
-                        Some(&contracts_path)
-                    )
+                    crate::cli::support::release_dispute_guidance(&target.token_contract)
                 );
             }
             if s.opened {
-                let note_key = args.note_key.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("close seller requires --note-key to sign sellerStop")
-                })?;
-                let keys =
-                    KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-                        .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+                // The flag where it was passed, the pool entry for this note where it was not:
+                // `close` carries its key as its own argument, and the rule is the shared one.
+                let secret = crate::cli::support::note_owner_secret_for(
+                    args.note_key.as_deref(),
+                    &note_addr,
+                    None,
+                    "close seller",
+                    "the key that signs sellerStop",
+                )?;
+                let keys = KeyPair::from_secret_hex(secret.trim())
+                    .map_err(|e| anyhow::anyhow!("note owner key (SDK secret hex): {e:?}"))?;
                 let note = dexdo_core::address::parse_chain_address(&note_addr)
                     .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
                 let receipt = submit_seller_stop(&chain, role, snapshot.state, &tc, &keys).await?;
@@ -805,12 +789,15 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 let note = dexdo_core::address::parse_chain_address(&note_addr)
                     .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
                 refuse_close_unless_unsold(&chain, role, &s, &tc, &note).await?;
-                let note_key = args.note_key.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("close seller requires --note-key to sign TokenContract.close()")
-                })?;
-                let keys =
-                    KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-                        .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+                let secret = crate::cli::support::note_owner_secret_for(
+                    args.note_key.as_deref(),
+                    &note_addr,
+                    None,
+                    "close seller",
+                    "the key that signs this deal's owner method",
+                )?;
+                let keys = KeyPair::from_secret_hex(secret.trim())
+                    .map_err(|e| anyhow::anyhow!("note owner key (SDK secret hex): {e:?}"))?;
                 let closed = submit_close_unsold(&chain, &tc, &note, &keys).await?;
                 let handle = target.handle.as_ref().map(|h| h.handle.clone());
                 if args.json {
@@ -834,16 +821,19 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                     close_hint(
                         &target,
                         &s,
-                        args.deals_dir.as_deref(),
-                        Some(&contracts_path)
+                        args.deals_dir.as_deref()
                     )
                 );
             }
-            let note_key = args.note_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("close seller requires --note-key to sign destroy")
-            })?;
-            let keys = KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-                .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+            let secret = crate::cli::support::note_owner_secret_for(
+                args.note_key.as_deref(),
+                &note_addr,
+                None,
+                "close seller",
+                "the key that signs destroy",
+            )?;
+            let keys = KeyPair::from_secret_hex(secret.trim())
+                .map_err(|e| anyhow::anyhow!("note owner key (SDK secret hex): {e:?}"))?;
             let note = dexdo_core::address::parse_chain_address(&note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             chain.destroy_token_contract(&tc, &note, &keys).await?;
@@ -897,17 +887,20 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                         &target.token_contract,
                         Some("seller"),
                         "seller",
-                        args.deals_dir.as_deref(),
-                        Some(&contracts_path)
+                        args.deals_dir.as_deref()
                     )
                 );
                 return Ok(());
             }
-            let note_key = args.note_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("close buyer requires --note-key to sign note owner method")
-            })?;
-            let keys = KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
-                .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+            let secret = crate::cli::support::note_owner_secret_for(
+                args.note_key.as_deref(),
+                &note_addr,
+                None,
+                "close buyer",
+                "the key that signs the note's owner method",
+            )?;
+            let keys = KeyPair::from_secret_hex(secret.trim())
+                .map_err(|e| anyhow::anyhow!("note owner key (SDK secret hex): {e:?}"))?;
             let note = dexdo_core::address::parse_chain_address(&note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             let buyer_note = chain.token_contract_buyer_note(&tc).await?;
@@ -983,13 +976,11 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                             &args.deal,
                             target.handle.is_none().then_some("buyer"),
                             "buyer",
-                            args.deals_dir.as_deref(),
-                            Some(&contracts_path)
+                            args.deals_dir.as_deref()
                         ),
                         status_command(
                             &args.deal,
-                            args.deals_dir.as_deref(),
-                            Some(&contracts_path)
+                            args.deals_dir.as_deref()
                         )
                     )
                 })?;
@@ -1030,8 +1021,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 close_hint(
                     &target,
                     &s,
-                    args.deals_dir.as_deref(),
-                    Some(&contracts_path)
+                    args.deals_dir.as_deref()
                 )
             );
         }
@@ -1039,17 +1029,9 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
-    if args.mock_chain {
-        return run_close_mock(args).await;
-    }
-    bail!("close unavailable: build with `--features shellnet`")
-}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "shellnet")]
     fn seller_stop_receipt(token_contract: &str) -> dexdo_core::SettlementActionReceipt {
         dexdo_core::SettlementActionReceipt {
             token_contract: token_contract.to_string(),
@@ -1080,7 +1062,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     fn deal_state(opened: bool, disputed: bool) -> dexdo_core::DealChainState {
         dexdo_core::DealChainState {
             funded: true,
@@ -1099,7 +1080,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     struct FakeSellerStopChain {
         seller_pubkey: Option<String>,
         receipt: dexdo_core::SettlementActionReceipt,
@@ -1107,7 +1087,6 @@ mod tests {
         submits: std::sync::atomic::AtomicUsize,
     }
 
-    #[cfg(feature = "shellnet")]
     impl FakeSellerStopChain {
         fn new(
             seller_pubkey: Option<String>,
@@ -1122,7 +1101,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::SellerStopChain for FakeSellerStopChain {
         async fn seller_pubkey(
@@ -1175,7 +1153,7 @@ mod tests {
             }),
         };
         let response = super::confirmed_buyer_stop_response(
-            "shellnet",
+            "net-a",
             Some("buyer-1".to_string()),
             "buyer",
             "0:tc".to_string(),
@@ -1200,7 +1178,6 @@ mod tests {
         assert_eq!(tx["post_state"]["tokensFinal"], serde_json::json!("3"));
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn seller_stop_rejects_wrong_role_key_and_non_open_state_before_submit() {
         use std::sync::atomic::Ordering;
@@ -1266,7 +1243,6 @@ mod tests {
         assert_eq!(wrong_key_chain.submits.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn seller_close_submits_exact_selector_and_renders_authoritative_receipt() {
         use std::sync::atomic::Ordering;
@@ -1294,7 +1270,7 @@ mod tests {
         assert_eq!(receipt.action, dexdo_core::SettlementAction::SellerStop);
 
         let response = super::confirmed_seller_stop_response(
-            "shellnet",
+            "net-a",
             Some("deal-seller-1".to_string()),
             token_contract.with_workchain(),
             "streaming",
@@ -1344,12 +1320,10 @@ mod tests {
     /// An unsold deal exactly as the chain reports one: nothing ever funded it, so nothing ever
     /// opened it, and `is_stopped()` is false because stopping is something only a started deal can
     /// do. That combination is why this shape used to reach `no_destroy_yet`.
-    #[cfg(feature = "shellnet")]
     fn unsold_deal_summary() -> crate::cli::deals::DealStateSummary {
         crate::cli::deals::summarize_deal_snapshot(&unsold_snapshot(false, false, false))
     }
 
-    #[cfg(feature = "shellnet")]
     fn unsold_snapshot(funded: bool, opened: bool, disputed: bool) -> dexdo_core::DealChainSnapshot {
         dexdo_core::DealChainSnapshot {
             account_code_hash: "code".to_string(),
@@ -1393,14 +1367,12 @@ mod tests {
 
     /// Records WHAT the close did and IN WHICH ORDER, because "the call exists and nothing invokes
     /// it" is exactly the defect reports: a counter that stays at zero is the whole proof.
-    #[cfg(feature = "shellnet")]
     struct FakeCloseUnsoldChain {
         latch: Option<dexdo_core::DealOfferLatch>,
         balances: std::sync::Mutex<std::collections::VecDeque<u128>>,
         log: std::sync::Mutex<Vec<String>>,
     }
 
-    #[cfg(feature = "shellnet")]
     impl FakeCloseUnsoldChain {
         fn new(latch: Option<dexdo_core::DealOfferLatch>, balances: &[u128]) -> Self {
             Self {
@@ -1419,7 +1391,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[async_trait::async_trait]
     impl super::CloseUnsoldDealChain for FakeCloseUnsoldChain {
         async fn offer_latch(
@@ -1462,7 +1433,6 @@ mod tests {
     /// deal has been read; the destruct is confirmed before any figure is reported; and the refund
     /// is the difference between two observed note balances rather than the 6 SHELL bond the
     /// snapshot happens to declare.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn close_of_an_unsold_deal_sends_token_contract_close_and_reports_an_observed_refund() {
         let token_contract =
@@ -1517,11 +1487,12 @@ mod tests {
         );
 
         let text = super::closed_unsold_deal_text(&token_contract.with_workchain(), &note, &closed);
+        // The line states money in SHELL, as every other answer this client gives does.
         for fact in [
             "role=seller action=close",
-            "refund=6000",
-            "balance_before=1000",
-            "balance_after=7000",
+            "refund=0.000006",
+            "balance_before=0.000001",
+            "balance_after=0.000007",
         ] {
             assert!(text.contains(fact), "missing {fact:?} in {text}");
         }
@@ -1549,7 +1520,6 @@ mod tests {
     /// matters most: `close()` succeeds there and does not close anything
     /// (`contracts/airegistry/TokenContract.sol:805-810`), so a client that sent it would report a
     /// close that never happened.
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn close_of_an_unsold_deal_refuses_before_spending_and_names_the_state() {
         let token_contract =
@@ -1650,7 +1620,6 @@ mod tests {
     /// order, and the door really encodes `TokenContract.close()`. Pinned at source level because
     /// the reported defect was a wiring absence, not a logic error: every unit below passed before
     /// this issue existed and the operator still had no way to close the deal.
-    #[cfg(feature = "shellnet")]
     #[test]
     fn production_seller_close_dispatches_an_unsold_deal_to_token_contract_close() {
         let source = include_str!("close.rs");
@@ -1677,9 +1646,12 @@ mod tests {
         let refuse = body[unsold..]
             .find("refuse_close_unless_unsold(&chain, role, &s, &tc, &note).await?")
             .expect("read-only refusals must run in the unsold arm");
+        // Keyed on the request for the key, not on the words it used to refuse with: the key comes
+        // from `--note-key` or from the pool entry now, and the rule this pins is the ORDER --
+        // read-only refusals first, the key after them, the spend last.
         let key = body[unsold..]
-            .find("close seller requires --note-key to sign TokenContract.close()")
-            .expect("the unsold arm must ask for the signing key by name");
+            .find("note_owner_secret_for(")
+            .expect("the unsold arm must ask for the signing key");
         let submit = body[unsold..]
             .find("submit_close_unsold(&chain, &tc, &note, &keys).await?")
             .expect("the unsold arm must submit TokenContract.close()");
@@ -1688,14 +1660,13 @@ mod tests {
             "refuse before asking for a key, and ask for a key before spending"
         );
 
-        let door = source
-            .find("async fn submit_close_unsold(")
-            .expect("the unsold close submitter");
-        let door_end = source[door..]
-            .find("\nfn closed_unsold_deal_response(")
-            .map(|offset| door + offset)
-            .unwrap_or(source.len());
-        let door = &source[door..door_end];
+        // `code_of`, not a slice ending at the next sibling. `closed_unsold_deal_response` is a
+        // NEIGHBOUR: rename it, move it, or put another function between, and `unwrap_or(source
+        // .len())` makes "the body" the whole rest of the file in silence -- where the three calls
+        // below are found whether or not `submit_close_unsold` makes them. That is the defect this
+        // branch exists to remove, and this guard was the last one still carrying it.
+        let door = crate::cli::source_probe::code_of(source, "async fn submit_close_unsold(");
+        let door = door.as_str();
         assert!(
             door.contains("chain.close_unsold_deal(token_contract, seller_keys).await?"),
             "the submitter must call the TokenContract.close() encoder"
@@ -1712,7 +1683,7 @@ mod tests {
         // The client-side encoder really addresses `close()` and passes it nothing: Task O removed
         // the caller-named payee, and a stale extra argument would address a method the deployed
         // contract does not have rather than fail a guard.
-        let core = include_str!("../../../core/src/shellnet/client.rs");
+        let core = include_str!("../../../core/src/chain/client.rs");
         let encoder = core
             .find("pub async fn close_unsold_deal(")
             .expect("the core TokenContract.close() encoder");
@@ -1731,7 +1702,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn production_seller_close_routes_through_existing_seller_stop_selector() {
         let source = include_str!("close.rs");
@@ -1749,7 +1719,6 @@ mod tests {
         assert!(!body.contains("seller cannot destroy opened deal"));
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn destroyed_after_stop_still_attempts_the_terminal_marker_and_preserves_receipt_on_error() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1816,7 +1785,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn destroyed_close_retry_reconciles_marker_without_a_second_stop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1908,23 +1876,15 @@ mod tests {
         assert!(history < marker && marker < state);
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
-    fn shellnet_buyer_close_routes_through_shared_explicit_stop() {
+    fn chain_buyer_close_routes_through_shared_explicit_stop() {
         let source = include_str!("close.rs");
-        let buyer = source
-            .find("deals::DealHandleRole::Buyer =>")
-            .expect("buyer close branch");
-        let end = source[buyer..]
-            .find("#[cfg(not(feature = \"shellnet\"))]")
-            .map(|offset| buyer + offset)
-            .expect("end of shellnet close implementation");
-        let body = &source[buyer..end];
+        let body =
+            crate::cli::source_probe::code_of(source, "deals::DealHandleRole::Buyer =>");
         assert!(body.contains(".explicit_buyer_stop(&note, &keys, &tc)"));
         assert!(!body.contains("chain.stream_stop(&note, &keys, &tc)"));
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
     async fn stream_cleanup_submits_exactly_once_while_confirmation_only_observes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1950,7 +1910,7 @@ mod tests {
     #[test]
     fn settlement_report_carries_the_last_observation_beside_the_payout() {
         let mut response = super::close_response(
-            "shellnet",
+            "net-a",
             Some("deal-0-tc-buyer".to_string()),
             "buyer",
             "0:tc".to_string(),
@@ -1993,7 +1953,7 @@ mod tests {
     #[test]
     fn settlement_report_without_an_observation_uses_null_not_zeroes() {
         let response = super::close_response(
-            "shellnet",
+            "net-a",
             Some("deal-0-tc-buyer".to_string()),
             "buyer",
             "0:tc".to_string(),

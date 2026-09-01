@@ -133,8 +133,8 @@ impl UpstreamFailure {
 /// requests on one `token_contract`, so each stream's relay adds to the same counter. `done` means **no more
 /// tokens will ever arrive for this deal/session** -- it is owned by the buyer **session lifecycle**, NOT
 /// by any single stream: one gRPC stream ending is NOT the session ending. The seller's `drive_advance` reads
-/// both(Acquire) so finalized ticks never exceed delivered tokens, and only stops waiting once the session is
-/// truly `done`(or the deal closes on-chain). A per-stream relay that set `done` would make the driver exit
+/// both (Acquire) so finalized ticks never exceed delivered tokens, and only stops waiting once the session is
+/// truly `done` (or the deal closes on-chain). A per-stream relay that set `done` would make the driver exit
 /// after the first request and under-finalize a sustained session -- so the relay only ever touches `count`.
 #[derive(Clone, Default)]
 pub struct DealDelivery {
@@ -158,6 +158,7 @@ impl DealDelivery {
 }
 
 /// Terminal classification for one request's authoritative delivery accounting.
+
 /// Capacity consumers use this only to reconcile an already-created request reservation. Provider-specific
 /// counting remains entirely inside [`crate::seller::upstream`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +182,7 @@ pub enum AuthoritativeDeliveryEvent {
 }
 
 /// Narrow seam for consumers that must durably reconcile request reservations with authoritative delivery.
+
 /// Implementations must record each event before returning. A recorder failure terminates the stream
 /// fail-closed; the gateway never asks the recorder to derive tokens from text, bytes, words or frames.
 #[allow(clippy::result_large_err)]
@@ -191,10 +193,12 @@ pub trait AuthoritativeDeliveryRecorder: Send + Sync {
     ) -> Result<(), Status>;
 
     /// Authorize a chunk whose authoritative token count can only arrive after it.
+
     /// The relay calls this BEFORE such a chunk reaches the buyer, so accounting stands on the path
     /// between receiving output and exposing it on the separate-usage branch too, not only on the
     /// structured one. Refusing ends the request; it never truncates the answer silently.
     /// The default recorder holds no reservation, so it has nothing to refuse against.
+
     /// `min_billable` is the largest authoritative figure this upstream has already charged for one
     /// run of unaccounted output on this stream -- the seller's own recorded number, never a count
     /// derived from text, bytes, words or frames -- and zero before the first one arrives.
@@ -305,7 +309,7 @@ pub struct GatewayState {
     delivered: Mutex<HashMap<String, DealDelivery>>,
     /// Durable per-TC capacity derived only from strict on-chain deal state.
     capacity: CapacityManager,
-    /// Upstream choice(mock model vs the real adapter). Immutable for the gateway's lifetime.
+    /// Upstream choice (mock model vs the real adapter). Immutable for the gateway's lifetime.
     upstream: UpstreamConfig,
     upstreams: Mutex<HashMap<String, UpstreamConfig>>,
     upstream_failure_tx: mpsc::UnboundedSender<UpstreamFailure>,
@@ -533,7 +537,7 @@ impl GatewayState {
         requested_max_tokens(req).unwrap_or(u64::MAX)
     }
 
-    /// The per-deal [`DealDelivery`] tracker(created on first access, shared across the deal's streams). Each
+    /// The per-deal [`DealDelivery`] tracker (created on first access, shared across the deal's streams). Each
     /// stream's relay adds delivered tokens to the cumulative `count`; `done` is NOT set here -- it means "no
     /// more tokens will ever arrive for this deal/session" and is owned by the buyer session lifecycle,
     /// never by a single stream. The seller driver reads both to bound finalized ticks by delivered tokens.
@@ -828,7 +832,7 @@ impl Gateway for GatewayService {
     type OpenStreamStream = ChunkStream;
 
     /// Step 2: verify the signature against the pubkey from the contract. Without a valid
-    /// signature the connection closes BEFORE forwarding. Otherwise -- an incremental stream(R6).
+    /// signature the connection closes BEFORE forwarding. Otherwise -- an incremental stream (R6).
     async fn open_stream(
         &self,
         request: Request<StreamRequest>,
@@ -891,7 +895,7 @@ impl Gateway for GatewayService {
             .unwrap_or(requested);
         // R1: the upstream adapts the CANONICAL request that arrived in the opening
         // call alongside authorization. The mock model builds fake output from the prompt; the real
-        // provider adapter proxies the request and normalizes the SSE(R1/R5/R6).
+        // provider adapter proxies the request and normalizes the SSE (R1/R5/R6).
         // The per-deal delivery tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so `count` accumulates over sequential requests. The relay is handed only
         // the counter -- `done` stays owned by the buyer session lifecycle, never set per-stream.
@@ -902,7 +906,7 @@ impl Gateway for GatewayService {
             delivered.event_sequence.clone(),
             self.state.upstream_failure_tx.clone(),
         );
-        // Incremental yielding(R6): without buffering. The upstream feeds an internal channel;
+        // Incremental yielding (R6): without buffering. The upstream feeds an internal channel;
         // `relay_counting` forwards each chunk to the buyer AND adds the delivered token count to the deal's
         // cumulative count, so the seller's `drive_advance` can bill only real delivered ticks.
         let (up_tx, up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
@@ -1258,9 +1262,9 @@ mod tests {
         forwarded
     }
 
-    /// the relay adds only delivered(`Ok`, successfully-sent) chunks to the deal `count`, and forwards
-    /// every item(incl. errors) to the buyer -- but it MUST NOT mark the deal-level `done`: a single gRPC
-    /// stream ending is not the deal/session ending(the buyer session lifecycle owns `done`).
+    /// the relay adds only delivered (`Ok`, successfully-sent) chunks to the deal `count`, and forwards
+    /// every item (incl. errors) to the buyer -- but it MUST NOT mark the deal-level `done`: a single gRPC
+    /// stream ending is not the deal/session ending (the buyer session lifecycle owns `done`).
     #[tokio::test]
     async fn relay_counts_delivered_chunks_without_marking_deal_done() {
         let delivery = DealDelivery::default();
@@ -1552,6 +1556,7 @@ mod tests {
     }
 
     /// capacity is consulted BEFORE output whose count arrives later crosses to the buyer.
+
     /// On the separate-usage branch -- the ordinary one, the shape every shipped adapter produces --
     /// `record_authoritative_delivery` runs only when the usage event arrives, so the relay used to
     /// forward content with nothing on the path between receiving it and exposing it. The refusal that
@@ -1792,18 +1797,22 @@ mod tests {
     }
 
     /// on the real entry point: a run the reservation cannot pay must not reach the buyer.
+
     /// The separate-usage branch reports its figure AFTER the content it counts, so the seller cannot
     /// know a run's price before exposing it. What stands on the path is the reservation, and asking
     /// it only whether it is non-empty refuses at exactly zero and nowhere else -- so a remainder that
     /// lands SHORT of the next run rather than on top of it still exposed one run and had its figure
     /// refused afterwards, leaving the buyer holding output the seller's own accounting had rejected.
     /// That is the loss describes, and it survived the first fix for it.
+
     /// The fixture upstream charges four tokens per run and reports each one after its content.
     /// Both halves are driven through `open_stream`, because a test that only proves output is
     /// withheld also passes on a seller that serves nothing:
+
     /// - six tokens of capacity pay the first run and leave two. Two cannot pay a run of four, so the
     /// second run must never cross, and the two that could not be spent go back to the deal.
     /// - eight pay both runs, so both must still be served in full.
+
     /// E2E-ROW: E2E-UPS-40/L0
     #[tokio::test]
     async fn a_run_the_reservation_cannot_pay_never_reaches_the_buyer() {
@@ -2226,7 +2235,7 @@ mod tests {
     }
 
     /// A corrupt complete provider frame kills the request before it can reach a terminal aggregate, so
-    /// nothing is delivered and nothing is billable(E2E-UPS-07/18).
+    /// nothing is delivered and nothing is billable (E2E-UPS-07/18).
     #[tokio::test]
     async fn malformed_complete_openai_sse_is_data_loss_and_bills_nothing() {
         let body = concat!(

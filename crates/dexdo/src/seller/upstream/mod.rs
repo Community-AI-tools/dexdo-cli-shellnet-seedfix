@@ -1,9 +1,11 @@
 //! Gateway upstream token source. Adapters:
-//! - [`mock`] -- mock model(`--mock-model`): deterministic fake tokens from the prompt
+//! - [`mock`] -- mock model (`--mock-model`): deterministic fake tokens from the prompt
+
 //! - [`openai`] -- **real OpenAI-compatible upstream**: Groq,
-//! streaming SSE -> normalization into `CanonChunk`(R1/R2/R5/R6).
+//! streaming SSE -> normalization into `CanonChunk` (R1/R2/R5/R6).
 //! - [`anthropic`] -- native Anthropic Messages API, streaming SSE -> the same canon.
-//! All branches normalize the upstream output into a single canonical stream(R1). Monetary accounting
+
+//! All branches normalize the upstream output into a single canonical stream (R1). Monetary accounting
 //! uses only the adapter's authoritative source: mock token ids, and -- for both real protocols -- the
 //! provider's own terminal native output total (`usage.completion_tokens` on OpenAI-compatible APIs,
 //! `usage.output_tokens` on Anthropic;, E2E-UPS-02). `CanonChunk` framing is never itself a token
@@ -30,11 +32,12 @@ pub enum UpstreamEvent {
         accounted_tokens: u64,
     },
     /// Authoritative usage for preceding successfully delivered chunks whose provider reports token usage
-    /// separately from its text frames(the native Anthropic adapter).
+    /// separately from its text frames (the native Anthropic adapter).
     Accounted(u64),
 }
 
 /// Attach an exact structured token count to a chunk.
+
 /// **The count is the chunk's token ids and nothing else.** Empty/no-signal chunks account zero,
 /// and a provider that reports its usage separately from its text frames bills through
 /// [`UpstreamEvent::Accounted`] instead.
@@ -118,6 +121,7 @@ impl StartupCapabilityRequirements {
 
 /// Resolve the model's own maximum output length -- the third
 /// bound on the outbound generation limit next to the buyer's request and the deal budget.
+
 /// **Fail closed**: an undeclared cap is UNKNOWN, not "unbounded". A deal budget is `ticks * TICK_SIZE`
 /// tokens and a request without `max_tokens` used to become `u32::MAX`; both exceed every real provider's
 /// output limit, so the provider answered `400` and no delivery ever succeeded. Refusing here happens
@@ -140,6 +144,7 @@ pub(crate) fn resolve_model_output_cap(
 }
 
 /// Is this provider HTTP status a **seller-side configuration** fault?
+
 /// The seller constructs the whole upstream request: the market forces the model and the gateway bounds the
 /// sampling params, so the buyer cannot shape it. A `4xx` rejection therefore means the seller's own model
 /// config/request is wrong, not that the upstream is transiently down. `401/403` keep the dedicated `auth`
@@ -151,7 +156,7 @@ pub(crate) fn is_seller_config_http_status(code: u16) -> bool {
 /// Annotate a provider `4xx` that is a seller configuration fault with the concrete subject: which model was
 /// served and which generation limit was sent. The `Status` code and the `upstream HTTP <code>` prefix
 /// are preserved verbatim -- stream-error policy and the failure classifier both parse them -- so this only
-/// enriches the message the operator(and the relayed buyer error body) actually reads.
+/// enriches the message the operator (and the relayed buyer error body) actually reads.
 pub(crate) fn annotate_seller_config_fault(
     status: Status,
     http_status: u16,
@@ -173,9 +178,9 @@ pub(crate) fn annotate_seller_config_fault(
     )
 }
 
-/// Gateway upstream choice(`--mock-model` vs the real adapter). Configured at seller startup
+/// Gateway upstream choice (`--mock-model` vs the real adapter). Configured at seller startup
 /// and **immutable** for the gateway's lifetime. The real branch carries base-url + model id;
-/// the key is read from the environment at runtime(see [`openai`]) and is not stored here.
+/// the key is read from the environment at runtime (see [`openai`]) and is not stored here.
 #[derive(Clone)]
 pub enum UpstreamConfig {
     /// Mock model: deterministic fake tokens from the prompt.
@@ -183,9 +188,9 @@ pub enum UpstreamConfig {
     /// The same mock model, declaring the exact on-chain registry identity.
     MockWithClaimedModel(String),
     /// Instance scammer: a mock that UNCONDITIONALLY substitutes the model (claims one other than
-    /// the frame's) -- a seller that client-side verification(B7) is obligated to catch. For the failover e2e.
+    /// the frame's) -- a seller that client-side verification (B7) is obligated to catch. For the failover e2e.
     MockScammer,
-    /// Real OpenAI-compatible upstream(Groq, etc.): API base + market model id.
+    /// Real OpenAI-compatible upstream (Groq, etc.): API base + market model id.
     OpenAi(openai::OpenAiConfig),
     /// Native Anthropic Messages API upstream.
     Anthropic(anthropic::AnthropicConfig),
@@ -194,6 +199,7 @@ pub enum UpstreamConfig {
 impl UpstreamConfig {
     /// **Provider health.** Prove that the configured endpoint accepts the configured credentials and
     /// exact served model through the same adapter used for buyer traffic. The caller owns the timeout.
+
     /// This answers "is my provider reachable and working?" and nothing more. It has no business knowing
     /// which market it is being asked about -- that question is [`Self::check_market_readiness`].
     pub async fn check_health(&self) -> Result<()> {
@@ -202,9 +208,11 @@ impl UpstreamConfig {
 
     /// **Market readiness.** Provider health AND: the model that actually answered is the model this
     /// market sells.
+
     /// Seller readiness asks a strictly larger question than provider health -- "may I sell on THIS
     /// market?" -- and this is the component that answers it. The refusal happens BEFORE `postSellOffer`,
     /// so a market whose provider answers as another model never gets an offer on the book.
+
     /// The market is the identity the per-deal upstream was built for: the seller CLI overrides the
     /// config's `frame_model` with `market.frame_model` when it builds this config
     /// (`cli::seller::seller_upstream`), so for a per-deal upstream that field IS the market being asked
@@ -280,12 +288,14 @@ impl UpstreamConfig {
         // below is byte-identical to what it has always sent, and
         // `issue_1227_plain_id_uses_the_unchanged_readiness_request_and_no_extra_probe` fails if
         // this leaks into it.
+
         // The PROMPT is chosen by whether a tool is actually OFFERED, not by whether this is a
         // capability probe. `build_request_with_startup_capabilities` builds `tools`/`tool_choice`
         // from `requirements.tools` alone, so a `--think`-only market sends a body with no tool in
         // it; asking THAT body to call `dexdo_capability_probe` would name a tool the request does
         // not carry -- the same self-contradiction, mirrored. A `--think`-only probe therefore keeps
         // the readiness prompt.
+
         // The BUDGET is the model's OWN declared output cap, not a number of ours. A capability
         // probe has to fit whatever the model does before it can answer -- under a forced
         // `tool_choice` the provider buffers the generation to parse the call, so a model cut off
@@ -294,9 +304,11 @@ impl UpstreamConfig {
         // providers than we can measure: any constant we pick here is fitted to whatever we last
         // measured and wrong for the next one. `resolve_model_output_cap` already holds the model's
         // own statement about itself, so we use that and stop guessing.
+
         // This costs nothing. `max_tokens` is a CEILING, not a spend: a model that calls the tool
         // spends what it needs and stops, and the provider bills the tokens produced, not the
         // ceiling offered. Raising the ceiling buys headroom for free.
+
         // An unknown cap FAILS CLOSED here, naming the model and the fix, exactly as the serving
         // path does -- never a fallback number, which is the habit this change exists to break.
         let (prompt, max_tokens) = match requirements {
@@ -376,6 +388,7 @@ impl UpstreamConfig {
                         // absent key, the substituted model -- and printing the code alone
                         // threw it away: the operator saw `FailedPrecondition` and nothing to
                         // act on, with the seller refusing to post and no way to tell why.
+
                         // the message stays IN the context string, because the caller in
                         // `seller::liveness` renders this with `error.to_string()` -- which shows
                         // only the outermost context -- and stores it in a `HealthFailure` with no
@@ -403,7 +416,7 @@ impl UpstreamConfig {
                                     None => status,
                                 };
                                 // same as above -- the provider's message stays in the
-                                // context string(the caller renders only the outermost one) and
+                                // context string (the caller renders only the outermost one) and
                                 // the typed `Status` is attached as the cause.
                                 let detail = format!(
                                     "upstream readiness failed ({:?}): {}",
@@ -421,9 +434,9 @@ impl UpstreamConfig {
     }
 
     /// Run the upstream: normalize its output into `CanonChunk` and send it incrementally into
-    /// `tx`(R6). `count` is the stream's token budget: no more than `count` delivered tokens. `req` is
-    /// the buyer's canonical request(R1). Finishes on upstream
-    /// exhaustion, on reaching `count`, or when the buyer disconnected(`tx` closed = STOP).
+    /// `tx` (R6). `count` is the stream's token budget: no more than `count` delivered tokens. `req` is
+    /// the buyer's canonical request (R1). Finishes on upstream
+    /// exhaustion, on reaching `count`, or when the buyer disconnected (`tx` closed = STOP).
     pub async fn run(
         &self,
         count: u64,
@@ -433,7 +446,7 @@ impl UpstreamConfig {
         self.run_for_market(None, None, count, req, tx).await
     }
 
-    /// [`Self::run`], for a caller that knows which market the call is being made for(seller readiness).
+    /// [`Self::run`], for a caller that knows which market the call is being made for (seller readiness).
     /// The market only selects which question the adapter's served-model check answers; it changes nothing
     /// about the request sent upstream. Buyer traffic passes `None` -- by the time a buyer streams, the
     /// market verdict was already given at readiness, and refusing mid-stream would strand paid capacity
@@ -646,6 +659,7 @@ mod tests {
 
     /// the capability probe's budget is the model's own declared output cap, and an
     /// undeclared cap FAILS CLOSED here rather than falling back to a number of ours.
+
     /// The fallback is the habit this change exists to break: any constant we pick is fitted to the
     /// models we happened to measure and wrong for the next one. The refusal must still name the
     /// model and the fix, and it must happen before the provider is contacted -- the base URL below
@@ -738,7 +752,9 @@ mod tests {
 
     /// A seller whose model reports no per-word probabilities passes its own start-up health check
     /// and is therefore allowed to put an offer on sale.
+
     /// E2E-UPS-01, `tests/e2e/test-specification.md`.
+
     /// Partial: the start half of the row only; the provider-contact, streaming and settlement
     /// halves are `a_model_without_logprobs_is_sellable_and_reaches_the_provider` in
     /// `crates/dexdo/src/seller/upstream/openai.rs`.
@@ -796,8 +812,9 @@ mod tests {
     /// not the model this seller committed to serve -- driven through the real readiness entry point
     /// (`UpstreamConfig::check_health`, the `upstream_authentication_and_model` component), not through the
     /// parser in isolation.
+
     /// The accepted cases are the SAME model in the other spellings this system uses -- the canonical market
-    /// id(`producer--model--version`) and the registry's display case -- so the refusal can only fire on a
+    /// id (`producer--model--version`) and the registry's display case -- so the refusal can only fire on a
     /// genuinely different model, never on a re-spelling.
     #[tokio::test]
     async fn readiness_refuses_a_provider_that_served_a_different_model() {
@@ -868,6 +885,7 @@ mod tests {
 
     /// E2E-ADV-02/L2, offline: an HONEST provider serving the model it was asked for must still not let an
     /// offer rest on a market that sells a DIFFERENT model.
+
     /// This is the case the guard could not see. [`OpenAiConfig::model`] is the slug the seller puts in the
     /// request and an OpenAI-compatible provider echoes it, so while that slug was in the accepted set the
     /// check was satisfied by construction on every honest provider -- it certified without being capable of
@@ -875,6 +893,7 @@ mod tests {
     /// [`UpstreamConfig::check_health`] answers "is my provider working?" and must PASS (the provider is
     /// healthy and served exactly what it was asked for), while [`UpstreamConfig::check_market_readiness`]
     /// answers "may I sell on this market?" and must REFUSE.
+
     /// The config is the live row's own shape: production overrides the config frame with the market id
     /// (`cli::seller::seller_upstream` -> [`OpenAiConfig::from_model`]), so a seller pointing `--model qwen`
     /// at a market provisioned for another identity gets exactly this.

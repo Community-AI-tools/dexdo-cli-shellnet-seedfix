@@ -1,10 +1,12 @@
 //! Pinning of the gateway's TLS certificate on the buyer side.
+
 //! There is no PKI. Trust in the gateway's self-signed certificate comes from the **fingerprint**
 //! that arrived in the note-encrypted handover. The buyer connects over TLS and accepts
 //! the connection **only if** the SHA-256 of the presented leaf certificate matches the pinned
-//! fingerprint; otherwise it tears down **before** receiving the stream(fail-closed). An active
+//! fingerprint; otherwise it tears down **before** receiving the stream (fail-closed). An active
 //! MITM with a foreign certificate is repelled this way.
-//! The implementation reuses the rustls stack that tonic already pulls in(tokio-rustls/hyper-util),
+
+//! The implementation reuses the rustls stack that tonic already pulls in (tokio-rustls/hyper-util),
 //! without a separate TLS stack: a custom `ServerCertVerifier` checks the fingerprint and delegates
 //! handshake signature verification to the standard rustls webpki provider.
 
@@ -29,9 +31,10 @@ use tower::service_fn;
 use crate::seller::tls::fingerprint_der;
 
 /// rustls verifier that pins the gateway's certificate fingerprint.
+
 /// `verify_server_cert` accepts the certificate **only** when SHA-256(DER) matches the pinned
 /// fingerprint. The TLS handshake signature is verified by the standard webpki provider -- so
-/// fingerprint pinning complements(does not replace) the cryptographic proof of key ownership.
+/// fingerprint pinning complements (does not replace) the cryptographic proof of key ownership.
 #[derive(Debug)]
 struct PinnedFingerprintVerifier {
     expected: String,
@@ -51,7 +54,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
         if presented == self.expected {
             Ok(ServerCertVerified::assertion())
         } else {
-            // Fail-closed: foreign certificate(MITM) -- rejection BEFORE receiving any stream.
+            // Fail-closed: foreign certificate (MITM) -- rejection BEFORE receiving any stream.
             Err(RustlsError::InvalidCertificate(
                 CertificateError::ApplicationVerificationFailure,
             ))
@@ -95,6 +98,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 
 /// Which step of the pinned dial failed, kept in the error chain so the stage survives tonic's
 /// opaque `transport error`.
+
 /// `tonic::transport::Error`'s whole `Display` is the literal string `transport error`, and the
 /// connector's own error is only reachable through `source()`. Tagging the step here is what lets
 /// [`dial_stage`] report `tcp_connect` versus `tls_handshake` without dialling a second time and
@@ -135,6 +139,7 @@ impl std::error::Error for DialStageError {
 }
 
 /// The step of the pinned dial that a [`connect_pinned`] failure actually reached.
+
 /// The connector tags its own two steps; anything that fails after the connector returned a
 /// stream is the h2 handshake tonic itself performs.
 pub fn dial_stage(error: &anyhow::Error) -> &'static str {
@@ -145,6 +150,7 @@ pub fn dial_stage(error: &anyhow::Error) -> &'static str {
 }
 
 /// The dial failure as the operator needs to see it: the stage it reached and every cause under it.
+
 /// A `tonic` transport error renders as the bare words `transport error`, and its Display walks no
 /// sources -- so the connect refusal, the TLS alert or the h2 rejection that actually happened never
 /// reaches the message the buyer returns. was diagnosed by hand for that reason alone.
@@ -176,6 +182,7 @@ pub fn dial_failure_detail(error: &anyhow::Error) -> String {
 }
 
 /// `true` when the peer answered but presented a certificate that is not the pinned one.
+
 /// This is the exact `rustls` variant [`PinnedFingerprintVerifier`] returns on a fingerprint
 /// mismatch, matched as a type rather than sniffed out of a rendered string -- so a wrong endpoint
 /// is never confused with a flaky one, and vice versa.
@@ -195,6 +202,7 @@ pub fn dial_reached_wrong_endpoint(error: &anyhow::Error) -> bool {
 
 /// The structured form of a failed buyer dial of a seller gateway: the address that was
 /// dialled, the stage it reached, and the preserved cause chain.
+
 /// The buyer path used to report the whole failure as `error=transport error` with the address
 /// nowhere in the log, at any level up to `RUST_LOG=trace` -- there was nothing to tell an
 /// unreachable host from a wrong advertised address from a closed port.
@@ -234,9 +242,11 @@ pub fn gateway_dial_error(endpoint: &str, error: anyhow::Error) -> anyhow::Error
 
 /// Open a gRPC channel to the gateway over TLS, pinning the certificate fingerprint from the
 /// handover.
+
 /// `endpoint` is `https://host:port` from the decrypted handover; `fingerprint` is the pinned
 /// fingerprint from the same place. If the presented certificate does not match, the connection
 /// does not come up.
+
 /// The returned error carries the failing step as a [`DialStageError`] in its chain; a caller that
 /// reports it to an operator turns it into the structured form with [`gateway_dial_error`].
 pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel> {
@@ -284,8 +294,9 @@ pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel
                 let tcp = tokio::net::TcpStream::connect(host_port)
                     .await
                     .map_err(|e| DialStageError::new("tcp_connect", e))?;
-                // The gateway certificate's SAN is fixed(`dexdo`) -- trust comes from fingerprint
+                // The gateway certificate's SAN is fixed (`dexdo`) -- trust comes from fingerprint
                 // pinning, not the name, so the handshake name is free to be whatever travels best.
+
                 // A handover endpoint is an ADDRESS far more often than a domain, and RFC 6066
                 // forbids sending a literal address in SNI. Sending `dexdo` for such an endpoint is
                 // both off-spec and load-bearing in the wrong direction: middleboxes that route or
@@ -293,14 +304,16 @@ pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel
                 // the connection. The buyer then reports a bare `transport error` for a gateway that
                 // is up and reachable: `openssl s_client` to the same address completes the handshake
                 // without SNI and is dropped with `-servername dexdo`.
+
                 // So: an address endpoint dials with `ServerName::IpAddress`, which rustls sends
                 // WITHOUT an SNI extension; a real hostname keeps its own name. Pinning is unchanged --
                 // the verifier ignores the name and compares the certificate fingerprint.
                 // The name presented in the ClientHello. Trust is the pinned fingerprint --
                 // `PinnedFingerprintVerifier` ignores the name outright -- so the name has one job:
                 // to travel. RFC 6066 forbids a literal address in SNI, and a name that resolves
-                // nowhere is what SNI-routing middleboxes(VPN proxies above all) drop, which reaches
+                // nowhere is what SNI-routing middleboxes (VPN proxies above all) drop, which reaches
                 // the operator as a bare `transport error` for a gateway that is up and listening.
+
                 // Taken from the socket we JUST connected on, not from the endpoint spelling: the
                 // address is the one fact that is always available and always well-formed by then.
                 // That leaves no unparseable case to handle -- no bracketed IPv6, no short-form IPv4
@@ -330,6 +343,7 @@ mod tests {
     /// An endpoint spelling that the system resolver accepts and `IpAddr::from_str` rejects must
     /// still dial, because the handshake name is taken from the connected socket rather than from
     /// the spelling.
+
     /// `127.1` is the short form; it is the spelling that made the endpoint-parsing revision of
     /// this fix hard-fail before any packet left. The assertion is the completed dial through
     /// `connect_pinned` -- the production path -- rather than a `ServerName` the test built itself,
@@ -370,6 +384,7 @@ mod tests {
 
     /// the buyer half of the complaint: a dial that never reaches the seller must name the
     /// address it dialled, say how far it got, and keep the underlying `io` error.
+
     /// What this replaces is the entire user-visible output of the failure:
     /// `consumer API: upstream open failed; error=transport error`. That string is
     /// `tonic::transport::Error`'s whole `Display`; the address appeared nowhere in the log, not
@@ -432,6 +447,7 @@ mod tests {
     /// The other half of "distinguish the failure modes": something answering on the address with
     /// a certificate that is not the pinned one is a DIFFERENT problem with a different fix, and
     /// must not be reported as an unreachable host.
+
     /// The mismatch is produced by a real second gateway with its own TLS identity, so detection
     /// runs through `connect_pinned` and the rustls verifier rather than a hand-built chain.
     #[tokio::test]
@@ -490,6 +506,7 @@ mod tests {
     }
 
     /// The structured dial report must reach the operator EXACTLY once.
+
     /// `dial_failure_detail` used to walk the chain a second time on top of `DexdoError`'s own
     /// Display, so every cause was printed twice and a second stage was appended after the hint.
     /// On a pin mismatch the appended stage disagreed with the headline -- `tls_handshake` over
@@ -543,9 +560,10 @@ mod tests {
         foreign.server_task.abort();
     }
 
-    /// `true` when the ClientHello carries the `server_name` extension(RFC 6066, type 0).
+    /// `true` when the ClientHello carries the `server_name` extension (RFC 6066, type 0).
+
     /// The extension list is walked by type rather than the bytes being searched for a needle: a
-    /// hostname can appear inside another extension(ALPN, ECH) and a substring match would call
+    /// hostname can appear inside another extension (ALPN, ECH) and a substring match would call
     /// that SNI.
     fn client_hello_has_sni(flight: &[u8]) -> bool {
         assert_eq!(
@@ -589,15 +607,18 @@ mod tests {
 
     /// The one property that distinguishes this fix from what it replaced, asserted where it is
     /// observable: the `server_name` extension is ABSENT from the ClientHello.
+
     /// Nothing downstream of the handshake can see this. `PinnedFingerprintVerifier` ignores the
     /// server name, so on loopback the constant `dexdo` and the socket-derived address complete
     /// the dial identically -- every other test in this module passes with the name computation
     /// reverted. Only the first flight tells them apart.
+
     /// The second half is a control on the OBSERVER, not on the buyer: the same rustls stack is
     /// pointed at the same parser with an explicit `DnsName`, so a parser that can only ever
     /// answer "absent" -- or a build that stopped sending extensions at all -- fails here instead
     /// of passing the assertion above for the wrong reason. It cannot be driven through
     /// `connect_pinned`, because this fix deliberately sends no SNI for ANY endpoint spelling.
+
     /// E2E-ROW: E2E-BUY-10/L0
     #[tokio::test]
     async fn the_client_hello_sends_no_server_name_for_an_address_endpoint() {

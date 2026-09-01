@@ -1,8 +1,10 @@
 //! the binding writer has one call site, counted so a space cannot walk past it.
+
 //! The rule itself is the compiler's now. `persist::save_active_binding` takes an
 //! `EmptyBindingSlot`, whose field is private to a module with no descendants, so a second writer
 //! that skips the already-bound refusal has no way to build the argument and does not type-check.
 //! Nothing in this file is what stops that one; `cargo build` is.
+
 //! What is left for a test is the second writer that DOES type-check -- one that makes the refusal
 //! and then writes anyway, bypassing whatever the single writer is later given to do. The count
 //! that was supposed to catch it read `save_active_binding` immediately followed by `(`, so a call
@@ -10,8 +12,9 @@
 //! while three places wrote the binding. Counting the name wherever it is APPLIED, whatever sits
 //! between it and its arguments, closes that spelling and closes `save_active_binding\n(` and
 //! `save_active_binding\t(` with it.
+
 //! What this deliberately does not do is guess. A comment wedged between the name and its arguments
-//! (`save_active_binding /* */(`) is not whitespace and is not normalized away here, because the
+//! (`save_active_binding /* */ (`) is not whitespace and is not normalized away here, because the
 //! count is no longer the guarantee -- it is the regression for the spelling that was reported, and
 //! widening it into "anything that looks like a call" would trade a defeatable guard for an
 //! unpredictable one.
@@ -20,6 +23,7 @@
 const SOURCE: &str = include_str!("wallet_manual.rs");
 
 /// Everything before the module's own unit tests.
+
 /// The test halves are excluded on purpose: a test may name the writer as often as it likes, and
 /// this file itself would otherwise be counted through the string literals below.
 fn production() -> &'static str {
@@ -30,6 +34,7 @@ fn production() -> &'static str {
 }
 
 /// How many times `name` appears as a whole identifier applied to an argument list.
+
 /// "Applied" rather than "followed by `(`": Rust puts no meaning on the whitespace between a
 /// function's name and its arguments, so neither does this. A longer identifier that merely
 /// contains `name` is not `name`, and a mention that is never applied -- a doc link, prose -- is
@@ -82,6 +87,7 @@ fn the_count_is_blind_to_what_sits_between_a_name_and_its_arguments() {
 }
 
 /// One definition and one call, whatever spacing either is written with.
+
 /// A second writer inside `persist` that made the refusal and then wrote would land here, which is
 /// the case the compiler cannot refuse: it can insist the refusal ran, not that the write happened
 /// once. Both places live in `persist`; if this fails, read it as "the binding now has more than
@@ -96,6 +102,7 @@ fn the_binding_writer_is_defined_once_and_applied_once() {
 }
 
 /// The writer's argument is the proof that the refusal ran.
+
 /// This is what makes the writer's visibility stop mattering, and therefore what a refactor could
 /// quietly undo: widen the parameter back to a plain `&Path` and the write becomes reachable from
 /// anywhere that can name it again.

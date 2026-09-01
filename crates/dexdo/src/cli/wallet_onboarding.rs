@@ -1,12 +1,11 @@
 //! `dexdo wallet onboard`: one explicit, resumable bee handoff to canonical agent wallets.
 
 use crate::cli::args::WalletOnboardArgs;
-#[cfg(not(feature = "shellnet"))]
-use anyhow::bail;
 use anyhow::Result;
 
-#[cfg(feature = "shellnet")]
-mod shellnet {
+pub(crate) use live::ONBOARD_STEPS;
+
+mod live {
     use std::path::{Path, PathBuf};
 
     use anyhow::{anyhow, bail, Context, Result};
@@ -44,37 +43,70 @@ mod shellnet {
     }
 
     /// The command boundary: the one place this command decides what its endpoint is.
+
     /// Lifted out of `run` unchanged so it can be asserted on. `run` is unreachable from a test --
     /// the next thing it does is talk to a chain -- so with the normalisation inline there was
     /// nowhere for a regression to bind, and the seam that matters is exactly this one: what the
     /// bee `ClientContext`, the `AuthProfile` write, the `ConnectClient` poll, the chain read and
     /// the durable state all receive.
+
     /// Normalise ONCE, here, and let every later use take this value.
-    /// The defaults are bare hosts(`dd-shellnet.ackinacki.org`). Reads survive that, but the WRITE
+
+    /// The defaults are bare hosts (one chain's host). Reads survive that, but the WRITE
     /// that publishes `agent_onboard_request` through `AuthProfile.add_context_text` goes out on
     /// the wrong scheme and fails as a bare `Send message` -- observed live on mainnet, with the
     /// request already prepared and durably stored. `wallet_validation_endpoint` normalised too
     /// late: only for validating an already-received Vault/Hot pair, never for the publish.
     fn onboarding_endpoint(args: &WalletOnboardArgs) -> Result<String> {
-        let endpoint = args
-            .endpoint
-            .as_deref()
-            .unwrap_or_else(|| args.network.default_endpoint())
-            .trim()
-            .to_string();
+        // The manifest names it, and nothing else does: `--endpoint` used to rank above it and the
+        // network's own default below it, and removed both.
+
+        // NO AGREEMENT CHECK HERE, AND THAT IS THE POINT: the network being onboarded is DERIVED
+        // from this same file. `network_from_manifest` loads `manifest_path()` and hands its
+        // `network` field to `WalletNetwork::from_manifest_label`, so a disagreement between the
+        // two is not representable -- the manifest cannot describe a chain other than the one it
+        // names. `run_remove_archived` is the case that still needs the check, because there the
+        // network comes from the ARCHIVED BINDING and the manifest is a second, independent source.
+
+        // A check stood here anyway, comparing `deployed.network` against the derived label as raw
+        // strings. It could fire on exactly one input -- a label padded with whitespace, which the
+        // derivation trims and the raw comparison does not -- and the refusal it then printed
+        // contradicted itself: "names net-a, and this onboarding is for net-a". What it
+
+        // chain and answered from another, back when the network came from a flag rather than from
+        // the file. The flag is gone and so is the divergence it created.
+        let manifest = crate::cli::commands::manifest_path()?;
+        let network = crate::cli::wallet::network_from_manifest()?;
+        let endpoint =
+            crate::cli::wallet::wallet_read_endpoint(Some(manifest.as_path()), network)?;
+        let endpoint = endpoint.trim().to_string();
         if endpoint.is_empty() {
-            bail!("--endpoint must not be empty");
+            bail!("the network names no endpoint to publish the onboarding request to");
         }
         dexdo_core::normalize_endpoint(&endpoint)
             .context("normalize the wallet onboarding endpoint")
     }
 
+    /// The `note deploy` follow-up, as a line that survives the shell an operator pastes it into.
+
+    /// this used to append `<existing note-deploy arguments>` to the command. That is not
+    /// argv -- a POSIX shell reads `<existing` as an input redirection, opens a file named
+    /// `existing`, and hands the binary two stray tokens, so the line an operator pastes is not the
+    /// line that was printed. It is the defect exactly, and it survived here because the span
+    /// carries no backticks while the lint reads backticked spans only.
+
+    /// Repaired the way this tree repairs it elsewhere (`release_dispute_guidance`): the command
+    /// renders the arguments it knows, and the ones it cannot render are left to the prose above,
+    /// which the shell never sees.
     fn note_deploy_handoff_command(wallets: &ValidatedWalletPair, hot_key: &Path) -> String {
-        format!(
-            "dexdo note deploy --multisig-address {} --multisig-key {} <existing note-deploy arguments>",
+        // Through `command_here`, so the line carries this run's `--data-dir`. Without it the
+        // follow-up deploys into the platform default and the binding it was just told to use is in
+        // another directory entirely.
+        crate::cli::support::command_here(&format!(
+            "note deploy --nominal N100 --multisig-address {} --multisig-private-key {}",
             wallets.hot_scoped_address,
             hot_key.display()
-        )
+        ))
     }
 
     #[async_trait(?Send)]
@@ -112,6 +144,37 @@ mod shellnet {
         vault: Option<KeyPair>,
     }
 
+    /// What onboarding does, in the order it does it, in the two tenses the display reads in.
+
+    /// Every one of these is a wait on somebody else -- the operator's phone, then the wallet, then
+    /// the chain, then a download. A wait nobody named is what made this command look like a wall of
+    /// sentences with no shape.
+    pub(crate) const ONBOARD_STEPS: [(&str, &str); 4] = [
+        (
+            // Also the operator's move: nothing happens until a phone reads the code on their
+            // screen. Written as the instruction it is, and drawn amber for the same reason.
+            "scan the code above with Acki Nacki Wallet",
+            "wallet app connected",
+        ),
+        (
+            // The wallet does not start until the operator approves it, so this is an instruction,
+            // not an observation. Said the other way round -- "waiting for the wallet app to
+            // deploy" -- it reads as the client watching something already in motion, and an
+            // operator with the phone in their hand waits for a deploy nobody asked them to
+            // confirm.
+            "approve the Vault/Hot deploy in Acki Nacki Wallet",
+            "Vault and Hot deployed by the wallet",
+        ),
+        (
+            "checking the pair on chain",
+            "pair checked on chain and bound",
+        ),
+        (
+            "preparing the proving reference string",
+            "proving material ready",
+        ),
+    ];
+
     pub(super) async fn run(
         args: WalletOnboardArgs,
         binding_id: &str,
@@ -125,8 +188,13 @@ mod shellnet {
         let (mut session, keys, created) =
             load_or_create_session(&args, &endpoint, &state_path, limits)?;
         let mut reconcile_prepared_request = !created && session.phase_name() == "request_prepared";
+        // Both of these report bookkeeping, not a result: which files were written before the
+        // command reached the network, and which durable phase a rerun picked up from. They matter
+        // when something has to be reconstructed after the fact, and they are noise while the
+        // operator is looking for the thing they have to scan -- so they go out at `info`, where
+        // `RUST_LOG` reaches them and the quiet default does not.
         if created {
-            eprintln!(
+            tracing::info!(
                 "wallet onboarding state and local Hot{} key persisted owner-only before connecting",
                 if keys.vault.is_some() {
                     "/Vault"
@@ -135,7 +203,7 @@ mod shellnet {
                 }
             );
         } else {
-            eprintln!(
+            tracing::info!(
                 "resuming wallet onboarding from durable phase `{}`",
                 session.phase_name()
             );
@@ -146,10 +214,18 @@ mod shellnet {
                 deep_link,
                 args.qr_file.as_deref(),
                 args.terminal_qr,
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
                 &mut std::io::stdout(),
             )?;
         }
 
+        // The display starts AFTER the invitation is drawn: the code goes to stdout, the live line
+        // to stderr, and a spinner running while a QR is being printed would rewrite a line of it.
+        // From here on nothing else prints, so the two never meet.
+        let _status = crate::cli::progress::Status::with_plan(
+            ONBOARD_STEPS[0].0,
+            ONBOARD_STEPS.iter().copied(),
+        );
         let io = CanonicalBeeSessionIo::new(&endpoint)?;
         let mut invitation_consumed_announced = false;
         loop {
@@ -163,9 +239,10 @@ mod shellnet {
             }
             match session.phase_name() {
                 "awaiting_wallet_hello" => {
+                    crate::cli::progress::step_needs_you(ONBOARD_STEPS[0].0);
                     session = session.advance(&io, limits).await?;
                     save_session(&state_path, &session)?;
-                    println!(
+                    tracing::info!(
                         "signed wallet_hello verified; request prepared durably before publication"
                     );
                 }
@@ -178,14 +255,17 @@ mod shellnet {
                         session.advance(&io, limits).await?
                     };
                     save_session(&state_path, &session)?;
-                    println!(
+                    // The wallet waits for the operator's approval, so the line is theirs to act on.
+                    crate::cli::progress::step_needs_you(ONBOARD_STEPS[1].0);
+                    tracing::info!(
                         "one agent_onboard_request reconciled; post-send bee ratchet persisted"
                     );
                 }
                 "awaiting_wallets_response" => {
                     session = session.advance(&io, limits).await?;
                     save_session(&state_path, &session)?;
-                    println!(
+                    crate::cli::progress::step(ONBOARD_STEPS[2].0);
+                    tracing::info!(
                         "durable agent_wallets_response authenticated and consumed; validating chain facts"
                     );
                 }
@@ -218,10 +298,14 @@ mod shellnet {
                     // nothing the canonical default has been rebased under the effective data
                     // directory, and that is the file this flow actually wrote. Recording the
                     // unresolved default would name a path that holds no key.
+
                     // `wallet_address` is read AFTER `mark_complete`, deliberately: this is the
                     // value completion used to discard, and reading it here is what proves it
                     // survived.
                     return Ok(binding_of(
+                        crate::cli::wallet::WalletNetwork::from_manifest_label(
+                            &validated.network,
+                        )?,
                         binding_id,
                         &validated,
                         &hot_key_arg,
@@ -236,15 +320,18 @@ mod shellnet {
 
     /// The binding this flow proved. It is BUILT, never written: `run_selected` commits it once
     /// through `WalletStore::commit_active`, which archives whatever it replaces.
+
     /// This is only about `wallet/binding.json`. The bee SESSION state (`--state`, written by
     /// `save_session`) stays exactly as it is and is not a binding: the specification keeps it as
     /// the temporary, resumable state of an Acki Nacki onboarding that may take an hour, and
     /// deleting it would break resumption.
+
     /// `hot_address` is the Hot and only the Hot. dexdo spends from the Hot; the Vault is the
     /// human's custody instrument. `vault_address` is recorded ALONGSIDE it -- not as a second
     /// candidate for spending, but because the `ackinacki-wallet` funding flow addresses its
-    /// Vault -> Hot top-up request to it(`cli::wallet_funding`), and a binding without it cannot
+    /// Vault -> Hot top-up request to it (`cli::wallet_funding`), and a binding without it cannot
     /// ask the Vault for anything. Nothing reads it as a wallet to spend from.
+
     /// `vault_key_file` is the key that signs the future Vault -> Hot request, so it is recorded
     /// whether or not it is a separate key. The specification's own binding example fixes both
     /// cases -- "owner-only path OR the same Hot key file" -- and the code already treats them as
@@ -253,6 +340,7 @@ mod shellnet {
     /// would record "this binding has no Vault key" about a binding that does; leaving it `None`
     /// when `--vault-key` WAS given loses a separately generated key that only this flow knows the
     /// path of.
+
     /// `push_profile_address` is `hello.wallet_address` -- the multifactor wallet address, which
     /// the recorded answer makes explicitly a DIFFERENT value from
     /// `hello.profile_address`. It is reserved non-secret metadata: nothing reads it yet, and it
@@ -262,6 +350,7 @@ mod shellnet {
     /// `AuthProfile` address is NOT written here: it is the other value, and it is kept in the
     /// completed onboarding state instead.
     fn binding_of(
+        network: crate::cli::wallet::WalletNetwork,
         binding_id: &str,
         validated: &ValidatedWalletPair,
         hot_key: &Path,
@@ -272,10 +361,10 @@ mod shellnet {
             version: crate::cli::wallet::BINDING_VERSION,
             id: binding_id.to_string(),
             provider: crate::cli::wallet::WalletProvider::AckinackiWallet,
-            network: match validated.network.as_str() {
-                "mainnet" => crate::cli::wallet::WalletNetwork::Mainnet,
-                _ => crate::cli::wallet::WalletNetwork::Shellnet,
-            },
+            // The label the WALLET reported, taken as it came. Mapping it onto a closed pair used
+            // to silently file anything that was not `mainnet` under the test network -- including
+            // a chain this binary had never heard of.
+            network,
             hot_address: validated.hot_scoped_address.clone(),
             vault_address: Some(validated.vault_scoped_address.clone()),
             hot_key_file: Some(hot_key.to_path_buf()),
@@ -383,7 +472,7 @@ mod shellnet {
         let nonce = KeyPair::generate().public_hex().to_string();
         let session = OnboardingSession::create(
             &args.agent_name,
-            args.network.as_str(),
+            crate::cli::wallet::network_from_manifest()?.as_str(),
             endpoint,
             hot.public_hex(),
             vault.as_ref().map(KeyPair::public_hex),
@@ -404,8 +493,13 @@ mod shellnet {
         if session.agent_name != args.agent_name.trim() {
             bail!("--agent-name does not match durable onboarding state");
         }
-        if session.network != args.network.as_str() {
-            bail!("--network does not match durable onboarding state");
+        if session.network != crate::cli::wallet::network_from_manifest()?.as_str() {
+            bail!(
+                "the durable onboarding state was written for network `{}`, and this run is on a \
+                 different one. Point DEXDO_MANIFEST at the manifest this session was started \
+                 under, or start a new session.",
+                session.network
+            );
         }
         // Sessions written before the endpoint was normalised hold a bare host, so compare the
         // normalised forms rather than the stored text: an operator mid-onboarding must not be
@@ -473,65 +567,161 @@ mod shellnet {
             .with_context(|| format!("persist wallet onboarding state {}", path.display()))
     }
 
+    /// Show the invitation where the operator can act on it.
+
+    /// Two readers want opposite things from this output, and `interactive` is which one is on the
+    /// other end.
+
+    /// A PARENT PROCESS reads the first line of stdout and gets the deep link to hand on. That
+    /// position is a machine contract, older than, and it holds wherever a program is reading:
+    /// a pipe, a redirection, a capture.
+
+    /// A HUMAN gets nothing from it. The wallet is a phone application, the scheme is handled on
+    /// the phone, and this is a workstation console -- there is nothing to tap, and a line of 670
+    /// opaque characters is the largest thing on their screen. So on a terminal the link is not
+    /// printed at all, and the scannable code is: it is the only part of this output an operator
+    /// can use. Anyone who does want the string still has the machine channel -- piping the command
+    /// puts the link back on line one, because that is exactly the case the contract is about.
+
+    /// The code itself is printed unconditionally either way: no flag to know about, no file to go
+    /// looking for. Where the terminal answers the capability probe it is an inline image -- an
+    /// escape sequence in this stream, so the module size stops being the font size and the code
+    /// gets small; where it does not, it is the compact text rendering. Neither opens a window, and
+    /// neither writes to disk: a file is produced only by an explicit `--qr-file`.
     fn print_invitation(
         deep_link: &str,
         qr_file: Option<&Path>,
-        terminal_qr: bool,
+        _terminal_qr: bool,
+        interactive: bool,
         output: &mut dyn std::io::Write,
     ) -> Result<()> {
-        writeln!(output, "{deep_link}")?;
-        writeln!(output, "Open this link on your phone (no camera needed).")?;
-        let qr = (qr_file.is_some() || terminal_qr)
-            .then(|| {
-                QrCode::new(deep_link.as_bytes())
-                    .context("ordinary bee connection deep link does not fit a QR code")
-            })
-            .transpose()?;
+        if !interactive {
+            writeln!(output, "{deep_link}")?;
+        }
         if let Some(path) = qr_file {
-            let qr = qr
-                .as_ref()
-                .ok_or_else(|| anyhow!("QR file requested without a rendered QR code"))?;
-            let svg = qr.render::<svg::Color>().quiet_zone(true).build();
+            // The saved file keeps the ordinary error correction. It is an image with no size
+            // constraint, so the trade the drawn code makes below -- correction for a smaller
+            // symbol -- buys nothing here, and its bytes are pinned by the intent regression.
+            let svg = QrCode::new(deep_link.as_bytes())
+                .context("ordinary bee connection deep link does not fit a QR code")?
+                .render::<svg::Color>()
+                .quiet_zone(true)
+                .build();
             write_private_atomic(path, svg.as_bytes())
                 .with_context(|| format!("save wallet onboarding QR code {}", path.display()))?;
             writeln!(output, "QR code saved to {}", path.display())?;
         }
-        if terminal_qr {
-            let qr = qr
-                .as_ref()
-                .ok_or_else(|| anyhow!("terminal QR requested without a rendered QR code"))?;
-            writeln!(output, "Or scan this QR code in the released wallet:")?;
-            // PR1362 owns everything around this line -- the link first, the opt-in flag, the
-            // injected writer. Only the rendering inside the flag changes: an image where the
-            // terminal proved it can show one, and PR1362's unicode rendering everywhere else.
-            crate::cli::qr_display::write_qr(output, qr)
-                .context("render the ordinary bee connection QR code")?;
-        }
+        writeln!(output, "Scan this in the Acki Nacki Wallet app:")?;
+        let scannable = crate::cli::qr_compact::smallest_code(deep_link.as_bytes())?;
+        crate::cli::qr_display::write_qr(output, &scannable)
+            .context("render the bee connection QR code")?;
         writeln!(output, "waiting for the wallet's signed hello...")?;
         output.flush().context("flush wallet onboarding invitation")?;
         Ok(())
     }
 
     fn print_invitation_consumed() {
-        println!("Connection invitation accepted; do not scan the QR code again.");
-        println!("If the command exits, rerun it with the same state and key files.");
+        crate::cli::progress::tick("code scanned; do not scan it again");
+        tracing::info!(
+            "the invitation is spent; rerunning this command with the same state and key files \
+             resumes rather than re-invites"
+        );
     }
 
+    /// The binding as the result of this command: what was created, and where what signs with it
+    /// lives.
+
+    /// The key file is named because counts a binding as an artifact -- something that
+    /// exists after the command and cannot be found again without the client -- and an artifact is
+    /// named with the file that holds its secret. It said the addresses and stopped, so the one
+    /// thing an operator has to keep, and keep private, was the one thing it did not mention.
+    /// The hand-off block: what the operator must do in the wallet application, and where.
+
+
+    /// result on stdout and everything else on stderr, and the result for all three providers is
+    /// printed by one function after this returns. On stdout it also broke `--json`: this block
+    /// went out first, so the "one JSON document" a runtime parses arrived with a styled human
+    /// heading in front of it and `jq` failed on the first line.
     fn print_handoff(wallets: &ValidatedWalletPair, hot_key: &Path) {
-        println!("wallet onboarding validated on {}:", wallets.network);
-        println!("  Vault: {}", wallets.vault_scoped_address);
-        println!("  Hot:   {}", wallets.hot_scoped_address);
-        println!(
-            "after funding Hot in the wallet, continue through the unchanged no-giver interface:"
+        // The live line comes down before the result goes up, or the two write over each other.
+        crate::cli::progress::complete();
+        use crate::cli::style::{self, Palette, Role};
+        let palette = Palette::stderr();
+        eprintln!(
+            "{}",
+            style::glyph_line(
+                palette,
+                style::OK,
+                Role::Ok,
+                &format!(
+                    "wallet bound {} {}",
+                    style::paint(palette, Role::Label, "\u{b7}"),
+                    style::paint(palette, Role::Bold, &wallets.network.to_string())
+                )
+            )
         );
-        println!("  {}", note_deploy_handoff_command(wallets, hot_key));
+        eprintln!(
+            "{}",
+            style::field(palette, "vault", &wallets.vault_scoped_address, Role::Id)
+        );
+        eprintln!(
+            "{}",
+            style::field(palette, "hot", &wallets.hot_scoped_address, Role::Id)
+        );
+        eprintln!(
+            "{}",
+            style::field(
+                palette,
+                "secret",
+                &format!(
+                    "{} holds the Hot key this binding signs with - keep it private",
+                    hot_key.display()
+                ),
+                Role::Text
+            )
+        );
+        // What the binding is FOR. A wallet on its own trades nothing here: trading happens from a
+        // note, so the next flow is deploying one, and the operator is told what a note is before
+        // being told to make one. The command is the one line meant to be copied, so it carries the
+        // colour that means "yours to act on".
+        eprintln!(
+            "{}",
+            style::field(
+                palette,
+                "next",
+                &style::paint(
+                    palette,
+                    Role::Wait,
+                    "fund Hot in the wallet app, then deploy a note - the dex's own anonymous"
+                ),
+                Role::Text
+            )
+        );
+        eprintln!(
+            "{}",
+            style::field_continued(&style::paint(
+                palette,
+                Role::Wait,
+                "wallet, the account trading is done from:"
+            ))
+        );
+        eprintln!(
+            "{}",
+            style::field_continued(&style::paint(
+                palette,
+                Role::Wait,
+                &note_deploy_handoff_command(wallets, hot_key)
+            ))
+        );
     }
 
     /// The exact on-chain shape one half of the agreed Acki Nacki pair must have.
-    /// Recorded on(2026-08-12): "owners are `[K0, K1, matching_agent_key]`; Vault/Hot
+
+    /// Recorded on (2026-08-12): "owners are `[K0, K1, matching_agent_key]`; Vault/Hot
     /// transaction confirms `2`/`1`, data confirms `2` on both", restated for the Vault as "the
     /// exact form: exactly three pubkey custodians including the local Vault key,
     /// `requiredTxnConfirms=2` and `requiredDataConfirms=2`".
+
     /// Every field is a money-safety invariant, so each one REFUSES rather than warns. A Hot that
     /// confirms with fewer signatures than agreed, or that carries a fourth custodian nobody
     /// intended, is a wallet a third party can spend from -- and this is the last point before the
@@ -731,6 +921,7 @@ mod shellnet {
     }
 
     /// Every custodian the getter returned, or an error naming the one that could not be read.
+
     /// Deliberately not a `filter_map`: silently DROPPING an entry whose `owner_pubkey` is missing
     /// or malformed would let a four-custodian wallet count as three, which is exactly the shape
     /// this check exists to refuse. An authoritative set that cannot be read in full is not an
@@ -761,6 +952,7 @@ mod shellnet {
     }
 
     /// The agreed custodian set, enforced exactly: the count, no repeated key, and the local key.
+
     /// The count is the half that was missing. Membership alone accepts a wallet that also carries
     /// a custodian the operator never agreed to -- on the Hot, where one signature executes, such a
     /// custodian can drain it alone.
@@ -815,7 +1007,6 @@ mod shellnet {
         use dexdo_wallet_onboarding::{parse_scoped_address, SessionPhase};
 
         use super::*;
-        use crate::cli::args::WalletNetworkArg;
 
         #[derive(Clone)]
         struct FixtureWallet {
@@ -864,7 +1055,7 @@ mod shellnet {
         fn response() -> AgentWalletsResponse {
             AgentWalletsResponse {
                 version: 1,
-                network: "shellnet".to_string(),
+                network: "net-a".to_string(),
                 vault: parse_scoped_address(&format!("{0}::{0}", public('c'))).unwrap(),
                 hot: parse_scoped_address(&format!("{0}::{0}", public('d'))).unwrap(),
             }
@@ -918,7 +1109,7 @@ mod shellnet {
             let validated = validate_wallet_pair(&chain, &response, &public('1'), &public('2'))
                 .await
                 .unwrap();
-            assert_eq!(validated.network, "shellnet");
+            assert_eq!(validated.network, "net-a");
             assert_eq!(validated.hot_scoped_address, response.hot.canonical);
             assert_eq!(validated.vault_scoped_address, response.vault.canonical);
             let command = note_deploy_handoff_command(&validated, Path::new("hot.key"));
@@ -939,11 +1130,21 @@ mod shellnet {
             assert_eq!(chain.writes.get(), 0);
         }
 
+        /// The endpoint handed to the write path is absolute, whatever shape it arrived in.
+
+        /// This used to pass a network LABEL and expect that network's host back, because the
+        /// function mapped one to the other from a compiled-in table. The table is gone --
+        /// the endpoint comes from the manifest -- so what is left to hold, and the only thing this
+        /// seam ever really did, is that a host without a scheme is not handed on as a relative URL.
         #[test]
-        fn default_shellnet_chain_validation_endpoint_is_absolute() {
+        fn the_chain_validation_endpoint_is_absolute() {
             assert_eq!(
-                wallet_validation_endpoint(WalletNetworkArg::Shellnet.default_endpoint()).unwrap(),
-                "https://dd-shellnet.ackinacki.org"
+                wallet_validation_endpoint("net-a.example").unwrap(),
+                "https://net-a.example"
+            );
+            assert_eq!(
+                wallet_validation_endpoint("  https://net-a.example  ").unwrap(),
+                "https://net-a.example"
             );
         }
 
@@ -1049,19 +1250,88 @@ mod shellnet {
             );
         }
 
+        /// What a PROGRAM reads: the link on the first line, and the code after it.
+
+        /// A caller takes the invitation from there, so the position holds for every destination
+        /// that is not a human -- a pipe, a redirection, this capture. is not a licence to
+        /// move it.
         #[test]
-        fn invitation_prints_the_text_link_first_and_creates_no_default_file() {
+        fn a_captured_invitation_leads_with_the_link_and_still_draws_the_code() {
             let dir = tempfile::tempdir().unwrap();
             let absent = dir.path().join("invite.svg");
             let deep_link = "bee-connect://invite/fixture";
             let mut output = Vec::new();
 
-            print_invitation(deep_link, None, false, &mut output).unwrap();
+            print_invitation(deep_link, None, false, false, &mut output).unwrap();
 
             let output = String::from_utf8(output).unwrap();
-            assert!(output.starts_with(&format!("{deep_link}\n")), "{output}");
-            assert!(!output.contains("Or scan this QR code"), "{output}");
+            assert_eq!(
+                output.lines().next(),
+                Some(deep_link),
+                "the link must be the first line: {output}"
+            );
+            let qr_line = output.find('\u{2588}').or_else(|| output.find('\u{2584}'));
+            assert!(qr_line.is_some(), "no QR block glyphs in output: {output}");
             assert!(!absent.exists());
+        }
+
+        /// What a HUMAN reads: the code, and not one character of the link.
+
+        /// The link opens a phone wallet, so on a workstation console there is nothing to do with
+        /// it, and at some 670 characters it is the largest thing on the screen. Printing it there
+        /// buys the operator nothing and costs them the code's legibility.
+        #[test]
+        fn an_interactive_invitation_shows_the_code_and_never_the_link() {
+            let deep_link = "bee-connect://invite/fixture";
+            let mut output = Vec::new();
+
+            print_invitation(deep_link, None, false, true, &mut output).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                !output.contains(deep_link),
+                "the link must not reach a human: {output}"
+            );
+            assert!(
+                output.contains('\u{2588}') || output.contains('\u{2584}'),
+                "no QR block glyphs in output: {output}"
+            );
+        }
+
+        /// The invitation must not depend on a terminal that can show an image: the same code
+        /// goes out whether or not the caller asked for the old opt-in flag.
+        #[test]
+        fn invitation_qr_does_not_depend_on_the_terminal_qr_flag() {
+            let deep_link = "bee-connect://invite/fixture";
+            let mut with_flag = Vec::new();
+            let mut without_flag = Vec::new();
+
+            print_invitation(deep_link, None, true, false, &mut with_flag).unwrap();
+            print_invitation(deep_link, None, false, false, &mut without_flag).unwrap();
+
+            assert_eq!(with_flag, without_flag);
+        }
+
+        /// The drawn code keeps the shape `qr_compact` promises: one module per column, two per
+        /// row, every line the same width.
+        #[test]
+        fn invitation_qr_keeps_the_module_square() {
+            let deep_link = "bee-connect://invite/fixture";
+            let mut output = Vec::new();
+
+            print_invitation(deep_link, None, false, true, &mut output).unwrap();
+
+            let code = crate::cli::qr_compact::smallest_code(deep_link.as_bytes()).unwrap();
+            let (columns, rows) = crate::cli::qr_compact::size_in_cells(&code);
+            let output = String::from_utf8(output).unwrap();
+            let drawn: Vec<&str> = output
+                .lines()
+                .filter(|line| line.chars().all(|c| c == ' ' || ('\u{2580}'..='\u{259F}').contains(&c)))
+                .collect();
+            assert_eq!(drawn.len(), rows, "{output}");
+            for line in drawn {
+                assert_eq!(line.chars().count(), columns, "{line:?}");
+            }
         }
 
         #[test]
@@ -1073,6 +1343,7 @@ mod shellnet {
             print_invitation(
                 "bee-connect://invite/fixture",
                 Some(&path),
+                false,
                 false,
                 &mut output,
             )
@@ -1094,9 +1365,8 @@ mod shellnet {
 
             let dir = tempfile::tempdir().unwrap();
             let args = WalletOnboardArgs {
+                // The manifest a run finds for itself; these fixtures never dial.
                 agent_name: "fixture-agent".to_string(),
-                network: WalletNetworkArg::Shellnet,
-                endpoint: None,
                 state: Some(dir.path().join("session.json")),
                 hot_key: Some(dir.path().join("hot.key")),
                 vault_key: Some(dir.path().join("vault.key")),
@@ -1106,7 +1376,7 @@ mod shellnet {
             let state = resolve_private_file_path(args.state.as_deref().unwrap(), "state").unwrap();
             let (session, keys, created) = load_or_create_session(
                 &args,
-                args.network.default_endpoint(),
+                crate::cli::wallet::test_network_a().as_str(),
                 &state,
                 session_limits(WalletOnboardingParams::canonical()),
             )
@@ -1141,6 +1411,7 @@ mod shellnet {
             assert!(!link.contains(keys.hot.public_hex()));
             assert!(!link.contains(keys.vault.as_ref().unwrap().public_hex()));
             // The onboarding intent is a public routing hint, not a secret: the wallet needs it to
+
             assert!(link.ends_with("&intent=agent_onboard"), "{link}");
             assert_eq!(link.matches("intent=agent_onboard").count(), 1, "{link}");
         }
@@ -1150,8 +1421,7 @@ mod shellnet {
             let dir = tempfile::tempdir().unwrap();
             let args = WalletOnboardArgs {
                 agent_name: "fixture-agent".to_string(),
-                network: WalletNetworkArg::Shellnet,
-                endpoint: None,
+                // The manifest a run finds for itself; these fixtures never dial.
                 state: Some(dir.path().join("session.json")),
                 hot_key: Some(dir.path().join("hot.key")),
                 vault_key: None,
@@ -1161,7 +1431,7 @@ mod shellnet {
             let state = resolve_private_file_path(args.state.as_deref().unwrap(), "state").unwrap();
             load_or_create_session(
                 &args,
-                args.network.default_endpoint(),
+                crate::cli::wallet::test_network_a().as_str(),
                 &state,
                 session_limits(WalletOnboardingParams::canonical()),
             )
@@ -1173,7 +1443,7 @@ mod shellnet {
             };
             assert!(load_or_create_session(
                 &changed,
-                changed.network.default_endpoint(),
+                crate::cli::wallet::test_network_b().as_str(),
                 &state,
                 session_limits(WalletOnboardingParams::canonical()),
             )
@@ -1185,18 +1455,9 @@ mod shellnet {
     include!("wallet_onboarding_shape_tests.rs");
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) async fn run_wallet_onboard(
     args: WalletOnboardArgs,
     binding_id: &str,
 ) -> Result<crate::cli::wallet::WalletBinding> {
-    shellnet::run(args, binding_id).await
-}
-
-#[cfg(all(not(feature = "shellnet"), test))]
-pub(crate) async fn run_wallet_onboard(
-    _args: WalletOnboardArgs,
-    _binding_id: &str,
-) -> Result<crate::cli::wallet::WalletBinding> {
-    bail!("wallet onboarding requires the `shellnet` feature")
+    live::run(args, binding_id).await
 }

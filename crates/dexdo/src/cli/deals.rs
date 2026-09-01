@@ -2,7 +2,6 @@
 //! `deals`/`status`/`close` without reassembling low-level addresses.
 
 use anyhow::{bail, Result};
-#[cfg(any(feature = "shellnet", test))]
 use dexdo_core::DealBuyerBond;
 use dexdo_core::{DealChainState, MarketManifest};
 use serde::{Deserialize, Serialize};
@@ -105,6 +104,7 @@ pub(crate) struct DealHandle {
 }
 
 /// The last claim-pipeline values read from a live `TokenContract.getState()`.
+
 /// `last_claim_time` is deliberately named after the getter field. It is the chain timestamp that
 /// accompanied the pair, not proof that the pair was still current when a later close executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,8 +133,7 @@ pub(crate) struct DealRecord {
     pub(crate) last_observed_promotion: Option<LastObservedPromotion>,
 }
 
-// `Placed`/`FundedButNeverOpened`/`Disputed` are produced only by the shellnet chain-state summariser.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+// `Placed`/`FundedButNeverOpened`/`Disputed` are produced only by the chain-state summariser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DealStateKind {
     Placed,
@@ -196,14 +195,12 @@ pub(crate) fn classify_deal_state(
     Ok(summarize_chain_state(state, buyer_bond))
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn summarize_deal_snapshot(
     snapshot: &dexdo_core::DealChainSnapshot,
 ) -> DealStateSummary {
     summarize_chain_state(snapshot.state, snapshot.buyer_bond)
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn summarize_chain_state(state: DealChainState, buyer_bond: DealBuyerBond) -> DealStateSummary {
     let kind = if state.disputed {
         DealStateKind::Disputed
@@ -238,7 +235,6 @@ fn summarize_chain_state(state: DealChainState, buyer_bond: DealBuyerBond) -> De
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn deal_state_getter_json(state: DealChainState) -> serde_json::Value {
     serde_json::json!({
         "funded": state.funded,
@@ -371,7 +367,130 @@ pub(crate) fn persist_last_observed_promotion(
     write_private_atomic(path, &bytes)
 }
 
+/// Does this refusal carry the one class the sweep may NOT skip?
+
+/// `load_deal_record` already tells its refusals apart, and has since: the schema check
+/// returns a typed [`DealHandleSchemaTooNew`], while every other failure is a plain
+/// `parse deal handle {path}:...`. Nothing new is introduced here -- this reads the distinction
+/// that already exists, the same way the regressions read it (`downcast_ref` over the cause
+/// chain). Kept as a named predicate so the sweep's arm states which class it is holding back
+/// rather than open-coding a downcast in a match guard.
+fn deal_handle_schema_is_too_new(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DealHandleSchemaTooNew>().is_some())
+}
+
+/// The line a skipped handle prints, as ONE fact with one owner.
+
+/// The path is the whole point: a sweep that silently dropped a file would turn a stale record into
+/// an invisible one, and the operator would have no way to find what to remove. Kept as a function
+/// so the naming is asserted directly instead of through a captured stderr.
+fn skipped_handle_warning(path: &Path, error: &anyhow::Error) -> String {
+    format!(
+        "warning: skipping unreadable deal handle {}: {error}",
+        path.display()
+    )
+}
+
 pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>> {
+    let mut out = Vec::new();
+    // the reason the sweep skipped something, kept in case it ends up with nothing to
+    // return. The FIRST is kept rather than the last: `read_dir` order is arbitrary, so "the last
+    // one that happened to be read" is not a property worth reporting, while "the first thing that
+    // went wrong" at least reads the same way twice on the same directory.
+    let mut first_skip: Option<anyhow::Error> = None;
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| anyhow::anyhow!("read deals dir {}: {e}", dir.display()))?
+    {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json")
+            || !p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.starts_with("deal-"))
+        {
+            continue;
+        }
+        match load_deal_handle(&p) {
+            Ok(handle) => out.push((p.clone(), handle)),
+            // A handle this scan merely CAME ACROSS is not a reason to kill the command. The deals
+            // directory accumulates across generations, and one file written by an older client --
+            // a market whose prices predate whole-SHELL quoting, say -- used to abort every command
+            // that enumerates handles, including `dexdo seller` startup, for a deal it had nothing
+            // to do with.
+
+            // This deliberately does NOT soften an explicitly named handle: `resolve_deal_ref`
+            // loads a direct path and a by-id path through `load_deal_handle` before it ever gets
+            // here, so asking for a broken handle BY NAME still fails loudly. Only the incidental
+            // sweep skips, and it says which file it skipped so the cause is never invisible.
+
+            // EXCEPT a record written by a NEWER runtime, which is not "unreadable" and is
+            // not this client's to skip. Every other refusal here says the file is beyond us --
+            // garbage, or a value we will not read (the live case was a market price quoted
+            // in the units of an older generation). A schema-too-new record says the OPPOSITE: the
+            // file is fine and WE are behind it, and the only safe answer is to stop and say so.
+            // Skipping it turns "keep the older runtime pinned until that deal terminates" into a
+            // deal that silently is not there, on the money path, which is what exists to
+            // prevent. It refuses whether or not a healthy handle sits beside it: a neighbour
+            // cannot tell the operator what this record needs them to know.
+            Err(error) if deal_handle_schema_is_too_new(&error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    path = %p.display(),
+                    error = %error,
+                    "skipping unreadable deal handle"
+                );
+                eprintln!("{}", skipped_handle_warning(&p, &error));
+                if first_skip.is_none() {
+                    first_skip = Some(error);
+                }
+            }
+        }
+    }
+    // an empty result is only an empty result when the directory really had nothing for us.
+
+    // The split is not by error CLASS but by whether anything survived. While a readable handle
+    // remains, a stale neighbour is noise and skipping it is what is for. When every candidate
+    // was skipped there is nobody left to carry the news, and returning `Ok(vec![])` tells the
+    // caller "no deals" about a directory that in fact holds one it could not read -- which on the
+    // buyer's resume path is a deal that silently is not there.
+
+    // So the caller gets the reason instead, with its own class intact: a schema-too-new keeps its
+    // typed cause and classifies as DEAL_RECORD_SCHEMA_TOO_NEW, a malformed record stays malformed,
+    // a read error stays a read error. A directory that genuinely holds no handles still returns an
+    // empty list -- nothing was skipped, so nothing is being hidden, and that is not a refusal.
+    if out.is_empty() {
+        if let Some(error) = first_skip {
+            return Err(error);
+        }
+    }
+    out.sort_by(|a, b| a.1.created_at_unix.cmp(&b.1.created_at_unix));
+    Ok(out)
+}
+
+/// Every handle in `dir`, and the FIRST unreadable one as an error instead of a warning.
+
+/// The difference from [`list_deal_handles`] is who is asking, not what is on disk.
+
+/// That sweep is lenient on purpose: a deals directory accumulates across generations, and
+/// one handle written by an older client used to abort every command that merely enumerates
+/// handles -- measured live, a handle from 1 August took the 4.0.36 seller gate down for a deal it
+/// had nothing to do with. Listing is not deciding, so listing skips and says what it skipped.
+
+/// A buyer resume IS deciding, and it decides about money. It asks "is there a record of a deal I
+/// already have?", and a skipped record answers "no" -- whereupon the buyer places a NEW order
+/// beside the one it could not read. That is the second order the durable handle exists to
+/// prevent, and it is why the three ways a record can be unusable have to stay distinct
+/// and loud: a schema from a future client, a record that cannot be read, and a record that does
+/// not parse are three different things an operator does three different things about.
+pub(crate) fn list_deal_handles_strict(
+    dir: &std::path::Path,
+) -> Result<Vec<(std::path::PathBuf, DealHandle)>> {
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
@@ -630,7 +749,7 @@ fn is_secret_field_name(key: &str) -> bool {
             | "note_key"
             | "private_key"
             | "priv_key"
-            | "multisig_key"
+            | "multisig_private_key"
     ) || key.contains("secret")
         || key.ends_with("_seed")
 }
@@ -715,7 +834,7 @@ mod tests {
 
     fn sample_market() -> MarketManifest {
         MarketManifest {
-            network: "shellnet".into(),
+            network: "net-a".into(),
             frame_model: "qwen/qwen3-32b".into(),
             model_hash: dexdo_core::model_hash_for("qwen/qwen3-32b"),
             inference_order_book: "0:11".into(),
@@ -723,7 +842,9 @@ mod tests {
             token_contract: "0:33".into(),
             seller_note: "0:44".into(),
             nonce: 7,
-            price_per_tick: 1000,
+            // Whole SHELL a tick: the manifest carries prices in SHELL, and the book holds no
+            // other kind.
+            price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 1024,
         }
     }
@@ -733,7 +854,7 @@ mod tests {
             version: DEAL_HANDLE_VERSION,
             handle: make_handle_id("0:33", DealHandleRole::Seller),
             role: DealHandleRole::Seller,
-            network: "shellnet".into(),
+            network: "net-a".into(),
             token_contract: "0:33".into(),
             note_addr: "0:44".into(),
             frame_model: "qwen/qwen3-32b".into(),
@@ -741,7 +862,7 @@ mod tests {
             order_book: Some("0:11".into()),
             root_model: Some("0:22".into()),
             market: Some(sample_market()),
-            contracts: "contracts/deployed.shellnet.json".into(),
+            contracts: "manifest/deployed.manifest.json".into(),
             endpoint: Some(DealEndpointInfo {
                 kind: "gateway".into(),
                 value: "127.0.0.1:8443".into(),
@@ -754,6 +875,7 @@ mod tests {
     /// Issue: a deal handle is written with canonical `<dapp_id>::<account_id>` addresses and is
     /// read back from either that or a legacy `0:<account_id>` file, so an existing deals dir keeps
     /// resolving to the same handle after the upgrade.
+
     /// The DApp half is role-specific. A per-deal `TokenContract` is a self-DApp account - its own
     /// `info.dapp_id` IS its account id - so it is written `<account_id>::<account_id>`. `note_addr`
     /// and `order_book` are system contracts of the shared dexdo DApp.
@@ -826,7 +948,7 @@ mod tests {
     #[test]
     fn deal_handle_allows_public_paths_with_private_words() {
         let mut h = sample_handle();
-        h.contracts = "/tmp/private-inference/contracts/deployed.shellnet.json".into();
+        h.contracts = "/tmp/private-inference/manifest/deployed.manifest.json".into();
         validate_deal_handle(&h).unwrap();
     }
 
@@ -1154,3 +1276,11 @@ mod tests {
         assert_ne!(observed.last_observed_promotion, None);
     }
 }
+
+#[cfg(test)]
+#[path = "deals_stale_handle_1697_tests.rs"]
+mod deals_stale_handle_1697_tests;
+
+#[cfg(test)]
+#[path = "deals_empty_sweep_1716_tests.rs"]
+mod deals_empty_sweep_1716_tests;

@@ -1,10 +1,11 @@
 //! Two consumer-interface translation layers:
-//! - **consumer request -> `CanonRequest`**(canonical, OpenAI chat-completions shape);
+//! - **consumer request -> `CanonRequest`** (canonical, OpenAI chat-completions shape);
 //! - **`CanonChunk` stream -> OpenAI-SSE** and **-> Anthropic-SSE**.
-//! Transcode happens **off-chain, on the buyer side**(B20): the wire(gRPC) and the canonical
+
+//! Transcode happens **off-chain, on the buyer side** (B20): the wire (gRPC) and the canonical
 //! format are not touched. Model verification runs on the canonical stream BEFORE re-rendering --
 //! [`crate::buyer::verify::StreamVerifier`]; chunks arrive here already
-//! past it(the verdict affects accept/STOP, B10).
+//! past it (the verdict affects accept/STOP, B10).
 
 use dexdo_proto::{CanonRequest, ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
@@ -13,10 +14,10 @@ use serde::{Deserialize, Serialize};
 // OpenAI chat-completions: consumer request.
 // ---------------------------------------------------------------------------
 
-/// Body of `POST /v1/chat/completions`(the OpenAI subset needed for B19).
+/// Body of `POST /v1/chat/completions` (the OpenAI subset needed for B19).
 #[derive(Debug, Deserialize)]
 pub struct OpenAiChatRequest {
-    /// The `model` field is NOT trusted -- the model is forced by the market/frame(B2, B19).
+    /// The `model` field is NOT trusted -- the model is forced by the market/frame (B2, B19).
     /// Kept for the "outside the frame -> reject" check.
     #[serde(default)]
     pub model: Option<String>,
@@ -54,7 +55,7 @@ impl StringOrVec {
     }
 }
 
-/// Consumer request(OpenAI) -> `CanonRequest`(B19, R1). The `model` field is NOT carried over:
+/// Consumer request (OpenAI) -> `CanonRequest` (B19, R1). The `model` field is NOT carried over:
 /// the model is forced by the market on the gateway side.
 pub fn openai_to_canon(req: OpenAiChatRequest) -> CanonRequest {
     let messages = req
@@ -78,7 +79,7 @@ pub fn openai_to_canon(req: OpenAiChatRequest) -> CanonRequest {
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI chat-completions: response re-render(SSE chunk + non-streaming).
+// OpenAI chat-completions: response re-render (SSE chunk + non-streaming).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
@@ -105,7 +106,7 @@ pub struct OpenAiDelta {
     pub content: Option<String>,
 }
 
-/// `chat.completion.chunk` with the text delta from `CanonChunk`(re-render B19, R6).
+/// `chat.completion.chunk` with the text delta from `CanonChunk` (re-render B19, R6).
 pub fn openai_delta_chunk(id: &str, model: &str, created: u64, text: &str, first: bool) -> String {
     let chunk = OpenAiChunk {
         id: id.to_string(),
@@ -128,7 +129,7 @@ pub fn openai_delta_chunk(id: &str, model: &str, created: u64, text: &str, first
     serde_json::to_string(&chunk).expect("serialize openai chunk")
 }
 
-/// Terminal `chat.completion.chunk` with the given `finish_reason`(before `[DONE]`). The caller
+/// Terminal `chat.completion.chunk` with the given `finish_reason` (before `[DONE]`). The caller
 /// supplies the classified terminal: `stop`, `length`, `capacity`, `error`, or `content_filter`.
 pub fn openai_final_chunk(id: &str, model: &str, created: u64, finish_reason: &str) -> String {
     let chunk = OpenAiChunk {
@@ -145,7 +146,7 @@ pub fn openai_final_chunk(id: &str, model: &str, created: u64, finish_reason: &s
     serde_json::to_string(&chunk).expect("serialize openai final chunk")
 }
 
-/// Full `chat.completion` for a non-streaming response(text aggregate, B19), including the
+/// Full `chat.completion` for a non-streaming response (text aggregate, B19), including the
 /// caller-classified `finish_reason`.
 pub fn openai_completion(
     id: &str,
@@ -169,10 +170,10 @@ pub fn openai_completion(
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic Messages: request + re-render(local transcode, B20).
+// Anthropic Messages: request + re-render (local transcode, B20).
 // ---------------------------------------------------------------------------
 
-/// Body of `POST /v1/messages`(the Anthropic subset needed for B20).
+/// Body of `POST /v1/messages` (the Anthropic subset needed for B20).
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
     #[serde(default)]
@@ -224,7 +225,7 @@ impl AnthropicContent {
     }
 }
 
-/// Anthropic request -> the same `CanonRequest`(OpenAI shape), local transcode(B20, R1).
+/// Anthropic request -> the same `CanonRequest` (OpenAI shape), local transcode (B20, R1).
 /// `system` maps to a `system`-role message; `model` is not trusted.
 pub fn anthropic_to_canon(req: AnthropicRequest) -> CanonRequest {
     let mut messages = Vec::new();
@@ -274,7 +275,7 @@ pub fn anthropic_message_start(id: &str, model: &str) -> AnthropicEvent {
     ("message_start", data.to_string())
 }
 
-/// Anthropic `content_block_start` event(a single text block, index 0).
+/// Anthropic `content_block_start` event (a single text block, index 0).
 pub fn anthropic_content_block_start() -> AnthropicEvent {
     let data = serde_json::json!({
         "type": "content_block_start",
@@ -284,7 +285,7 @@ pub fn anthropic_content_block_start() -> AnthropicEvent {
     ("content_block_start", data.to_string())
 }
 
-/// Anthropic `content_block_delta` event with the text delta from `CanonChunk`(B20, R6).
+/// Anthropic `content_block_delta` event with the text delta from `CanonChunk` (B20, R6).
 pub fn anthropic_content_block_delta(text: &str) -> AnthropicEvent {
     let data = serde_json::json!({
         "type": "content_block_delta",
@@ -301,7 +302,7 @@ pub fn anthropic_content_block_stop() -> AnthropicEvent {
 }
 
 /// Anthropic `message_delta` event with the given `stop_reason`. The honest end is `"end_turn"`;
-/// a verification bail(B10, substitution) is `"refusal"`, so the consumer can tell a
+/// a verification bail (B10, substitution) is `"refusal"`, so the consumer can tell a
 /// scam-aborted response from a normal completion (review; `refusal` is Anthropic's standard
 /// stop_reason for a non-normal completion).
 pub fn anthropic_message_delta(stop_reason: &str) -> AnthropicEvent {

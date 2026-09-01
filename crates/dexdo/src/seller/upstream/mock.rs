@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 /// Run the mock upstream: build up to `count` deterministic fake tokens **from the prompt**
-/// of the canonical request(R1) and send them incrementally into `tx`(R6, token-by-token). Each mock
+/// of the canonical request (R1) and send them incrementally into `tx` (R6, token-by-token). Each mock
 /// chunk carries one fake token id, so gateway accounting sees one delivered token. Both sides know the tokens are fake (`--mock-model` on
 /// both,). When there is no request -- neutral `mock-token-*`.
 /// Token ids per chunk in the `DEXDO_FIXTURE_FATCHUNK` fixture.
@@ -21,19 +21,22 @@ pub async fn run(
     scammer: bool,
     claimed_model: Option<&str>,
 ) {
-    // claims a DIFFERENT(real) model than the market's frame model -> the buyer's verification(B7) rejects it.
+
+    // claims a DIFFERENT (real) model than the market's frame model -> the buyer's verification (B7) rejects it.
     // `scammer` makes the substitution UNCONDITIONAL -- a seller instance that always
-    // serves the wrong model regardless of the prompt(for the multi-seller failover e2e).
+    // serves the wrong model regardless of the prompt (for the multi-seller failover e2e).
     let substitute = scammer
         || req
             .map(last_user_message)
             .map(|p| p.contains("DEXDO_FIXTURE_SUBSTITUTE"))
             .unwrap_or(false);
-    // token_ids OUTSIDE its vocabulary -> the buyer's verification(B5, tokenizer check) -> Bail.
+
+    // token_ids OUTSIDE its vocabulary -> the buyer's verification (B5, tokenizer check) -> Bail.
     let foreign = req
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_FOREIGN"))
         .unwrap_or(false);
+
     // one. A seller chooses how many tokens a chunk holds, so the buyer's per-request grant has to
     // hold against a chunk that overshoots what is left of it rather than against a convenient
     // one-token-per-chunk stream.
@@ -41,12 +44,14 @@ pub async fn run(
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_FATCHUNK"))
         .unwrap_or(false);
+
     // overshoots it by chunking around it: one token, then two. A buyer whose grant is two must
     // refuse the second chunk BEFORE rendering it, not notice afterwards that it delivered three.
     let straddle = req
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_STRADDLE"))
         .unwrap_or(false);
+
     // actually given, so a test can read off the wire what the buyer SENT rather than infer it from
     // how much came back. `count` is the seller's resolved limit, which for an unconstrained mock is
     // exactly the request's `params.max_tokens`.
@@ -84,11 +89,11 @@ pub async fn run(
                 vec![seq as u32]
             },
             seq: seq as u64,
-            // R3: the gateway declares the available signals on the first chunk. The mock yields(fake)
+            // R3: the gateway declares the available signals on the first chunk. The mock yields (fake)
             // token_ids; the tokenizer family is the mock profile.
             manifest: (seq == 0).then(|| {
                 if substitute {
-                    // Fixture: real family + a foreign model(!= frame) -> buyer's B7 -> Bail.
+                    // Fixture: real family + a foreign model (!= frame) -> buyer's B7 -> Bail.
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
@@ -96,14 +101,14 @@ pub async fn run(
                     }
                 } else if foreign {
                     // Claims the qwen tokenizer, but token_ids are outside the qwen vocabulary -> B5 -> Bail.
-                    // claimed_model is empty(R4, don't fabricate) -> B7 doesn't run; B5 is what catches it.
+                    // claimed_model is empty (R4, don't fabricate) -> B7 doesn't run; B5 is what catches it.
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
                         claimed_model: String::new(),
                     }
                 } else {
-                    // Mock(Permissive -- B5/B7 pass).
+                    // Mock (Permissive -- B5/B7 pass).
                     SignalManifest {
                         tokenizer_family: "mock".to_string(),
                         has_token_ids: true,
@@ -146,12 +151,12 @@ pub async fn run(
             .await
             .is_err()
         {
-            break; // buyer disconnected(STOP)
+            break; // buyer disconnected (STOP)
         }
     }
 }
 
-/// The last `user`-role message in the canonical request(the prompt the output is built from).
+/// The last `user`-role message in the canonical request (the prompt the output is built from).
 fn last_user_message(req: &CanonRequest) -> &str {
     req.messages
         .iter()
@@ -162,11 +167,11 @@ fn last_user_message(req: &CanonRequest) -> &str {
 }
 
 /// Deterministic fake output from the prompt: a prefix marker + echo of the words of the last
-/// user message, one delta token per word, truncated to `count`(mock model).
+/// user message, one delta token per word, truncated to `count` (mock model).
 fn derive_tokens(req: &CanonRequest, count: u64) -> Vec<String> {
     let prompt = last_user_message(req);
     let mut seed: Vec<String> = Vec::new();
-    // Mock marker + echo of the prompt token-by-token(R6: incrementality is preserved).
+    // Mock marker + echo of the prompt token-by-token (R6: incrementality is preserved).
     seed.push("mock-reply: ".to_string());
     for word in prompt.split_whitespace() {
         seed.push(format!("{word} "));

@@ -8,9 +8,9 @@ service Gateway {
   // Authorization step 1: the gateway issues a challenge -- a nonce bound to the token_contract.
   rpc GetChallenge(ChallengeRequest) returns (Challenge);
 
-  // Step 2: the buyer signs the challenge with the note's private key(B18). The gateway verifies
+  // Step 2: the buyer signs the challenge with the note's private key (B18). The gateway verifies
   // the signature against the pubkey from the token_contract and streams chunks ONLY on a match;
-  // otherwise the connection is closed before forwarding(R16).
+  // otherwise the connection is closed before forwarding (R16).
   rpc OpenStream(StreamRequest) returns (stream CanonChunk);
 }
 
@@ -28,11 +28,11 @@ message StreamRequest {
   string token_contract = 1;
   // The same nonce the gateway issued.
   bytes nonce = 2;
-  // ed25519 signature(challenge_bytes) with the buyer's note private key.
+  // ed25519 signature (challenge_bytes) with the buyer's note private key.
   bytes signature = 3;
   // Canonical request: the prompt +
   // sampling parameters travel in the opening call alongside authorization. The gateway adapts
-  // it to its upstream's format(R1). The `model` field is NOT trusted -- the model is forced by the market.
+  // it to its upstream's format (R1). The `model` field is NOT trusted -- the model is forced by the market.
   CanonRequest request = 4;
 }
 
@@ -51,20 +51,20 @@ message ChatMessage {
 }
 
 message SamplingParams {
-  // 0 = not set(the upstream default is used).
+  // 0 = not set (the upstream default is used).
   double temperature = 1;
   // 0 = not set.
   uint32 max_tokens = 2;
   // Stop sequences.
   repeated string stop = 3;
-  // EXPLICIT greedy decode(temperature=0): needed for the B7 full spot-check, so the seller
+  // EXPLICIT greedy decode (temperature=0): needed for the B7 full spot-check, so the seller
   // decodes deterministically and reconciles against the reference endpoint. Separate from `temperature`,
-  // because there 0 = "not set"(the upstream default), whereas here temp=0 must be FORCED.
+  // because there 0 = "not set" (the upstream default), whereas here temp=0 must be FORCED.
   bool greedy = 4;
 }
 
 // Declaration of the available subset of verification signals: the gateway EXPLICITLY states what
-// it returns and does NOT fabricate what is missing(R3/R4). The buyer degrades by fact.
+// it returns and does NOT fabricate what is missing (R3/R4). The buyer degrades by fact.
 message SignalManifest {
   // Retired: `has_logprobs`. Log probabilities are not a verification layer -- most models do not
   // support them at all, so the number is never reused.
@@ -86,11 +86,11 @@ message CanonChunk {
   string text = 1;
   // token-ids for the tokenizer check; in they are fake.
   repeated uint32 token_ids = 2;
-  // Sequence number(incrementality, R6).
+  // Sequence number (incrementality, R6).
   uint64 seq = 3;
-  // Signal declaration -- the gateway states it on the FIRST chunk(seq=0); not repeated afterwards.
+  // Signal declaration -- the gateway states it on the FIRST chunk (seq=0); not repeated afterwards.
   SignalManifest manifest = 5;
-  // Reasoning/thinking delta from providers that separate it from user-visible content(for verification only).
+  // Reasoning/thinking delta from providers that separate it from user-visible content (for verification only).
   // Consumer OpenAI/Anthropic renderers do not expose this as `content`.
   string reasoning = 6;
 }

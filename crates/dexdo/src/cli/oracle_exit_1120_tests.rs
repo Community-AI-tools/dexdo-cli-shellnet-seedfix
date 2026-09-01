@@ -3,6 +3,13 @@ use super::{
     validate_pmp_exit_preflight, PmpExitAction, PmpExitObservation,
 };
 
+/// `getDetails.resultEnd` -- the chain's own `_resultStart + GRACE_PERIOD`. The fixed
+/// `CancelStake` preflight reads it instead of keeping a second copy of GRACE_PERIOD.
+const RESULT_END: u64 = 1_787_246_775;
+/// One second inside the result window: every pre-existing case in this file is a case where the
+/// grace period has NOT passed, so they keep meaning exactly what they meant before.
+const BEFORE_GRACE_END: u64 = RESULT_END - 1;
+
 fn observation() -> PmpExitObservation {
     PmpExitObservation {
         stake_present: true,
@@ -19,6 +26,7 @@ fn observation() -> PmpExitObservation {
 fn cancelled_pmp() -> serde_json::Value {
     serde_json::json!({
         "approved": true,
+        "resultEnd": RESULT_END.to_string(),
         "resolvedOutcome": null,
         "isCancelled": true,
         "frozen": true,
@@ -29,6 +37,7 @@ fn cancelled_pmp() -> serde_json::Value {
 fn resolved_pmp() -> serde_json::Value {
     serde_json::json!({
         "approved": true,
+        "resultEnd": RESULT_END.to_string(),
         "resolvedOutcome": "1",
         "isCancelled": false,
         "frozen": true,
@@ -50,6 +59,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .is_ok());
 
@@ -60,6 +70,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &state,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -72,6 +83,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &state,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -84,6 +96,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &state,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -96,6 +109,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &state,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -108,6 +122,7 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &cancelled_pmp(),
         &shutdown(true),
         &state,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -120,16 +135,21 @@ fn issue_1120_cancel_stake_preflight_rejects_each_visible_contract_refusal() {
         &active,
         &shutdown(true),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
-    .contains("not cancelled"));
+    // CHANGED THIS ASSERTION ON PURPOSE. "not cancelled" alone was the whole old condition
+    // and it refused the self-cancelling call the contract provides. The refusal is still here --
+    // this PMP is inside its result window -- but it now names WHICH half is missing.
+    .contains("grace period has not passed"));
 
     assert!(validate_pmp_exit_preflight(
         PmpExitAction::CancelStake,
         &cancelled_pmp(),
         &shutdown(false),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -143,6 +163,7 @@ fn issue_1120_claim_preflight_requires_resolution_shutdown_and_exact_stake_width
         &resolved_pmp(),
         &shutdown(true),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .is_ok());
 
@@ -153,6 +174,7 @@ fn issue_1120_claim_preflight_requires_resolution_shutdown_and_exact_stake_width
         &unapproved,
         &shutdown(true),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .is_err());
 
@@ -163,6 +185,7 @@ fn issue_1120_claim_preflight_requires_resolution_shutdown_and_exact_stake_width
         &unresolved,
         &shutdown(true),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -173,6 +196,7 @@ fn issue_1120_claim_preflight_requires_resolution_shutdown_and_exact_stake_width
         &resolved_pmp(),
         &shutdown(false),
         &observation(),
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()
@@ -185,6 +209,7 @@ fn issue_1120_claim_preflight_requires_resolution_shutdown_and_exact_stake_width
         &resolved_pmp(),
         &shutdown(true),
         &wrong_width,
+        BEFORE_GRACE_END,
     )
     .unwrap_err()
     .to_string()

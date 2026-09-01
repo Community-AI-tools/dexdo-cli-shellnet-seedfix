@@ -1,16 +1,26 @@
 //! `dexdo-core` -- shared types, protocol parameters, the stream state machine, the crypto note,
 //! and an on-chain abstraction with a mock implementation. Pure logic without networking (state
 //! machine/formulas), plus real local note cryptography and `MockChainBackend`.
+
 //! Canon: `dexdo-cli.md`-, `private-inference-market-design.md`-,, Appx. A.
+
+// The default limit of 128 is not enough to prove `Send` for the chain backend's async trait
+// methods now that there are no cargo features. With the features, `place_buy` and the
+// nine calls it transitively awaits were split across two compilations and neither had to be
+// proved whole; in one build rustc walks the entire chain and gives up at the limit with
+// "overflow evaluating the requirement". It is a warning on this toolchain -- the bound is
+// assumed rather than proved -- and a warning is the wrong place for a `Send` bound to be
+// decided, because the same code is an error on any toolchain that counts a step differently.
+#![recursion_limit = "256"]
 
 // issue: canonical `<dapp_id>::<account_id>` addresses -- the one parse/format for every address a
 // user reads, pastes, or has persisted. Non-gated: the format logic is offline-tested.
 pub mod address;
 // issue: Shell Accumulator SHELL <-> eccUSDC money arithmetic and getter decoders. Non-gated
 // on purpose - the planning logic is what decides whether money moves, so it is offline-tested and
-// runs under the default-feature CI gate rather than only under `shellnet`.
+// runs under the default-feature CI gate rather than only under the chain build.
 pub mod accumulator;
-pub mod chain;
+pub mod market;
 // issue: the structured user-facing error (stable code + kind + message + preserved source
 // chain). It lives in `core` -- not in the CLI crate -- because `dexdo` already depends on `core`,
 // so there is no dependency inversion, and both crates can construct the same codes.
@@ -21,71 +31,72 @@ pub mod note;
 pub mod onchain_diagnostics;
 pub mod params;
 pub mod settle;
-// issue: market-provisioning output manifest(pure data; consumed by seller/buyer).
+// issue: market-provisioning output manifest (pure data; consumed by seller/buyer).
 pub mod manifest;
-// issue: oracle/PMP prediction-market provisioning manifest(pure data).
+// issue: oracle/PMP prediction-market provisioning manifest (pure data).
 pub mod oracle_manifest;
-// wallet-address parse/normalize(`half1::half2` -> `0:<half2>`), fail-loud. Non-gated so
-// the format logic is offline-tested; consumed by the real money path(`shellnet`) and the seed-wallet CLI.
+// wallet-address parse/normalize (`half1::half2` -> `0:<half2>`), fail-loud. Non-gated so
+// the format logic is offline-tested; consumed by the real money path (the chain build) and the seed-wallet CLI.
 pub mod wallet;
 mod canonical_multisig_allowlist;
-// real shellnet backend on top of the gosh.ackinacki SDK(behind the `shellnet` feature).
-#[cfg(feature = "shellnet")]
+// real chain backend on top of the gosh.ackinacki SDK (behind a cargo feature that no longer exists).
 pub mod canonical_multisig;
-#[cfg(not(feature = "shellnet"))]
-pub mod canonical_multisig {
-    pub use crate::canonical_multisig_allowlist::{
-        is_supported_spending_code_hash, CODE_HASH, CONTRACT_NAME, LEGACY_SPENDING_CODE_HASH,
-        SUPPORTED_SPENDING_CODE_HASHES, VERSION,
-    };
-}
-/// Stable classification prefix emitted when the shellnet read policy exhausts its retry budget.
+/// Stable classification prefix emitted when the chain read policy exhausts its retry budget.
 /// It remains feature-independent because the seller must recognize that result in default builds.
 pub const CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX: &str = "chain read got no answer after ";
-#[cfg(feature = "shellnet")]
-pub mod shellnet;
+pub mod chain;
 
-/// SDK shellnet types -- re-exported behind `shellnet` for the live harness and the production CLI note-deploy
+/// which of `withdrawTokens`'s eleven gates holds a note's money. Feature-independent: the
+/// per-gate regression the money directive asks for must run in the default build.
+pub mod note_withdraw_gate;
+pub use note_withdraw_gate::{
+    check_withdrawal_arrival, note_withdraw_gate_from_storage, NoteWithdrawalArrival,
+    refusal_carries_a_withdraw_gate_code, withdraw_gate_line,
+    NoteWithdrawGate, WithdrawGate, WITHDRAW_GATE_EXIT_CODES, WITHDRAW_GATE_FIELDS,
+};
+
+/// SDK chain types -- re-exported behind the chain build for the live harness and the production CLI note-deploy
 /// path. Wallet custody stays external. `note deploy` generates the PrivateNote owner key and persists it in
 /// operator-owned recovery/pool files; subsequent commands read wallet/note secrets from explicit files.
-#[cfg(feature = "shellnet")]
 pub use gosh_ackinacki::{
     airegistry, private_note,
     sdk::{Address, ChainClient, KeyPair},
 };
-#[cfg(feature = "shellnet")]
 pub mod ackinacki_wallet {
     pub use gosh_ackinacki::wallet::query;
 }
-#[cfg(feature = "test-giver")]
-pub use shellnet::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
-#[cfg(feature = "shellnet")]
-pub use shellnet::{
+pub use chain::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
+pub use chain::{
     endpoint_urls, keypair_ed_pubkey, normalize_endpoint, note_transfer_amount_refusal,
     note_transfer_deposit_identifier_hash, note_transfer_dest_refusal, note_transfer_sender_refusal,
-    note_transfer_submit_hint, real_market_deal_view, resolve_endpoint,
-    shellnet_clock_skew_preflight, shellnet_http_client, DealContext, Deployed, MoneySubmitError,
+    note_transfer_submit_hint, note_withdraw_gate_from_account_boc, real_market_deal_view,
+    resolve_endpoint,
+    chain_clock_skew_preflight, chain_http_client, DealContext, Deployed, MoneySubmitError,
     NoteTransferRefusal, RealBuyerBackend, RealChainBackend, RealDealBackend, RealNote,
     RealSellerBackend,
-    ShellnetDoctorCheck, ShellnetDoctorReport, ShellnetDoctorStatus, TokenContractCurrentFacts,
+    ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus, TokenContractCurrentFacts,
+    NoteDealCreditReceipt,
     TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
-    TokenContractSettlementReceipts, DEFAULT_SHELLNET_ENDPOINT,
+    TokenContractSettlementReceipts,
 };
 
 pub use address::{CanonicalAddress, DEXDO_DAPP_ID};
-pub use chain::flags as order_flags;
-pub use chain::{
-    aggregate_tree, check_buy_deposit_headroom, check_disputable,
+pub use market::flags as order_flags;
+pub use market::{
+    aggregate_tree, buyer_net_result, buyer_total_debit,
+    check_buy_deposit_headroom, check_declared_payout_against_credits, check_disputable,
     check_matched_token_contract_state, check_reclaimable, check_recoverable,
     check_release_disputable, check_seller_pubkey, check_subscription_buy_reserve,
-    check_withdrawable_shell, deal_anomalies, executable_quote, order_deadline_is_live,
+    check_withdrawable_shell, deal_anomalies, executable_quote, implied_write_off,
+    order_deadline_is_live,
     ordinary_buy_reserve, per_model_breakdown, required_escrow_for_buy,
     submit_safe_single_ask_quote, subscription_buy_clearing_refund, subscription_buy_reserve,
     subscription_claim_cap_at,
     subscription_current_week_headroom, validate_seller_resume_state, BuyerOrderFact,
     BuyerOrderFactKind, BuyerStopTerminalFact, BuyerStopTerminalReceipt, ChainBackend, ChainError,
     ClaimBounds, CounterpartyTally,
-    DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState, DealOfferLatch, DealRole,
+    ConservationBreach, DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState,
+    DealLedger, DealLedgerStep, DealMoneyFlow, DealOfferLatch, DealRole, DealSettlement,
     DealSellerBond, DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
     MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend,
     MockSubscriptionExit, MockSubscriptionTerminal, ModelBreakdown,
@@ -109,7 +120,8 @@ pub use onchain_diagnostics::{
 };
 pub use oracle_manifest::OracleMarketManifest;
 pub use params::{
-    cli_buy_deadline_is_valid, default_buy_deadline, probe_seed_owed, DobParams, ProtocolConsts,
+    cli_buy_deadline_is_valid, default_buy_deadline, price_raw_from_shell, probe_seed_owed,
+    shell_amount, shell_amount_of_text, shell_amount_raw, DobParams, ProtocolConsts,
     Shell, DEAL_SNAPSHOT_MAX_ATTEMPTS, DEFAULT_BUY_TTL, MATCH_OPEN_TIMEOUT,
     BUYER_HANDOVER_WAIT_SECS, BUYER_ON_DEMAND_PURCHASE_SECS, MATCH_OPEN_TIMEOUT_SECS,
     MAX_SELL_TTL, MIN_STREAM_BUY_TICKS, PLATFORM_FEE_BPS, PRICE_STEP,

@@ -1,4 +1,5 @@
 //! Shared constructors for the claim/delivery measurements added by.
+
 //! The CLI owns stdout, sequencing, and timestamps. Keeping the complete v1 objects here gives the
 //! production writers and the regression test one schema path without exposing any output sink to
 //! the money-driving tasks.
@@ -8,7 +9,7 @@ use crate::seller::ClaimDeliveryMeasurement;
 use serde_json::{json, Value};
 
 pub const SELLER_EVENT_SCHEMA: &str = "dexdo.seller.event.v1";
-pub const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v1";
+pub const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SellerClaimEventKind {

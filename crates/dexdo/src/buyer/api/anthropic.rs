@@ -1,7 +1,7 @@
 //! Optional Anthropic-compatible endpoint: `POST /v1/messages`,
-//! a **local transcode** to the same `CanonRequest`(OpenAI shape) and back `CanonChunk` ->
+//! a **local transcode** to the same `CanonRequest` (OpenAI shape) and back `CanonChunk` ->
 //! Anthropic-SSE, for Anthropic-native clients. The transcode is off-chain, on the
-//! buyer side: the wire(gRPC) and the canonical format are not touched.
+//! buyer side: the wire (gRPC) and the canonical format are not touched.
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
@@ -21,14 +21,14 @@ use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `POST /v1/messages`(B20). Transcodes the request -> `CanonRequest`, opens the same
+/// `POST /v1/messages` (B20). Transcodes the request -> `CanonRequest`, opens the same
 /// authorized TLS gRPC stream and re-renders `CanonChunk` into Anthropic-SSE
 /// (`message_start` -> `content_block_*` -> `message_delta` -> `message_stop`).
 pub async fn messages(
     State(state): State<ApiState>,
     Json(req): Json<AnthropicRequest>,
 ) -> Response {
-    // The model is forced by the market(B2/B19) -- the same check as for the OpenAI path.
+    // The model is forced by the market (B2/B19) -- the same check as for the OpenAI path.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
@@ -57,10 +57,11 @@ pub async fn messages(
         }
         RouteBudget::Exhausted(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
     }
-    // one-per-deal content-identity gate(B8 + B7-full), run ONCE before the first paid stream -- the same
+    // one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream -- the same
     // gate as the OpenAI path. The inline StreamVerifier only runs B5/B6 + the cheap declared-NAME B7; a seller
     // serving a cheaper model under the correct NAME is caught only here. On a bail the gate closes the deal and
     // attempts policy recovery; a transport error is not cached, so a later request retries.
+
     // this runs AFTER admission and inside the reservation it granted - verification is paid
     // output on this deal, so an exhausted week must not reach it and what it consumes comes out of
     // the same grant as the answer.
@@ -164,7 +165,7 @@ pub async fn messages(
     };
 
     // Session-scoped: no per-request STOP -- the shared session settles once at session end / on a
-    // verification-bail(as in the OpenAI path).
+    // verification-bail (as in the OpenAI path).
     let delivery_events = state.delivery_events.clone();
     if stream {
         sse_response(
@@ -192,7 +193,7 @@ pub async fn messages(
     }
 }
 
-/// Re-render the canonical stream to Anthropic-SSE(B20, R6). Accounting/verification happen before re-rendering.
+/// Re-render the canonical stream to Anthropic-SSE (B20, R6). Accounting/verification happen before re-rendering.
 #[allow(clippy::too_many_arguments)]
 fn sse_response(
     upstream: tonic::Streaming<CanonChunk>,
@@ -251,7 +252,7 @@ fn sse_response(
             }
         }
         // Session-scoped: completion / max_tokens / upstream-error do NOT STOP -- only a
-        // verification-bail ends the session early(STOP + bail off). `errored` still drives stop_reason below.
+        // verification-bail ends the session early (STOP + bail off). `errored` still drives stop_reason below.
         let bailed = driver.bailed();
         let received = driver.received();
         drop(driver);
@@ -273,6 +274,7 @@ fn sse_response(
         }
         // stop_reason does NOT pass off a bail/error as an honest `end_turn` -- bail -> `refusal`,
         // transport error -> `error`, otherwise `end_turn`.
+
         // `max_tokens` used to require `received == 0`, so a grant that cut the answer after
         // some of it had already been rendered reported `end_turn` -- indistinguishable from a model
         // that finished. The cap ends the answer at any `received`, not only at zero.
@@ -318,13 +320,13 @@ pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Ev
     }
 }
 
-/// Build an axum SSE `Event` from `(name, JSON data)`(B20). A single source of truth for the
+/// Build an axum SSE `Event` from `(name, JSON data)` (B20). A single source of truth for the
 /// frame -- the HTTP layer adds `event:`/`data:`.
 fn event((name, data): render::AnthropicEvent) -> Event {
     Event::default().event(name).data(data)
 }
 
-/// Non-streaming Anthropic response(B20): a single `message` JSON with aggregated text.
+/// Non-streaming Anthropic response (B20): a single `message` JSON with aggregated text.
 #[allow(clippy::too_many_arguments)]
 async fn aggregate_response(
     upstream: tonic::Streaming<CanonChunk>,
@@ -378,7 +380,7 @@ async fn aggregate_response(
         }
     }
     // Session-scoped: a clean completion / max_tokens does NOT STOP -- only a verification-bail ends
-    // the session early(STOP + bail off).
+    // the session early (STOP + bail off).
     let bailed = driver.bailed();
     let received = driver.received();
     drop(driver);
@@ -418,7 +420,7 @@ async fn aggregate_response(
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
     request_guard.complete();
-    // verification bail -> `refusal`(distinguishable from an honest `end_turn`).
+    // verification bail -> `refusal` (distinguishable from an honest `end_turn`).
     // `max_tokens` no longer requires `received == 0` -- a grant that cut the answer after
     // part of it had been aggregated reported `end_turn`, which is what a finished model reports.
     let stop_reason = if bailed {

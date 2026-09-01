@@ -1,4 +1,5 @@
 //! Client-side ModelRegistry policy for issue.
+
 //! The registry is an on-chain authority. This module keeps the local pieces
 //! reusable and testable: strict operator config, read-only registry facts, and
 //! role-neutral validation against dexdo's own model hash/book derivation.
@@ -9,17 +10,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "shellnet")]
 use serde_json::json;
-#[cfg(feature = "shellnet")]
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
 };
-#[cfg(feature = "shellnet")]
 use tokio::sync::OnceCell;
 
-#[cfg(feature = "shellnet")]
 type RegistryAccountSnapshot = std::result::Result<String, String>;
 
 pub const MODEL_REGISTRY_ABI_JSON: &str =
@@ -101,7 +98,9 @@ impl RegistryValidationPolicy {
 
     pub fn disabled() -> Self {
         Self {
-            network: "shellnet".to_string(),
+            // Even switched off, the label names the chain this run is on: it is read back into
+            // refusals, and a literal here would name a chain the operator is not working on.
+            network: dexdo_core::params::current_network().to_string(),
             registry_address: None,
             seller_check_model_registry: false,
             seller_deploy_missing_order_book: false,
@@ -147,12 +146,16 @@ impl RawRegistryValidationConfig {
                 cfg.schema
             );
         }
-        if cfg.registry.network != "shellnet" {
-            bail!(
-                "registry.network `{}` is unsupported (only `shellnet` is supported)",
-                cfg.registry.network
-            );
-        }
+        // a network LABEL is checked for being a network, and nothing more. It used to be
+        // the whole decision -- anything but one hard-coded label was refused by name -- which
+        // made `--model-registry-validation` impossible to express on mainnet no matter what was
+        // deployed there. Whether a registry actually EXISTS is a fact about the chain, so it is
+        // answered by reading the account (`ChainModelRegistryReader::account_boc`), and its
+        // refusal names the address and the network it looked at.
+        // No check that the label is "known".: the client keeps no list of networks, so it
+        // has no ground to refuse one. Whether a registry EXISTS on the chain the manifest names is
+        // a fact about that chain, and it is answered by reading the account -- which is what the
+        // reader below does, naming the address and the network it looked at when it is not there.
         if let Some(addr) = cfg.registry.address.as_deref() {
             cfg.registry.address = Some(validate_registry_address(addr)?);
         }
@@ -292,6 +295,54 @@ pub async fn validate_registered_model(
     })
 }
 
+/// The registry WAS READ, and this is what it said.
+
+/// callers have to tell a verdict about the name apart from a failure to obtain one, because
+/// the two give the operator opposite instructions -- change the name, versus try again when the
+/// endpoint answers. Both arrive as `Err` from this resolver, so the difference is carried by the
+/// TYPE rather than by the words.
+
+/// It is a type and not a substring match for a measured reason: this error's own text interpolates
+/// the claimed model, the candidate list, the suggestions and the registry address, so any sniffing
+/// of it can be triggered by an operator's model name (`acme--vision--403b`) or by the account id a
+/// future ModelRegistry happens to be deployed at.
+
+/// Everything the reader itself raises -- no manifest entry, an inactive account, a transport
+/// failure, a rate-limit -- travels as an ordinary error and therefore means "not read".
+#[derive(Debug)]
+pub struct RegistryAnswered(String);
+
+impl RegistryAnswered {
+    /// Mark a message as a verdict the registry produced.
+
+    /// Public so a test can build the two cases apart. A test that fabricated a verdict with a bare
+    /// `anyhow!` would be fabricating the very distinction under test -- and did: the first draft of
+    /// `an_unreadable_registry_is_not_reported_as_a_bad_model_name` built its membership miss that
+    /// way, and the miss was classified as an unread registry, which is the failure the function
+    /// exists to prevent.
+    pub fn error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self(message.into()))
+    }
+}
+
+impl std::fmt::Display for RegistryAnswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegistryAnswered {}
+
+/// Did this failure carry a verdict from the registry, anywhere in its chain?
+
+/// `false` means the registry could not be asked. The chain is walked because callers add context
+/// on the way up, and the marker must survive that.
+pub fn registry_answered(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RegistryAnswered>().is_some())
+}
+
 pub async fn resolve_registered_model_identity(
     reader: &(dyn ModelRegistryReader + Send + Sync),
     role: RegistryRole,
@@ -306,7 +357,8 @@ pub async fn resolve_registered_model_identity(
             Some(entry) if entry.exists => {
                 let expected_model_hash = dexdo_core::model_hash_for(candidate);
                 if normalize_hash(&entry.model_hash) != normalize_hash(&expected_model_hash) {
-                    bail!(
+                    // A VERDICT: the registry was read and its entry disagrees with itself.
+                    return Err(RegistryAnswered::error(format!(
                         "{} content identity registry check failed: claimed model {} resolved to ModelRegistry {} entry {} but modelHash {} != sha256(entry) {}",
                         role.as_str(),
                         claimed_model,
@@ -314,17 +366,19 @@ pub async fn resolve_registered_model_identity(
                         candidate,
                         entry.model_hash,
                         expected_model_hash
-                    );
+                    )));
                 }
-                let order_book =
-                    nonzero_registry_order_book(&entry.order_book).with_context(|| {
-                        format!(
-                            "{} content identity registry check failed: ModelRegistry {} entry {} returned malformed orderBook",
-                            role.as_str(),
-                            registry_display,
-                            candidate
-                        )
-                    })?;
+                // A VERDICT too: the entry was READ and its orderBook is unusable. Left unmarked
+                // this read as "the registry could not be reached", and the operator was told to
+                // retry -- for a bad on-chain entry that retrying will never change.
+                let order_book = nonzero_registry_order_book(&entry.order_book).map_err(|error| {
+                    RegistryAnswered::error(format!(
+                        "{} content identity registry check failed: ModelRegistry {} entry {} returned malformed orderBook: {error:#}",
+                        role.as_str(),
+                        registry_display,
+                        candidate
+                    ))
+                })?;
                 return Ok(ResolvedModelIdentity {
                     requested_model: claimed_model.to_string(),
                     registry_model: candidate.clone(),
@@ -338,23 +392,24 @@ pub async fn resolve_registered_model_identity(
     let suggestions = registered_model_suggestions(reader, claimed_model)
         .await
         .unwrap_or_default();
+    // Both of these are VERDICTS: every candidate was looked up and none is registered.
     if !suggestions.is_empty() {
-        bail!(
+        return Err(RegistryAnswered::error(format!(
             "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}; registered canonical suggestions: {:?}",
             role.as_str(),
             claimed_model,
             registry_display,
             misses,
             suggestions
-        );
+        )));
     }
-    bail!(
+    Err(RegistryAnswered::error(format!(
         "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}",
         role.as_str(),
         claimed_model,
         registry_display,
         misses
-    )
+    )))
 }
 
 async fn registered_model_suggestions(
@@ -400,7 +455,6 @@ async fn registered_model_suggestions(
         let Ok(Some(order_book)) = nonzero_registry_order_book(&entry.order_book) else {
             continue;
         };
-        #[cfg(feature = "shellnet")]
         {
             let Ok(expected_order_book) =
                 dexdo_core::RealChainBackend::canonical_inference_orderbook_address(
@@ -413,14 +467,11 @@ async fn registered_model_suggestions(
                 continue;
             }
         }
-        #[cfg(not(feature = "shellnet"))]
-        let _ = order_book;
         suggestions.push(name);
     }
     Ok(suggestions)
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn model_registry_names_from_storage_fields(fields: &Value) -> Result<Vec<String>> {
     let mut names = fields
         .get("_models")
@@ -490,10 +541,46 @@ pub fn registry_identity_candidates(model_id: &str) -> Vec<String> {
     let alias = model_id_alias(trimmed);
     push_candidate(&mut out, &alias);
 
-    if let Some(display_alias) = display_case_served_alias(&alias) {
-        push_candidate(&mut out, &display_alias);
+    let display_alias = display_case_served_alias(&alias);
+    if let Some(display_alias) = display_alias.as_deref() {
+        push_candidate(&mut out, display_alias);
+    }
+
+    // the 4.0.36 catalog names a model WITHOUT its producer -- `Qwen/Qwen3-32B` is seeded
+    // into ModelRegistry as `Qwen3-32B` -- so a producer-prefixed candidate list resolves nothing
+    // on a 4.0.36 chain. The prefixed forms stay FIRST: a registry carrying both conventions must
+    // still answer with the prefixed name, which is what every 4.0.35 deployment registered.
+
+    // Both producer-free forms are needed because the catalog mixes case within one file
+    // (`gpt-oss-20b` is there and `Gpt-Oss-20B` is not; `Qwen3-32B` is there and `qwen3-32b` is
+    // not). The lowercase one goes first because it is the one that pays off: of the catalogue's
+    // 10957 producer-free names, 6153 are all-lowercase, while only 667 of the 4804 capitalised
+    // ones are reproducible by `display_case_token` at all -- it renders `SRPO-Qwen-32B` as
+    // `Srpo-Qwen-32B` and misses. Order is cost only: coverage is the same either way, since both
+    // forms are always tried before the lookup gives up.
+
+    // Counted over `contracts/canonical-model-ids.md` as the lines that carry no whitespace, which
+    // is what separates a name from the file's own prose; the total agrees with the header's own
+    // arithmetic (8558 baseline - 53 merged aliases + 2428 additions + 24 catalogue delta of
+    // 2026-08-27). An earlier revision of this comment said 10952/6153/665, counted with a filter
+    // that let a few header lines through.
+    push_producer_free(&mut out, &alias);
+    if let Some(display_alias) = display_alias.as_deref() {
+        push_producer_free(&mut out, display_alias);
     }
     out
+}
+
+/// The part of a served alias after the producer, or nothing when there is no producer to drop.
+fn producer_free_name(model_id: &str) -> Option<&str> {
+    let (producer, rest) = model_id.split_once('/')?;
+    (!producer.is_empty() && !rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+
+fn push_producer_free(out: &mut Vec<String>, served_alias: &str) {
+    if let Some(bare) = producer_free_name(served_alias) {
+        push_candidate(out, bare);
+    }
 }
 
 pub fn model_id_alias(model_id: &str) -> String {
@@ -656,8 +743,7 @@ impl ModelRegistryReader for UnavailableModelRegistryReader {
     }
 }
 
-#[cfg(feature = "shellnet")]
-pub struct ShellnetModelRegistryReader {
+pub struct ChainModelRegistryReader {
     chain: dexdo_core::RealChainBackend,
     registry_address: dexdo_core::Address,
     abi_json: String,
@@ -665,8 +751,7 @@ pub struct ShellnetModelRegistryReader {
     getter_runner: dexdo_core::airegistry::run::GetterRunner,
 }
 
-#[cfg(feature = "shellnet")]
-impl ShellnetModelRegistryReader {
+impl ChainModelRegistryReader {
     pub fn from_manifest(contracts: &Path, registry_address: &str) -> Result<Self> {
         Self::from_manifest_with_endpoint(contracts, None, registry_address)
     }
@@ -676,7 +761,12 @@ impl ShellnetModelRegistryReader {
         endpoint: Option<&str>,
         registry_address: &str,
     ) -> Result<Self> {
-        Self::from_manifest_abi_json(contracts, endpoint, registry_address, MODEL_REGISTRY_ABI_JSON)
+        Self::from_manifest_abi_json(
+            contracts,
+            endpoint,
+            registry_address,
+            MODEL_REGISTRY_ABI_JSON,
+        )
     }
 
     pub fn from_manifest_abi_json(
@@ -692,7 +782,13 @@ impl ShellnetModelRegistryReader {
             .map_err(|e| anyhow::anyhow!("ModelRegistry address {registry_address}: {e}"))?
             .into_chain();
         let chain = dexdo_core::RealChainBackend::connect_with_endpoint(contracts, endpoint)
-            .with_context(|| format!("connect shellnet using {}", contracts.display()))?;
+            .with_context(|| {
+                format!(
+                    "connect {} using {}",
+                    dexdo_core::params::current_network(),
+                    contracts.display()
+                )
+            })?;
         let snapshot_key = format!(
             "{}\0{}",
             chain.client().endpoint(),
@@ -731,17 +827,25 @@ impl ShellnetModelRegistryReader {
                         .get_account(&self.registry_address)
                         .await?
                         .ok_or_else(|| {
+                            // the refusal states the FACT it found -- no registry account at
+                            // this address on this chain -- and names both, because that is what
+                            // tells the operator whether the address or the network is wrong.
                             anyhow::anyhow!(
-                                "ModelRegistry {} account was not found",
+                                "no ModelRegistry at {} on network `{}` ({}): the account was not \
+                                 found",
                                 dexdo_core::address::display(
                                     &self.registry_address.with_workchain()
-                                )
+                                ),
+                                self.chain.network(),
+                                self.chain.client().endpoint()
                             )
                         })?;
                     if !account.is_active() {
                         bail!(
-                            "ModelRegistry {} is not active (status {})",
+                            "ModelRegistry {} on network `{}` ({}) is not active (status {})",
                             dexdo_core::address::display(&self.registry_address.with_workchain()),
+                            self.chain.network(),
+                            self.chain.client().endpoint(),
                             account.status
                         );
                     }
@@ -761,6 +865,27 @@ impl ShellnetModelRegistryReader {
             .map_err(|error| anyhow::anyhow!(error.clone()))
     }
 
+    /// The cardinality the registry states about ITSELF, read from `count()`.
+
+    /// Separate from decoding `_models`, and that is the point: the two are independent answers to
+    /// the same question, so a disagreement between them is evidence rather than noise. ``
+    /// exports both and refuses when they differ -- a name list that quietly disagrees with the
+    /// count is the kind of half-truth an operator would seed a `models.json` from.
+    pub async fn declared_model_count(&self) -> Result<u32> {
+        let answered = self
+            .getter_runner
+            .run_getter(
+                &self.abi_json,
+                &self.registry_address.with_workchain(),
+                self.account_boc().await?,
+                "count",
+                dexdo_core::airegistry::run::no_args(),
+            )
+            .await
+            .context("ModelRegistry count()")?;
+        parse_registry_count(&answered)
+    }
+
     async fn getter(&self, method: &str, frame_model: &str) -> Result<Value> {
         self.getter_runner
             .run_getter(
@@ -774,7 +899,6 @@ impl ShellnetModelRegistryReader {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn registry_account_snapshots(
 ) -> &'static Mutex<HashMap<String, Arc<OnceCell<RegistryAccountSnapshot>>>> {
     static SNAPSHOTS: OnceLock<Mutex<HashMap<String, Arc<OnceCell<RegistryAccountSnapshot>>>>> =
@@ -782,9 +906,8 @@ fn registry_account_snapshots(
     SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(feature = "shellnet")]
 #[async_trait]
-impl ModelRegistryReader for ShellnetModelRegistryReader {
+impl ModelRegistryReader for ChainModelRegistryReader {
     async fn model(&self, frame_model: &str) -> Result<Option<ModelRegistryEntry>> {
         let has = self
             .getter("has", frame_model)
@@ -794,22 +917,47 @@ impl ModelRegistryReader for ShellnetModelRegistryReader {
             return Ok(None);
         }
 
+        // Everything below this line is a VERDICT, and is marked as one.
+
+        // `has` already answered yes, so the registry was reached and read. What can still fail here
+        // is the ENTRY: a `modelHashOf` with no hash in it, an `orderBookOf` that is malformed or
+        // zero. Left as plain errors these came back through `registry_was_unreachable` as "the
+        // ModelRegistry could not be read", and `deploy-market` told the operator to retry -- for a
+        // bad on-chain entry that retrying will never change.
+
+        // The marker was applied one layer up, in `resolve_registered_model_identity`, which these
+        // never reach: they leave the reader with `?` and the layer above only sees an error.
         let model_hash_of = self
             .getter("modelHashOf", frame_model)
             .await
             .with_context(|| format!("ModelRegistry modelHashOf({frame_model})"))?;
-        let model_hash = getter_hash(&model_hash_of, &["value0"])
-            .context("modelHashOf returned no modelHash")?;
+        let model_hash = getter_hash(&model_hash_of, &["value0"]).ok_or_else(|| {
+            RegistryAnswered::error(format!(
+                "ModelRegistry entry {frame_model}: modelHashOf returned no modelHash"
+            ))
+        })?;
 
         let order_book_of = self
             .getter("orderBookOf", frame_model)
             .await
             .with_context(|| format!("ModelRegistry orderBookOf({frame_model})"))?;
-        let raw_order_book = getter_address(&order_book_of, &["value0"])
-            .context("orderBookOf returned no address")?;
+        let raw_order_book = getter_address(&order_book_of, &["value0"]).ok_or_else(|| {
+            RegistryAnswered::error(format!(
+                "ModelRegistry entry {frame_model}: orderBookOf returned no address"
+            ))
+        })?;
         let order_book = nonzero_registry_order_book(&raw_order_book)
-            .context("orderBookOf returned malformed address")?
-            .ok_or_else(|| anyhow::anyhow!("orderBookOf returned zero address"))?;
+            .map_err(|error| {
+                RegistryAnswered::error(format!(
+                    "ModelRegistry entry {frame_model}: orderBookOf returned a malformed address: \
+                     {error:#}"
+                ))
+            })?
+            .ok_or_else(|| {
+                RegistryAnswered::error(format!(
+                    "ModelRegistry entry {frame_model}: orderBookOf returned the zero address"
+                ))
+            })?;
 
         Ok(Some(ModelRegistryEntry {
             exists: true,
@@ -825,6 +973,49 @@ impl ModelRegistryReader for ShellnetModelRegistryReader {
             "ModelRegistry",
         )?;
         model_registry_names_from_storage_fields(&fields)
+    }
+}
+
+/// The `uint32` a `count()` answer carries, whatever shape the decoder chose for it.
+
+/// Free-standing and not a method, because the parsing is the part that can be wrong in silence:
+/// `tvm` decodes small unsigned integers to a JSON string as readily as to a number, and a reader
+/// that handled only one of the two would answer `0` for a registry holding ten thousand names --
+/// and `0` is a number the caller cannot tell from an empty registry.
+
+/// Accepts what a getter legitimately produces and nothing else: a JSON number in `u32` range, a
+/// decimal string of ASCII digits, or a hex string behind `0x` OR `0X`. Both spellings, because the
+/// tree's own canonical reader takes both (`chain::client::parse_u128_literal`) and a copy that
+/// took one would fail against a decoder that capitalises it. A sign, a fraction, an empty hex tail
+/// and anything above `u32::MAX` are NAMED rather than coerced -- a count that quietly became
+/// something else is the failure this whole path exists to prevent.
+pub fn parse_registry_count(answered: &Value) -> Result<u32> {
+    let raw = answered
+        .get("value0")
+        .ok_or_else(|| anyhow::anyhow!("ModelRegistry count() returned no value0"))?;
+    let refuse = |text: &str| anyhow::anyhow!("ModelRegistry count() answered {text:?}");
+    match raw {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            match trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+                    u32::from_str_radix(hex, 16).map_err(|_| refuse(trimmed))
+                }
+                Some(_) => Err(refuse(trimmed)),
+                None if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) => {
+                    trimmed.parse::<u32>().map_err(|_| refuse(trimmed))
+                }
+                None => Err(refuse(trimmed)),
+            }
+        }
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("ModelRegistry count() answered {number}")),
+        other => anyhow::bail!("ModelRegistry count() answered {other}, which is not a number"),
     }
 }
 
@@ -912,7 +1103,6 @@ fn address_from_value(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| value.get("address").and_then(|v| v.as_str()))
 }
 
-#[cfg(feature = "shellnet")]
 fn getter_bool(value: &Value, keys: &[&str]) -> Option<bool> {
     keys.iter().find_map(|key| {
         let v = value.get(*key)?;
@@ -924,7 +1114,6 @@ fn getter_bool(value: &Value, keys: &[&str]) -> Option<bool> {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn getter_hash(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         let v = value.get(*key)?;
@@ -945,7 +1134,6 @@ fn getter_hash(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn getter_address(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         let s = value.get(*key)?.as_str()?.trim();
@@ -972,11 +1160,67 @@ mod tests {
         format!(
             r#"{{
               "schema": "{MODEL_REGISTRY_VALIDATION_SCHEMA}",
-              "registry": {{ "address": "{REG}", "network": "shellnet" }},
+              "registry": {{ "address": "{REG}", "network": "net-a" }},
               "seller": {{ "check_model_registry": {seller}, "deploy_missing_order_book": false }},
               "buyer": {{ "check_model_registry": {buyer} }}
             }}"#
         )
+    }
+
+    /// Every shape a `count()` answer arrives in, and every shape it must refuse.
+
+    /// Placed in the plain test module on purpose. It was written when the command that calls this
+    /// sat behind a cargo feature CI only compiled, so a test beside the command never executed in
+    /// the build that gates the tree. removed the features, and the placement is still the
+    /// right one: this parser is reachable from more than that one command.
+
+    /// The refusing half is the load-bearing one. A parser that coerced instead of refusing would
+    /// answer `0` for a full registry, and `0` is indistinguishable from an empty one -- the very
+    /// confusion the count/map cross-check exists to prevent.
+    #[test]
+    fn a_count_answer_is_read_in_every_shape_and_refused_in_every_other() {
+        use serde_json::json;
+
+        for (answered, expected) in [
+            (json!({"value0": 10933}), 10933_u32),
+            (json!({"value0": "10933"}), 10933),
+            (json!({"value0": " 10933 "}), 10933),
+            (json!({"value0": "0x2AB5"}), 10933),
+            // Both spellings of the prefix: a decoder that capitalises it is not a broken registry.
+            (json!({"value0": "0X2ab5"}), 10933),
+            (json!({"value0": 0}), 0),
+            (json!({"value0": u32::MAX}), u32::MAX),
+        ] {
+            assert_eq!(
+                super::parse_registry_count(&answered).unwrap_or_else(|error| panic!(
+                    "{answered} is a shape a getter produces, and it was refused: {error}"
+                )),
+                expected,
+                "{answered}"
+            );
+        }
+
+        for answered in [
+            json!({}), // no value0 is not a count of zero
+            json!({"value0": "0x"}), // a prefix with no digits behind it
+            json!({"value0": "0X"}),
+            json!({"value0": "+5"}), // a sign is not a getter's spelling
+            json!({"value0": "-1"}),
+            json!({"value0": ""}),
+            json!({"value0": "not-a-number"}),
+            json!({"value0": "1e5"}), // reads as hex-ish, is neither
+            json!({"value0": 10933.5}), // a count is not fractional
+            json!({"value0": -1}),
+            json!({"value0": (u32::MAX as u64) + 1}), // above the ABI's uint32
+            json!({"value0": "4294967296"}),
+            json!({"value0": true}),
+            json!({"value0": ["10933"]}),
+        ] {
+            assert!(
+                super::parse_registry_count(&answered).is_err(),
+                "{answered} was accepted as a count; a coerced count is a silent zero"
+            );
+        }
     }
 
     #[test]
@@ -1027,15 +1271,23 @@ mod tests {
         assert!(policy.seller_deploy_missing_order_book);
     }
 
+    /// What "malformed" means, and what it stopped meaning.
+
+    /// A row asserting that an UNRECOGNISED network label is rejected used to sit at the end of this
+    /// list. It is gone with the list of networks it depended on: the client holds no such
+    /// list, so it has no ground to call one label well-formed and another not. Whether a registry
+    /// exists on the chain the manifest names is a fact about that chain, and it is answered by
+    /// reading the account -- which is what `ChainModelRegistryReader` does, naming the address and
+    /// the network it looked at when it is not there. The rows that remain are about SHAPE, which is
+    /// the only thing a parser can honestly judge.
     #[test]
     fn parser_rejects_malformed_config() {
         let bad_configs = vec![
-            r#"{"registry":{"address":"0:aaaa","network":"shellnet"},"seller":{"check_model_registry":true},"buyer":{"check_model_registry":true}}"#.to_string(),
+            r#"{"registry":{"address":"0:aaaa","network":"net-a"},"seller":{"check_model_registry":true},"buyer":{"check_model_registry":true}}"#.to_string(),
             config(true, true).replace(r#""buyer": {"#, r#""extra": 1, "buyer": {"#),
             config(true, true).replace(REG, "0:dead"),
             config(true, true)
                 .replace(r#""check_model_registry": true"#, r#""check_model_registry": "yes""#),
-            config(true, true).replace(r#""network": "shellnet""#, r#""network": "mainnet""#),
         ];
         for bad in bad_configs {
             assert!(
@@ -1056,7 +1308,7 @@ mod tests {
             format!(
                 r#"{{
                   "schema": "{MODEL_REGISTRY_VALIDATION_SCHEMA}",
-                  "registry": {{ "network": "shellnet" }},
+                  "registry": {{ "network": "net-a" }},
                   "seller": {{ "check_model_registry": true, "deploy_missing_order_book": false }},
                   "buyer": {{ "check_model_registry": false }}
                 }}"#
@@ -1077,14 +1329,41 @@ mod tests {
         );
     }
 
+    /// The default registry address is READ from the manifest, on every committed manifest.
+
+    /// This used to name one manifest and assert that chain's address as a literal, which made the
+    /// test a copy of the file it was reading -- red on the day of a legitimate deployment, and
+    /// silent about the other manifest entirely. What it is actually for is that the address comes
+    /// out of the file rather than out of the binary, and that holds for every manifest there is.
     #[test]
-    fn default_address_reads_committed_shellnet_manifest() {
-        let contracts = repo_path("contracts/deployed.shellnet.json");
-        let address = default_registry_address(&contracts).unwrap();
-        assert_eq!(
-            address,
-            "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
-        );
+    fn the_default_address_comes_out_of_each_committed_manifest() {
+        let dir = repo_path("manifest");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("read the committed manifest directory") {
+            let path = entry.expect("read a manifest directory entry").path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".manifest.json") {
+                continue;
+            }
+            let declared: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("parse {name}: {error}"));
+
+            let address = default_registry_address(&path)
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                Some(address.as_str()),
+                declared["model_registry"].as_str(),
+                "{name}: the default address must be the one the manifest records"
+            );
+            checked += 1;
+        }
+
+        assert!(checked >= 1, "no committed manifest was found in {}", dir.display());
     }
 
     #[derive(Default)]
@@ -1131,7 +1410,7 @@ mod tests {
 
     fn policy(seller_deploy_missing_order_book: bool) -> RegistryValidationPolicy {
         RegistryValidationPolicy {
-            network: "shellnet".to_string(),
+            network: "net-a".to_string(),
             registry_address: Some(REG.to_string()),
             seller_check_model_registry: true,
             seller_deploy_missing_order_book,
@@ -1167,14 +1446,7 @@ mod tests {
     #[test]
     fn model_registry_reader_uses_embedded_abi_not_filesystem_path() {
         let source = include_str!("registry.rs");
-        let reader_impl = source
-            .find("impl ShellnetModelRegistryReader")
-            .expect("reader impl present");
-        let impl_end = source[reader_impl..]
-            .find("#[cfg(feature = \"shellnet\")]\n#[async_trait]")
-            .map(|offset| reader_impl + offset)
-            .expect("reader impl end marker present");
-        let body = &source[reader_impl..impl_end];
+        let body = crate::source_probe::code_of(source, "impl ChainModelRegistryReader");
 
         assert!(
             source.contains(
@@ -1192,15 +1464,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn model_registry_reader_prefers_explicit_endpoint_over_manifest() {
         let dir = temp_dir("registry-explicit-endpoint");
-        let contracts = dir.path().join("deployed.shellnet.json");
+        let contracts = dir.path().join("deployed.manifest.json");
         std::fs::write(
             &contracts,
             serde_json::json!({
-                "network": "shellnet",
+                "network": "net-a",
                 "endpoint": "https://stale-manifest.example/graphql",
                 "superroot": ZERO_ADDR,
                 "dapp_config": "",
@@ -1211,7 +1482,7 @@ mod tests {
         )
         .unwrap();
 
-        let reader = ShellnetModelRegistryReader::from_manifest_with_endpoint(
+        let reader = ChainModelRegistryReader::from_manifest_with_endpoint(
             &contracts,
             Some("https://explicit.example/graphql"),
             REG,
@@ -1221,11 +1492,10 @@ mod tests {
         assert_eq!(reader.chain.client().endpoint(), "https://explicit.example");
     }
 
-    #[cfg(feature = "shellnet")]
     #[tokio::test]
-    #[ignore = "read-only live shellnet evidence; requires current deployed.shellnet.json endpoint"]
-    async fn live_shellnet_model_registry_reader_reads_seeded_model() {
-        let contracts = repo_path("contracts/deployed.shellnet.json");
+    #[ignore = "read-only live evidence; requires DEXDO_MANIFEST to name a reachable manifest"]
+    async fn live_model_registry_reader_reads_seeded_model() {
+        let contracts = dexdo_core::params::manifest_path().expect("DEXDO_MANIFEST");
         let registry = default_registry_address(&contracts).unwrap();
         let registry_addr = dexdo_core::Address::parse(&registry).unwrap();
         let chain = dexdo_core::RealChainBackend::connect(&contracts).unwrap();
@@ -1263,8 +1533,8 @@ mod tests {
         // display refs such as normalized producer--model--version strings.
         let frame_models = ["Qwen/Qwen3-32B", "openai/gpt-oss-20b"];
 
-        let reader = ShellnetModelRegistryReader::from_manifest(&contracts, &registry)
-            .expect("shellnet ModelRegistry reader");
+        let reader = ChainModelRegistryReader::from_manifest(&contracts, &registry)
+            .expect("ModelRegistry reader");
         let mut found = None;
         for frame_model in frame_models {
             if let Some(entry) = reader
@@ -1312,7 +1582,32 @@ mod tests {
 
     #[tokio::test]
     async fn content_identity_resolves_each_qwen_alias_in_bounded_candidate_order() {
-        for requested in ["qwen--qwen3--32b", "qwen/qwen3-32b", "Qwen/Qwen3-32B"] {
+        // The list is pinned by COMPOSITION rather than by a length ceiling. had to add two
+        // producer-free forms, and a ceiling raised from 3 to 5 would have let a sixth candidate --
+        // one more chain read on every failed lookup -- arrive later without saying so. Spelled
+        // out, a sixth breaks this test by name. What the old ceiling guarded is still guarded:
+        // the prefixed forms come first, so a 4.0.35 registry answers on candidate 3 as before and
+        // the producer-free reads are only ever paid by a chain that needs them.
+        for (requested, expected) in [
+            (
+                "qwen--qwen3--32b",
+                &[
+                    "qwen--qwen3--32b",
+                    "qwen/qwen3-32b",
+                    "Qwen/Qwen3-32B",
+                    "qwen3-32b",
+                    "Qwen3-32B",
+                ][..],
+            ),
+            (
+                "qwen/qwen3-32b",
+                &["qwen/qwen3-32b", "Qwen/Qwen3-32B", "qwen3-32b", "Qwen3-32B"][..],
+            ),
+            (
+                "Qwen/Qwen3-32B",
+                &["Qwen/Qwen3-32B", "qwen/qwen3-32b", "qwen3-32b", "Qwen3-32B"][..],
+            ),
+        ] {
             let reader = FakeReader::default().with(
                 "Qwen/Qwen3-32B",
                 Some(registered_entry("Qwen/Qwen3-32B", ADDR1)),
@@ -1333,9 +1628,80 @@ mod tests {
                 .iter()
                 .position(|candidate| candidate == "Qwen/Qwen3-32B")
                 .unwrap();
-            assert!(candidates.len() <= 3);
+            assert_eq!(candidates, expected, "candidate order for {requested}");
             assert_eq!(reader.queries(), candidates[..=registered]);
+            assert!(
+                !reader
+                    .queries()
+                    .iter()
+                    .any(|query| query == "qwen3-32b" || query == "Qwen3-32B"),
+                "{requested}: a 4.0.35 registry answers before any producer-free read is paid for, \
+                 so neither producer-free form may be queried here: {:?}",
+                reader.queries(),
+            );
         }
+    }
+
+    /// as the live gate produced it: contracts 4.0.36 seeded ModelRegistry from a catalog
+    /// that dropped the producer, so the chain knows `Qwen3-32B` and knows nothing named
+    /// `Qwen/Qwen3-32B`. Before this, the buyer tried three producer-prefixed forms, resolved
+    /// none, and refused a model the registry was carrying -- `live_10_executable_book_auto_match`
+    /// and `live_520_strict_reference_buyer_serves_model_response` both died there.
+
+    /// Both spellings are exercised because the 4.0.36 catalog mixes them within one file, which is
+    /// why one producer-free candidate is not enough.
+    #[tokio::test]
+    async fn issue_1699_a_producer_free_registry_resolves_the_model_the_chain_carries() {
+        for (requested, seeded) in [
+            ("qwen--qwen3--32b", "Qwen3-32B"),
+            ("Qwen/Qwen3-32B", "Qwen3-32B"),
+            ("openai--gpt-oss--20b", "gpt-oss-20b"),
+        ] {
+            let reader = FakeReader::default().with(seeded, Some(registered_entry(seeded, ADDR1)));
+            let identity =
+                resolve_registered_model_identity(&reader, RegistryRole::Buyer, REG, requested)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{requested} must resolve against a 4.0.36 registry: {error:#}")
+                    });
+
+            assert_eq!(identity.requested_model, requested);
+            assert_eq!(identity.registry_model, seeded);
+            assert_eq!(identity.model_hash, dexdo_core::model_hash_for(seeded));
+            assert_eq!(identity.order_book, ADDR1);
+            assert_eq!(
+                reader.queries().last().map(String::as_str),
+                Some(seeded),
+                "{requested}: the producer-free name is what finally answered",
+            );
+        }
+    }
+
+    /// The other half of the same decision: adding producer-free candidates must not change what a
+    /// 4.0.35 registry answers. A registry carrying BOTH conventions still resolves to the
+    /// prefixed name, because that is the one every 4.0.35 deployment registered and hashed.
+    #[tokio::test]
+    async fn issue_1699_a_registry_carrying_both_conventions_still_answers_with_the_prefixed_name()
+    {
+        let reader = FakeReader::default()
+            .with(
+                "Qwen/Qwen3-32B",
+                Some(registered_entry("Qwen/Qwen3-32B", ADDR1)),
+            )
+            .with("Qwen3-32B", Some(registered_entry("Qwen3-32B", ADDR2)))
+            .with("qwen3-32b", Some(registered_entry("qwen3-32b", ADDR2)));
+
+        let identity = resolve_registered_model_identity(
+            &reader,
+            RegistryRole::Buyer,
+            REG,
+            "qwen--qwen3--32b",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(identity.registry_model, "Qwen/Qwen3-32B");
+        assert_eq!(identity.order_book, ADDR1);
     }
 
     #[test]
@@ -1788,10 +2154,10 @@ mod tests {
     }
 
     fn write_contracts(dir: &Path, address: &str) -> PathBuf {
-        let path = dir.join("deployed.shellnet.json");
+        let path = dir.join("deployed.manifest.json");
         std::fs::write(
             &path,
-            format!(r#"{{"network":"shellnet","model_registry":"{address}"}}"#),
+            format!(r#"{{"network":"net-a","model_registry":"{address}"}}"#),
         )
         .unwrap();
         path
@@ -1893,17 +2259,12 @@ mod issue_1076_tests {
         "0:9999999999999999999999999999999999999999999999999999999999999999"
     }
 
-    #[cfg(feature = "shellnet")]
     fn order_book_for_hash(model_hash: &str) -> String {
         dexdo_core::RealChainBackend::canonical_inference_orderbook_address(model_hash)
             .unwrap()
             .with_workchain()
     }
 
-    #[cfg(not(feature = "shellnet"))]
-    fn order_book_for_hash(_model_hash: &str) -> String {
-        "0:1111111111111111111111111111111111111111111111111111111111111111".to_string()
-    }
 
     fn suggestions_from_error(error: &str) -> Vec<String> {
         let (_, suggestions) = error
@@ -2020,5 +2381,50 @@ mod issue_1076_tests {
             "{error}"
         );
         assert_eq!(reader.discovery_queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// a registry that ANSWERED is never reported as one that could not be read.
+
+    /// The two give opposite instructions -- change the name, versus try again later -- and callers
+    /// tell them apart by the `RegistryAnswered` type, not by words. This holds the marker on every
+    /// verdict `resolve_registered_model_identity` can reach.
+
+    /// Written because the marker was first placed on this layer ALONE, and the production reader
+    /// (`ChainModelRegistryReader::model`) leaves with `?` before ever getting here: a registry
+    /// whose entry carried a zero `orderBookOf` was read, answered, and still reported as
+    /// unreachable, with `deploy-market` telling the operator to retry something that will never
+    /// change. Those reader-side verdicts are marked at their own site now; this test guards the
+    /// half a fake reader can reach.
+    #[tokio::test]
+    async fn a_membership_miss_is_marked_as_a_verdict_and_a_read_failure_is_not() {
+        let miss = resolve_registered_model_identity(
+            &SuggestionReader::decode_failure(),
+            RegistryRole::Buyer,
+            registry_address(),
+            "acme--nothing--v1",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            registry_answered(&miss),
+            "every candidate was looked up and none is registered -- that is an ANSWER: {miss:#}"
+        );
+
+        // The other side, or the check above would be satisfied by marking everything: an error
+        // that never reached the catalog must NOT be marked, or a rate-limited endpoint would tell
+        // the operator their correct model name is wrong.
+        let unread = anyhow::anyhow!("no ModelRegistry at 0:0d0d on network net-a");
+        assert!(
+            !registry_answered(&unread),
+            "a failure to reach the registry is not a verdict about the name"
+        );
+
+        // And the marker survives the context callers add on the way up, which is the only reason
+        // the chain is walked rather than the top error inspected.
+        let wrapped = miss.context("deploy-market refuses before deploying anything");
+        assert!(
+            registry_answered(&wrapped),
+            "the marker must survive `.context(...)`: {wrapped:#}"
+        );
     }
 }

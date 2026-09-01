@@ -1,4 +1,5 @@
 //! Gateway stream-session authorization.
+
 //! Challenge-response: the gateway issues a `nonce` bound to the `token_contract`; the buyer
 //! signs it with the note's private key; the gateway verifies the signature against the buyer's pubkey
 //! recorded in the `token_contract` at match time, and only then forwards the stream.
@@ -38,7 +39,7 @@ impl AuthRegistry {
         }
     }
 
-    /// Register the buyer's pubkey for a contract(the seller learned it from the match).
+    /// Register the buyer's pubkey for a contract (the seller learned it from the match).
     pub fn register(&self, token_contract: &str, buyer_pubkey: NotePubkey) {
         lock_or_recover(&self.buyer_pubkeys, AUTH_BUYER_PUBKEYS_LOCK)
             .insert(token_contract.to_string(), buyer_pubkey);
@@ -94,9 +95,10 @@ impl AuthRegistry {
 
     /// Verify the buyer's response: the nonce must match the issued one, and the signature must pass
     /// against the recorded buyer pubkey.
+
     /// **Consume-on-success**: the nonce is consumed ONLY on a successful signature.
     /// Otherwise anyone who knows the `token_contract` + intercepted the issued nonce could, with a
-    /// garbage-signature call, "burn" an honest buyer's challenge(a trivial DoS). This does not open
+    /// garbage-signature call, "burn" an honest buyer's challenge (a trivial DoS). This does not open
     /// up replay: a signature over the same nonce is valid exactly until the first success, after which the nonce
     /// is removed and a repeat won't pass the nonce check.
     pub fn verify_response(
@@ -131,7 +133,7 @@ impl AuthRegistry {
             // Broken signature: the nonce is NOT touched -- the honest buyer will resend a valid response.
             return false;
         }
-        // Success: consume this nonce(single-use against replay). If another concurrent verifier already consumed
+        // Success: consume this nonce (single-use against replay). If another concurrent verifier already consumed
         // the same nonce, this call fails closed; independent outstanding nonces for the same deal remain valid.
         self.discard_challenge(token_contract, nonce)
     }
@@ -156,8 +158,8 @@ mod tests {
         note.sign(&challenge_bytes(tc, nonce))
     }
 
-    /// Y1/(negative/regression): a garbage signature with an intercepted nonce must NOT consume
-    /// an honest buyer's challenge(otherwise a trivial DoS).
+    /// Y1/ (negative/regression): a garbage signature with an intercepted nonce must NOT consume
+    /// an honest buyer's challenge (otherwise a trivial DoS).
     #[test]
     fn broken_signature_does_not_burn_honest_challenge() {
         let reg = AuthRegistry::new();
@@ -226,7 +228,7 @@ mod tests {
     }
 
     /// Replay on a DIFFERENT deal: the challenge is bound to the `token_contract` -- an intercepted signature
-    /// for tc1 is not valid on tc2, even if the nonce matched(worst case).
+    /// for tc1 is not valid on tc2, even if the nonce matched (worst case).
     #[test]
     fn signature_cannot_be_replayed_on_another_deal() {
         let reg = AuthRegistry::new();
@@ -241,7 +243,7 @@ mod tests {
             !reg.verify_response("tc2", b"nonce-x", &sig_tc1),
             "signature over the tc1 challenge is not valid on tc2"
         );
-        // But on its own deal -- it passes(sanity).
+        // But on its own deal -- it passes (sanity).
         assert!(
             reg.verify_response("tc1", b"nonce-x", &sig_tc1),
             "on its own deal the signature is valid"

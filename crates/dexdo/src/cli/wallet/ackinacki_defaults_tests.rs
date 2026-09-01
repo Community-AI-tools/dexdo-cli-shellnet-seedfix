@@ -1,16 +1,22 @@
 //! follow-up item 6: `wallet onboard ackinacki-wallet` has owner-only default paths.
+
 //! # The defect
+
 //! `--state` and `--hot-key` had no defaults, so choosing `ackinacki-wallet` from the interactive
 //! provider menu could not run at all: a menu carries no command line, and the flow answered with an
 //! error saying the menu could not supply its arguments. The operator picked a provider from a list
 //! the CLI itself offered and was told to start again.
+
 //! # Why the default is not simply "the working directory"
+
 //! `--hot-key` names a generated PRIVATE KEY. `--contracts` and `--models` may default to a relative
 //! path and land wherever the operator is standing; a secret may not. So the canonical default is
 //! resolved inside the owner-only binding draft reserved for this exact attempt. Two onboarding
 //! attempts therefore cannot alias or overwrite one another. Anything the operator passes is used
 //! exactly as given.
+
 //! # How the menu path is proved here
+
 //! By calling `ackinacki_onboard_args`, the pure function `ackinacki_flow` actually uses, and
 //! asserting the request it returns. This module previously asserted that certain refusal phrases
 //! were ABSENT from `wallet.rs`. That shape cannot fail usefully: rewording the refusal, respacing
@@ -19,9 +25,11 @@
 use clap::Parser as _;
 
 /// The menu path must REACH onboarding, with a request that can actually run.
+
 /// The interactive menu carries no command line, so `provider_flow` hands this provider
 /// `explicit: None`. That arm used to be a dead end that only told the operator to start again; it
 /// must now produce exactly the request the bare subcommand makes.
+
 /// Every field is asserted, not just the two that gained defaults. An argument whose value nothing
 /// pins is free to drift, and this is the one code path where no human is present to notice that
 /// the request went out naming the wrong network or a stray endpoint.
@@ -46,24 +54,18 @@ fn the_interactive_menu_no_longer_dead_ends_on_the_arguments_error() {
         Some(binding_dir.join(dexdo_core::params::DEFAULT_WALLET_ONBOARD_HOT_KEY_PATH)),
         "the generated private key must be private to this binding attempt"
     );
-    assert!(
-        from_the_menu.endpoint.is_none(),
-        "the menu must not invent an endpoint; the network selects it"
-    );
+    // The endpoint assertion that stood here is gone with the field. It said "the menu
+    // must not invent an endpoint; the network selects it", and there is now no endpoint for the
+    // menu to invent: `--endpoint` was removed from every command, so the manifest is the only
+    // thing that names one. The property is held by the type, which is the stronger place for it.
     assert!(
         from_the_menu.vault_key.is_none(),
         "a distinct Vault key is opt-in, and the menu never opts in on the operator's behalf"
     );
-    assert!(
-        matches!(
-            from_the_menu.network,
-            crate::cli::args::WalletNetworkArg::Shellnet
-        ),
-        "the menu must resolve to the same network clap defaults to, not to mainnet"
-    );
 }
 
 /// The other half of the same function: an explicit command line is carried through UNCHANGED.
+
 /// Without this, `ackinacki_onboard_args` could return the canonical defaults for every input and
 /// the menu assertion above would still pass -- while every operator who typed `--hot-key` silently
 /// had their private key written somewhere else. The command line is driven through clap rather than
@@ -178,6 +180,7 @@ fn two_binding_ids_never_alias_or_overwrite_their_default_secrets() {
 }
 
 /// The two flags now parse without being given, which is what makes the menu path possible.
+
 /// `--agent-name` deliberately stays required on the SUBCOMMAND: it is the label a human reads in
 /// the wallet app when approving, so on a command line the operator chooses it. Only the menu, which
 /// has no command line, falls back to the canonical default.

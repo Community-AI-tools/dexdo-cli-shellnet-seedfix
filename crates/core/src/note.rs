@@ -1,7 +1,8 @@
 //! Note trait and crypto handover.
+
 //! In the `LocalNote` implementation is **real local cryptography**:
 //! x25519 for `encrypt_to`/`decrypt`, ed25519 for `sign`/verify, ChaCha20-Poly1305 as AEAD.
-//! Only the key source is mocked(local generation); the chain-backed Note arrives in.
+//! Only the key source is mocked (local generation); the chain-backed Note arrives in.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -13,8 +14,8 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-/// Note public key(anonymous). Carries the x25519 pubkey(for endpoint encryption)
-/// and the ed25519 pubkey(for verifying the challenge signature). In reality this is one note
+/// Note public key (anonymous). Carries the x25519 pubkey (for endpoint encryption)
+/// and the ed25519 pubkey (for verifying the challenge signature). In reality this is one note
 /// pubkey; here there are two independent pairs bound by a single note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotePubkey {
@@ -24,14 +25,14 @@ pub struct NotePubkey {
     pub ed: [u8; 32],
 }
 
-/// Signature of an action/challenge with the note's private key(ed25519).
+/// Signature of an action/challenge with the note's private key (ed25519).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature(pub [u8; 64]);
 
 /// Note crypto operation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum NoteError {
-    /// Decryption failed(wrong key / corrupted ciphertext).
+    /// Decryption failed (wrong key / corrupted ciphertext).
     #[error("decrypt failed")]
     Decrypt,
     /// Malformed ciphertext.
@@ -43,10 +44,11 @@ pub enum NoteError {
 }
 
 /// Note -- a shielded wallet with handover cryptography.
+
 /// `encrypt_to`/`decrypt` -- x25519 + AEAD; `sign`/verify -- ed25519.
 /// The key source in is local generation; in it is `gosh.ackinacki`.
 pub trait Note: Send + Sync {
-    /// Note public key(anonymous).
+    /// Note public key (anonymous).
     fn pubkey(&self) -> NotePubkey;
     /// Encrypt `msg` to the `peer` pubkey.
     fn encrypt_to(&self, peer: &NotePubkey, msg: &[u8]) -> Vec<u8>;
@@ -56,7 +58,7 @@ pub trait Note: Send + Sync {
     fn sign(&self, msg: &[u8]) -> Signature;
 }
 
-/// Verify a signature against the note pubkey(ed25519). Gateway side.
+/// Verify a signature against the note pubkey (ed25519). Gateway side.
 pub fn verify(pubkey: &NotePubkey, msg: &[u8], sig: &Signature) -> bool {
     let vk = match VerifyingKey::from_bytes(&pubkey.ed) {
         Ok(vk) => vk,
@@ -67,9 +69,9 @@ pub fn verify(pubkey: &NotePubkey, msg: &[u8], sig: &Signature) -> bool {
 }
 
 /// Derive the x25519 handover pubkey from the note's ed25519 pubkey: one note key sets
-/// both the signature(ed25519) and the handover encryption (x25519 = Montgomery form of ed25519, the
+/// both the signature (ed25519) and the handover encryption (x25519 = Montgomery form of ed25519, the
 /// birational equivalence Edwards<->Montgomery). This is how the seller **reconstructs the buyer's x25519
-/// from on-chain `getBuyerPubkey`(ed25519)** -- the counterparty's pubkey is read from the chain, no
+/// from on-chain `getBuyerPubkey` (ed25519)** -- the counterparty's pubkey is read from the chain, no
 /// separate x25519 is needed. `None` -- an invalid ed25519 point.
 pub fn x25519_pub_from_ed25519_pub(ed_pub: &[u8; 32]) -> Option<[u8; 32]> {
     VerifyingKey::from_bytes(ed_pub)
@@ -78,22 +80,23 @@ pub fn x25519_pub_from_ed25519_pub(ed_pub: &[u8; 32]) -> Option<[u8; 32]> {
 }
 
 /// Local note with real keys.
-/// If the note is built deterministically from a key(`from_seed`/`from_secret_hex`), it carries
-/// its `seed` in memory -- this is the **tree root**: child(sub)notes are
+
+/// If the note is built deterministically from a key (`from_seed`/`from_secret_hex`), it carries
+/// its `seed` in memory -- this is the **tree root**: child (sub)notes are
 /// derived by index via [`LocalNote::derive`]. The ephemeral `generate()` and the child notes
-/// themselves carry no seed(flat tree of depth 1). The seed is never written to disk.
+/// themselves carry no seed (flat tree of depth 1). The seed is never written to disk.
 pub struct LocalNote {
     x_secret: StaticSecret,
     ed_signing: SigningKey,
-    /// Root seed(only on a deterministically built root note) -- for deriving children.
+    /// Root seed (only on a deterministically built root note) -- for deriving children.
     seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl LocalNote {
     /// Generate a new note from the system RNG.: this is an **ephemeral** note --
     /// admissible only as a one-off mock fixture of a single e2e run, not as the identity of production
-    /// subcommands(for those use `from_seed`/`from_secret_hex`, with continuity across runs).
-    /// An ephemeral note without a seed cannot be a tree root(`derive` returns `None`).
+    /// subcommands (for those use `from_seed`/`from_secret_hex`, with continuity across runs).
+    /// An ephemeral note without a seed cannot be a tree root (`derive` returns `None`).
     pub fn generate() -> Self {
         let mut rng = rand::rngs::OsRng;
         let x_secret = StaticSecret::random_from_rng(rng);
@@ -106,14 +109,16 @@ impl LocalNote {
     }
 
     /// Build a note **deterministically** from a 32-byte root secret:
-    /// the same key -> the same note(persistent identity), without writing to disk. ed25519 is taken
+    /// the same key -> the same note (persistent identity), without writing to disk. ed25519 is taken
     /// directly from the seed; x25519 is an HKDF derivative of the seed (domain separation
     /// `dexdo/note/x25519/v1`), so that one root key sets both parts of the note.
-    /// This is the **tree root**(HD-style): child(sub)notes are derived from this seed by index
+
+    /// This is the **tree root** (HD-style): child (sub)notes are derived from this seed by index
     /// via [`LocalNote::derive`] / enumerated by [`NoteTree`]. The seed is held only in memory.
+
     /// **NOTE: x25519 here is an HKDF derivative, != [`LocalNote::from_ed25519_signing`]**
     /// (which takes the Montgomery form of the ed25519 scalar). For the same 32 bytes the two paths yield
-    /// **different** x25519 -- intentionally: `from_seed` is HD-identity(D7), `from_ed25519_signing` is the
+    /// **different** x25519 -- intentionally: `from_seed` is HD-identity (D7), `from_ed25519_signing` is the
     /// chain-reconstructible `RealNote` handover. Do not mix them.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let ed_signing = SigningKey::from_bytes(seed);
@@ -129,13 +134,15 @@ impl LocalNote {
         }
     }
 
-    /// **Deterministic(sub)note derivation by index**. From the root
+    /// **Deterministic (sub)note derivation by index**. From the root
     /// seed a child seed is derived with domain-separated HKDF (`info = "dexdo/note/derive/v1" ||
     /// index_be`), then the child note is built with the same [`from_seed`]. Guarantees:
+
     /// - **Reproducibility:** the same `(root_seed, index)` always yields the same note
     /// (pubkey + keys), without any randomness -- restarting with the same key restores
-    /// the whole tree(regression test on determinism).
+    /// the whole tree (regression test on determinism).
     /// - **Enumerability:** the index is a `u32`; the tree's notes are enumerated by [`NoteTree::nodes`].
+
     /// `None` for a note without a seed (ephemeral `generate()` or a child note itself -- the tree is
     /// flat, depth 1: the single D7 axis is the index under the root; nested paths are out of scope).
     pub fn derive(&self, index: u32) -> Option<Self> {
@@ -148,7 +155,7 @@ impl LocalNote {
         hk.expand(&info, &mut child)
             .expect("HKDF-SHA256 expand of 32 bytes never fails");
         // A child note is a leaf: its seed is an HKDF of the root, the root cannot be recovered from it,
-        // so the tree stays flat(`derive` does not continue from a child). The root seed lives at the root.
+        // so the tree stays flat (`derive` does not continue from a child). The root seed lives at the root.
         let mut note = Self::from_seed(&child);
         note.seed = None;
         Some(note)
@@ -160,7 +167,7 @@ impl LocalNote {
         self.seed.as_deref()
     }
 
-    /// Load a note from a hex secret(32 bytes, optional `0x` prefix) -- the `--note-key` key format
+    /// Load a note from a hex secret (32 bytes, optional `0x` prefix) -- the `--note-key` key format
     /// . dexdo only **reads** the key, never writes or rotates it: custody of the root
     /// is an external module/wallet. A wrong key -> an explicit error, not silent generation.
     pub fn from_secret_hex(hex: &str) -> Result<Self, NoteError> {
@@ -181,7 +188,8 @@ impl LocalNote {
     /// scalar), rather than from an independent HKDF/random key. Then
     /// `pubkey().x == x25519_pub_from_ed25519_pub(pubkey().ed)`, and the counterparty reconstructs the
     /// pubkey from on-chain ed25519 -- no separate x25519 channel is needed. Used by `RealNote` (, one
-    /// note key on the chain). The x25519 secret = the ed25519 signing scalar(x25519 clamps idempotently).
+    /// note key on the chain). The x25519 secret = the ed25519 signing scalar (x25519 clamps idempotently).
+
     /// **NOTE: != [`LocalNote::from_seed`].** `from_seed` derives x25519 via **HKDF**
     /// (the D7 HD-path), this one via the **Montgomery form** of the signing scalar. For the same 32 bytes
     /// they yield **DIFFERENT** x25519 secrets. The derivations are intentionally distinct -- do not mix paths.
@@ -196,17 +204,18 @@ impl LocalNote {
 }
 
 /// A note tree of a single identity: a root key + **enumerable** child
-/// (sub)notes by deterministic index. A single deal/order lives on a specific(sub)note, but
+/// (sub)notes by deterministic index. A single deal/order lives on a specific (sub)note, but
 /// all of them are derived from one key -- so the identity = the key AND the whole tree under it, not one note.
+
 /// dexdo only **reads** the root key and derives notes **in memory** as needed
 /// (`node`/`nodes`): nothing is written to disk. Enumerating
-/// the window `0..width` is enough for acceptance(the routing pool B4/D5 is separate behavior, not active here).
+/// the window `0..width` is enough for acceptance (the routing pool B4/D5 is separate behavior, not active here).
 pub struct NoteTree {
     root: LocalNote,
 }
 
 impl NoteTree {
-    /// Build a tree from a root key(32-byte hex secret `--note-key`). Equivalent to
+    /// Build a tree from a root key (32-byte hex secret `--note-key`). Equivalent to
     /// `LocalNote::from_secret_hex` + child enumeration; a wrong key -> `NoteError::BadKey`.
     pub fn from_secret_hex(hex: &str) -> Result<Self, NoteError> {
         Ok(Self {
@@ -214,7 +223,7 @@ impl NoteTree {
         })
     }
 
-    /// Build a tree from a ready root note(from `--note-key`/wallet). A note without a seed
+    /// Build a tree from a ready root note (from `--note-key`/wallet). A note without a seed
     /// (ephemeral) gives a degenerate tree: only the note itself as index 0, no children.
     pub fn new(root: LocalNote) -> Self {
         Self { root }
@@ -225,7 +234,7 @@ impl NoteTree {
         &self.root
     }
 
-    /// (Sub)note by index -- **reproducibly**(the same root+index -> the same note). For a note with
+    /// (Sub)note by index -- **reproducibly** (the same root+index -> the same note). For a note with
     /// a seed this is `root.derive(index)`; for an ephemeral root without a seed index `0` = the root itself
     /// (no children -- the tree is degenerate). `None` for index > 0 on a seedless root.
     pub fn node(&self, index: u32) -> Option<LocalNote> {
@@ -240,33 +249,33 @@ impl NoteTree {
         }
     }
 
-    /// Enumerate the first `width`(sub)notes of the tree(`index = 0..width`) -- the window over which
+    /// Enumerate the first `width` (sub)notes of the tree (`index = 0..width`) -- the window over which
     /// the monitor aggregates the state of the whole identity. Reproducible: repeating with the same key gives the same notes.
     pub fn nodes(&self, width: u32) -> impl Iterator<Item = LocalNote> + '_ {
         (0..width).filter_map(move |i| self.node(i))
     }
 
-    /// Anonymous pubkeys of the first `width`(sub)notes -- the input for the monitor's aggregated snapshot
+    /// Anonymous pubkeys of the first `width` (sub)notes -- the input for the monitor's aggregated snapshot
     /// . "From whom" = the note pubkey.
     pub fn node_pubkeys(&self, width: u32) -> Vec<NotePubkey> {
         self.nodes(width).map(|n| n.pubkey()).collect()
     }
 }
 
-// Ciphertext format: ephemeral x25519 pub(32) || nonce(12) || AEAD ciphertext.
+// Ciphertext format: ephemeral x25519 pub (32) || nonce (12) || AEAD ciphertext.
 const EPK_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 /// Handover KDF domain string -- fixes the scheme/version in the key output.
 const HANDOVER_INFO: &[u8] = b"dexdo/handover/x25519-chacha20poly1305/v1";
-/// Domain string of the(sub)note-by-index derivation KDF -- separates the child
-/// seed output from the x25519 derivative(`dexdo/note/x25519/v1`), so the axes do not collide.
+/// Domain string of the (sub)note-by-index derivation KDF -- separates the child
+/// seed output from the x25519 derivative (`dexdo/note/x25519/v1`), so the axes do not collide.
 const DERIVE_INFO: &[u8] = b"dexdo/note/derive/v1";
 
-/// The canonical handover ECIES-KDF(security review O1): the raw x25519 DH output is non-uniform
+/// The canonical handover ECIES-KDF (security review O1): the raw x25519 DH output is non-uniform
 /// (lies in a subgroup, has cofactor structure) and is unsuitable as a direct symmetric key.
 /// We run `shared` through HKDF-SHA256 binding `epk` and the recipient's pubkey into `info` -- the key
 /// is deterministic but bound to this ephemeral pair and recipient. `epk` additionally goes in as
-/// AAD under AEAD, so the ephemeral pubkey is authenticated by the tag(tampering -> decryption error).
+/// AAD under AEAD, so the ephemeral pubkey is authenticated by the tag (tampering -> decryption error).
 fn handover_key(shared: &[u8; 32], epk: &[u8; 32], recipient_x_pub: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, shared);
     let mut info = Vec::with_capacity(HANDOVER_INFO.len() + EPK_LEN + 32);
@@ -288,7 +297,7 @@ impl Note for LocalNote {
     }
 
     fn encrypt_to(&self, peer: &NotePubkey, msg: &[u8]) -> Vec<u8> {
-        // Sender's ephemeral x25519 key -> ECDH with the recipient's pubkey -> HKDF -> AEAD key(O1).
+        // Sender's ephemeral x25519 key -> ECDH with the recipient's pubkey -> HKDF -> AEAD key (O1).
         let mut rng = rand::rngs::OsRng;
         let eph_secret = StaticSecret::random_from_rng(rng);
         let eph_pub = XPublicKey::from(&eph_secret);
@@ -345,7 +354,7 @@ mod tests {
 
     #[test]
     fn from_seed_is_deterministic_and_distinct() {
-        // the same root key -> the same note(persistent identity across runs).
+        // the same root key -> the same note (persistent identity across runs).
         let seed = [7u8; 32];
         let a = LocalNote::from_seed(&seed);
         let b = LocalNote::from_seed(&seed);
@@ -371,11 +380,11 @@ mod tests {
     }
 
     /// regression: the two `LocalNote` x25519 derivations are NON-INTEROPERABLE. `from_seed`
-    /// (`from_secret_hex`) derives x25519 via **HKDF**(the mock / HD identity); the chain-reconstructible
+    /// (`from_secret_hex`) derives x25519 via **HKDF** (the mock / HD identity); the chain-reconstructible
     /// handover uses the **Montgomery** form (`from_ed25519_signing`, and the seller's
     /// `x25519_pub_from_ed25519_pub` from the on-chain ed25519). For the SAME key they differ -- so a mock/HKDF
     /// note can NEVER decrypt a real seller's ciphertext. The buyer DX
-    /// guard(`Buyer::resolve_endpoint`) detects exactly this (`pubkey().x != x25519_pub_from_ed25519_pub(ed)`).
+    /// guard (`Buyer::resolve_endpoint`) detects exactly this (`pubkey().x != x25519_pub_from_ed25519_pub(ed)`).
     #[test]
     fn from_seed_x25519_is_not_the_montgomery_handover_form() {
         let seed = [42u8; 32];
@@ -387,7 +396,7 @@ mod tests {
             mpk.x, montgomery,
             "from_seed (HKDF) x25519 must differ from Montgomery(ed) -- the non-interop invariant ( 'do not mix')"
         );
-        // Real handover identity: from_ed25519_signing -> x25519 IS the Montgomery form(the consistent real path).
+        // Real handover identity: from_ed25519_signing -> x25519 IS the Montgomery form (the consistent real path).
         let real = LocalNote::from_ed25519_signing(SigningKey::from_bytes(&seed));
         let rpk = real.pubkey();
         assert_eq!(
@@ -399,7 +408,8 @@ mod tests {
 
     #[test]
     fn derive_is_deterministic_reproducible_and_distinct_per_index() {
-        // note(pubkey+keys), without randomness. Different indices -> different notes; child note != root.
+
+        // note (pubkey+keys), without randomness. Different indices -> different notes; child note != root.
         let root = LocalNote::from_seed(&[7u8; 32]);
         let a0 = root.derive(0).expect("root has seed");
         let b0 = LocalNote::from_seed(&[7u8; 32]).derive(0).expect("seed");
@@ -409,9 +419,9 @@ mod tests {
         // Different indices -> different notes.
         let a1 = root.derive(1).unwrap();
         assert_ne!(a0.pubkey(), a1.pubkey(), "different index -> different note");
-        // The child note is not equal to the root(derivation, not identity).
+        // The child note is not equal to the root (derivation, not identity).
         assert_ne!(root.pubkey(), a0.pubkey(), "child note != root");
-        // The child note is fully functional(signature + handover) -- it is a real note.
+        // The child note is fully functional (signature + handover) -- it is a real note.
         let sig = a0.sign(b"challenge");
         assert!(verify(&a0.pubkey(), b"challenge", &sig));
         // A different root -> a different tree.
@@ -426,7 +436,7 @@ mod tests {
     #[test]
     fn ephemeral_and_child_notes_have_no_seed_so_tree_is_flat() {
         // Derivation is available only from a root with a seed. The ephemeral generate() and the child
-        // notes themselves carry no seed -> the tree is flat, depth 1(nested paths are out of scope, not needed for D7).
+        // notes themselves carry no seed -> the tree is flat, depth 1 (nested paths are out of scope, not needed for D7).
         assert!(LocalNote::generate().seed().is_none());
         assert!(LocalNote::generate().derive(0).is_none());
         let child = LocalNote::from_seed(&[5u8; 32]).derive(3).unwrap();
@@ -440,7 +450,7 @@ mod tests {
     #[test]
     fn note_tree_enumerates_distinct_reproducible_nodes() {
         // the tree is enumerable and reproducible. From one key -- several DIFFERENT notes;
-        // repeating with the same key gives the same pubkeys(the same tree after a restart).
+        // repeating with the same key gives the same pubkeys (the same tree after a restart).
         let tree = NoteTree::from_secret_hex(&"2a".repeat(32)).unwrap();
         let pks = tree.node_pubkeys(3);
         assert_eq!(pks.len(), 3);
@@ -449,10 +459,10 @@ mod tests {
         assert_ne!(pks[0], pks[2]);
         // node(i) matches the i-th enumerated pubkey.
         assert_eq!(tree.node(1).unwrap().pubkey(), pks[1]);
-        // Restart(a new tree from the same key) -> the same notes.
+        // Restart (a new tree from the same key) -> the same notes.
         let again = NoteTree::from_secret_hex(&"2a".repeat(32)).unwrap();
         assert_eq!(again.node_pubkeys(3), pks, "same key -> same tree");
-        // The tree root = from_secret_hex(the "root itself" index note differs from the children).
+        // The tree root = from_secret_hex (the "root itself" index note differs from the children).
         assert_eq!(
             tree.root().pubkey(),
             LocalNote::from_secret_hex(&"2a".repeat(32))
@@ -463,7 +473,7 @@ mod tests {
 
     #[test]
     fn ephemeral_tree_is_degenerate_root_only() {
-        // Ephemeral root without a seed: index 0 = the root itself, no children(degenerate tree).
+        // Ephemeral root without a seed: index 0 = the root itself, no children (degenerate tree).
         let tree = NoteTree::new(LocalNote::generate());
         let root_pk = tree.root().pubkey();
         assert_eq!(tree.node(0).unwrap().pubkey(), root_pk);
@@ -531,8 +541,8 @@ mod tests {
         assert!(eve.decrypt(&ct).is_err());
     }
 
-    /// O1(negative): the ephemeral pubkey `epk` is bound both in the KDF(`info`) and as AAD -- tampering
-    /// with any of its bytes breaks decryption(rather than panicking), closing the tamper case under the
+    /// O1 (negative): the ephemeral pubkey `epk` is bound both in the KDF (`info`) and as AAD -- tampering
+    /// with any of its bytes breaks decryption (rather than panicking), closing the tamper case under the
     /// "home-grown crypto" red flag.
     #[test]
     fn tampered_epk_is_rejected() {
@@ -541,7 +551,7 @@ mod tests {
         let base = alice.encrypt_to(&bob.pubkey(), b"https://gateway.example:8443|fp");
         // Sanity check: clean ciphertext decrypts.
         assert!(bob.decrypt(&base).is_ok());
-        // Any corrupted byte of the epk region(first 32) -> a decryption error.
+        // Any corrupted byte of the epk region (first 32) -> a decryption error.
         for i in 0..EPK_LEN {
             let mut ct = base.clone();
             ct[i] ^= 0xFF;

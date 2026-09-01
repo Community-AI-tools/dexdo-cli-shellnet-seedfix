@@ -1,12 +1,14 @@
 //! `dexdo note balance` reports the `_busy` latch.
-//! `dex::ERR_NOTE_BUSY(121)` sends the operator here -- "check what the note is busy with
+
+//! `dex::ERR_NOTE_BUSY (121)` sends the operator here -- "check what the note is busy with
 //! (`dexdo note balance` on the SENDING note reports `busyAddress`)" -- and the command printed no
 //! such line, so a latched note was indistinguishable from a free one, `status: Active` included.
 //! The latch does not time out: the contract clears it only on the acknowledgement of the operation
 //! that set it, or when that message bounces, so the operator had nowhere to read the counterparty
 //! they have to resolve.
+
 //! The `getDetails` payloads below are the two shapes
-//! `crates/core/src/shellnet/client.rs::note_transfer_refusals_are_read_from_get_details` already
+//! `crates/core/src/chain/client.rs::note_transfer_refusals_are_read_from_get_details` already
 //! pins for the refusal that raises 121 -- `busyAddress: null` and the same set address -- so the
 //! rendering is asserted against the same fixture the error path is.
 

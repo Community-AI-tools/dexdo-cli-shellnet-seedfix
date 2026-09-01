@@ -1,11 +1,14 @@
 //! re-audit items 4 and 8: what the funding wait does with a read that got no answer, and
 //! what its failure hands a machine consumer.
+
 //! Every case here drives the real entry point the two money commands reach -
 //! `ensure_hot_funded_with_turn` with the turn already held, which is exactly how
 //! `fund_hot_for_money_command` calls it - through the two seams a real run uses: a balance reader
 //! and a provider. Nothing calls an internal helper, and nothing writes an end state by hand.
+
 //! Item 8's case asserts the FIELDS of the error envelope a `--json` run emits, built by the same
 //! `machine::machine_error` that `main.rs` prints, rather than any `stderr` wording.
+
 //! Declared from `cli/mod.rs` rather than from `wallet_funding.rs` so the regression still
 //! compiles - and still fails - when the funding module alone is reverted to its pre-fix state.
 
@@ -56,7 +59,7 @@ fn vault_address() -> String {
 fn binding() -> WalletBinding {
     WalletBinding {
         provider: WalletProvider::AckinackiWallet,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         hot_address: self_dapp_hot(),
         vault_address: Some(vault_address()),
     }
@@ -189,6 +192,7 @@ fn executed() -> RequestPresence {
 }
 
 /// A transport failure whose WORDS carry none of the vocabulary `classify_error` matches on.
+
 /// That is the point of it: its code can only come from downcasting the typed cause. A message
 /// that happens to contain "gateway" would be classified identically with or without the cause,
 /// and would prove nothing about whether the cause survived.
@@ -277,10 +281,12 @@ fn pending() -> RequestPresence {
 // ---------------------------------------------------------------------------------------------
 
 /// A read that got no answer does not end the wait while the operator's window is still open.
+
 /// The shared per-read retry is sized for one read - five attempts inside forty-five seconds - and
 /// that is right for every other caller. Here it is the inner loop: when it gives up, the balance
 /// is still unknown, and "unknown" is precisely the state `--funding-timeout` was raised to sit
 /// through. Before this, one exhausted read ended a ten-minute wait in forty-five seconds.
+
 /// Both sides of the request are covered: the failure before anything is arranged must not skip
 /// the arrangement, and the failure after it must not lose the wait that the request was created
 /// for.
@@ -326,6 +332,7 @@ async fn a_read_that_got_no_answer_keeps_waiting_inside_the_funding_window() {
 }
 
 /// An answer that will not change is not waited out, and it is the answer that surfaces.
+
 /// Two halves, because the fix must not have turned every failure into a ten-minute wait:
 /// a read that answers "this input cannot even be encoded" leaves on its first read, and a final
 /// answer arriving after an unanswered one is the error the operator is handed.
@@ -389,9 +396,11 @@ fn envelope(error: &anyhow::Error) -> serde_json::Value {
 }
 
 /// A failure that leaves a Vault request behind says so in the machine envelope.
+
 /// The one question a machine consumer cannot answer from an exit code is whether money has
 /// already left the Vault. `funding_notice` on the success object answers it; before this, the
 /// timeout and the read failure answered it only in `stderr` prose, which no orchestrator parses.
+
 /// Both endings are covered - the wait's own timeout and a read that answered no - and both
 /// funding states an operator can be left in: a request this run created, and a request an earlier
 /// run created that is still in the queue.
@@ -434,6 +443,7 @@ async fn a_failed_wait_names_the_funding_state_it_left_behind() {
 }
 
 /// The field means what it says: nothing was arranged, so nothing is claimed.
+
 /// `already_funded` is a state the operator may be in for real, so it must never be produced by a
 /// run that arranged nothing. An absent `funding_notice` is the answer "no funding request of this
 /// run exists", and a consumer branches on it.
@@ -454,6 +464,7 @@ async fn a_failure_before_any_request_carries_no_funding_state() {
 }
 
 /// The envelope carries the funding EVENT and no secret alongside it.
+
 /// The named fields are the whole contract: `schema`, `operation`, `code`, `message`, `cause`,
 /// `retryable` and `funding_notice`. The funding half contributes exactly one name from a closed
 /// set - never the creator key, the Vault address, the provider's own words or a local path.
@@ -506,9 +517,17 @@ async fn the_funding_state_in_the_envelope_is_one_closed_set_name_and_no_secret(
         1,
         "the operator message must appear once in `cause`, not once per error layer: {cause}"
     );
+    // rewrote the wording; the machine field must still carry the WHOLE message, which is
+    // what this asserts -- the instruction to run it again, and the detail with the raw figures a
+    // consumer reads.
+    let lower = cause.to_ascii_lowercase();
     assert!(
-        cause.contains("re-run the same command"),
+        lower.contains("run the same command again") || lower.contains("re-run the same command"),
         "and it must still be the whole message: {cause}"
+    );
+    assert!(
+        cause.contains("still missing"),
+        "the detail with the raw figures stays in the envelope: {cause}"
     );
 
     let rendered = serde_json::to_string(&envelope).expect("serialize");
@@ -523,6 +542,7 @@ async fn the_funding_state_in_the_envelope_is_one_closed_set_name_and_no_secret(
 }
 
 /// The human rendering of the funding state and its serialized `event` are the same name.
+
 /// The state travels through the error chain as a typed cause whose `Display` an operator reads,
 /// and out of the envelope as a serde tag a machine reads. Two spellings of one fact drift; this
 /// pins them together for every variant of the closed set.
@@ -551,11 +571,13 @@ fn the_funding_event_name_is_the_one_serde_writes() {
 }
 
 /// Naming the funding state must not silently rename the failure.
+
 /// The envelope gained `funding_notice`; it must not have given up `code` to get it. `code` is what
 /// an orchestrator branches on, and `classify_error` picks it by DOWNCASTING the causes - a
 /// `DexdoError` carrying `E_GATEWAY_UNREACHABLE` or `E_GATEWAY_WRONG_ENDPOINT`, a
 /// `DealHandleSchemaTooNew` - before it ever looks at words. So the state has to be attached in a
 /// way that leaves the error an error.
+
 /// The first shape of this fix did not: it rendered the cause to a string and rebuilt the error
 /// around it, which erased every typed cause and quietly demoted a gateway failure to the
 /// message-matched fallback. Both halves below are the guard against that returning.

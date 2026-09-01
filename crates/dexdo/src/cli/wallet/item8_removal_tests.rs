@@ -31,7 +31,7 @@ impl Fixture {
             .commit_active(&new)
             .expect("commit replacement")
             .expect("old binding archived");
-        let active = store.binding_path(WalletNetwork::Shellnet);
+        let active = store.binding_path(&crate::cli::wallet::test_network_a());
         Self {
             _temp: temp,
             store,
@@ -69,10 +69,10 @@ struct Snapshot {
 
 fn binding(id: &str, hot_address: &str) -> WalletBinding {
     WalletBinding {
+        network: crate::cli::wallet::test_network_a(),
         version: BINDING_VERSION,
         id: id.to_string(),
         provider: WalletProvider::Manual,
-        network: WalletNetwork::Shellnet,
         hot_address: hot_address.to_string(),
         vault_address: None,
         hot_key_file: None,
@@ -311,13 +311,7 @@ fn secrets_staging_failure_restores_the_archive_without_touching_keys() {
 #[test]
 fn no_removal_path_contains_a_chain_write_primitive() {
     let wallet = include_str!("../wallet.rs");
-    let command = wallet
-        .split_once("async fn run_remove_archived(args")
-        .expect("shellnet remove-archived command")
-        .1
-        .split_once("#[cfg(not(feature = \"shellnet\"))]")
-        .expect("non-shellnet command boundary")
-        .0;
+    let command = crate::cli::source_probe::code_of(wallet, "async fn run_remove_archived(args");
     let body = wallet
         .split_once("async fn remove_archived_binding_after_balance_check")
         .expect("removal boundary")

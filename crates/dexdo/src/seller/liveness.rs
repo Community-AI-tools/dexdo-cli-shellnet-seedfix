@@ -4,7 +4,7 @@ use super::{
 };
 use anyhow::Result;
 use dexdo_core::{
-    chain::{RestingSellCancelStartError, RestingSellCancelWatch},
+    market::{RestingSellCancelStartError, RestingSellCancelWatch},
     params::{
         SellerLivenessParams, SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
         TRANSIENT_READ_TOTAL_BUDGET,
@@ -136,11 +136,13 @@ pub enum CancellationDisposition {
         known_result: String,
     },
     /// no cancellation was attempted, because the order died of its own deadline.
+
     /// Distinct from `AlreadyAbsent`: on-chain expiry removal is lazy, so the row may well still be
     /// sitting in the book. It is simply unmatchable, and claiming it is gone would be a fact this
     /// client never read.
     NotAttemptedExpired,
     /// the expired order was reaped off the book, and no successor was posted for `reason`.
+
     /// The residual capacity is idle and stays idle until an operator acts, so the reason travels
     /// with the outcome instead of only into a log line.
     ReapedNotRelisted {
@@ -169,6 +171,41 @@ impl CancellationDisposition {
             _ => None,
         }
     }
+
+    /// has the chain PROVEN that no buyer can still match this ask?
+
+    /// This is the one question that decides whether the seller may stop serving a deal, and it is
+    /// answered here so that every caller asks it rather than re-deriving it. Three places already
+    /// spelled the same `matches!` out by hand -- the gateway abort in this file, and the startup and
+    /// shutdown guards in `cli/seller.rs` -- and a fourth place, the running retire path, did not
+    /// spell it at all. That is how happened: `liveness` deliberately kept the gateway alive
+    /// for the two unproven outcomes, and the pool retired the deal anyway, cancelling the decision
+    /// one layer down. A predicate copied into N places is a policy that can disagree with itself,
+    /// so it lives on the type that carries the outcome.
+
+    /// Proven, and why:
+
+    /// * `Cancelled` / `AlreadyAbsent` / `ReapedNotRelisted` -- the order is off the book. The book
+    /// has ONE removal point (`InferenceOrderBook._removeFromBook`), so off means unmatchable.
+    /// * `AlreadyMatched` -- it matched; it cannot match again.
+    /// * `NotAttemptedExpired` -- the row may well still be sitting there, but the matcher drops an
+    /// expired maker inline on every crossing (`_isExpired(mk.deadline)`, three sites in the match
+    /// walk), so it is unmatchable without anyone writing anything.
+
+    /// NOT proven:
+
+    /// * `RejectedStillResting` -- the chain refused the cancel and the exact order still rests.
+    /// * `UnknownFailure` -- nothing established either way, which is not the same as "gone".
+    pub fn proven_unmatchable(&self) -> bool {
+        match self {
+            Self::Cancelled
+            | Self::AlreadyAbsent
+            | Self::AlreadyMatched(_)
+            | Self::NotAttemptedExpired
+            | Self::ReapedNotRelisted { .. } => true,
+            Self::UnknownFailure { .. } | Self::RejectedStillResting { .. } => false,
+        }
+    }
 }
 
 impl std::fmt::Display for CancellationDisposition {
@@ -183,6 +220,7 @@ impl std::fmt::Display for CancellationDisposition {
 
 /// The authoritative expiry of the exact supervised SELL, and the moment the seller observed it
 /// .
+
 /// `deadline` is read back out of the order book, never reconstructed as `post time + MAX_SELL_TTL`:
 /// the chain anchors it at `block.timestamp` inside `PrivateNote.postSellOffer`
 /// (`contracts/dex/PrivateNote.sol:793`), and a client clock that differs from the node's would put
@@ -201,9 +239,10 @@ pub enum RestingStopReason {
     Shutdown,
     Watcher(String),
     /// the supervised order reached its own on-chain deadline.
+
     /// Terminal, and deliberately NOT a health failure -- nothing is wrong with this seller. Its offer
     /// simply stopped being executable, which is the ordinary end of every SELL: the deadline is
-    /// mandatory and capped at `MAX_SELL_TTL = 3600`(`contracts/dex/PrivateNote.sol:41,792`), so a
+    /// mandatory and capped at `MAX_SELL_TTL = 3600` (`contracts/dex/PrivateNote.sol:41,792`), so a
     /// seller that runs longer than an hour reaches this outcome by design, not by fault.
     Expired(RestingOfferExpiry),
 }
@@ -262,7 +301,7 @@ pub enum AdvertiseProbePolicy {
     /// Default. A TRANSPORT-level self-probe failure against a **public** advertised address
     /// degrades to a loud warning and the offer still posts: from the seller host the advertised
     /// address is a known-limited observation point. A probe
-    /// that proves the address is the WRONG endpoint(pinned-certificate mismatch, foreign gateway)
+    /// that proves the address is the WRONG endpoint (pinned-certificate mismatch, foreign gateway)
     /// stays fatal, and so does any failure against a non-public advertised address.
     #[default]
     TolerateTunneledTransportFailure,
@@ -270,7 +309,7 @@ pub enum AdvertiseProbePolicy {
     Required,
 }
 
-/// A failed stage of the shared pinned-TLS(h2) gateway probe, with its source chain.
+/// A failed stage of the shared pinned-TLS (h2) gateway probe, with its source chain.
 #[derive(Debug)]
 pub struct ProbeFault {
     /// `endpoint_parse` / `dns_resolve` / `tcp_connect` / `tls_handshake` /
@@ -349,6 +388,7 @@ impl std::error::Error for ProbeFault {
 
 /// The structured shell shared by every `advertised_gateway` fault, so the timeout path and the
 /// error path render identically apart from their stage and cause lines.
+
 /// Before this, the probe's failure reached the operator as `advertised_gateway failed: transport
 /// error` -- `tonic::transport::Error`'s `Display` is that literal string, and `error.to_string()`
 /// at the boundary discarded everything under it. lost hours to exactly that.
@@ -466,7 +506,7 @@ pub async fn probe_gateway(
         }
     };
     // Stage 4 -- the gateway's own gRPC surface. A non-gRPC HTTP response is preserved in the
-    // tonic status(including its mapped HTTP status code), while a valid but foreign gRPC service
+    // tonic status (including its mapped HTTP status code), while a valid but foreign gRPC service
     // is still classified as the wrong endpoint at this same `grpc_challenge` boundary.
     let mut client = GatewayClient::new(channel);
     let challenge = match client
@@ -627,11 +667,12 @@ async fn check_readiness_with_probes(
 
     // Both readiness components share the canonical per-cycle deadline. Poll them concurrently so
     // a tolerated stalled self-probe cannot starve an already-healthy exact-model check.
+
     // E2E-ADV-02: readiness asks a strictly LARGER question than provider health -- "may I sell on
     // this market?" -- so this component is `check_market_readiness`, not `check_health`. Provider health is
     // one half of it; the other half is that the model which actually answered is the model this market
     // sells. `check_health` cannot make that call: it is not told which market it is being asked about, and
-    // the seller's own outbound slug(which an OpenAI-compatible provider echoes) certified itself there.
+    // the seller's own outbound slug (which an OpenAI-compatible provider echoes) certified itself there.
     let (probe_result, upstream_result) = tokio::join!(
         tokio::time::timeout_at(deadline, probe),
         tokio::time::timeout_at(deadline, upstream_probe),
@@ -660,6 +701,7 @@ async fn check_readiness_with_probes(
             );
         }
         // a failed self-probe is fatal, with no tolerated arm. The offer is not posted.
+
         // The arm deleted here degraded a TRANSPORT-level failure against a public advertised
         // address to a warning and posted anyway, on the ground that a NAT/VPN/reverse-tunnel path
         // hairpins back to this process and can fail from the seller host while a remote buyer
@@ -748,7 +790,7 @@ async fn target_state(
     identity: &RestingOfferIdentity,
 ) -> Result<TargetState> {
     // Sample before the awaited read: crossing the deadline in transit can only keep an offer until
-    // the next poll(the matcher already skips it), while sampling after could retire an offer that
+    // the next poll (the matcher already skips it), while sampling after could retire an offer that
     // was live at observation merely because the network read was slow.
     let observed_at = unix_timestamp();
     let orders = chain
@@ -760,7 +802,7 @@ async fn target_state(
     {
         validate_resting_offer(order, Some(&identity.owner_note), cfg)?;
         // present in the book is not the same as usable. A row past its own deadline is skipped
-        // by the matcher(`_isExpired`, `contracts/airegistry/InferenceOrderBook.sol:1115-1117`), so
+        // by the matcher (`_isExpired`, `contracts/airegistry/InferenceOrderBook.sol:1115-1117`), so
         // resuming onto it would report readiness for an offer no buyer can reach.
         if !dexdo_core::order_deadline_is_live(order.is_buy, order.deadline, observed_at) {
             return Ok(TargetState::Expired(RestingOfferExpiry {
@@ -790,16 +832,18 @@ enum SupervisedOfferPoll {
 }
 
 /// Is the exact supervised order past its own authoritative deadline right now?
+
 /// The deadline is re-read from the book on every call rather than cached at post time, so a wall-clock
 /// jump, a delayed task wake or a stale local estimate cannot extend on-chain order validity: whatever
 /// happened while this task was asleep, the answer comes from the same read that proves the order is
 /// still there.
+
 /// an order that has left the book WITHOUT a fill is the same fact arriving early. Expiry removal
 /// is permissionless, so a matcher crossing the book or another keeper may sweep this seller's ask
 /// seconds after its deadline and before this poll ever sees it expired
 /// (`contracts/airegistry/InferenceOrderBook.sol:1015-1019,1679-1691`). The removal counts as an expiry
 /// only once the deal proves it was not a fill -- an unfunded deal has sold nothing, and a fill and its
-/// funding land in the same match(`contracts/airegistry/InferenceOrderBook.sol:1082-1092`). Without
+/// funding land in the same match (`contracts/airegistry/InferenceOrderBook.sol:1082-1092`). Without
 /// this, a swept ask left the seller supervising an order that no longer exists, healthy and
 /// unreachable, which is the very state exists to end.
 async fn resting_offer_expiry(
@@ -808,7 +852,7 @@ async fn resting_offer_expiry(
     last_observed_deadline: Option<u64>,
 ) -> Result<SupervisedOfferPoll> {
     // Sample before the awaited read: crossing the deadline in transit can only keep an offer until
-    // the next poll(the matcher already skips it), while sampling after could retire an offer that
+    // the next poll (the matcher already skips it), while sampling after could retire an offer that
     // was live at observation merely because the network read was slow.
     let observed_at = unix_timestamp();
     let orders = chain
@@ -845,6 +889,7 @@ async fn resting_offer_expiry(
 }
 
 /// The terminal expiry line an operator and a log scraper both read.
+
 /// It carries the order id, the TokenContract, the absolute deadline and the observed time, so the
 /// outcome can be checked against the chain without trusting the process that emitted it.
 fn trace_offer_expired(identity: &RestingOfferIdentity, expiry: &RestingOfferExpiry) {
@@ -919,11 +964,13 @@ enum RelistDecision {
 }
 
 /// Reap the exact expired ask and prove the deal may carry a successor.
+
 /// Submits the permissionless `expireOrder(orderId)` once, then confirms the authoritative
 /// consequences rather than the submit: the exact order absent from the book, no OTHER live SELL for
 /// the deal, the `_offerPosted` latch released by `onSellClosed`
 /// (`contracts/airegistry/TokenContract.sol:729-736`), the deal still unsold, and its
 /// constructor-bound capacity readable.
+
 /// The submit's own result is deliberately not authority in either direction. `expireOrder` is
 /// permissionless and idempotent -- a gone or still-live order is a silent no-op
 /// (`contracts/airegistry/InferenceOrderBook.sol:1679-1691`) -- so a matcher, another keeper or a
@@ -992,6 +1039,7 @@ async fn reap_expired_offer(
 }
 
 /// One authoritative pass of the reap gate.
+
 /// `Ok(Ok(decision))` is terminal, `Ok(Err(pending))` describes a state that a later pass may still
 /// resolve, and `Err` is a failed read. Only the middle one is worth polling for: everything else is
 /// either proven or deterministic.
@@ -1003,7 +1051,7 @@ async fn reap_state(
 ) -> Result<std::result::Result<RelistDecision, String>> {
     // A match that landed before the deadline outranks the expiry: the deal is sold, and serving it
     // is worth more than any successor. The book cannot create a NEW one -- `_match` skips a row past
-    // its deadline(`contracts/airegistry/InferenceOrderBook.sol:1115-1117`) -- so this is the earlier
+    // its deadline (`contracts/airegistry/InferenceOrderBook.sol:1115-1117`) -- so this is the earlier
     // fill this seller had not observed yet, not a fill against the expired order.
     if let Some(matched) = chain
         .read_openable_match_now(&identity.token_contract)
@@ -1347,15 +1395,18 @@ async fn watch_accepted_cancel(
 
 /// where the one cycle deadline is USED, so that "one deadline, read twice" can be asserted
 /// as itself.
+
 /// A supervision cycle computes its deadline once, bounds the readiness check with it, and hands
 /// the SAME instant to the cancellation. Nothing about that is visible from outside the function:
 /// both a shared deadline and two independent ones end in the same `unknown_failure` carrying the
 /// same `budget_ms`, and the only externally different thing about two deadlines is that the cycle
 /// takes about twice as long. That is why this property used to be asserted with a stopwatch, and
 /// why the stopwatch kept failing under scheduling pressure while the property itself held.
+
 /// This is observation and nothing else. Both the recorder and its call sites are `#[cfg(test)]`,
 /// so a non-test build does not contain them, and in either build the deadline is computed at
 /// exactly the same point from exactly the same inputs.
+
 /// Thread-local rather than global: libtest gives each test its own thread and these tests drive
 /// `supervise_with_timing` on it directly, so recordings cannot bleed between tests running
 /// concurrently in the same binary -- the very condition that made the old stopwatch flaky.
@@ -1626,15 +1677,11 @@ async fn stop_exact_offer(
         CancellationDisposition::AlreadyMatched(_) => Ok(SellerStartupOutcome::Ready(
             SellerOfferStartup::ResumedFunded,
         )),
-        disposition
-        @ (CancellationDisposition::UnknownFailure { .. }
-        | CancellationDisposition::RejectedStillResting { .. }) => {
-            Ok(SellerStartupOutcome::Stopped {
-                identity: Some(identity.clone()),
-                reason,
-                disposition,
-            })
-        }
+        disposition if !disposition.proven_unmatchable() => Ok(SellerStartupOutcome::Stopped {
+            identity: Some(identity.clone()),
+            reason,
+            disposition,
+        }),
         disposition => {
             seller.server_task.abort();
             Ok(SellerStartupOutcome::Stopped {
@@ -1764,12 +1811,14 @@ async fn resolve_interrupted_startup(
 }
 
 /// Startup readiness, with the same bounded tolerance for an isolated stall the periodic path has.
+
 /// The periodic check retries a TIMED-OUT probe once
 /// (`SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS`, "two attempts absorb one isolated stall"). Startup
 /// had no retry at all, and it is where a stall costs the most: no ask is posted, the seller exits,
 /// and the market stays empty until an operator notices. Observed against a provider answering a
 /// plain completion in two seconds: `upstream_authentication_and_model timed out: bounded upstream
 /// model probe expired`, and the offer was never placed.
+
 /// Only a timeout is retried. A readiness FAILURE -- a dead gateway, a model that is not the model
 /// this market sells -- stays fatal on the first answer, as before: it is evidence of unfitness, and
 /// asking twice cannot change it.
@@ -2114,8 +2163,8 @@ where
                 _ = health.tick() => {
                     // The cycle budget can be spent before this arm is ever entered. The expiry
                     // read in the same `select!` holds the loop for up to
-                    // `TRANSIENT_READ_TOTAL_BUDGET`(45s) while the health cadence is
-                    // `health_interval`(20s), so ONE slow book read is enough for the health tick
+                    // `TRANSIENT_READ_TOTAL_BUDGET` (45s) while the health cadence is
+                    // `health_interval` (20s), so ONE slow book read is enough for the health tick
                     // to arrive later than `last_healthy + cycle_timeout`. Sizing the check from
                     // what is left of that window then hands it ZERO: the `timeout_at` in
                     // `check_readiness_with_probe` fires before a socket is opened, the seller
@@ -2123,6 +2172,7 @@ where
                     // healthy resting SELL, and tells the operator to clean up an order that was
                     // never sick. Observed on a long-lived seller: last healthy 12:37:01, next
                     // cycle 12:38:41, deal retired on a probe that never ran.
+
                     // A starved cycle is evidence about this loop, not about the gateway. Give the
                     // check its own budget and measure the cancellation headroom from the instant
                     // it actually starts.
@@ -2221,6 +2271,7 @@ where
                     // that decides when the next read starts. A book that never answers still cannot
                     // wedge supervision: the nested select keeps shutdown and the match watcher live
                     // while this arm waits for the bounded read.
+
                     // A transport blip is not proof of expiry either, so an unreadable book leaves the
                     // seller owning an offer whose current expiry is unverified, and the next tick asks
                     // again. Only an authoritative row that is present AND past its deadline ends
@@ -2299,6 +2350,7 @@ where
     // chain, so cancelling it would spend gas to remove something the matcher already skips, and the
     // cancel would race the permissionless sweep for no gain. Readiness ends here, before any cleanup
     // or relist work -- that is's job, and it starts from this outcome.
+
     // The gateway is deliberately left running: an expired offer is not an unhealthy seller, and the
     // successor offer posts needs the same gateway still answering.
     if let Trigger::Expired(expired) = trigger {
@@ -2324,13 +2376,7 @@ where
         }
         disposition => disposition,
     };
-    if timing.abort_gateway_on_stop
-        && !matches!(
-            &disposition,
-            CancellationDisposition::UnknownFailure { .. }
-                | CancellationDisposition::RejectedStillResting { .. }
-        )
-    {
+    if timing.abort_gateway_on_stop && disposition.proven_unmatchable() {
         seller.server_task.abort();
     }
     Ok(RestingSellerOutcome::Stopped {
@@ -2347,11 +2393,13 @@ where
 
 /// Supervise one resting ask and, when it dies of its own deadline, reap it and carry the deal's
 /// remaining capacity into exactly one successor.
+
 /// A SELL's deadline is mandatory and capped at `MAX_SELL_TTL = 3600`
 /// (`contracts/dex/PrivateNote.sol:41,792`), so an alive seller meets it by design rather than by
 /// fault. Every iteration of this loop supervises ONE generation: the loop only turns after the
 /// previous generation is authoritatively off the book, and it stops for good at the first outcome
 /// that is not an expiry.
+
 /// The successor rests on the SAME deal, and that is not a shortcut. A `TokenContract`'s
 /// `_maxTicks` and `_pricePerTick` are constructor statics -- `postFromNote` re-posts exactly them
 /// (`contracts/airegistry/TokenContract.sol:713-718`) -- and an ask leaving the book WITHOUT a fill
@@ -2361,12 +2409,17 @@ where
 /// (`contracts/airegistry/InferenceOrderBook.sol:1088-1092`), so `getDeal().maxTicks` IS the
 /// remaining capacity, read here from the deal itself rather than copied out of the expired row.
 #[allow(clippy::too_many_arguments)]
-async fn supervise_and_relist_with_timing<S>(
+/// the relist loop, REPORTING the generation it ends on.
+
+/// Split from `supervise_and_relist_with_timing` rather than replacing it: that entry point has
+/// callers whose identity is not theirs to lend mutably, and they do not care which generation the
+/// loop finished on. Only the pool does -- it holds the entry the shutdown sweep acts upon.
+async fn supervise_and_relist_reporting_identity<S>(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     watch: &SellerMatchWatchConfig,
-    identity: &RestingOfferIdentity,
+    identity: &mut RestingOfferIdentity,
     shutdown: S,
     timing: SupervisionTiming,
 ) -> Result<RestingSellerOutcome>
@@ -2374,7 +2427,9 @@ where
     S: Future<Output = ()>,
 {
     tokio::pin!(shutdown);
-    let mut identity = identity.clone();
+    // NOT a clone. The relist loop below advances this to the successor, and the pool
+    // holds the entry the shutdown sweep will act on -- so advancing a private copy left the
+    // pool pointing at a consumed predecessor and the successor resting unserved.
     let mut cfg = cfg.clone();
     loop {
         let expired = match supervise_with_timing(
@@ -2382,7 +2437,7 @@ where
             chain,
             &cfg,
             watch,
-            &identity,
+            &*identity,
             shutdown.as_mut(),
             timing,
         )
@@ -2397,7 +2452,7 @@ where
 
         let reap_deadline = tokio::time::Instant::now() + timing.reap_timeout;
         let (remaining_ticks, price_per_tick) =
-            match reap_expired_offer(chain, &cfg, &identity, reap_deadline, timing.reap_poll).await
+            match reap_expired_offer(chain, &cfg, &*identity, reap_deadline, timing.reap_poll).await
             {
                 RelistDecision::Relist {
                     remaining_ticks,
@@ -2509,7 +2564,7 @@ where
         }
         let successor_identity = RestingOfferIdentity {
             order_id: successor,
-            ..identity.clone()
+            ..(*identity).clone()
         };
         let successor_deadline = match successor_absolute_deadline(
             chain,
@@ -2541,17 +2596,38 @@ where
             }
         };
         trace_offer_relisted(
-            &identity,
+            &*identity,
             &expired,
             successor,
             successor_deadline,
             remaining_ticks,
         );
-        identity = successor_identity;
+        *identity = successor_identity;
     }
 }
 
+/// The relist loop for callers that do not need the generation it ended on. Behaviour is unchanged:
+/// it supervises a private copy, exactly as it always did.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_and_relist_with_timing<S>(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+    identity: &RestingOfferIdentity,
+    shutdown: S,
+    timing: SupervisionTiming,
+) -> Result<RestingSellerOutcome>
+where
+    S: Future<Output = ()>,
+{
+    let mut owned = identity.clone();
+    supervise_and_relist_reporting_identity(seller, chain, cfg, watch, &mut owned, shutdown, timing)
+        .await
+}
+
 /// The successor's own absolute deadline, straight out of the book.
+
 /// Read rather than reconstructed, for the same reason `RestingOfferExpiry` carries the book's
 /// figure: the chain anchors it at `block.timestamp + ttl` inside `PrivateNote.postSellOffer`
 /// (`contracts/dex/PrivateNote.sol:793`). It also bounds the relist loop -- a successor must outlive
@@ -2599,6 +2675,7 @@ async fn successor_absolute_deadline(
 }
 
 /// Supervise exactly ONE generation of a resting ask and return its terminal outcome.
+
 /// the seller process itself uses [`supervise_resting_offer_with_relist`], because a deadline is
 /// not the end of an alive seller. This entry stays for the callers that want a single generation and
 /// the outcome that ended it -- an acceptance run asserting one exact terminal fact, not a daemon.
@@ -2635,7 +2712,7 @@ pub async fn supervise_resting_offer_with_relist<S>(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     watch: &SellerMatchWatchConfig,
-    identity: &RestingOfferIdentity,
+    identity: &mut RestingOfferIdentity,
     shutdown: S,
     abort_gateway_on_stop: bool,
     advertise_probe: AdvertiseProbePolicy,
@@ -2643,7 +2720,7 @@ pub async fn supervise_resting_offer_with_relist<S>(
 where
     S: Future<Output = ()>,
 {
-    supervise_and_relist_with_timing(
+    supervise_and_relist_reporting_identity(
         seller,
         chain,
         cfg,
@@ -3199,7 +3276,7 @@ mod tests {
 
     /// A resting SELL as the chain can actually hold one. The deadline is live and finite because a
     /// SELL's is mandatory: `PrivateNote.postSellOffer` refuses `ttl == 0` and caps it at
-    /// `MAX_SELL_TTL = 3600`(`contracts/dex/PrivateNote.sol:41,792`), so a zero here would describe a
+    /// `MAX_SELL_TTL = 3600` (`contracts/dex/PrivateNote.sol:41,792`), so a zero here would describe a
     /// row the book cannot contain.
     fn order(order_id: u128, owner: &str, token_contract: &str) -> OrderBookOrder {
         order_with_deadline(
@@ -3630,10 +3707,12 @@ mod tests {
     /// pin the CAPABILITY probe body the way
     /// `issue_1227_plain_id_uses_the_unchanged_readiness_request_and_no_extra_probe` pins the plain
     /// one, so a future edit cannot silently change what we ask a provider to prove.
+
     /// The measurement behind these two fields is on the constants themselves. In one sentence:
     /// asked with the readiness prompt and the readiness budget, `qwen/qwen3-32b`,
     /// `qwen/qwen3.6-27b`, `openai/gpt-oss-20b` and `openai/gpt-oss-120b` never called the tool on
-    /// Groq(2026-08-12), so a `--tools` market could not start on any of them.
+    /// Groq (2026-08-12), so a `--tools` market could not start on any of them.
+
     /// This asserts the WHOLE body, not the two fields that moved: the tool schema and the forced
     /// `tool_choice` are what the provider is actually asked to honour, and they were proven
     /// innocent of precisely by being byte-identical between the failing and passing runs.
@@ -3693,6 +3772,7 @@ mod tests {
     /// the capability prompt and budget are the CAPABILITY probe's alone. The post-SELL
     /// readiness request in the very same tools startup must still carry the readiness prompt and
     /// the readiness budget, byte for byte, with no tool fields at all.
+
     /// Two questions, two constants: is what asking one of them with the other's budget cost,
     /// and this is the assertion that fails if's fix leaks back into the shared path.
     #[tokio::test]
@@ -3726,6 +3806,7 @@ mod tests {
     }
 
     /// a `--think`-only probe must not name a tool it does not offer.
+
     /// `tools`/`tool_choice` are built from `requirements.tools` alone, so this body carries
     /// `reasoning` and NO tool of any kind. Asking it to "call the dexdo_capability_probe tool"
     /// would be an incoherent request, and a provider entitled to refuse it would make `--think`
@@ -3733,6 +3814,7 @@ mod tests {
     /// whether a tool is OFFERED, and this pins both halves of that choice: the readiness prompt
     /// here, the capability prompt in
     /// `issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_budget`.
+
     /// The budget is still the capability one: reasoning needs the room even when no tool is asked
     /// for.
     #[tokio::test]
@@ -3920,6 +4002,7 @@ mod tests {
 
     /// A seller whose advertised public address refuses the trial delivery does not become ready
     /// and posts no offer to the book.
+
     /// E2E-ADV-10, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-10/L0
     /// NOT RUN ON WINDOWS. The alias below is a NAME, not a literal -- `127.1` is what makes
@@ -3929,9 +4012,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4009,7 +4094,9 @@ mod tests {
     }
 
     /// Assert that a seller whose preflight failed posted no offer and opened no stream.
+
     /// Shared by E2E-ADV-10, E2E-ADV-11 and E2E-ADV-12, `tests/e2e/test-specification.md`.
+
     /// Partial: the buyer-escrow half of those rows is not observable at this layer -- no buyer
     /// note exists in these fixtures -- so only the seller-side facts are asserted.
     fn assert_nothing_was_posted(backend: &CancelBackend, label: &str, error: &str) {
@@ -4027,6 +4114,7 @@ mod tests {
         );
         // 3 -- the seller never opened a stream, which is the seller-side money move: `open_stream`
         // posts the `2P` bond and freezes the probe tick.
+
         // `CancelBackend.opens` counts `open_stream` -- the SELLER's call, not the buyer's escrow.
         // The buyer-escrow half of the row is owed at L1, where a real buyer's note can be read.
         assert_eq!(
@@ -4038,12 +4126,14 @@ mod tests {
 
     /// Re-spell a loopback `127.0.0.1:<port>` as `127.1:<port>`, which the classifier calls PUBLIC
     /// while the real dial still lands on the held local socket.
+
     /// `advertise_host` splits the single colon and hands `127.1` to
-    /// `classify_advertise`(`advertise.rs:143`); Rust's `IpAddr` parser requires four octets, so
+    /// `classify_advertise` (`advertise.rs:143`); Rust's `IpAddr` parser requires four octets, so
     /// `"127.1".parse::<IpAddr>()` FAILS and the string falls through to `classify_name`, which
     /// calls anything outside its reserved-local list public. The dial is a different code path:
     /// `TcpStream::connect` hands the string to `getaddrinfo`, whose `inet_aton` still accepts the
     /// classic BSD abbreviated form and yields `127.0.0.1`.
+
     /// So the PUBLIC address class becomes controllable, and every case that needs "public AND
     /// something I own is on the other end" is deterministic instead of depending on whether the
     /// host has a default route to TEST-NET-1.
@@ -4060,6 +4150,7 @@ mod tests {
 
     /// An address that ACCEPTS the connection and then never speaks, for as long as the listener is
     /// held -- the deterministic probe TIMEOUT.
+
     /// The counterpart of `refusing_endpoint`, and its own doc explains why this works: `listen(2)`
     /// completes the TCP handshake out of the backlog, so `connect` succeeds even though nothing
     /// ever calls `accept`. Stage 1 of `probe_advertised_gateway` therefore passes and stage 2
@@ -4074,6 +4165,7 @@ mod tests {
     }
 
     /// Render a startup outcome for an assertion message, whichever arm it took.
+
     /// A refused preflight can surface two ways: as `Err`, or -- on a head that still tolerates the
     /// failure -- as `Ok(Stopped {.. })` after the offer rested and a later health cycle cancelled
     /// it. Both must be printable, because the book assertion runs before either is ruled out.
@@ -4101,16 +4193,20 @@ mod tests {
     /// E2E-ADV-10, the timeout arm. Predecessor:
     /// `pr795_edge_tolerated_public_probe_timeout_keeps_healthy_upstream_ready_and_posts`, which
     /// asserted `Ok` plus `posts == 1` on the same input.
+
     /// A HEALTHY upstream is deliberately kept in the fixture: the point of the predecessor was that
     /// a tolerated probe timeout must not starve the exact-model check, and that half of the
     /// reasoning survives the ruling. What changes is the verdict -- a healthy model is not a licence
     /// to advertise an address nobody can dial.
+
     /// It drives the production readiness->post sequence, so the verification is the BOOK and the
     /// SUBMIT PATH. An earlier revision stopped at `check_readiness_with_probe` and asserted only
     /// the returned error, which could have passed while the posting path still wrote an order.
+
     /// This covers the TRANSPORT-fault arm. The TIMEOUT arm is a separate construction site in
-    /// production(`liveness.rs:467-476` against `:466`) and gets its own test below, which asserts
+    /// production (`liveness.rs:467-476` against `:466`) and gets its own test below, which asserts
     /// the classification and the book together.
+
     /// E2E-ADV-10, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-10/L0
     /// NOT RUN ON WINDOWS. The alias below is a NAME, not a literal -- `127.1` is what makes
@@ -4120,9 +4216,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4182,10 +4280,12 @@ mod tests {
 
     /// E2E-ADV-10, the TIMEOUT arm -- the classification and the book, through production's own
     /// composition.
+
     /// Predecessor: `pr795_edge_tolerated_public_probe_timeout_keeps_healthy_upstream_ready_and_posts`,
     /// which asserted `Ok` plus `posts == 1`. A HEALTHY upstream is kept because the predecessor's
     /// point -- a tolerated probe timeout must not starve the exact-model check -- survives the
     /// ruling; what changes is the verdict.
+
     /// **Three earlier revisions of this row were wrong, and the last of them was wrong in the
     /// direction that is harder to notice.** It asserted only the returned error; then it
     /// re-implemented `if readiness.is_ok() { post }` in the test, which is the TEST's composition
@@ -4194,12 +4294,14 @@ mod tests {
     /// deterministically. That concession was measured rather than assumed and was still false --
     /// `public_alias` is the counter-example, and an honest `partial` over a closeable gap is its
     /// own kind of wrong answer.
+
     /// So this drives `prepare_seller_offer_with_timing` -- production's composition, readiness at
     /// `liveness.rs:999`, the no-post return at `:1020`, the post at `:1047` -- against a listener
     /// that accepts and never speaks TLS, advertised under its public alias. The probe reaches
     /// stage 2 and hangs there until the bounded deadline elapses, so the timeout branch at
     /// `:467-476` is the one that builds the fault, and the stage assertion below is what proves
     /// it rather than the transport branch at `:466`.
+
     /// E2E-ADV-10, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-10/L0
     /// NOT RUN ON WINDOWS. The alias below is a NAME, not a literal -- `127.1` is what makes
@@ -4209,9 +4311,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4275,16 +4379,19 @@ mod tests {
     }
 
     /// E2E-ADV-03 -- the check is on the ADVERTISED `host:port`, and a successful BIND is not it.
+
     /// The gateway bind at `cli/seller.rs:2285-2314` proves something is listening on the LISTEN
     /// address. On a listen/advertise mismatch -- the common operator error -- the bind succeeds
     /// while the pair a buyer will dial is closed. This drives the real readiness->post sequence
     /// with a gateway genuinely bound and serving, and a genuinely refused advertised port, and
     /// asserts that nothing was posted.
+
     /// GREEN on this head, for a reason worth stating: tolerance is gated on
     /// `advertise_is_public`, so a private mismatch is already fatal. The PUBLIC mismatch is the
     /// same operator error one address class over and is NOT green -- that case is
     /// `public_advertise_transport_failure_is_fatal_and_the_book_stays_empty`, which is ignored
     /// until the ruling lands. Read the two together; either alone understates the gap.
+
     /// E2E-ADV-03, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-03/L0
     #[tokio::test]
@@ -4359,6 +4466,7 @@ mod tests {
 
     /// E2E-ADV-11 and E2E-ADV-12 -- a wrong-endpoint PROOF stops the post under every
     /// policy, and stays so after the ruling.
+
     /// This is the half of the old `probe_should_degrade` predicate that had to SURVIVE the
     /// deletion of the degrade path: its `&& !fault.wrong_endpoint` conjunct. deleted the
     /// predicate and the arm it guarded, so a wrong-endpoint fault is now fatal the same way every
@@ -4366,23 +4474,28 @@ mod tests {
     /// written against `prepare_seller_offer_with_timing` -- the production readiness->post sequence
     /// -- so that removing the predicate could not remove the guarantee with it, AND so that the
     /// verification is the posted-offer facts rather than the value of a returned error.
+
     /// **Both faults are produced by the real probe against a real counterparty**, never injected.
     /// An earlier revision handed `check_readiness_with_probe` an already-constructed
     /// `ProbeFault::wrong_endpoint`, which asserted that such a fault is fatal ONCE ONE EXISTS and
     /// proved nothing about whether the probe still detects one. Here:
-    /// - ADV-11(pinned-certificate mismatch) is a second real gateway with its own TLS identity,
+
+    /// - ADV-11 (pinned-certificate mismatch) is a second real gateway with its own TLS identity,
     /// so detection runs through `connect_pinned` and the rustls verifier;
-    /// - ADV-12(something answering that is not this gateway) is a real gRPC server returning an
+    /// - ADV-12 (something answering that is not this gateway) is a real gRPC server returning an
     /// application status, so detection runs through the challenge exchange.
+
     /// **Both dimensions are swept, and the address class is no longer conceded.** An earlier
     /// revision said a PUBLIC address answering with the wrong endpoint could not be produced from
     /// a test host, and marked the rows `partial` on it. `public_alias` refutes that: the
     /// counterparty stays local and the advertised spelling is what the classifier judges, so a
     /// public advertised address is exercised against a real wrong-endpoint proof.
+
     /// GREEN on this head. A regression, not a specification: the code PR it was written to catch
     /// -- one deleting the tolerance and taking the wrong-endpoint guarantee with it -- is, and
     /// this test stayed green through it. What it catches now is any future PR that reintroduces a
     /// tolerated path and exempts a wrong-endpoint fault from it.
+
     /// E2E-ADV-11, E2E-ADV-12, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-11/L0
     /// E2E-ROW: E2E-ADV-12/L0
@@ -4393,9 +4506,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4465,8 +4580,9 @@ mod tests {
                 foreign.server_task.abort();
 
                 // ---- ADV-12: something ANSWERS on the advertised address and is not this gateway ----
+
                 // The probe must reach `grpc_challenge`, so the TLS pin has to SUCCEED first: a
-                // separately generated seller would fail at `tls_certificate_pin`(`liveness.rs:351`)
+                // separately generated seller would fail at `tls_certificate_pin` (`liveness.rs:351`)
                 // and the case would silently become a second copy of ADV-11 above. So readiness is
                 // run for the impostor's OWN identity -- the pin matches, the connection completes, and
                 // the interceptor returns a server-side gRPC status, which is what
@@ -4519,6 +4635,7 @@ mod tests {
 
     /// E2E-ADV-12 -- **every** server-returned gRPC status is a wrong-endpoint proof, on both
     /// address classes.
+
     /// Restores `pr795_edge_server_returned_grpc_application_statuses_are_fatal_before_sell`, which
     /// an earlier revision of this file deleted while replacing the area. That test swept five
     /// status classes; production classifies every returned status identically at
@@ -4526,11 +4643,13 @@ mod tests {
     /// the sweep is what stops a later refactor special-casing one of them into a tolerated
     /// transport fault. Losing it was a regression, and the narrowed replacement covered only
     /// `PermissionDenied`.
+
     /// Two things are added on top of the restored sweep rather than replacing it: readiness runs
     /// for the impostor's OWN identity so the TLS pin SUCCEEDS and the probe genuinely reaches
     /// `grpc_challenge` (a separately generated seller fails at `tls_certificate_pin` first and
     /// silently proves the pin instead), and the PUBLIC address class is covered via
     /// `public_alias`.
+
     /// E2E-ADV-12, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-12/L0
     /// NOT RUN ON WINDOWS. The alias below is a NAME, not a literal -- `127.1` is what makes
@@ -4540,9 +4659,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4559,7 +4680,7 @@ mod tests {
         ] {
             for class in ["private", "public"] {
                 // A FRESH impostor per case: `prepare_seller_offer_with_timing` aborts the gateway
-                // task on a readiness failure(`liveness.rs:1035`), so a reused one would fail the
+                // task on a readiness failure (`liveness.rs:1035`), so a reused one would fail the
                 // next case at `GatewayTask` and never reach the probe at all -- proving nothing
                 // about the status under test.
                 let (seller, listen) = status_seller(tonic::Status::new(
@@ -4616,18 +4737,22 @@ mod tests {
     /// E2E-ADV-10, swept -- successor to
     /// `probe_degradation_covers_only_transport_faults_on_a_public_advertise`, which was the only
     /// direct assertion that degradation exists at all.
+
     /// The predecessor's first assertion -- transport fault + public advertise + the default policy
     /// DEGRADES -- is the one the ruling cancels. Its other three remain true and are kept, so this
     /// is a strict superset of what it replaces: no transport fault, on any address class, under
     /// any policy, is tolerated.
+
     /// Driven through `prepare_seller_offer_with_timing` with a REAL probe against a real refused
     /// address, and verified on the posted-offer facts. An earlier revision injected the fault into
     /// `check_readiness_with_probe` and asserted only the returned error, which could have passed
     /// while the posting path still wrote an order.
+
     /// Both address classes are reachable here because a transport fault -- unlike a wrong-endpoint
     /// proof -- needs nothing to answer: `192.0.2.1` is public and unroutable, and a bound-but-not-
     /// listening loopback socket is private and refused. The refusing reservation is held for the
     /// whole assertion, since a bind-and-drop hands the port back to the kernel.
+
     /// E2E-ADV-10, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-10/L0
     /// NOT RUN ON WINDOWS. The alias below is a NAME, not a literal -- `127.1` is what makes
@@ -4637,9 +4762,11 @@ mod tests {
     /// resolves, and that spelling classifies as loopback, which is the opposite of what this row
     /// needs. No name exists that Windows resolves to loopback AND `classify_name` calls public:
     /// the only such name is `localhost`, which that function lists as non-public by design.
+
     /// A second measured obstacle stands behind the first: on `windows-latest` even a refused
     /// connect returns after 2.031 s, against this fixture's 300 ms probe budget, so the row would
     /// read `handshake_timeout` whatever spelling it used.
+
     /// What the row proves -- our own classification and verdict logic -- has nothing platform-bound
     /// in it and is proven on Linux and macOS. Skipping is honest here; a permanently red leg is
     /// not, because it hides the Windows regressions this suite could still catch.
@@ -4717,8 +4844,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_unreachable_rejected_missing_model_and_timeout_fail_closed() {
-        // The first case is the UNREACHABLE upstream(refused at connect), a different fail-closed
-        // path from the fourth(a server that answers too slowly). If a bind-and-drop port is taken
+        // The first case is the UNREACHABLE upstream (refused at connect), a different fail-closed
+        // path from the fourth (a server that answers too slowly). If a bind-and-drop port is taken
         // by somebody else the two collapse into one and the case stops proving its own name
         // so the refusing reservation is held for the whole assertion.
         let (_dead_hold, dead) = crate::test_refusing_endpoint::refusing_endpoint();
@@ -4771,11 +4898,13 @@ mod tests {
             // an ordering nothing promises. The last case gives readiness 100 ms against an upstream
             // that answers in 500 ms; on a loaded host the local pinned-TLS self-probe loses that
             // same 100 ms and the failure reads `AdvertisedGateway` instead of `UpstreamModel`.
+
             // The subject of this test is the UPSTREAM: a bad upstream must fail readiness, and the
             // slow one must be reported as a timeout. So the gateway's outcome is ESTABLISHED
             // instead of raced, the way settled the same class -- run the REAL probe against
             // the REAL gateway first and assert its REAL result, then hand the readiness call that
             // settled outcome so the only component still racing the budget is the one under test.
+
             // This injects no fault and hides none: `probe_gateway` never reaches the upstream (DNS,
             // TCP, pinned TLS and the gRPC challenge all terminate at the seller's own gateway), so
             // a probe that stopped detecting a broken gateway fails the assertion below rather than
@@ -4900,6 +5029,7 @@ mod tests {
     /// `a_closed_advertised_port_posts_nothing_even_though_the_gateway_is_bound`,
     /// `upstream_unreachable_rejected_missing_model_and_timeout_fail_closed`, and
     /// `gateway_task_death_cancels_within_one_health_cycle`.
+
     /// E2E-ADV-01, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-01/L0
     #[tokio::test]
@@ -4941,13 +5071,16 @@ mod tests {
     /// that startup never invoked it, so the fact worth proving is that
     /// `prepare_seller_offer_with_timing` CALLS `assert_note_covers_seller_bond` and that a refusal
     /// stops the seller before `postSellOffer`.
+
     /// This is `e2e_adv_01_all_preflights_pass_before_one_post` with ONE variable changed -- that row
     /// is healthy, ready, and posts exactly once on this same fixture -- so `posts == 0` here can only
     /// be the bond gate.
+
     /// The error must also SURVIVE as an error. A startup `Err` raised any later than this is
-    /// swallowed by `resolve_interrupted_startup`(`liveness.rs:1274-1357`) into
+    /// swallowed by `resolve_interrupted_startup` (`liveness.rs:1274-1357`) into
     /// `Ok(SellerStartupOutcome::Stopped {.. })`, so gating inside `post_offer` would have reported
     /// a clean stop over a bond the note cannot pay.
+
     /// E2E-ADV-14, `tests/e2e/test-specification.md`.
     #[tokio::test]
     async fn e2e_adv_14_a_record_that_cannot_cover_the_bond_stops_startup_before_any_post() {
@@ -4995,6 +5128,7 @@ mod tests {
     /// `foreign-provider-model`; changing the signal manifest is deliberately not used as a
     /// substitute for provider identity. Both arms assert the submit counter and authoritative
     /// book. L1/L2 remain live gates and are not claimed by this deterministic row.
+
     /// E2E-ADV-02, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-02/L0
     #[tokio::test]
@@ -5068,6 +5202,7 @@ mod tests {
     /// sample. Start with a verified endpoint and an exact resting id, then replace the advertised
     /// route with a deterministic public transport refusal while supervision is live. The exact
     /// order must be cancelled and confirmed absent.
+
     /// E2E-ADV-06, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-06/L0
     #[tokio::test]
@@ -5186,6 +5321,7 @@ mod tests {
     }
 
     /// A seller whose provider answers the way a REAL provider answers reaches the book.
+
     /// Every readiness row above this one is fed a hand-written stream, and every one of them closes
     /// with a single terminal usage record. A live Groq `qwen/qwen3-32b` does not: it states the same
     /// total twice, on the `finish_reason` chunk and again on the dedicated
@@ -5193,6 +5329,7 @@ mod tests {
     /// failed the `upstream_authentication_and_model` component, and the seller exited with
     /// "seller readiness failed before SELL" -- so the book stayed empty and no buyer had anywhere to
     /// go. Offline the whole suite was green, because no fixture had ever been the real wire.
+
     /// So this row is fed `LIVE_GROQ_READINESS_CAPTURE` -- the exact recorded bytes, unedited -- and
     /// drives production's own composition (`prepare_seller_offer_with_timing`: readiness, then the
     /// post). The claim is the one the campaign falsified: the seller becomes ready and the SELL is
@@ -5209,7 +5346,7 @@ mod tests {
         // the capture is a real `qwen/qwen3-32b` stream, so this row must SELL the model it
         // actually replays -- readiness refuses a market whose provider answers as another model. The
         // market id is the knob, not the outbound slug: the slug is what we ask the provider for, and a
-        // provider that echoes it cannot thereby prove anything about the market(E2E-ADV-02/L2).
+        // provider that echoes it cannot thereby prove anything about the market (E2E-ADV-02/L2).
         let mut upstream = openai(base_url);
         if let UpstreamConfig::OpenAi(cfg) = &mut upstream {
             cfg.frame_model = crate::seller::upstream::openai::DEFAULT_MODEL.to_string();
@@ -5483,6 +5620,7 @@ mod tests {
     /// `2026-08-02 16:48:45 MSK`; after it passed, the process stayed alive, kept logging healthy
     /// cycles and kept waiting for a match that could no longer happen, while the buyer-facing
     /// executable-book read already returned nothing.
+
     /// Health here is deliberately PERFECT and the match watcher never fires, so nothing but the
     /// deadline itself can end supervision -- a health-driven cancel would be a different outcome and
     /// would fail the disposition assertion below.
@@ -5704,6 +5842,7 @@ mod tests {
     }
 
     /// The book and the deal as the contracts hold them, for the expiry-relist paths.
+
     /// Every rule below is a contract rule, not a convenience:
     /// - a post while `_offerPosted` is set is SILENTLY dropped
     /// (`contracts/airegistry/TokenContract.sol:713`), which is exactly the failure a seller that
@@ -5858,7 +5997,7 @@ mod tests {
             self
         }
 
-        /// Another actor(a matcher, a keeper) reaped the ask before this seller looked.
+        /// Another actor (a matcher, a keeper) reaped the ask before this seller looked.
         fn reaped_by_another_actor(self) -> Self {
             self.rows.lock().unwrap().clear();
             *self.offer_posted.lock().unwrap() = false;
@@ -6128,6 +6267,7 @@ mod tests {
 
     /// E2E-SELL-10 /, the whole money path: deadline -> `expireOrder(exact id)` -> the deal's
     /// latch released -> exactly one accepted successor for the authoritative remaining capacity.
+
     /// The offer this seller posted is 1024 ticks and nothing ever filled it, so the deal's
     /// `getDeal().maxTicks` is still 1024 -- the successor is sized from THAT read, not from the
     /// expired row. The successor carries a fresh order id and a strictly later absolute deadline,
@@ -6146,12 +6286,16 @@ mod tests {
         // `getDeal()` instead, so these two are what the assertions below must NOT see.
         let mut cfg = relist_cfg(&backend, &seller, 8);
         cfg.price_per_tick = 999;
+        // Stop once the authoritative book read has observed the successor, never after a fixed
+        // wait: every assertion below is about chain state, so the scheduler must not decide
+        // whether the relist got that far.
+        let successor_observed = backend.successor_observed.clone();
 
         let outcome = run_relist(
             &seller,
             &backend,
             &identity(&owner, &tc, expired_order_id),
-            async { tokio::time::sleep(Duration::from_millis(120)).await },
+            async move { successor_observed.notified().await },
             cfg,
         )
         .await;
@@ -6234,12 +6378,15 @@ mod tests {
         let expired_order_id = 11;
         let seller = relist_seller().await;
         let cfg = relist_cfg(&backend, &seller, 512);
+        // The reconciliation is the subject, so the run ends when the successor has been read back
+        // from the book -- not when a timer says it probably has.
+        let successor_observed = backend.successor_observed.clone();
 
         let outcome = run_relist(
             &seller,
             &backend,
             &identity(&owner, &tc, expired_order_id),
-            async { tokio::time::sleep(Duration::from_millis(120)).await },
+            async move { successor_observed.notified().await },
             cfg,
         )
         .await;
@@ -6284,6 +6431,7 @@ mod tests {
     }
 
     /// E2E-SELL-11 /: an expiry the seller cannot prove is never a licence to post.
+
     /// The permissionless sweep is silent in both directions, so an `expireOrder` that changed
     /// nothing looks exactly like one that worked. Here the row never leaves the book: posting anyway
     /// would either duplicate the offer or -- because `postFromNote` drops a post while `_offerPosted`
@@ -6346,12 +6494,15 @@ mod tests {
         let expired_order_id = backend.resting_order_id().expect("the expired ask rests");
         let seller = relist_seller().await;
         let cfg = relist_cfg(&backend, &seller, 32);
+        // The latch is held for four reads, so how long the wait takes is the seller's business.
+        // What the test needs is the successor actually resting, which is the signal below.
+        let successor_observed = backend.successor_observed.clone();
 
         let outcome = run_relist(
             &seller,
             &backend,
             &identity(&owner, &tc, expired_order_id),
-            async { tokio::time::sleep(Duration::from_millis(200)).await },
+            async move { successor_observed.notified().await },
             cfg,
         )
         .await;
@@ -6614,7 +6765,7 @@ mod tests {
         let seller = relist_seller().await;
         let cfg = relist_cfg(&backend, &seller, 8);
         // The gateway dies while the ask is already past its deadline: supervision reaches the expiry
-        // outcome first(its health cycle is an hour away), so the refusal below can only come from
+        // outcome first (its health cycle is an hour away), so the refusal below can only come from
         // the readiness gate in front of the successor.
         seller.server_task.abort();
         while !seller.server_task.is_finished() {
@@ -6650,6 +6801,7 @@ mod tests {
 
     /// E2E-SELL-12 /: a restart at each write boundary of an expiry/relist reconciles to exactly
     /// one live order, and writes nothing twice.
+
     /// The entry point is the production startup path a restarting seller runs
     /// (`prepare_seller_offer_with_liveness`, called by `prepare_pool_deal` for every pool deal), not
     /// an internal recovery helper: the reconciliation under test is its authoritative
@@ -6821,10 +6973,11 @@ mod tests {
         seller.server_task.abort();
     }
 
-    /// E2E-SELL-10 /(invariant): however many deadlines a healthy seller lives through, the
+    /// E2E-SELL-10 / (invariant): however many deadlines a healthy seller lives through, the
     /// book holds at most one live offer for its deal, each generation's successor carries a strictly
     /// later deadline and a strictly newer id than the ask it replaced, and the capacity offered
     /// never changes -- the deal's own `getDeal()` is the only source it is read from.
+
     /// Between generations the run is ended by a shutdown, which cancels the live successor, so each
     /// following generation is re-seeded as the chain would present it: one resting ask, past its
     /// deadline, still in the book because expiry removal is lazy. The gateway is renewed with it:
@@ -6841,11 +6994,23 @@ mod tests {
         for generation in 1..=4_u64 {
             let seller = relist_seller().await;
             let cfg = relist_cfg(&backend, &seller, 256);
+            // End the generation on THIS generation's successor, and on nothing else.
+
+            // `successor_observed` is a `notify_one`, so it stores a permit when nobody is waiting:
+            // a leftover from the previous generation would satisfy the wait before this one had
+            // posted anything. The post count is what makes the wait about this generation's fact
+            // rather than about any notification -- the notify only wakes the check.
+            let successor_observed = backend.successor_observed.clone();
+            let posts = &backend.posts;
             let outcome = run_relist(
                 &seller,
                 &backend,
                 &identity(&owner, &tc, reaped.order_id),
-                async { tokio::time::sleep(Duration::from_millis(120)).await },
+                async move {
+                    while posts.load(Ordering::SeqCst) < generation {
+                        successor_observed.notified().await;
+                    }
+                },
                 cfg,
             )
             .await;
@@ -7006,11 +7171,13 @@ mod tests {
         .unwrap();
 
         // the property this test is named after, asserted as itself.
+
         // The cancellation must run against the deadline the readiness check was already bounded
         // by, not against a fresh one -- one cycle deadline, read twice. This used to be inferred
         // from `started.elapsed() < 80ms`, on the reasoning that two deadlines would take about
         // twice as long. A wall clock cannot tell "two deadlines" apart from "this thread was
         // descheduled", so inside the full binary it reported the second and blamed the first.
+
         // Deliberately not "exactly one health observation": how many readiness cycles run before
         // one fails is a scheduling detail, and pinning it would rebuild the flakiness this
         // replaces. What must hold is that the cancellation shares the deadline of the cycle that
@@ -7065,6 +7232,7 @@ mod tests {
     /// E2E-SELL-03 -- a deterministic upstream rejection cancels the exact id at occurrence one.
     /// `timed_out=false` is the structured class distinction from E2E-SELL-01/02 timeouts; the
     /// existing gateway-task and watcher tests pin the other deterministic classes.
+
     /// E2E-SELL-03, `tests/e2e/test-specification.md`.
     #[tokio::test]
     async fn e2e_sell_03_deterministic_failure_cancels_exact_offer_once() {
@@ -7363,7 +7531,7 @@ mod tests {
             assert!(known_result.contains("authoritative_state=present"));
             assert!(known_result.contains("operator_action="));
             // the guidance names the order to cancel and the command, without printing a
-            // line that cannot run(`orders` needs identity and market/model this module lacks).
+            // line that cannot run (`orders` needs identity and market/model this module lacks).
             assert!(known_result.contains("cancel resting order 105"));
             assert!(known_result.contains("`dexdo orders cancel`"));
             assert!(!known_result.contains("--order-id"));
@@ -7508,6 +7676,7 @@ mod tests {
 
     /// A fake model server that answers a different way each time it is asked, and counts how
     /// many times it was asked.
+
     /// One script entry per accepted connection. The last entry repeats for every request past the
     /// end of the script, so `vec![failing]` is a permanently broken model and
     /// `vec![failing, healthy]` is one that hiccups once.
@@ -7550,6 +7719,7 @@ mod tests {
     }
 
     /// An offer sitting in the market that expires at a stated moment.
+
     /// `order()` above always says zero, which for a sell offer means malformed rather than "never
     /// expires", so anything about expiry needs a real second here.
     fn now_unix() -> u64 {
@@ -7561,10 +7731,12 @@ mod tests {
 
     /// E2E-SELL-01 -- when the model is slow to answer once and fine the next time, the seller's
     /// offer stays on sale.
+
     /// Setup: an offer already on sale, a model that answers the first check too slowly and the
     /// second check normally. Do: run the seller's periodic checking. Observe: the offer with that
     /// exact number is still listed, no withdrawal was submitted, and the model was asked more
     /// than once.
+
     /// E2E-SELL-01, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-SELL-01/L0
     #[tokio::test]
@@ -7656,6 +7828,7 @@ mod tests {
     /// E2E-SELL-01 diagnostic contract -- the first timeout classification carries one-based
     /// `attempt=1`, the exact transient failure class, and a positive remaining budget. This is a
     /// schema/semantics oracle only; it claims neither a canonical numeric value nor provenance.
+
     /// E2E-SELL-01, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-SELL-01/L0
     #[ignore = "EXPECTED TO FAIL until timeout health failures expose first attempt class and positive remaining budget"]

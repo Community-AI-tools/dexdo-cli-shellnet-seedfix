@@ -47,8 +47,7 @@ impl std::fmt::Debug for DerivedMultisigKey {
     }
 }
 
-#[cfg(feature = "shellnet")]
-pub fn derive_multisig_key_from_seed_phrase(
+pub fn derive_multisig_private_key_from_seed_phrase(
     phrase: &str,
 ) -> Result<DerivedMultisigKey, MultisigSeedError> {
     let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -83,25 +82,15 @@ pub fn derive_multisig_key_from_seed_phrase(
     })
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub fn derive_multisig_key_from_seed_phrase(
-    _phrase: &str,
-) -> Result<DerivedMultisigKey, MultisigSeedError> {
-    Err(MultisigSeedError::UnsupportedDerivation(
-        "build dexdo with --features shellnet".into(),
-    ))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "shellnet")]
     const TVM_TONOS_FIXTURE_WORD_INDICES: [u16; 12] = [
         1636, 1293, 905, 102, 1057, 1956, 1247, 1750, 597, 881, 1302, 3,
     ];
 
-    #[cfg(feature = "shellnet")]
     fn phrase_12() -> String {
         TVM_TONOS_FIXTURE_WORD_INDICES
             .iter()
@@ -110,7 +99,6 @@ mod tests {
             .join(" ")
     }
 
-    #[cfg(feature = "shellnet")]
     fn phrase_24() -> String {
         bip39::Mnemonic::from_entropy(&[0u8; 32], bip39::Language::English)
             .unwrap()
@@ -118,7 +106,6 @@ mod tests {
             .to_string()
     }
 
-    #[cfg(feature = "shellnet")]
     fn sdk_derive(phrase: &str, word_count: u8) -> tvm_client::crypto::KeyPair {
         let context = std::sync::Arc::new(
             tvm_client::ClientContext::new(tvm_client::ClientConfig::default()).unwrap(),
@@ -135,12 +122,11 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn derivation_matches_sdk_for_12_word_phrase() {
         let phrase = phrase_12();
         let expected = sdk_derive(&phrase, 12);
-        let derived = derive_multisig_key_from_seed_phrase(&phrase).unwrap();
+        let derived = derive_multisig_private_key_from_seed_phrase(&phrase).unwrap();
         assert_eq!(derived.public_hex(), expected.public);
         assert_eq!(derived.secret_hex(), expected.secret);
         assert_eq!(
@@ -149,20 +135,18 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn derivation_matches_sdk_for_24_word_phrase() {
         let phrase = phrase_24();
         let expected = sdk_derive(&phrase, 24);
-        let derived = derive_multisig_key_from_seed_phrase(&phrase).unwrap();
+        let derived = derive_multisig_private_key_from_seed_phrase(&phrase).unwrap();
         assert_eq!(derived.public_hex(), expected.public);
         assert_eq!(derived.secret_hex(), expected.secret);
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn unsupported_word_count_is_rejected_precisely() {
-        let err = derive_multisig_key_from_seed_phrase(
+        let err = derive_multisig_private_key_from_seed_phrase(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
         )
         .unwrap_err()
@@ -173,32 +157,29 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn seed_phrase_whitespace_is_normalized_without_changing_derivation() {
         let phrase = phrase_12();
         let spaced = phrase.replace(' ', "\n  ");
         assert_eq!(
-            derive_multisig_key_from_seed_phrase(&spaced).unwrap(),
-            derive_multisig_key_from_seed_phrase(&phrase).unwrap()
+            derive_multisig_private_key_from_seed_phrase(&spaced).unwrap(),
+            derive_multisig_private_key_from_seed_phrase(&phrase).unwrap()
         );
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn invalid_seed_phrase_error_does_not_echo_input() {
         let bad = "zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz zzzz";
-        let err = derive_multisig_key_from_seed_phrase(bad)
+        let err = derive_multisig_private_key_from_seed_phrase(bad)
             .unwrap_err()
             .to_string();
         assert_eq!(err, "invalid seed phrase");
         assert!(!err.contains(bad));
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn derived_key_debug_never_leaks_secret() {
-        let key = derive_multisig_key_from_seed_phrase(&phrase_12()).unwrap();
+        let key = derive_multisig_private_key_from_seed_phrase(&phrase_12()).unwrap();
         let dbg = format!("{key:?}");
         assert!(dbg.contains(key.public_hex()));
         assert!(!dbg.contains(key.secret_hex()));
@@ -215,12 +196,4 @@ mod tests {
         assert_zeroize_on_drop(&key.secret_hex);
     }
 
-    #[cfg(not(feature = "shellnet"))]
-    #[test]
-    fn seed_derivation_requires_shellnet_sdk_feature() {
-        let err = derive_multisig_key_from_seed_phrase("not read")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--features shellnet"));
-    }
 }

@@ -467,7 +467,7 @@ mod tests {
             version: deals::DEAL_HANDLE_VERSION,
             handle: deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer),
             role: deals::DealHandleRole::Buyer,
-            network: "shellnet".into(),
+            network: "net-a".into(),
             token_contract,
             note_addr: format!("0:{}", "4".repeat(64)),
             frame_model: "qwen/qwen3-32b".into(),
@@ -475,14 +475,13 @@ mod tests {
             order_book: None,
             root_model: None,
             market: None,
-            contracts: "contracts/deployed.shellnet.json".into(),
+            contracts: "manifest/deployed.manifest.json".into(),
             endpoint: None,
             created_order_ids: vec![],
             created_at_unix: 1,
         }
     }
 
-    #[cfg(feature = "shellnet")]
     #[test]
     fn windows_pool_temp_and_final_dacl_is_protected_owner_only() {
         let directory = tempfile::tempdir().expect("temp directory");
@@ -539,11 +538,10 @@ mod tests {
         let wallet = format!("0:{}", "a".repeat(64));
         let state = note::NoteDeployRecoveryState::new(
             note::NoteDeployRecoveryRequest {
-                endpoint: "https://dd-shellnet.ackinacki.org",
+                endpoint: "https://net-a.example",
                 nominal: "N100",
                 token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
-                ecc_shell_deposit: 100_000_000_000,
                 funding_multisig_address: &wallet,
             },
             &public,

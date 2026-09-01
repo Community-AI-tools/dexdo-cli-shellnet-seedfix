@@ -1,14 +1,18 @@
 //! a Hot short of native gas ONLY must be told the native figure, never "nothing".
+
 //! A live mainnet `note deploy` printed, verbatim:
+
 //! ```text
 //! Hot wallet 426c59b2...2838fe::426c59b2...2838fe is short nothing. Send it to that address; this
 //! command continues by itself as soon as the balance arrives on chain.
 //! ```
+
 //! and then blocked for good on a transfer no message had ever sized. The shortfall is TWO disjoint
 //! values - native vmshell gas and the ECC currency map - and the instruction rendered only the map.
 //! A wallet rich in ECC[2] and low on gas is exactly the state in which that map is empty, so the
 //! operator was told the sum of a missing balance was "nothing" while the gate that blocks on it
 //! reads BOTH values.
+
 //! The figures here are the live ones: the Hot held 14_022_000 raw native against this money path's
 //! 507_002_000 native floor, leaving it 492_980_000 short.
 
@@ -39,6 +43,7 @@ fn hot_address() -> String {
 }
 
 /// The live shape, computed by the production requirement rather than asserted into being.
+
 /// The empty currency map and the non-zero native shortfall both come out of
 /// [`FundingRequirements`] against a real balance, so this reproduces the state a real run reaches
 /// instead of hand-building a request that merely looks like it.
@@ -70,7 +75,7 @@ fn live_native_only_shortfall(provider: WalletProvider) -> FundingRequest {
 
     FundingRequest {
         provider,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         vault_address: (provider == WalletProvider::AckinackiWallet)
             .then(|| format!("{}::{}", hex64(0x11), hex64(0x11))),
         hot_address: hot_address(),
@@ -170,12 +175,12 @@ fn a_shortfall_in_both_balances_names_both() {
     let instruction = provider.manual_instruction(&request);
     assert_names_the_native_shortfall(&instruction);
     assert!(
-        instruction.contains("600 raw ECC[2] SHELL"),
+        instruction.contains("0.0000006 SHELL"),
         "the ECC half is unchanged: {instruction}"
     );
     assert!(
         instruction.contains(&format!(
-            "{LIVE_NATIVE_SHORTFALL} raw native vmshell and 600 raw ECC[2] SHELL"
+            "{LIVE_NATIVE_SHORTFALL} raw native vmshell and 0.0000006 SHELL"
         )),
         "both disjoint balances are named, in one list: {instruction}"
     );

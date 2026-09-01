@@ -1,4 +1,5 @@
 //! Tests for the shared Hot check-and-fund mechanism.
+
 //! Every one of these drives the real entry point [`ensure_hot_funded`] through the two seams a
 //! real run uses - a balance reader and a provider - rather than calling an internal helper or
 //! writing an end state by hand. A test that fabricated the state it then asserts on would prove a
@@ -6,13 +7,11 @@
 
 use std::cell::{Cell, RefCell};
 
-#[cfg(feature = "shellnet")]
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
-#[cfg(feature = "shellnet")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -36,7 +35,7 @@ fn vault_address() -> String {
 fn binding(provider: WalletProvider) -> WalletBinding {
     WalletBinding {
         provider,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         hot_address: self_dapp_hot(),
         vault_address: provider
             .creates_vault_request()
@@ -207,21 +206,19 @@ async fn run(
 }
 
 fn record(dir: &Path) -> Option<FundingJournalRecord> {
-    load_funding_journal(dir, "shellnet", &self_dapp_hot()).expect("read journal")
+    load_funding_journal(dir, "net-a", &self_dapp_hot()).expect("read journal")
 }
 
 fn temp() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp data dir")
 }
 
-#[cfg(feature = "shellnet")]
 fn account_response(native: u128, shell: u128) -> String {
     format!(
         r#"{{"data":{{"blockchain":{{"account":{{"info":{{"acc_type_name":"Active","boc":null,"code_hash":"abc","balance":"0x{native:x}","balance_other":[{{"currency":2.0,"value":"0x{shell:x}"}}]}}}}}}}}}}"#
     )
 }
 
-#[cfg(feature = "shellnet")]
 async fn serve_account_responses(
     responses: Vec<(&'static str, String)>,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -250,7 +247,6 @@ async fn serve_account_responses(
     (endpoint, reads, task)
 }
 
-#[cfg(feature = "shellnet")]
 async fn run_with_real_reader(
     dir: &Path,
     client: &dexdo_core::ChainClient,
@@ -278,7 +274,7 @@ async fn run_with_real_reader(
 #[test]
 fn journal_path_is_one_file_per_hot_under_the_data_directory() {
     let dir = temp();
-    let path = funding_journal_path(dir.path(), "shellnet", &self_dapp_hot());
+    let path = funding_journal_path(dir.path(), "net-a", &self_dapp_hot());
     assert_eq!(
         path.parent().expect("parent"),
         dir.path().join("wallet").join("funding-requests")
@@ -291,20 +287,20 @@ fn journal_path_is_one_file_per_hot_under_the_data_directory() {
 #[test]
 fn journal_key_separates_networks_that_would_otherwise_share_a_file() {
     // A bare concatenation of the two inputs is not injective: "shell" + "net<addr>" and
-    // "shellnet" + "<addr>" would produce the same bytes and therefore the same file for two
+    // "net-a" + "<addr>" would produce the same bytes and therefore the same file for two
     // different Hots. One file per Hot is the property the key is relied on for.
     let hot = self_dapp_hot();
     assert_ne!(
-        funding_journal_key("shellnet", &hot),
+        funding_journal_key("net-a", &hot),
         funding_journal_key("shell", &format!("net{hot}"))
     );
     assert_ne!(
-        funding_journal_key("shellnet", &hot),
+        funding_journal_key("net-a", &hot),
         funding_journal_key("mainnet", &hot)
     );
     assert_eq!(
-        funding_journal_key("shellnet", &hot),
-        funding_journal_key("shellnet", &hot)
+        funding_journal_key("net-a", &hot),
+        funding_journal_key("net-a", &hot)
     );
 }
 
@@ -312,8 +308,8 @@ fn journal_key_separates_networks_that_would_otherwise_share_a_file() {
 fn the_lock_and_the_journal_name_the_same_hot() {
     let dir = temp();
     let hot = self_dapp_hot();
-    let journal = funding_journal_path(dir.path(), "shellnet", &hot);
-    let lock = hot_lock_path(dir.path(), "shellnet", &hot);
+    let journal = funding_journal_path(dir.path(), "net-a", &hot);
+    let lock = hot_lock_path(dir.path(), "net-a", &hot);
     assert_eq!(journal.parent(), lock.parent());
     assert_eq!(
         journal.file_stem().expect("journal stem"),
@@ -339,7 +335,7 @@ async fn the_journal_is_written_owner_only() {
     )
     .await;
 
-    let path = funding_journal_path(dir.path(), "shellnet", &self_dapp_hot());
+    let path = funding_journal_path(dir.path(), "net-a", &self_dapp_hot());
     let mode = std::fs::metadata(&path).expect("journal metadata").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the funding journal must be owner-only");
     let dir_mode = std::fs::metadata(funding_requests_dir(dir.path()))
@@ -587,7 +583,7 @@ async fn a_repeat_cannot_resume_down_a_different_providers_flow() {
     )
     .await
     .expect_err("a provider change over an open request must be refused");
-    let message = error.to_string();
+    let message = format!("{error:#}");
     assert!(message.contains("ackinacki-wallet"), "{message}");
     assert!(message.contains("gosh-ai"), "{message}");
     assert_eq!(provider2.submits.get(), 0);
@@ -607,7 +603,7 @@ async fn a_funding_flow_from_a_provider_the_binding_does_not_name_is_refused() {
     )
     .await
     .expect_err("provider mismatch");
-    assert!(error.to_string().contains("provider mismatch"), "{error}");
+    assert!(format!("{error:#}").contains("provider mismatch"), "{error}");
     assert!(
         record(dir.path()).is_none(),
         "a refused run must not open a record"
@@ -633,14 +629,19 @@ async fn a_timeout_leaves_a_state_that_a_rerun_re_checks() {
     let error = run(dir.path(), &binding, &chain1, &provider1, tight_bounds())
         .await
         .expect_err("the balance never arrived");
-    let message = error.to_string();
+    let message = format!("{error:#}");
     assert!(message.contains("timed out"), "{message}");
+    // rewrote the wording; what is pinned is the MEANING, which is what these two lines were
+    // ever for: the operator is told to run the command again, and told that nothing pending was
+    // cancelled -- the clause that exists because somebody read a timeout as a cancellation and
+    // sent a second transfer.
+    let lower = message.to_ascii_lowercase();
     assert!(
-        message.contains("re-run the same command"),
+        lower.contains("run the same command again") || lower.contains("re-run the same command"),
         "the operator must be told to repeat the command: {message}"
     );
     assert!(
-        message.contains("Nothing was cancelled"),
+        lower.contains("nothing was cancelled"),
         "the operator must be told nothing pending was cancelled: {message}"
     );
     let after_timeout = record(dir.path()).expect("the timeout kept the record");
@@ -649,7 +650,7 @@ async fn a_timeout_leaves_a_state_that_a_rerun_re_checks() {
     // No lock survives the timeout: the next run must not have to wait on a corpse.
     let lock = acquire_hot_lock(
         dir.path(),
-        "shellnet",
+        "net-a",
         &self_dapp_hot(),
         Duration::from_millis(50),
         Duration::from_millis(1),
@@ -703,7 +704,7 @@ async fn a_timeout_writes_nothing_of_its_own_into_the_record() {
         .await
         .expect_err("timeout");
     let after_many_passes =
-        load_funding_journal(dir2.path(), "shellnet", &self_dapp_hot()).expect("read").expect("record");
+        load_funding_journal(dir2.path(), "net-a", &self_dapp_hot()).expect("read").expect("record");
 
     assert!(chain2.reads.get() > 1, "the longer wait really did poll again");
     assert_eq!(after_one_pass.state, after_many_passes.state);
@@ -806,12 +807,11 @@ async fn a_chain_read_error_neither_closes_the_record_nor_counts_as_a_balance() 
     )
     .await
     .expect_err("an unreadable chain is not a funded Hot");
-    assert!(error.to_string().contains("502"), "{error}");
+    assert!(format!("{error:#}").contains("502"), "{error}");
     assert!(record(dir.path()).is_none());
     assert_eq!(provider.submits.get(), 0);
 }
 
-#[cfg(feature = "shellnet")]
 #[tokio::test]
 async fn the_production_hot_reader_retries_one_transient_account_failure() {
     let body = account_response(vault_to_hot_native_value(), 1_000);
@@ -836,7 +836,6 @@ async fn the_production_hot_reader_retries_one_transient_account_failure() {
     );
 }
 
-#[cfg(feature = "shellnet")]
 #[tokio::test]
 async fn an_ecc_funded_hot_requests_only_its_exact_native_shortfall() {
     let native_shortfall = 123;
@@ -867,7 +866,6 @@ async fn an_ecc_funded_hot_requests_only_its_exact_native_shortfall() {
     );
 }
 
-#[cfg(feature = "shellnet")]
 #[tokio::test]
 async fn a_native_funded_hot_requests_only_its_exact_ecc_shortfall() {
     let (endpoint, _, server) = serve_account_responses(vec![(
@@ -909,7 +907,7 @@ async fn a_provider_without_a_vault_creates_no_request_and_probes_nothing() {
         )
         .await
         .expect_err("nothing topped the Hot up");
-        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(error.chain().any(|cause| cause.to_string().contains("timed out")), "{error}");
         assert_eq!(provider.submits.get(), 0, "{provider_kind:?}");
         assert_eq!(provider.probes.get(), 0, "{provider_kind:?}");
         let open = record(dir.path()).expect("the open need is still recorded");
@@ -980,7 +978,7 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     let hot = self_dapp_hot();
     let held = acquire_hot_lock(
         dir.path(),
-        "shellnet",
+        "net-a",
         &hot,
         Duration::from_millis(50),
         Duration::from_millis(1),
@@ -988,7 +986,7 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     .expect("first holder");
     assert_eq!(
         held.path(),
-        hot_lock_path(dir.path(), "shellnet", &hot),
+        hot_lock_path(dir.path(), "net-a", &hot),
         "the holder must name the Hot it actually locked"
     );
 
@@ -998,7 +996,7 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     let blocked = std::thread::spawn(move || {
         acquire_hot_lock(
             &dir_path,
-            "shellnet",
+            "net-a",
             &hot_for_thread,
             Duration::from_millis(50),
             Duration::from_millis(1),
@@ -1013,7 +1011,7 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     let other = format!("{}::{}", hex64(0xc3), hex64(0xc3));
     let other_lock = acquire_hot_lock(
         dir.path(),
-        "shellnet",
+        "net-a",
         &other,
         Duration::from_millis(50),
         Duration::from_millis(1),
@@ -1027,7 +1025,7 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     let next = std::thread::spawn(move || {
         acquire_hot_lock(
             &dir_path,
-            "shellnet",
+            "net-a",
             &hot,
             Duration::from_millis(500),
             Duration::from_millis(1),
@@ -1060,7 +1058,7 @@ async fn the_funded_hot_keeps_the_lock_until_the_caller_drops_it() {
     let contended = std::thread::spawn(move || {
         acquire_hot_lock(
             &dir_path,
-            "shellnet",
+            "net-a",
             &hot,
             Duration::from_millis(50),
             Duration::from_millis(1),
@@ -1077,7 +1075,7 @@ async fn the_funded_hot_keeps_the_lock_until_the_caller_drops_it() {
     drop(funded);
     let lock = acquire_hot_lock(
         dir.path(),
-        "shellnet",
+        "net-a",
         &self_dapp_hot(),
         Duration::from_millis(500),
         Duration::from_millis(1),
@@ -1094,7 +1092,7 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
     let dir = temp();
     let request = FundingRequest {
         provider: WalletProvider::AckinackiWallet,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         vault_address: Some(vault_address()),
         hot_address: self_dapp_hot(),
         hot_dapp_id: hex64(0xa1),
@@ -1114,7 +1112,7 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
     let read = record(dir.path()).expect("record");
     assert_eq!(read, written);
     assert_eq!(read.provider, WalletProvider::AckinackiWallet);
-    assert_eq!(read.network, "shellnet");
+    assert_eq!(read.network, "net-a");
     assert_eq!(read.vault_address.as_deref(), Some(vault_address().as_str()));
     assert_eq!(read.hot_address, self_dapp_hot());
     assert_eq!(read.creator_pubkey, "pubkey");
@@ -1126,7 +1124,7 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
 
     let raw = std::fs::read_to_string(funding_journal_path(
         dir.path(),
-        "shellnet",
+        "net-a",
         &self_dapp_hot(),
     ))
     .expect("read raw");
@@ -1142,11 +1140,11 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
 fn a_record_this_client_cannot_read_is_refused_rather_than_acted_on() {
     let dir = temp();
     ensure_funding_requests_dir(dir.path()).expect("dir");
-    let path = funding_journal_path(dir.path(), "shellnet", &self_dapp_hot());
+    let path = funding_journal_path(dir.path(), "net-a", &self_dapp_hot());
     std::fs::write(&path, br#"{"version":99999,"written_by":"a newer client"}"#).expect("write");
-    let error = load_funding_journal(dir.path(), "shellnet", &self_dapp_hot())
+    let error = load_funding_journal(dir.path(), "net-a", &self_dapp_hot())
         .expect_err("an unreadable record must not be treated as absence");
-    let message = error.to_string();
+    let message = format!("{error:#}");
     assert!(
         message.contains("version 99999"),
         "a record from a newer client must be reported as a version this client does not \
@@ -1159,7 +1157,7 @@ fn a_record_this_client_cannot_read_is_refused_rather_than_acted_on() {
 
     std::fs::write(&path, b"not json at all").expect("write");
     assert!(
-        load_funding_journal(dir.path(), "shellnet", &self_dapp_hot()).is_err(),
+        load_funding_journal(dir.path(), "net-a", &self_dapp_hot()).is_err(),
         "an unreadable record must never read as absence, which is the state that permits a submit"
     );
 }

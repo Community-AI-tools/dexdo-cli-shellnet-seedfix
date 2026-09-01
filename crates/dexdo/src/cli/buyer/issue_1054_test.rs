@@ -153,7 +153,7 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
     let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
     let dir = tempfile::tempdir().expect("create isolated buyer preflight directory");
     let note_addr = format!("0:{}", "a".repeat(64));
-    let frame_model = "qwen--qwen3--32b";
+    let frame_model = "Qwen3-32B";
     let pool_path = dir.path().join("pool.json");
     std::fs::write(
         &pool_path,
@@ -199,7 +199,6 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
         ticks: 2,
         max_price_per_tick: dexdo_core::PRICE_STEP,
         escrow: None,
-        contracts: contracts.clone(),
         policy: Some(policy),
     };
     let unframed_class = dexdo_core::params::EMPTY_MODEL_BOOK_CLASS;
@@ -223,7 +222,7 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
         &mut machine_context,
         BuyerCommandRuntime {
             backend: Some((backend, note)),
-            shellnet_preflight: BuyerShellnetPreflight::OfflineTest,
+            chain_preflight: BuyerChainPreflight::OfflineTest,
             shutdown: Box::pin(std::future::pending()),
         },
     )
@@ -255,13 +254,13 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
             "--ticks",
             "2",
             "--max-price-per-tick",
-            "1000000000",
+            // The remedy is a line to type back, so the ceiling is stated as the argument takes
+            // it: one SHELL a tick.
+            "1",
             "--note-addr",
             note_addr.as_str(),
             "--models",
             models.to_str().unwrap(),
-            "--contracts",
-            contracts.to_str().unwrap(),
         ],
         "the remedy must re-read the same model, volume, ceiling, note, and manifests"
     );

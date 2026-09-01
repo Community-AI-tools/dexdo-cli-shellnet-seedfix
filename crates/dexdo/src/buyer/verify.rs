@@ -1,12 +1,14 @@
 //! Client-side model verification. Runs **inline on the canonical
-//! stream BEFORE re-rendering**(B5-B9), on the buyer's side -- the protocol does not guarantee
+//! stream BEFORE re-rendering** (B5-B9), on the buyer's side -- the protocol does not guarantee
 //! authenticity off-chain; the client provides it.
-//! Layers in increasing order of cost: **B5 tokenizer-check**(here), then reference
-//! spot-check(B7), behavioral probes(B8), per-seller score(B10). Currently B5 is
+
+//! Layers in increasing order of cost: **B5 tokenizer-check** (here), then reference
+//! spot-check (B7), behavioral probes (B8), per-seller score (B10). Currently B5 is
 //! up -- it is mandatory first and cheaply catches a crude model substitution.
+
 //! The verifier is **stateful per stream**: the `SignalManifest` arrives on the first chunk,
 //! the verifier captures it and runs the available layers on each chunk. No signals / not declared --
-//! we do not fabricate(R4), we degrade(R3) to the next layers.
+//! we do not fabricate (R4), we degrade (R3) to the next layers.
 
 use crate::registry::model_id_alias;
 use crate::seller::{ModelConfig, ModelsConfig};
@@ -20,7 +22,7 @@ use std::sync::Arc;
 pub enum Verdict {
     /// Signals consistent on the available subset -- continue accepting.
     Pass,
-    /// Substitution/inconsistency caught -- bail. Carries the reason(for the log/dispute).
+    /// Substitution/inconsistency caught -- bail. Carries the reason (for the log/dispute).
     Bail(String),
 }
 
@@ -36,7 +38,7 @@ enum TokenizerProfile {
 
 /// Family profile for B5, **data-driven**: if a configured model declares this
 /// `tokenizer_family` with an explicit `vocab_size`, use it; else fall back to the built-in family
-/// mapping; else `None`(undeclared/unknown family -> nothing to check at this layer). `models = None`
+/// mapping; else `None` (undeclared/unknown family -> nothing to check at this layer). `models = None`
 /// (no config threaded) degrades to the family mapping -- the byte-for-byte pre-config behavior.
 fn profile_for(family: &str, models: Option<&ModelsConfig>) -> Option<TokenizerProfile> {
     if let Some(models) = models {
@@ -52,18 +54,18 @@ fn profile_for(family: &str, models: Option<&ModelsConfig>) -> Option<TokenizerP
     match family {
         // Mock: tokens are fake by design, nothing to check.
         "mock" => Some(TokenizerProfile::Permissive),
-        // Qwen3(the D3 path -- Groq `qwen/qwen3-32b`): vocabulary ~152064.
+        // Qwen3 (the D3 path -- Groq `qwen/qwen3-32b`): vocabulary ~152064.
         "qwen" => Some(TokenizerProfile::Vocab(152_064)),
         // Llama 3.x: vocabulary 128256.
         "llama" => Some(TokenizerProfile::Vocab(128_256)),
-        // GPT-4o/cl100k family: ~100352(round up; o200k is outside the start profile).
+        // GPT-4o/cl100k family: ~100352 (round up; o200k is outside the start profile).
         "gpt" => Some(TokenizerProfile::Vocab(100_352)),
         _ => None,
     }
 }
 
 /// Tokenizer-check: `token_ids` against the profile of the declared `family`. An unknown/empty
-/// family -> nothing to check(degradation R3 -- `Pass` at this layer; the next layers/spot-check catch it).
+/// family -> nothing to check (degradation R3 -- `Pass` at this layer; the next layers/spot-check catch it).
 fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig>) -> Verdict {
     match profile_for(family, models) {
         None | Some(TokenizerProfile::Permissive) => Verdict::Pass,
@@ -78,15 +80,15 @@ fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig
 
 /// Stateful verifier of a single stream. Captures the `SignalManifest` from the first chunk and
 /// runs the available layers inline on each chunk BEFORE re-rendering. A `Bail` verdict is a signal to the buyer
-/// to bail(B10).
+/// to bail (B10).
 #[derive(Debug, Default)]
 pub struct StreamVerifier {
     manifest: Option<SignalManifest>,
-    /// The market frame's model(what the buyer pays for, B2) -- the model declared by the seller
+    /// The market frame's model (what the buyer pays for, B2) -- the model declared by the seller
     /// is checked against it. `None` -- the check is disabled.
     expected_model: Option<String>,
     /// Loaded model config for the **data-driven** B5 vocabulary. `None` -- degrade to the
-    /// built-in family mapping(the pre-config behavior; unit fixtures use this path).
+    /// built-in family mapping (the pre-config behavior; unit fixtures use this path).
     models: Option<Arc<ModelsConfig>>,
 }
 
@@ -95,7 +97,7 @@ impl StreamVerifier {
         Self::default()
     }
 
-    /// Verifier that checks the declared model against the frame model(B7).
+    /// Verifier that checks the declared model against the frame model (B7).
     pub fn with_expected_model(model: String) -> Self {
         Self {
             manifest: None,
@@ -105,7 +107,7 @@ impl StreamVerifier {
     }
 
     /// Like [`with_expected_model`](Self::with_expected_model) but threads the loaded model config so
-    /// B5 uses the per-model `vocab_size`(data-driven) instead of only the built-in family mapping.
+    /// B5 uses the per-model `vocab_size` (data-driven) instead of only the built-in family mapping.
     pub fn with_expected_model_and_models(model: String, models: Arc<ModelsConfig>) -> Self {
         Self {
             manifest: None,
@@ -116,16 +118,16 @@ impl StreamVerifier {
 
     /// Verify the next canonical chunk. `Pass` -- continue; `Bail(reason)` -- bail.
     pub fn verify(&mut self, chunk: &CanonChunk) -> Verdict {
-        // R3: the manifest arrives on the first chunk(seq=0) -- capture it for the whole stream.
+        // R3: the manifest arrives on the first chunk (seq=0) -- capture it for the whole stream.
         if let Some(m) = &chunk.manifest {
             self.manifest = Some(m.clone());
         }
         let Some(manifest) = &self.manifest else {
-            // The gateway did not declare signals(R3/R4) -- on an empty subset there is nothing to check;
-            // we do not fabricate. We rely on the next layers(spot-check B7).
+            // The gateway did not declare signals (R3/R4) -- on an empty subset there is nothing to check;
+            // we do not fabricate. We rely on the next layers (spot-check B7).
             return Verdict::Pass;
         };
-        // B5: tokenizer-check -- only if the gateway declared token_ids(otherwise degradation R3).
+        // B5: tokenizer-check -- only if the gateway declared token_ids (otherwise degradation R3).
         if manifest.has_token_ids {
             let v = tokenizer_check(
                 &manifest.tokenizer_family,
@@ -137,9 +139,9 @@ impl StreamVerifier {
             }
         }
         // B7: the declared model must match the frame model (what
-        // the buyer pays for, B2). Substitution in the declaration is a flag("do not trust the declaration blindly").
-        // Mock is skipped(fake by design). Full comparison against reference X (running the prompt
-        // on a trusted endpoint, ~1-5% of requests) is(reference source) horizon, see the report sidecar.
+        // the buyer pays for, B2). Substitution in the declaration is a flag ("do not trust the declaration blindly").
+        // Mock is skipped (fake by design). Full comparison against reference X (running the prompt
+        // on a trusted endpoint, ~1-5% of requests) is (reference source) horizon, see the report sidecar.
         if let Some(expected) = &self.expected_model {
             let claimed = manifest.claimed_model.as_str();
             let is_mock = matches!(
@@ -152,14 +154,14 @@ impl StreamVerifier {
                 ));
             }
         }
-        // B8(behavioral probes) - via a separate mechanism: the buyer sends a probe prompt and checks
-        // the response against the exact-model fingerprint([`behavioral_check`]); this is not per-chunk.
+        // B8 (behavioral probes) - via a separate mechanism: the buyer sends a probe prompt and checks
+        // the response against the exact-model fingerprint ([`behavioral_check`]); this is not per-chunk.
         Verdict::Pass
     }
 }
 
 /// Behavioral fingerprint of an exact/reference model: a deterministic probe-prompt + a quirk that
-/// the declared model characteristically emits(format/tokenization/refusals). Built from per-model config
+/// the declared model characteristically emits (format/tokenization/refusals). Built from per-model config
 /// ([`crate::seller::FingerprintCfg`]) -- owned `String` so it can be constructed at runtime, not a hardcoded set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
@@ -171,9 +173,9 @@ pub struct Fingerprint {
 }
 
 /// Resolve the config entry that governs `model_id` for **fingerprint / vocab** purposes. Matches by
-/// config key or `frame_model`(via `ModelsConfig::get`), then exact `served_model`, then the served-form
-/// alias(`model_id_alias`) across `frame_model` / `served_model` / `identity_aliases` -- so the registry
-/// (`Qwen/Qwen3-32B`) and canonical(`qwen--qwen3--32b`) spellings both resolve to the same entry.
+/// config key or `frame_model` (via `ModelsConfig::get`), then exact `served_model`, then the served-form
+/// alias (`model_id_alias`) across `frame_model` / `served_model` / `identity_aliases` -- so the registry
+/// (`Qwen/Qwen3-32B`) and canonical (`qwen--qwen3--32b`) spellings both resolve to the same entry.
 fn resolve_model_cfg<'a>(model_id: &str, models: &'a ModelsConfig) -> Option<&'a ModelConfig> {
     let id = model_id.trim();
     if let Ok(m) = models.get(id) {
@@ -209,7 +211,7 @@ fn fingerprints_for(model_id: &str, models: &ModelsConfig) -> Vec<Fingerprint> {
 /// (`base_url` + `served_model` + `api_key_env`). Resolves ONLY by config key / `frame_model` /
 /// exact `served_model` -- NOT `identity_aliases`: a provider-neutral registry name (e.g. `Qwen/Qwen3-32B`,
 /// which may be served elsewhere) has no reference here, so we do not compare it against the configured
-/// provider's greedy output. `None` -- no reference -> **degradation**(R3): reliance on the cheap B7 + B5/B6.
+/// provider's greedy output. `None` -- no reference -> **degradation** (R3): reliance on the cheap B7 + B5/B6.
 pub fn reference_endpoint_for(model_id: &str, models: &ModelsConfig) -> Option<ReferenceEndpoint> {
     let id = model_id.trim();
     let cfg = models
@@ -247,7 +249,7 @@ pub fn executable_reference_model_for<'a>(
     Some(cfg.frame_model.as_str())
 }
 
-/// Default probe-prompt of an exact/reference model(B8) -- the first configured fingerprint. `None` -- no fingerprint
+/// Default probe-prompt of an exact/reference model (B8) -- the first configured fingerprint. `None` -- no fingerprint
 /// (degradation R3: B8 does not apply, reliance on B5/B6/B7).
 pub fn default_probe(model_id: &str, models: &ModelsConfig) -> Option<String> {
     fingerprints_for(model_id, models)
@@ -258,7 +260,7 @@ pub fn default_probe(model_id: &str, models: &ModelsConfig) -> Option<String> {
 
 /// Behavioral probe: the declared model's response to the probe-prompt must carry its quirk.
 /// A mismatch -> the model is not the one declared -> `Bail`. A prompt not in the registry / no fingerprint ->
-/// degradation(`Pass` at this layer).
+/// degradation (`Pass` at this layer).
 pub fn behavioral_check(
     model_id: &str,
     probe_prompt: &str,
@@ -299,8 +301,8 @@ pub fn behavioral_check_with_reasoning(
 // ---- B7 full spot-check: greedy comparison against the declared model's official endpoint ----
 
 /// The declared model's **official** reference endpoint: the buyer compares the
-/// seller's greedy output against it. **Data-driven**(owned `String`) -- built from a model's configured
-/// upstream. The key is read from env at runtime(`api_key_env`) and is NOT stored here(masked in logs).
+/// seller's greedy output against it. **Data-driven** (owned `String`) -- built from a model's configured
+/// upstream. The key is read from env at runtime (`api_key_env`) and is NOT stored here (masked in logs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceEndpoint {
     pub base_url: String,
@@ -308,7 +310,7 @@ pub struct ReferenceEndpoint {
     pub api_key_env: String,
 }
 
-/// Coarse tokenizer family by model id(`qwen`/`llama`/`gpt`/...). This is for diagnostics/tokenizer profiles only;
+/// Coarse tokenizer family by model id (`qwen`/`llama`/`gpt`/...). This is for diagnostics/tokenizer profiles only;
 /// content-identity fingerprints/references are keyed by exact model id or explicit aliases.
 pub fn family_of(model: &str) -> String {
     let m = model.to_ascii_lowercase();
@@ -320,7 +322,7 @@ pub fn family_of(model: &str) -> String {
     String::new()
 }
 
-/// Text normalization for comparison: lowercase, words of alphanumerics(punctuation stripped).
+/// Text normalization for comparison: lowercase, words of alphanumerics (punctuation stripped).
 fn normalize_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -346,10 +348,10 @@ fn normalize_words(s: &str) -> Vec<String> {
     words
 }
 
-/// Agreement fraction over the **leading word prefix**(B7 spot-check), normalized by the full
-/// reference length so a seller cannot raise its score by answering less. Greedy(temp=0) of the
-/// same model gives an identical prefix(-> 1.0); a different model diverges early(-> low). `0.0`,
-/// if there is nothing to compare(empty response on either side).
+/// Agreement fraction over the **leading word prefix** (B7 spot-check), normalized by the full
+/// reference length so a seller cannot raise its score by answering less. Greedy (temp=0) of the
+/// same model gives an identical prefix (-> 1.0); a different model diverges early (-> low). `0.0`,
+/// if there is nothing to compare (empty response on either side).
 pub fn prefix_agreement(seller: &str, reference: &str) -> f64 {
     let a = normalize_words(seller);
     let b = normalize_words(reference);
@@ -360,8 +362,8 @@ pub fn prefix_agreement(seller: &str, reference: &str) -> f64 {
     matched as f64 / b.len() as f64
 }
 
-/// B7 spot-check verdict: agreement with the reference >= threshold -> `Pass`(model confirmed);
-/// otherwise -> `Bail`(greedy output diverged from the official endpoint -> not the declared model).
+/// B7 spot-check verdict: agreement with the reference >= threshold -> `Pass` (model confirmed);
+/// otherwise -> `Bail` (greedy output diverged from the official endpoint -> not the declared model).
 pub fn spotcheck_verdict(agreement: f64, threshold: f64) -> Verdict {
     if agreement >= threshold {
         Verdict::Pass
@@ -443,13 +445,13 @@ mod tests {
 
     #[test]
     fn degrades_when_no_token_ids_or_no_manifest() {
-        // has_token_ids=false(e.g. Groq SSE) -> the tokenizer-check does not run(R3), Pass.
+        // has_token_ids=false (e.g. Groq SSE) -> the tokenizer-check does not run (R3), Pass.
         let mut v = StreamVerifier::new();
         assert_eq!(
             v.verify(&chunk(0, vec![], Some(manifest("", false)))),
             Verdict::Pass
         );
-        // No manifest at all -> nothing to check, Pass(we do not fabricate).
+        // No manifest at all -> nothing to check, Pass (we do not fabricate).
         let mut v2 = StreamVerifier::new();
         assert_eq!(v2.verify(&chunk(0, vec![5], None)), Verdict::Pass);
     }
@@ -473,7 +475,7 @@ mod tests {
 
     #[test]
     fn claimed_model_mismatch_bails() {
-        // The seller declares a different(cheap) model than the frame paid for -> substitution -> Bail.
+        // The seller declares a different (cheap) model than the frame paid for -> substitution -> Bail.
         let mut v = StreamVerifier::with_expected_model("qwen/qwen3-32b".to_string());
         let c = chunk(
             0,
@@ -488,7 +490,7 @@ mod tests {
 
     #[test]
     fn mock_skips_model_check() {
-        // Mock -- the model comparison does not apply(fake by design), even on a mismatch.
+        // Mock -- the model comparison does not apply (fake by design), even on a mismatch.
         let mut v = StreamVerifier::with_expected_model("dexdo-mock".to_string());
         let c = chunk(0, Vec::new(), Some(manifest_full("mock", "mock")));
         assert_eq!(v.verify(&c), Verdict::Pass);
@@ -523,9 +525,9 @@ mod tests {
         .expect("qwen config")
     }
 
-    /// A TWO-model config(qwen + gpt-oss-20b), both served by Groq -- proves the verification mechanism is
+    /// A TWO-model config (qwen + gpt-oss-20b), both served by Groq -- proves the verification mechanism is
     /// general: BOTH yield real fingerprints + reference purely from config, no code change. gpt-oss's
-    /// fingerprint sets `accepts_reasoning_side_channel = false`(it is not a reasoning model).
+    /// fingerprint sets `accepts_reasoning_side_channel = false` (it is not a reasoning model).
     fn two_models() -> ModelsConfig {
         ModelsConfig::from_json(
             r#"{ "models": {
@@ -574,7 +576,7 @@ mod tests {
 
     #[test]
     fn behavioral_probe_missing_quirk_bails() {
-        // qwen3-32b declared, but the response lacks <think>(substitute model, not reasoning) -> Bail.
+        // qwen3-32b declared, but the response lacks <think> (substitute model, not reasoning) -> Bail.
         let cfg = qwen_models();
         let probe = default_probe("qwen--qwen3--32b", &cfg).unwrap();
         assert!(matches!(
@@ -671,7 +673,7 @@ mod tests {
 
     #[test]
     fn behavioral_probe_unknown_family_degrades() {
-        // No exact-model fingerprint -> degradation(Pass), we do not fabricate.
+        // No exact-model fingerprint -> degradation (Pass), we do not fabricate.
         let cfg = qwen_models();
         assert!(default_probe("unknown", &cfg).is_none());
         assert_eq!(behavioral_check("unknown", "x", "y", &cfg), Verdict::Pass);
@@ -679,7 +681,7 @@ mod tests {
 
     #[test]
     fn behavioral_probe_non_registered_prompt_skips() {
-        // A prompt not in the probe registry -> the layer does not apply(Pass).
+        // A prompt not in the probe registry -> the layer does not apply (Pass).
         let cfg = qwen_models();
         assert_eq!(
             behavioral_check("qwen", "random prompt", "no think here", &cfg),
@@ -689,11 +691,11 @@ mod tests {
 
     #[test]
     fn second_model_gpt_oss_is_fully_verifiable_from_config() {
-        // Mandatory(Track 2): a config with TWO models yields real fingerprints + reference for BOTH,
+        // Mandatory (Track 2): a config with TWO models yields real fingerprints + reference for BOTH,
         // and behavioral_check bails a wrong-content response for gpt-oss just like qwen -- purely from data.
         let cfg = two_models();
 
-        // Fingerprints resolve for BOTH(canonical + served spellings).
+        // Fingerprints resolve for BOTH (canonical + served spellings).
         let qwen_probe = default_probe("qwen--qwen3--32b", &cfg).expect("qwen fingerprint");
         let oss_probe = default_probe("openai--gpt-oss--20b", &cfg).expect("gpt-oss fingerprint");
         assert_eq!(
@@ -702,7 +704,7 @@ mod tests {
         );
         assert_ne!(qwen_probe, oss_probe, "each model has its own probe");
 
-        // References resolve for BOTH(Groq base_url, per-model served id).
+        // References resolve for BOTH (Groq base_url, per-model served id).
         let rq = reference_endpoint_for("qwen--qwen3--32b", &cfg).expect("qwen reference");
         assert_eq!(rq.model, "qwen/qwen3-32b");
         let ro = reference_endpoint_for("openai--gpt-oss--20b", &cfg).expect("gpt-oss reference");
@@ -779,7 +781,7 @@ mod tests {
         .unwrap();
         let cfg = Arc::new(cfg);
         // expected_model "m" matches the `manifest` helper's claimed_model so the B7 name check is a no-op and
-        // this test isolates B5(the `manifest` claimed_model is "m").
+        // this test isolates B5 (the `manifest` claimed_model is "m").
         let mut v = StreamVerifier::with_expected_model_and_models("m".to_string(), cfg.clone());
         // token-id 150 >= config vocab 100 -> Bail (the built-in mapping has no "tinyfam", so without config
         // this would degrade to Pass -- proving the config drove the check).
@@ -788,7 +790,7 @@ mod tests {
             matches!(verdict, Verdict::Bail(_)),
             "config vocab bails out-of-range id"
         );
-        // Without the config the same "tinyfam" family is unknown -> degradation(Pass).
+        // Without the config the same "tinyfam" family is unknown -> degradation (Pass).
         let mut v2 = StreamVerifier::with_expected_model("m".to_string());
         assert_eq!(
             v2.verify(&chunk(0, vec![10, 150], Some(manifest("tinyfam", true)))),
@@ -807,10 +809,10 @@ mod tests {
         assert_eq!(r.model, "qwen/qwen3-32b");
         assert_eq!(r.api_key_env, "GROQ_API_KEY");
         assert!(reference_endpoint_for("qwen/qwen3-32b", &cfg).is_some());
-        // The live ModelRegistry name is provider-neutral(identity alias only); do not compare its
+        // The live ModelRegistry name is provider-neutral (identity alias only); do not compare its
         // output against the configured Groq reference here.
         assert!(reference_endpoint_for("Qwen/Qwen3-32B", &cfg).is_none());
-        // No reference -> degradation(R3).
+        // No reference -> degradation (R3).
         assert!(reference_endpoint_for("qwen--qwen3.6--27b", &cfg).is_none());
         assert!(reference_endpoint_for("llama", &cfg).is_none());
         assert!(reference_endpoint_for("mock", &cfg).is_none());
@@ -828,7 +830,7 @@ mod tests {
         // way to pass any threshold. Normalised by the reference, two matching words out of four are
         // worth exactly half. This line asserted the defect; it now asserts the guarantee.
         assert_eq!(prefix_agreement("the answer", "the answer is 42"), 0.5);
-        // Punctuation/case do not matter(normalization).
+        // Punctuation/case do not matter (normalization).
         assert_eq!(prefix_agreement("Hello,   World!", "hello world"), 1.0);
         // Streaming providers may emit no whitespace at token boundaries around numbers/operators.
         assert_eq!(prefix_agreement("compute17 *23", "compute 17 * 23"), 1.0);
@@ -848,7 +850,7 @@ mod tests {
 
     #[test]
     fn spotcheck_verdict_threshold() {
-        // High agreement(>= threshold) -> Pass; below -> Bail. The boundary is inclusive.
+        // High agreement (>= threshold) -> Pass; below -> Bail. The boundary is inclusive.
         assert_eq!(
             spotcheck_verdict(1.0, DEFAULT_SPOTCHECK_THRESHOLD),
             Verdict::Pass
@@ -866,8 +868,8 @@ mod tests {
     /// the threshold is calibrated against measured run-to-run agreement, NOT against an
     /// assumed determinism. Both figures come from the real [`DEFAULT_SPOTCHECK_PROBE`] at
     /// `CONTENT_PROBE_MAX_TOKENS`, greedy, against Groq: an honest seller (the same model on both
-    /// legs) floors at 0.41(`qwen/qwen3-32b` branches at word 21 of 51), a substituting seller
-    /// (6 different models) tops out at 0.02(branch at word 0/1). Both populations must stay on
+    /// legs) floors at 0.41 (`qwen/qwen3-32b` branches at word 21 of 51), a substituting seller
+    /// (6 different models) tops out at 0.02 (branch at word 0/1). Both populations must stay on
     /// their own side of the threshold, or the gate refuses honest sellers again.
     #[test]
     fn spotcheck_threshold_separates_measured_populations() {

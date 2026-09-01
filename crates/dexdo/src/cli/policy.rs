@@ -334,10 +334,12 @@ pub(crate) struct SellerRuntimePolicy {
 }
 
 /// What to offer an operator who has to fill this field in.
+
 /// The schema accepts more than the runtime executes: `seller.on.after_deal_done` parses
 /// `republish` and `republish_with_backoff`, and `seller.on.buyer_no_show` parses
 /// `cleanup_and_republish` and `cleanup_and_retire`, but this daemon cannot perform a fresh-TC
 /// republish or a buyer-side cleanup, and refuses them at startup.
+
 /// Listing them as plain choices sends the operator to fill the policy with a value that fails a
 /// minute later, at a place that names a different field. So the ones the runtime executes are
 /// offered first, and the rest are named as what they are -- parsed, not executable today.
@@ -400,6 +402,33 @@ pub(crate) fn validate_seller_runtime_capabilities(policy: &SellerRuntimePolicy)
 struct PolicyProblem {
     key: String,
     allowed: String,
+}
+
+/// Every field a role's policy file must carry, by path.
+
+/// Read from the same table the validator reads, so a question set built against this cannot ask
+/// for a field the file does not need, or miss one it does. That is the whole guarantee: an
+/// operator who answers every question ends up with a file that loads.
+pub(crate) fn required_paths(role: RuntimeRole) -> Vec<&'static str> {
+    role_fields(role).iter().map(|field| field.path).collect()
+}
+
+/// Would the validator accept `value` for `path`? Answered through the same rule it uses.
+
+/// For the questions that offer choices: an answer whose wording an operator reads has to carry a
+/// value the file accepts, and nothing but this table decides which those are.
+pub(crate) fn accepts(path: &str, value: &str) -> bool {
+    let optional = seller_chain_unavailable_field();
+    let Some(field) = [RuntimeRole::Seller, RuntimeRole::Buyer]
+        .into_iter()
+        .flat_map(role_fields)
+        .copied()
+        .chain(std::iter::once(optional))
+        .find(|field| field.path == path)
+    else {
+        return false;
+    };
+    field_valid(Some(&Value::from(value)), field.kind)
 }
 
 fn role_fields(role: RuntimeRole) -> &'static [PolicyField] {
@@ -636,10 +665,241 @@ fn format_incomplete_error(path: &Path, role: RuntimeRole, problems: &[PolicyPro
     out
 }
 
+/// Ask the operator the rules their role needs, and hand back the file with the answers in it.
+
+/// The questions are situations rather than field paths ([`super::policy_questions`]), and the
+/// values they produce are the ones this module already validates -- a test pins both, so an answer
+/// that would not load cannot be offered.
+
+/// `base` is whatever is on disk, so answering fills the gaps rather than replacing choices the
+/// operator has already made.
+fn ask_the_rules(role: RuntimeRole, base: &Value) -> Result<Value> {
+    use crate::cli::policy_questions::{
+        BUYER_COUNTS, BUYER_QUESTIONS, SELLER_COUNTS, SELLER_QUESTIONS,
+    };
+
+    let (questions, counts) = match role {
+        RuntimeRole::Buyer => (BUYER_QUESTIONS, BUYER_COUNTS),
+        RuntimeRole::Seller => (SELLER_QUESTIONS, SELLER_COUNTS),
+    };
+    let mut value = base.clone();
+    scaffold_roles(&mut value, match role {
+        RuntimeRole::Buyer => PolicyRoleArg::Buyer,
+        RuntimeRole::Seller => PolicyRoleArg::Seller,
+    });
+    eprintln!(
+        "{}",
+        crate::cli::choose::title(&format!(
+            "Setting up the {} rules -- what to do when the other side lets you down",
+            role.command_name()
+        ))
+    );
+    eprintln!(
+        "{}",
+        crate::cli::choose::note(&[
+            "Asked once. The answers are written to this instance's policy file,",
+            "and no command asks again unless you change them.",
+            "",
+            "They are needed in advance because every one of these happens",
+            "while money is already committed.",
+        ])
+    );
+    for question in questions {
+        // Already answered with something valid: leave it alone. Re-asking would invite an operator
+        // to change a rule they came here for an unrelated reason.
+        if field_valid(get_path(&value, question.path), field_kind(question.path)) {
+            continue;
+        }
+        // Only what this role's runtime can carry out. Where that leaves one answer there is no
+        // question to ask: it is stated and set, because a menu of one is a question with no
+        // decision in it.
+        let offered = question.offering(runtime_supported(question.path));
+        // A question this runtime can carry out no answer to is the interview's own defect, not the
+        // operator's: it is refused rather than skipped. The line here used to CONSTRUCT that error
+        // and drop it on the floor, so the run went on and ended in the generic "the rules are not
+        // filled in" -- which sends an operator to fill a field the client would refuse anyway.
+        let Some((first, _)) = offered.first() else {
+            bail!(
+                "{}: this runtime can carry out none of the answers to that question, so the rules \
+                 cannot be completed by asking. Fill the file by hand or upgrade the client.",
+                question.path
+            );
+        };
+        eprintln!();
+        eprintln!("{}", crate::cli::choose::heading(question.situation));
+        eprintln!("{}", crate::cli::choose::aside(question.because));
+        if offered.len() == 1 {
+            eprintln!("{}", crate::cli::choose::answered(&format!("{} -- the only thing this client can do today", first.says)));
+            set_path(&mut value, question.path, Value::from(first.value));
+            continue;
+        }
+        let rows: Vec<String> = offered
+            .iter()
+            .map(|(answer, suggested)| {
+                if *suggested {
+                    format!("{} (suggested)", answer.says)
+                } else {
+                    answer.says.to_string()
+                }
+            })
+            .collect();
+        let picked = crate::cli::choose::ask("What should it do?", rows)?
+            .ok_or_else(|| anyhow!("no answer chosen; nothing was written"))?;
+        // No panic on a path an operator is standing on: the rules file decides what a money command
+        // does when the other side misbehaves, and a client that aborts here leaves them with a
+        // backtrace instead of an answer. The invariant is real -- what was offered came from these
+        // very answers -- so a break of it is the client's own fault, said as such.
+        let chosen = question
+            .answers
+            .iter()
+            .position(|answer| answer.value == offered[picked].0.value)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: the answer picked is not one this question offers, which is a defect in \
+                     this client; nothing was written",
+                    question.path
+                )
+            })?;
+        // The menu is erased on the way out, so the answer is left behind in its place: an
+        // interview that shows only the questions afterwards reads as though nothing was decided.
+        eprintln!(
+            "{}",
+            crate::cli::choose::answered(question.answers[chosen].says)
+        );
+        set_path(
+            &mut value,
+            question.path,
+            Value::from(question.answers[chosen].value),
+        );
+    }
+    for count in counts {
+        if field_valid(get_path(&value, count.path), field_kind(count.path)) {
+            continue;
+        }
+        eprintln!();
+        eprintln!("{}", crate::cli::choose::heading(count.situation));
+        eprintln!("{}", crate::cli::choose::aside(count.because));
+        let answer = crate::cli::choose::ask_number(
+            &format!("  {}", count.unit),
+            count.suggested,
+            count.least,
+        )?;
+        record_count(&mut value, count, answer)?;
+    }
+    Ok(value)
+}
+
+/// Whether the number this count asks for is stated in SHELL, while the field it fills holds raw
+/// ECC[2] units.
+
+/// Path-keyed, like [`runtime_supported`] and `field_kind` beside it, because the unit belongs to
+/// the FIELD rather than to the wording of the question: `total_spend_cap_shells` is compared
+/// against `escrow * attempt` in raw units (`cli::buyer`), the tests that write it write raw, and
+/// the published buyer document states it in raw. The interview asks in SHELL because that is what
+/// a person has; the two meet here and nowhere else.
+
+/// Exactly one count is money today. A second one added to the interview without a line here would
+/// be recorded a billion times small, so a test pins this list against the prompts' own units.
+fn count_is_stated_in_shell(path: &str) -> bool {
+    matches!(path, "buyer.failover.total_spend_cap_shells")
+}
+
+/// Put one number the operator stated into the rules file -- the boundary where an interview answer
+/// becomes a value on disk, and the only place the two units meet.
+
+/// A count stated in SHELL is converted here and nowhere later, through the very parser `--escrow`,
+/// `--budget` and `--amount` carry (`cli::args::parse_shell_amount`, over
+/// `dexdo_core::shell_amount_raw`): one grammar for every SHELL figure a person states, one place
+/// that knows what a SHELL is worth in raw units, and the same refusal by name for a figure that is
+/// really a stale raw one -- an operator pasting `24600000000` out of the buyer document into a
+/// prompt asking for SHELL is told so instead of having it multiplied again.
+
+/// Everything else is a count of things -- deals, sellers -- and is written exactly as answered.
+
+/// the interview asked "how much may be spent in total, in SHELL?", suggested `20`, and wrote
+/// `20` into a field the runtime reads as 20 raw ECC[2] units -- two hundredths of a microSHELL. The
+/// first failover attempt projected a spend of some 8e9 against it and the client stopped with
+/// `result=total_spend_cap_reached`, naming the operator's own ceiling for what was a unit defect.
+fn record_count(
+    value: &mut Value,
+    count: &crate::cli::policy_questions::Count,
+    answer: u64,
+) -> Result<()> {
+    let recorded = if count_is_stated_in_shell(count.path) {
+        let raw = crate::cli::args::parse_shell_amount(&answer.to_string())
+            .map_err(|why| anyhow!("{}: {why}", count.path))?;
+        // Refused rather than truncated: the rules file holds this as a JSON integer the loader
+        // reads with `as_u64`, and a figure that does not fit is one no run could honour.
+        u64::try_from(raw).map_err(|_| {
+            anyhow!(
+                "{}: {answer} SHELL is beyond the range this field can hold",
+                count.path
+            )
+        })?
+    } else {
+        answer
+    };
+    set_path(value, count.path, Value::from(recorded));
+    Ok(())
+}
+
+/// The answers a role's RUNTIME can actually carry out today, where that is narrower than what the
+/// file accepts.
+
+/// The two are not the same thing, and the gap is not cosmetic: a seller whose policy says
+/// `after_deal_done=republish` writes a valid file and then refuses to start, because the daemon
+/// cannot republish onto a fresh TokenContract. An interview that offered those answers would walk
+/// the operator into that refusal, which is exactly what it exists to prevent.
+
+/// `None` where every accepted value is executable.
+pub(crate) fn runtime_supported(path: &str) -> Option<&'static [&'static str]> {
+    match path {
+        "seller.on.after_deal_done" => Some(SELLER_RUNTIME_AFTER_DONE),
+        "seller.on.buyer_no_show" => Some(SELLER_RUNTIME_BUYER_NO_SHOW),
+        _ => None,
+    }
+}
+
+/// What the validator accepts for one path, so the interview can tell an answered field from an
+/// unanswered one by exactly the same rule.
+fn field_kind(path: &str) -> FieldKind {
+    [RuntimeRole::Seller, RuntimeRole::Buyer]
+        .into_iter()
+        .flat_map(role_fields)
+        .find(|field| field.path == path)
+        .map(|field| field.kind)
+        .unwrap_or(FieldKind::IntegerAtLeast(1))
+}
+
+/// Read and check, and never write: what `policy validate` runs.
+
+/// The asking variant below fills the gaps in place, which is right when a command is on its way to
+/// spending and wrong for a command whose whole job is to report. A check that repairs what it
+/// checks can only ever answer "fine".
+pub(crate) fn inspect_policy_file(explicit: Option<&Path>, role: RuntimeRole) -> Result<Value> {
+    let path = resolve_policy_path(explicit)?;
+    let value = read_policy(&path)?;
+    let problems = validate_value(&value, role);
+    if problems.is_empty() {
+        return Ok(value);
+    }
+    bail!("{}", format_incomplete_error(&path, role, &problems));
+}
+
 pub(crate) fn validate_policy_file(explicit: Option<&Path>, role: RuntimeRole) -> Result<Value> {
     let path = resolve_policy_path(explicit)?;
+    // Missing is not the same as unreadable. A file that is not there yet can be written from the
+    // operator's answers; one that exists and cannot be parsed is a file to look at, never to
+    // overwrite -- it may hold rules somebody set deliberately.
+    let absent = !path.exists();
     let value = match read_policy(&path) {
         Ok(value) => value,
+        Err(_) if absent && crate::cli::interaction::may_ask() => {
+            let answered = ask_the_rules(role, &serde_json::json!({}))?;
+            write_policy(&path, &answered)?;
+            eprintln!("rules written to {}", path.display());
+            answered
+        }
         Err(e) => {
             bail!(
                 "policy ({}) is missing or unreadable - dexdo {} will not place an order.\n\
@@ -652,58 +912,94 @@ pub(crate) fn validate_policy_file(explicit: Option<&Path>, role: RuntimeRole) -
         }
     };
     let problems = validate_value(&value, role);
-    if !problems.is_empty() {
-        bail!("{}", format_incomplete_error(&path, role, &problems));
+    if problems.is_empty() {
+        return Ok(value);
     }
-    Ok(value)
+    // Incomplete, and somebody is there to answer: ask for the gaps rather than send them off to
+    // edit JSON by hand. `dexdo policy init` writes every field as `UNSET`, so this is the state an
+    // operator following the instructions lands in.
+    if crate::cli::interaction::may_ask() {
+        let answered = ask_the_rules(role, &value)?;
+        if validate_value(&answered, role).is_empty() {
+            write_policy(&path, &answered)?;
+            eprintln!("rules written to {}", path.display());
+            return Ok(answered);
+        }
+    }
+    bail!("{}", format_incomplete_error(&path, role, &problems));
 }
 
 pub(crate) fn load_buyer_runtime_policy(explicit: Option<&Path>) -> Result<BuyerRuntimePolicy> {
-    let value = validate_policy_file(explicit, RuntimeRole::Buyer)?;
-    let choice = |key: &str| {
-        get_path(&value, key)
+    buyer_runtime_policy_of(&validate_policy_file(explicit, RuntimeRole::Buyer)?)
+}
+
+/// The rules as the buyer runtime will hold them, including what it can actually execute.
+
+/// Split from the read for the reason the seller's half was, and reached by `policy validate` the
+/// same way: the buyer arm of that command used to run the shape check alone. Today every value the
+/// shape check accepts has a runtime action behind it -- so this refuses nothing, and that is the
+/// point: the moment an option is offered that the runtime cannot carry out, `policy validate` says
+/// so instead of reporting "fine" and letting `dexdo buyer` refuse the same file later.
+
+/// Which is also why the fallthroughs are refusals and not `unreachable!`: an option added to the
+/// accepted list without an action here is a client defect, and a defect on the money path is a
+/// refusal, never a panic.
+pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolicy> {
+    let cannot = |key: &str, said: &str| {
+        anyhow!(
+            "{key} -> {said} (accepted by the file's shape, but this runtime has no action for it)"
+        )
+    };
+    let choice = |key: &str| -> Result<&str> {
+        get_path(value, key)
             .and_then(Value::as_str)
-            .expect("validated choice")
+            .ok_or_else(|| anyhow!("{key} is not one of the answers this file may carry"))
     };
-    let int = |key: &str| {
-        get_path(&value, key)
+    let int = |key: &str| -> Result<u64> {
+        get_path(value, key)
             .and_then(Value::as_u64)
-            .expect("validated integer")
+            .ok_or_else(|| anyhow!("{key} is not a whole number"))
     };
-    let no_handover_after_match = match choice("buyer.on.no_handover_after_match") {
+    let key = "buyer.on.no_handover_after_match";
+    let no_handover_after_match = match choice(key)? {
         "wait_then_reclaim" => NoHandoverAfterMatchAction::WaitThenReclaim,
         "next_seller" => NoHandoverAfterMatchAction::NextSeller,
         "fail_closed" => NoHandoverAfterMatchAction::FailClosed,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
-    let malformed_handover = match choice("buyer.on.malformed_handover") {
+    let key = "buyer.on.malformed_handover";
+    let malformed_handover = match choice(key)? {
         "reclaim" => MalformedHandoverAction::Reclaim,
         "dispute" => MalformedHandoverAction::Dispute,
         "fail_closed" => MalformedHandoverAction::FailClosed,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
-    let dead_gateway = match choice("buyer.on.dead_gateway") {
+    let key = "buyer.on.dead_gateway";
+    let dead_gateway = match choice(key)? {
         "retry_then_reclaim" => DeadGatewayAction::RetryThenReclaim,
         "next_seller" => DeadGatewayAction::NextSeller,
         "fail_closed" => DeadGatewayAction::FailClosed,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
-    let empty_stream = match choice("buyer.on.empty_stream") {
+    let key = "buyer.on.empty_stream";
+    let empty_stream = match choice(key)? {
         "reclaim" => EmptyStreamAction::Reclaim,
         "next_seller" => EmptyStreamAction::NextSeller,
         "fail_closed" => EmptyStreamAction::FailClosed,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
-    let seller_stalls_mid_stream = match choice("buyer.on.seller_stalls_mid_stream") {
+    let key = "buyer.on.seller_stalls_mid_stream";
+    let seller_stalls_mid_stream = match choice(key)? {
         "accept_delivered_then_reclaim" => SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
         "dispute" => SellerStallsMidStreamAction::Dispute,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
-    let bad_output_scam = match choice("buyer.on.bad_output_scam") {
+    let key = "buyer.on.bad_output_scam";
+    let bad_output_scam = match choice(key)? {
         "stop" => BadOutputScamAction::Stop,
         "dispute" => BadOutputScamAction::Dispute,
         "stop_and_blacklist" => BadOutputScamAction::StopAndBlacklist,
-        _ => unreachable!("validated choice"),
+        said => return Err(cannot(key, said)),
     };
     Ok(BuyerRuntimePolicy {
         no_handover_after_match,
@@ -712,13 +1008,23 @@ pub(crate) fn load_buyer_runtime_policy(explicit: Option<&Path>) -> Result<Buyer
         empty_stream,
         seller_stalls_mid_stream,
         bad_output_scam,
-        max_sellers_to_try: int("buyer.failover.max_sellers_to_try"),
-        total_spend_cap_shells: int("buyer.failover.total_spend_cap_shells"),
+        max_sellers_to_try: int("buyer.failover.max_sellers_to_try")?,
+        total_spend_cap_shells: int("buyer.failover.total_spend_cap_shells")?,
     })
 }
 
 pub(crate) fn load_seller_runtime_policy(explicit: Option<&Path>) -> Result<SellerRuntimePolicy> {
-    let value = validate_policy_file(explicit, RuntimeRole::Seller)?;
+    seller_runtime_policy_of(&validate_policy_file(explicit, RuntimeRole::Seller)?)
+}
+
+/// The rules as the seller runtime will hold them, including what it can actually execute.
+
+/// Split from the read so that `policy validate` runs the SAME check without the asking-and-writing
+/// half. It reported "fine" on `after_deal_done=republish` for exactly as long as the two were one
+/// function: shape validation accepts that value, and only this capability check refuses it -- the
+/// runtime cannot republish onto a fresh TokenContract from the seller daemon.
+pub(crate) fn seller_runtime_policy_of(value: &Value) -> Result<SellerRuntimePolicy> {
+    let value = value.clone();
     let choice = |key: &str| {
         get_path(&value, key)
             .and_then(Value::as_str)
@@ -890,15 +1196,28 @@ pub(crate) fn run_policy(args: PolicyArgs) -> Result<()> {
             Ok(())
         }
         PolicyCommand::Validate(args) => match args.role {
+            // Read-only on purpose: this command reports, and a report that fills in what it found
+            // missing can only ever say "fine".
+
+            // Read-only is NOT the same as check-less, and conflating the two is how this command
+            // started passing `after_deal_done=republish`: the shape check accepts that value and
+            // only the runtime-capability check refuses it. So the same check the seller runs at
+            // startup runs here too, over the value that was read rather than over one this command
+            // repaired.
+            PolicyValidateRoleArg::Buyer => {
+                let value = inspect_policy_file(args.path.as_deref(), RuntimeRole::Buyer)?;
+                buyer_runtime_policy_of(&value)?;
+                Ok(())
+            }
             PolicyValidateRoleArg::Seller => {
-                load_seller_runtime_policy(args.path.as_deref())?;
+                let value = inspect_policy_file(args.path.as_deref(), RuntimeRole::Seller)?;
+                seller_runtime_policy_of(&value)?;
                 Ok(())
             }
         },
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) fn doctor_policy_line(explicit: Option<&Path>) -> Result<String> {
     let path = resolve_policy_path(explicit)?;
     if !path.exists() {
@@ -1217,6 +1536,53 @@ mod tests {
 #[path = "policy_1196_tests.rs"]
 mod issue_1196_tests;
 
+/// A check must not repair what it checks: `policy validate` reports and writes nothing, even on a
+/// terminal where a command on its way to spending would have asked.
+#[test]
+fn validate_reports_an_incomplete_file_without_touching_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("policy.json");
+    let mut scaffold = serde_json::json!({});
+    scaffold_roles(&mut scaffold, PolicyRoleArg::Seller);
+    let bytes = serde_json::to_vec_pretty(&scaffold).expect("serialize");
+    std::fs::write(&path, &bytes).expect("write the scaffold");
+
+    assert!(inspect_policy_file(Some(&path), RuntimeRole::Seller).is_err());
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        bytes,
+        "the file must be byte-for-byte what it was"
+    );
+}
+
+/// both roles can be checked, because both are refused at startup when their rules are
+/// incomplete. `policy init` has always scaffolded either; only the check was seller-only, so a
+/// buyer could write a policy and had no way to find out whether it would load.
+#[test]
+fn validate_accepts_both_roles_and_uses_each_role_own_loader() {
+    use crate::cli::args::PolicyValidateRoleArg;
+    use clap::ValueEnum as _;
+
+    let roles: Vec<PolicyValidateRoleArg> = PolicyValidateRoleArg::value_variants().to_vec();
+    assert!(roles.contains(&PolicyValidateRoleArg::Buyer), "{roles:?}");
+    assert!(roles.contains(&PolicyValidateRoleArg::Seller), "{roles:?}");
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("policy.json");
+    // A file scaffolded for the seller alone must fail the BUYER check: same file, different role,
+    // and the check has to be the role's own loader rather than a shared "looks like JSON".
+    let mut scaffold = serde_json::json!({});
+    scaffold_roles(&mut scaffold, PolicyRoleArg::Seller);
+    std::fs::write(&path, serde_json::to_vec_pretty(&scaffold).expect("serialize"))
+        .expect("write the scaffold");
+    assert!(load_seller_runtime_policy(Some(&path)).is_err(), "a scaffold is UNSET until filled in");
+    assert!(load_buyer_runtime_policy(Some(&path)).is_err(), "a seller file has no buyer rules");
+}
+
 #[cfg(test)]
 #[path = "policy_fixture_gate_tests.rs"]
 mod policy_fixture_gate_tests;
+
+#[cfg(test)]
+#[path = "policy_1492_tests.rs"]
+mod issue_1492_tests;

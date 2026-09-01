@@ -1,4 +1,5 @@
 //! The real chain behind [`VaultChain`].
+
 //! Everything here is a read or a write against the Vault's own canonical multisig contract, using
 //! the readers this client already has: `run_getter_retrying` for `getTransactions` and
 //! `getParameters`, the ext-out history pager for the finalized queue events, and the same
@@ -7,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use dexdo_core::shellnet::RetryingReads as _;
+use dexdo_core::chain::RetryingReads as _;
 use dexdo_core::{Address, CanonicalAddress, KeyPair};
 use serde_json::Value;
 
@@ -150,7 +151,7 @@ fn vault_to_hot_submit_transaction_params(fingerprint: &FundingFingerprint) -> R
     for (currency, amount) in &fingerprint.cc {
         cc.insert(currency.to_string(), serde_json::json!(amount.to_string()));
     }
-    // The canonical builder hard-codes `dapp_id = ROOT_PN_DAPP_ID`("4"), which is right for
+    // The canonical builder hard-codes `dapp_id = ROOT_PN_DAPP_ID` ("4"), which is right for
     // every dexdo destination and wrong for this one: a Hot is a self-DApp multisig, so the
     // transfer has to be addressed into the Hot's OWN DApp. Forwarding it into DApp 4 would burn
     // the attached vmshell without the money ever reaching the Hot, and the wait would then sit
@@ -183,8 +184,20 @@ impl VaultChain for RealVaultChain<'_> {
     }
 
     async fn history(&self) -> Result<Vec<VaultQueueEvent>> {
-        let http = dexdo_core::shellnet_http_client()?;
-        let records = dexdo_core::shellnet::read_multisig_queue_history(
+        let http = dexdo_core::chain_http_client()?;
+        // this Vault queue reader is NOT on the live seller path, so it is deferred --
+        // but the reason recorded here used to be wrong, and the wrong reason is the dangerous part.
+        // It said the call site "cannot name a network". It can: `RealVaultChain` has exactly one
+        // construction site, wallet_funding.rs:2158, inside `fund_hot_for_money_command`, which
+        // already takes `network: &str` and receives the manifest-derived value from both callers.
+        // Nothing forbids threading it either -- `ChainRequestCeiling::from_manifest` is the ONE way
+        // a ceiling is decided, so using it here would be that same way, not the second way
+        // forbids. What is actually true is narrower: this struct does not carry the network
+        // today, and giving this provider the backend's own gate is a later batch. So Unlimited is a
+        // DEFERRAL stated in the open, not an impossibility -- and mainnet Vault queue history goes
+        // out unmetered until that batch lands.
+        let records = dexdo_core::chain::read_multisig_queue_history(
+            dexdo_core::chain::ChainRequestCeiling::Unlimited,
             &http,
             &self.endpoint,
             self.vault.account_id(),
@@ -196,7 +209,7 @@ impl VaultChain for RealVaultChain<'_> {
             .into_iter()
             .map(|record| {
                 let (kind, transaction_id, dest, value, dapp_id) = match record.event {
-                    dexdo_core::shellnet::MultisigQueueEvent::Submitted {
+                    dexdo_core::chain::MultisigQueueEvent::Submitted {
                         transaction_id,
                         dest,
                         value,
@@ -208,7 +221,7 @@ impl VaultChain for RealVaultChain<'_> {
                         value,
                         dapp_id,
                     ),
-                    dexdo_core::shellnet::MultisigQueueEvent::Sent {
+                    dexdo_core::chain::MultisigQueueEvent::Sent {
                         transaction_id,
                         dest,
                         value,
@@ -245,8 +258,8 @@ impl VaultChain for RealVaultChain<'_> {
         // has. A destination that does not parse is not a destination a receipt can be proven at.
         let destination = CanonicalAddress::parse(destination)
             .map_err(|e| anyhow!("funding destination {destination} is not a chain address: {e}"))?;
-        let http = dexdo_core::shellnet_http_client()?;
-        dexdo_core::shellnet::prove_multisig_delivery_message(
+        let http = dexdo_core::chain_http_client()?;
+        dexdo_core::chain::prove_multisig_delivery_message(
             &http,
             &self.endpoint,
             sent_event_message_id,
@@ -271,8 +284,8 @@ impl VaultChain for RealVaultChain<'_> {
     }
 
     async fn chain_time_secs(&self) -> Result<u64> {
-        let http = dexdo_core::shellnet_http_client()?;
-        dexdo_core::shellnet::chain_time_secs(&http, &self.endpoint).await
+        let http = dexdo_core::chain_http_client()?;
+        dexdo_core::chain::chain_time_secs(&http, &self.endpoint).await
     }
 
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
@@ -295,8 +308,8 @@ impl VaultChain for RealVaultChain<'_> {
             anyhow!("encode UpdateCustodianMultisigWallet_v2.submitTransaction -> Hot top-up: {e}")
         })?;
 
-        let http = dexdo_core::shellnet_http_client()?;
-        dexdo_core::shellnet_clock_skew_preflight(&self.endpoint).await?;
+        let http = dexdo_core::chain_http_client()?;
+        dexdo_core::chain_clock_skew_preflight(&self.endpoint).await?;
         // Everything from here on is an OUTCOME, never an error: a send whose result cannot be
         // established leaves the journal at `prepared`, and the next run reconciles it against the
         // chain. Turning it into `Err` would lose the distinction between "we know nothing was
@@ -317,7 +330,7 @@ impl VaultChain for RealVaultChain<'_> {
             });
         }
 
-        let receipt = match dexdo_core::shellnet::observe_note_deploy_wallet_action(
+        let receipt = match dexdo_core::chain::observe_note_deploy_wallet_action(
             &http,
             &self.endpoint,
             &boc,

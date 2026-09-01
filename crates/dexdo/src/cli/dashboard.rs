@@ -15,7 +15,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) const DASHBOARD_VERSION: u32 = 1;
+/// Version 2 states money in SHELL. Version 1 stated the same fields in raw ECC[2], and the field
+/// names did not change with them -- a consumer keyed on `version` is the only thing that can tell
+/// the two apart, so it moves with the unit.
+pub(crate) const DASHBOARD_VERSION: u32 = 2;
 pub(crate) const DASHBOARD_JSON_PATH: &str = "/api/dashboard.json";
 
 #[derive(Clone)]
@@ -25,19 +28,11 @@ pub(crate) struct DashboardAppState {
 }
 
 impl DashboardAppState {
-    #[cfg(not(feature = "shellnet"))]
-    pub(crate) fn local(deals_dir: PathBuf) -> Self {
-        Self {
-            deals_dir,
-            backend: Arc::new(LocalDashboardBackend),
-        }
-    }
 
-    #[cfg(feature = "shellnet")]
-    pub(crate) fn shellnet(deals_dir: PathBuf) -> Self {
+    pub(crate) fn for_chain(deals_dir: PathBuf) -> Self {
         Self {
             deals_dir,
-            backend: Arc::new(ShellnetDashboardBackend),
+            backend: Arc::new(ChainDashboardBackend),
         }
     }
 }
@@ -78,24 +73,15 @@ pub(crate) struct DashboardByFact {
     pub(crate) closed: Option<bool>,
 }
 
-#[cfg(not(feature = "shellnet"))]
-struct LocalDashboardBackend;
 
-#[cfg(not(feature = "shellnet"))]
-#[async_trait]
-impl DashboardBackend for LocalDashboardBackend {
-    async fn facts(&self, _handle: &DealHandle) -> Result<DashboardFacts> {
-        Ok(DashboardFacts::default())
-    }
-}
 
 #[cfg(test)]
-pub(crate) struct ChainDashboardBackend<C> {
+pub(crate) struct FakeChainDashboardBackend<C> {
     chain: Arc<C>,
 }
 
 #[cfg(test)]
-impl<C> ChainDashboardBackend<C> {
+impl<C> FakeChainDashboardBackend<C> {
     fn new(chain: Arc<C>) -> Self {
         Self { chain }
     }
@@ -103,7 +89,7 @@ impl<C> ChainDashboardBackend<C> {
 
 #[cfg(test)]
 #[async_trait]
-impl<C> DashboardBackend for ChainDashboardBackend<C>
+impl<C> DashboardBackend for FakeChainDashboardBackend<C>
 where
     C: ChainBackend + Send + Sync,
 {
@@ -130,12 +116,10 @@ where
     }
 }
 
-#[cfg(feature = "shellnet")]
-struct ShellnetDashboardBackend;
+struct ChainDashboardBackend;
 
-#[cfg(feature = "shellnet")]
 #[async_trait]
-impl DashboardBackend for ShellnetDashboardBackend {
+impl DashboardBackend for ChainDashboardBackend {
     async fn facts(&self, handle: &DealHandle) -> Result<DashboardFacts> {
         use dexdo_core::RealChainBackend;
 
@@ -152,7 +136,7 @@ impl DashboardBackend for ShellnetDashboardBackend {
                 ..DashboardLifecycle::default()
             });
         let byfact = match snapshot {
-            Some(snapshot) => dashboard_byfact_from_shellnet_state(snapshot)?,
+            Some(snapshot) => dashboard_byfact_from_chain_state(snapshot)?,
             None => DashboardByFact {
                 closed: Some(true),
                 ..DashboardByFact::default()
@@ -172,7 +156,6 @@ impl DashboardBackend for ShellnetDashboardBackend {
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
 fn lifecycle_from_chain_state(state: dexdo_core::DealChainState) -> DashboardLifecycle {
     let terminal = state.is_stopped();
     let state_name = if state.disputed {
@@ -210,8 +193,7 @@ fn byfact_from_chain_snapshot(snapshot: dexdo_core::StreamSnapshot) -> Dashboard
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
-fn dashboard_byfact_from_shellnet_state(
+fn dashboard_byfact_from_chain_state(
     snapshot: dexdo_core::DealChainSnapshot,
 ) -> Result<DashboardByFact> {
     let state = snapshot.state;
@@ -423,31 +405,41 @@ fn dashboard_deal(handle: &DealHandle, facts: DashboardFacts) -> DashboardDeal {
     }
 }
 
-fn accounting_for(role: DealHandleRole, byfact: &DashboardByFact) -> DashboardAccounting {
+pub(crate) fn accounting_for(
+    role: DealHandleRole,
+    byfact: &DashboardByFact,
+) -> DashboardAccounting {
     let tokens = byfact.tokens_final;
     let ticks = tokens.map(|tokens| tokens / dexdo_core::TICK_SIZE);
+    // The same by-fact fields `status` reports, from the same snapshot: they are SHELL there and
+    // SHELL here. Ticks and tokens are counts and stay counts.
+    let shell = |value: Option<u128>| value.map(dexdo_core::shell_amount);
     match role {
         DealHandleRole::Buyer => DashboardAccounting {
-            shell_paid: byfact.seller_received.map(|v| v.to_string()),
-            shell_locked: byfact.buyer_locked.map(|v| v.to_string()),
-            buyer_bond: byfact.buyer_bond.map(|v| v.to_string()),
-            buyer_bond_required: byfact.buyer_bond_required.map(|v| v.to_string()),
-            shell_refunded: byfact.buyer_refunded.map(|v| v.to_string()),
-            shell_burned: byfact.burned.map(|v| v.to_string()),
+            shell_paid: shell(byfact.seller_received),
+            shell_locked: shell(byfact.buyer_locked),
+            buyer_bond: shell(byfact.buyer_bond),
+            buyer_bond_required: shell(byfact.buyer_bond_required),
+            shell_refunded: shell(byfact.buyer_refunded),
+            shell_burned: shell(byfact.burned),
             ticks_spent: ticks.map(|v| v.to_string()),
             tokens_spent: tokens.map(|v| v.to_string()),
             ..DashboardAccounting::default()
         },
         DealHandleRole::Seller => DashboardAccounting {
-            shell_locked: byfact.seller_locked.map(|v| v.to_string()),
-            shell_burned: byfact.burned.map(|v| v.to_string()),
-            finalized_owed: byfact.seller_received.map(|v| v.to_string()),
+            shell_locked: shell(byfact.seller_locked),
+            shell_burned: shell(byfact.burned),
+            finalized_owed: shell(byfact.seller_received),
             delivered_ticks: ticks.map(|v| v.to_string()),
             delivered_tokens: tokens.map(|v| v.to_string()),
             ..DashboardAccounting::default()
         },
     }
 }
+
+#[cfg(test)]
+#[path = "dashboard_html_render_1714_tests.rs"]
+mod dashboard_html_render_1714_tests;
 
 pub(crate) fn render_html(snapshot: &DashboardSnapshot) -> String {
     let mut out = String::new();
@@ -668,7 +660,7 @@ mod tests {
             version: deals::DEAL_HANDLE_VERSION,
             handle: format!("{}-tc-open", role.as_str()),
             role,
-            network: "shellnet".into(),
+            network: "net-a".into(),
             token_contract: "0:feedface".into(),
             note_addr: match role {
                 DealHandleRole::Buyer => "0:buyer".into(),
@@ -679,7 +671,7 @@ mod tests {
             order_book: Some("0:book".into()),
             root_model: Some("0:root".into()),
             market: Some(dexdo_core::MarketManifest {
-                network: "shellnet".into(),
+                network: "net-a".into(),
                 frame_model: "qwen/qwen3-32b".into(),
                 model_hash: dexdo_core::model_hash_for("qwen/qwen3-32b"),
                 inference_order_book: "0:book".into(),
@@ -690,7 +682,7 @@ mod tests {
                 price_per_tick: 1000,
                 max_ticks: 8,
             }),
-            contracts: "contracts/deployed.shellnet.json".into(),
+            contracts: "manifest/deployed.manifest.json".into(),
             endpoint: (role == DealHandleRole::Seller).then(|| deals::DealEndpointInfo {
                 kind: "gateway".into(),
                 value: "127.0.0.1:8443".into(),
@@ -771,10 +763,14 @@ mod tests {
         .await
         .unwrap();
         let json = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(json["version"], DASHBOARD_VERSION);
+        // The literal, not the constant: the payload's money is SHELL, and a test that reads the
+        // constant agrees with any value it is given, which is how the fields moved units under
+        // `"version": 1`. Changing the unit again has to change this line by hand.
+        assert_eq!(json["version"], 2);
+        assert_eq!(DASHBOARD_VERSION, 2);
         assert_eq!(json["source"]["json_endpoint"], DASHBOARD_JSON_PATH);
         assert_eq!(json["buyer"][0]["token_contract"], "0:feedface");
-        assert_eq!(json["buyer"][0]["accounting"]["shell_paid"], "2000");
+        assert_eq!(json["buyer"][0]["accounting"]["shell_paid"], "0.000002");
         assert!(json["seller"].as_array().unwrap().is_empty());
         let body = serde_json::to_string(&json).unwrap();
         for forbidden in [
@@ -782,7 +778,10 @@ mod tests {
             "private_key",
             "secret",
             "seed",
-            "contracts/deployed",
+            // The manifest path, as this tree spells it. It was "contracts/deployed" until
+            // moved the manifests, and a canary looking for a string the client can no longer
+            // print is a canary that cannot die.
+            "manifest/deployed",
         ] {
             assert!(!body.contains(forbidden), "{body}");
         }
@@ -849,7 +848,7 @@ mod tests {
         assert_eq!(snapshot.buyer[0].state, "opened");
         assert_eq!(
             snapshot.buyer[0].accounting.shell_paid.as_deref(),
-            Some("2000")
+            Some("0.000002")
         );
         assert_eq!(snapshot.buyer[1].handle, "buyer-malformed");
         assert_eq!(snapshot.buyer[1].token_contract, "0:malformed");
@@ -859,7 +858,7 @@ mod tests {
         assert_eq!(snapshot.buyer[2].state, "opened");
         assert_eq!(
             snapshot.buyer[2].accounting.shell_paid.as_deref(),
-            Some("2000")
+            Some("0.000002")
         );
     }
 
@@ -937,12 +936,12 @@ mod tests {
         };
 
         let seller = accounting_for(DealHandleRole::Seller, &byfact);
-        assert_eq!(seller.finalized_owed.as_deref(), Some("200"));
+        assert_eq!(seller.finalized_owed.as_deref(), Some("0.0000002"));
         assert_eq!(seller.delivered_ticks.as_deref(), Some("0"));
         assert_eq!(seller.delivered_tokens.as_deref(), Some("0"));
 
         let buyer = accounting_for(DealHandleRole::Buyer, &byfact);
-        assert_eq!(buyer.shell_paid.as_deref(), Some("200"));
+        assert_eq!(buyer.shell_paid.as_deref(), Some("0.0000002"));
         assert_eq!(buyer.ticks_spent.as_deref(), Some("0"));
         assert_eq!(buyer.tokens_spent.as_deref(), Some("0"));
     }
@@ -994,7 +993,7 @@ mod tests {
             last_claim_time: 1,
             dispute_time: 0,
         };
-        let byfact = dashboard_byfact_from_shellnet_state(dexdo_core::DealChainSnapshot {
+        let byfact = dashboard_byfact_from_chain_state(dexdo_core::DealChainSnapshot {
             account_code_hash: "code".to_string(),
             account_boc_hash: "boc".to_string(),
             state,
@@ -1028,15 +1027,30 @@ mod tests {
 
         let buyer = accounting_for(DealHandleRole::Buyer, &byfact);
         let seller = accounting_for(DealHandleRole::Seller, &byfact);
-        assert_eq!(buyer.shell_paid, Some((above_u64 + 1).to_string()));
-        assert_eq!(buyer.shell_locked, Some((2 * above_u64 + 3).to_string()));
-        assert_eq!(buyer.buyer_bond, Some((above_u64 + 3).to_string()));
-        assert_eq!(seller.shell_locked, Some((above_u64 + 2).to_string()));
-        assert_eq!(seller.finalized_owed, Some((above_u64 + 1).to_string()));
+        assert_eq!(
+            buyer.shell_paid,
+            Some(dexdo_core::shell_amount(above_u64 + 1))
+        );
+        assert_eq!(
+            buyer.shell_locked,
+            Some(dexdo_core::shell_amount(2 * above_u64 + 3))
+        );
+        assert_eq!(
+            buyer.buyer_bond,
+            Some(dexdo_core::shell_amount(above_u64 + 3))
+        );
+        assert_eq!(
+            seller.shell_locked,
+            Some(dexdo_core::shell_amount(above_u64 + 2))
+        );
+        assert_eq!(
+            seller.finalized_owed,
+            Some(dexdo_core::shell_amount(above_u64 + 1))
+        );
     }
 
     #[tokio::test]
-    async fn shellnet_parser_rejects_missing_live_fields() {
+    async fn chain_parser_rejects_missing_live_fields() {
         let incomplete = serde_json::json!({
             "finalizedOwed": "2000",
             "funded": false,
@@ -1063,7 +1077,7 @@ mod tests {
         assert_eq!(lifecycle.state.as_deref(), Some("opened"));
         assert_eq!(lifecycle.terminal, Some(false));
 
-        let byfact = dashboard_byfact_from_shellnet_state(dexdo_core::DealChainSnapshot {
+        let byfact = dashboard_byfact_from_chain_state(dexdo_core::DealChainSnapshot {
             account_code_hash: "code".to_string(),
             account_boc_hash: "boc".to_string(),
             state,
@@ -1118,17 +1132,20 @@ mod tests {
         assert_eq!(deal.funded, Some(true));
         assert_eq!(deal.opened, Some(true));
         assert_eq!(deal.terminal, Some(false));
-        assert_eq!(deal.accounting.shell_paid.as_deref(), Some("2000"));
-        assert_eq!(deal.accounting.shell_locked.as_deref(), Some("1250"));
-        assert_eq!(deal.accounting.buyer_bond.as_deref(), Some("200"));
-        assert_eq!(deal.accounting.buyer_bond_required.as_deref(), Some("200"));
+        assert_eq!(deal.accounting.shell_paid.as_deref(), Some("0.000002"));
+        assert_eq!(deal.accounting.shell_locked.as_deref(), Some("0.00000125"));
+        assert_eq!(deal.accounting.buyer_bond.as_deref(), Some("0.0000002"));
+        assert_eq!(
+            deal.accounting.buyer_bond_required.as_deref(),
+            Some("0.0000002")
+        );
         assert_eq!(deal.accounting.shell_refunded, None);
         assert_eq!(deal.accounting.shell_burned, None);
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["buyer"][0]["opened"], true);
         assert_eq!(json["buyer"][0]["terminal"], false);
-        assert_eq!(json["buyer"][0]["accounting"]["shell_locked"], "1250");
-        assert_eq!(json["buyer"][0]["accounting"]["buyer_bond"], "200");
+        assert_eq!(json["buyer"][0]["accounting"]["shell_locked"], "0.00000125");
+        assert_eq!(json["buyer"][0]["accounting"]["buyer_bond"], "0.0000002");
         assert!(json["buyer"][0]["accounting"]["shell_burned"].is_null());
         let body = serde_json::to_string(&json).unwrap();
         assert!(!body.contains("\"shell_locked\":\"0\""), "{body}");
@@ -1274,7 +1291,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_uses_only_chain_read_methods() {
         let chain = Arc::new(WriteBombChain::new());
-        let backend = ChainDashboardBackend::new(chain.clone());
+        let backend = FakeChainDashboardBackend::new(chain.clone());
         let snapshot = dashboard_from_handles(
             vec![(
                 PathBuf::from("buyer.json"),

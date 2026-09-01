@@ -1,4 +1,5 @@
 //! Test-only seller seam for buyer-side adversarial stream fixtures.
+
 //! Ordinary requests delegate to the production gateway unchanged. A request carrying the existing
 //! `DEXDO_FIXTURE_FATCHUNK` marker takes a bare gRPC branch after authorization: that branch observes
 //! the cap on the wire but deliberately does not turn it into a seller reservation. It therefore

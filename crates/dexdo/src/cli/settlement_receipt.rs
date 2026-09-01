@@ -1,34 +1,40 @@
 use super::args::SettlementReceiptArgs;
 use anyhow::Result;
 
-#[cfg(feature = "shellnet")]
 use anyhow::Context;
-#[cfg(feature = "shellnet")]
 use dexdo_core::{
-    Deployed, RealChainBackend, TokenContractCurrentFacts, TokenContractReceiptChainData,
-    TokenContractSettlementEvent, TokenContractSettlementReceipt,
+    buyer_net_result, buyer_total_debit, implied_write_off, Deployed, RealChainBackend,
+    TokenContractCurrentFacts, TokenContractReceiptChainData, TokenContractSettlementEvent,
+    TokenContractSettlementReceipt,
 };
-#[cfg(feature = "shellnet")]
 use serde::Serialize;
-#[cfg(feature = "shellnet")]
 use serde_json::{json, Value};
-#[cfg(feature = "shellnet")]
 use std::collections::BTreeSet;
-#[cfg(feature = "shellnet")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "shellnet")]
+#[cfg(test)]
+#[path = "settlement_receipt_conservation_1417.rs"]
+mod settlement_receipt_conservation_1417;
+// `#[cfg(test)]` alone. This arrived as `all(test, feature = "...")` naming a cargo feature this tree
+// no longer declares, so the module compiled to nothing: the
+// money defect it pins -- a conservation verdict reading `conserved` when nothing was
+// cross-checked -- was guarded by a test that never ran, in the default gate or anywhere else.
+// Found twice independently, here and in, which is the shape of a defect that leaves no
+// trace: a `cfg` naming something that does not exist excludes the code without a word.
+#[cfg(test)]
+#[path = "settlement_receipt_unverified_conservation_1417.rs"]
+mod settlement_receipt_unverified_conservation_1417;
+
+#[cfg(test)]
+#[path = "settlement_receipt_exit_code_1785.rs"]
+mod settlement_receipt_exit_code_1785;
+
 const RECEIPT_SCHEMA: &str = "dexdo.settlement-receipt.v1";
-#[cfg(feature = "shellnet")]
 const PROOF_LEVEL: &str = "chain_event_observed";
-#[cfg(feature = "shellnet")]
 const REWARDS_SCHEMA: &str = "dexdo.note-rewards.v1";
-#[cfg(feature = "shellnet")]
 const REWARDS_SOURCE: &str = "dexdo-points-rewards";
-#[cfg(feature = "shellnet")]
 const REWARDS_SEMANTICS: &str = "note_season_aggregate_not_per_deal";
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct SettlementReceiptV1 {
     schema: &'static str,
@@ -40,13 +46,18 @@ struct SettlementReceiptV1 {
     deal: DealReceipt,
     current: Option<CurrentReceipt>,
     terminal: TerminalReceipt,
+    outcome: OutcomeReceipt,
     settlement_sequence: Vec<EventReceipt>,
+    /// Omitted entirely -- not emitted as `null` -- when the chain could not be read: this
+    /// receipt already distinguishes "read and found nothing" from "could not read", and a money
+    /// identity printed as `null` would claim the first while meaning the second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conservation: Option<ConservationReceipt>,
     withdrawal: WithdrawalReceipt,
     rewards: RewardsJoinReceipt,
     consistency_issues: Vec<String>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct NetworkReceipt {
     name: String,
@@ -54,7 +65,6 @@ struct NetworkReceipt {
     contracts_generation: Option<String>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct TokenContractIdentity {
     address: String,
@@ -63,14 +73,12 @@ struct TokenContractIdentity {
     code_identity: CodeIdentityReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct ContractVersionReceipt {
     version: String,
     contract: String,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct CodeIdentityReceipt {
     actual_code_hash: Option<String>,
@@ -78,14 +86,12 @@ struct CodeIdentityReceipt {
     matches_manifest: Option<bool>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct PartiesReceipt {
     buyer_note: PartyReceipt,
     seller_note: PartyReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct PartyReceipt {
     role: &'static str,
@@ -93,14 +99,12 @@ struct PartyReceipt {
     source: Option<&'static str>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct DealReceipt {
     terms: Option<DealTermsReceipt>,
     asset: AssetReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct DealTermsReceipt {
     tick_size: String,
@@ -108,14 +112,12 @@ struct DealTermsReceipt {
     max_ticks: String,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct AssetReceipt {
     symbol: &'static str,
     ecc_id: u8,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct CurrentReceipt {
     state: CurrentStateReceipt,
@@ -123,7 +125,6 @@ struct CurrentReceipt {
     seller: CurrentSellerReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct CurrentStateReceipt {
     funded: bool,
@@ -140,7 +141,6 @@ struct CurrentStateReceipt {
     funded_time: u64,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct CurrentFeesReceipt {
     fee_accrued: String,
@@ -150,7 +150,6 @@ struct CurrentFeesReceipt {
     rebate_slope_bps: u64,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct CurrentSellerReceipt {
     seller_pubkey: String,
@@ -158,7 +157,6 @@ struct CurrentSellerReceipt {
     nonce: u64,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug)]
 struct ParsedCurrent {
     receipt: CurrentReceipt,
@@ -168,7 +166,6 @@ struct ParsedCurrent {
     version: ContractVersionReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct IndexerOrderReceipt {
     created_at: u64,
@@ -176,7 +173,6 @@ struct IndexerOrderReceipt {
     message_id: String,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Serialize)]
 struct EventReceipt {
     kind: &'static str,
@@ -186,7 +182,6 @@ struct EventReceipt {
     indexer_order: IndexerOrderReceipt,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct TerminalReceipt {
     status: &'static str,
@@ -197,7 +192,58 @@ struct TerminalReceipt {
     indexer_order: Option<IndexerOrderReceipt>,
 }
 
-#[cfg(feature = "shellnet")]
+/// WHAT HAPPENED TO THE MONEY, and from whose statement.
+
+/// `terminal` above answers a different question -- did the DEAL post a settlement event -- and on one
+/// real path the honest answer to that question is "no" while the escrow has nevertheless been
+/// returned in full. `cleanupUnopened` emits no settlement event at all; the contract says so where
+/// the event used to be declared. All the deal leaves is `ContractDestroyed`, which proves
+/// destruction and nothing about money, so a receipt built only from the deal's own events reports
+/// `not_final` on a deal that is completely settled. That is not a missing event to be papered over:
+/// it is the receipt reading the side that does not report money.
+
+/// So this block reads the side that does. The note announces what it received
+/// (`PrivateNote.DealCredited`), and `status` says which statement the figure came from:
+
+/// * `settled` -- the deal posted its own terminal settlement; `amount` is its refund figure;
+/// * `returned` -- the deal said nothing, and the note reports being credited for this deal;
+/// * `divergent` -- BOTH spoke and they disagree. Reported as a finding, never resolved by
+/// choosing: two chain statements about one deal that do not match is exactly
+/// what an owner needs told, and a receipt that picked the prettier one would be
+/// inventing a third truth;
+/// * `undetermined` -- nothing established it. `missing` names what was absent, so the gap is a
+/// stated gap rather than a silence.
+#[derive(Debug, Serialize)]
+struct OutcomeReceipt {
+    status: &'static str,
+    /// Raw ECC[2] SHELL, as a decimal string like every other figure in this receipt. `None` only
+    /// when nothing established one.
+    amount: Option<String>,
+    /// Which statement `amount` came from: `deal_terminal_event` or `note_deal_credited`.
+    source: Option<&'static str>,
+    /// The deal's own refund figure, when it posted one -- present alongside `note_amount` on a
+    /// divergence so both halves of the disagreement are in the receipt.
+    deal_amount: Option<String>,
+    /// The total the notes report being credited for this deal.
+    note_amount: Option<String>,
+    /// Every note credit that fed `note_amount`, with the provenance the deal's own events carry.
+    note_credits: Vec<NoteCreditReceipt>,
+    /// The note accounts that were read at all. Empty means no counterparty was identified -- a
+    /// different answer from "read and found nothing", and the two must not look alike.
+    notes_read: Vec<String>,
+    /// Machine-readable reasons the outcome is `undetermined`.
+    missing: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NoteCreditReceipt {
+    note: String,
+    amount: String,
+    message_id: String,
+    created_at: u64,
+    indexer_order: IndexerOrderReceipt,
+}
+
 #[derive(Debug, Serialize)]
 struct WithdrawalReceipt {
     status: &'static str,
@@ -206,7 +252,6 @@ struct WithdrawalReceipt {
     finalized_owed: Option<String>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct RewardsJoinReceipt {
     schema: &'static str,
@@ -216,7 +261,6 @@ struct RewardsJoinReceipt {
     queries: Vec<RewardsQueryReceipt>,
 }
 
-#[cfg(feature = "shellnet")]
 #[derive(Debug, Serialize)]
 struct RewardsQueryReceipt {
     role: &'static str,
@@ -224,7 +268,85 @@ struct RewardsQueryReceipt {
     query_path: Option<String>,
 }
 
-#[cfg(feature = "shellnet")]
+/// where every unit of this deal's SHELL came from and went.
+
+/// `TokenContract` holds the deal's money as a scalar `_balance` and moves it with exactly three
+/// primitives -- `_balance +=` on the three funding entries, `_payShell` to a note, `_burnShell` to
+/// RootPN. So the deal's whole life is one identity:
+
+/// ```text
+/// escrow + seller bond + buyer bond == credited to notes + written off
+/// ```
+
+/// and, because the outflow side has only those two primitives, whatever was funded and did not
+/// reach a note **was burned**. That is what makes `written_off` an accounting result rather than a
+/// leftover, and it is why this block never reports a remainder it cannot name.
+#[derive(Debug, Serialize)]
+struct ConservationReceipt {
+    /// `conserved`, `unbalanced`, `incomplete` or `unverified`. `incomplete` means a term could not
+    /// be read at all, which is a different answer from a mismatch and must not be dressed up as
+    /// one; `unverified` means the identity had only ONE account's word for both of its sides, so it
+    /// closed by construction and states nothing about the money.
+    status: &'static str,
+    /// Which money this verdict is about, said out loud so `conserved` is not read as a statement
+    /// about everything the deal touched. The deal's SHELL is a scalar `uint128 _balance` inside
+    /// `TokenContract`; native `vmshell` gas is a different balance on a different plane and no term
+    /// here counts it. A defect that moves ECC[2] into the native pocket -- the 4.0.36 class, where
+    /// a transfer succeeds, the intent is right and the reserve never grows -- is invisible to every
+    /// figure in this block.
+    covers: &'static str,
+    funded_in: String,
+    /// Every funding message, so each term of `funded_in` is traceable to one transaction.
+    funding: Vec<ConservationTermReceipt>,
+    credited_to_notes: String,
+    written_off: String,
+    /// How `written_off` was established: implied by the identity, or declared by the deal itself.
+    written_off_basis: &'static str,
+    /// The burn the terminal event declared, where it declares one (`ProbeBurned`). Present next to
+    /// `written_off` so the two can be compared rather than merged.
+    declared_write_off: Option<String>,
+    /// The payout the terminal event declared, where it declares both legs.
+    declared_payout: Option<String>,
+    /// The payout term actually used in the identity.
+    payout: Option<String>,
+    /// Which statement `payout` came from: `note_deal_credited` or `deal_terminal_event`. The notes
+    /// are preferred, so the identity is checked between two different accounts wherever possible.
+    payout_source: &'static str,
+    /// Raw ECC[2] SHELL that no term accounts for. Zero on a settled deal, and never rounded.
+    unexplained: String,
+    buyer_position: Option<BuyerPositionReceipt>,
+    /// Machine-readable reasons `status` is not `conserved`.
+    missing: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConservationTermReceipt {
+    kind: &'static str,
+    amount: String,
+    message_id: String,
+    created_at: u64,
+}
+
+/// What the buyer actually paid for one deal -- the figure was missing.
+
+/// `deposit` is the fee-inclusive escrow and NOTHING ELSE. Since 4.0.35 an ordinary deal also debits
+/// the buyer's note `BUYER_BOND = 2P` in a separate `fundBuyerBond` message, so `deposit -
+/// refund_to_buyer` is not the buyer's result and never was. Reading it as one understated the
+/// buyer's outlay by the whole bond and made a correct settlement look short by exactly
+/// `2 000 000 000`. `total_debit` and `net` are published so no reader has to derive them.
+#[derive(Debug, Serialize)]
+struct BuyerPositionReceipt {
+    deposit: String,
+    bond: String,
+    total_debit: String,
+    credited_back: String,
+    /// Signed, in raw ECC[2] SHELL. Negative is the ordinary case: it is the price of the service.
+    net: String,
+    /// `deposit - credited_back` -- the figure a reader computes when the bond is invisible. Printed
+    /// so the trap is named in the receipt instead of being rediscovered.
+    net_excluding_bond: String,
+}
+
 struct ReceiptContext {
     generated_at: u64,
     network: String,
@@ -235,7 +357,6 @@ struct ReceiptContext {
     season: Option<u32>,
 }
 
-#[cfg(feature = "shellnet")]
 fn normalized_code_hash(value: &str) -> Option<String> {
     let value = value
         .trim()
@@ -244,7 +365,6 @@ fn normalized_code_hash(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_ascii_lowercase())
 }
 
-#[cfg(feature = "shellnet")]
 fn decimal_u128(value: &Value, field: &str) -> Option<String> {
     let raw = value.get(field)?;
     let parsed = match raw {
@@ -255,7 +375,6 @@ fn decimal_u128(value: &Value, field: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
-#[cfg(feature = "shellnet")]
 fn integer_u64(value: &Value, field: &str) -> Option<u64> {
     let raw = value.get(field)?;
     match raw {
@@ -265,12 +384,10 @@ fn integer_u64(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn boolean(value: &Value, field: &str) -> Option<bool> {
     value.get(field)?.as_bool()
 }
 
-#[cfg(feature = "shellnet")]
 fn string(value: &Value, field: &str) -> Option<String> {
     value
         .get(field)?
@@ -280,14 +397,12 @@ fn string(value: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[cfg(feature = "shellnet")]
 fn normalized_address(value: &str) -> Option<String> {
     dexdo_core::Address::parse(value)
         .ok()
         .map(|address| address.with_workchain())
 }
 
-#[cfg(feature = "shellnet")]
 fn optional_nonzero_address(value: &Value, field: &str) -> Option<Option<String>> {
     let raw = value.get(field)?.as_str()?.trim();
     if raw.is_empty() {
@@ -301,7 +416,6 @@ fn optional_nonzero_address(value: &Value, field: &str) -> Option<Option<String>
     Some((!bare.chars().all(|character| character == '0')).then_some(address))
 }
 
-#[cfg(feature = "shellnet")]
 fn parse_current(current: &TokenContractCurrentFacts) -> Option<ParsedCurrent> {
     let state = CurrentStateReceipt {
         funded: boolean(&current.state, "funded")?,
@@ -354,7 +468,6 @@ fn parse_current(current: &TokenContractCurrentFacts) -> Option<ParsedCurrent> {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn event_kind_payload(event: &TokenContractSettlementEvent) -> (&'static str, Value) {
     match event {
         TokenContractSettlementEvent::ContractDeployed { token_contract } => {
@@ -366,6 +479,9 @@ fn event_kind_payload(event: &TokenContractSettlementEvent) -> (&'static str, Va
         ),
         TokenContractSettlementEvent::SellerBondFunded { amount } => {
             ("SellerBondFunded", json!({"amount": amount.to_string()}))
+        }
+        TokenContractSettlementEvent::BuyerBondFunded { amount } => {
+            ("BuyerBondFunded", json!({"amount": amount.to_string()}))
         }
         TokenContractSettlementEvent::StreamOpened {
             buyer,
@@ -464,7 +580,6 @@ fn event_kind_payload(event: &TokenContractSettlementEvent) -> (&'static str, Va
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn rendered_event(receipt: &TokenContractSettlementReceipt) -> EventReceipt {
     let (kind, payload) = event_kind_payload(&receipt.event);
     let indexer_order = IndexerOrderReceipt {
@@ -481,7 +596,6 @@ fn rendered_event(receipt: &TokenContractSettlementReceipt) -> EventReceipt {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn is_terminal(event: &TokenContractSettlementEvent) -> bool {
     matches!(
         event,
@@ -492,7 +606,28 @@ fn is_terminal(event: &TokenContractSettlementEvent) -> bool {
     )
 }
 
-#[cfg(feature = "shellnet")]
+/// The refund the DEAL itself posted on its terminal event. Every terminal kind carries one, and it
+/// already includes the buyer bond: each of these paths calls `_releaseBuyerBond`, which folds the
+/// surviving bond back into the deposit before the figure is computed. That is what makes it
+/// comparable, one to one, with what the buyer's note reports being credited.
+fn terminal_refund_to_buyer(event: &TokenContractSettlementEvent) -> Option<u128> {
+    match event {
+        TokenContractSettlementEvent::ProbeBurned {
+            refund_to_buyer, ..
+        }
+        | TokenContractSettlementEvent::StreamStopped {
+            refund_to_buyer, ..
+        }
+        | TokenContractSettlementEvent::DisputeResolved {
+            refund_to_buyer, ..
+        }
+        | TokenContractSettlementEvent::StreamReclaimed {
+            refund_to_buyer, ..
+        } => Some(*refund_to_buyer),
+        _ => None,
+    }
+}
+
 fn event_buyer(event: &TokenContractSettlementEvent) -> Option<&str> {
     match event {
         TokenContractSettlementEvent::StreamFunded { buyer, .. }
@@ -506,7 +641,6 @@ fn event_buyer(event: &TokenContractSettlementEvent) -> Option<&str> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn event_contract(event: &TokenContractSettlementEvent) -> Option<&str> {
     match event {
         TokenContractSettlementEvent::ContractDeployed { token_contract }
@@ -517,7 +651,6 @@ fn event_contract(event: &TokenContractSettlementEvent) -> Option<&str> {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn rewards_query(
     role: &'static str,
     participant_note: Option<String>,
@@ -534,7 +667,6 @@ fn rewards_query(
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn unavailable_receipt(context: ReceiptContext) -> SettlementReceiptV1 {
     let buyer_note = PartyReceipt {
         role: "buyer",
@@ -545,6 +677,21 @@ fn unavailable_receipt(context: ReceiptContext) -> SettlementReceiptV1 {
         role: "seller",
         address: None,
         source: None,
+    };
+    // The chain could not be read at all, so neither money statement was even attempted. Saying
+    // that is the whole point of the block: an unread chain must not look like a silent one.
+    let outcome = OutcomeReceipt {
+        status: "undetermined",
+        amount: None,
+        source: None,
+        deal_amount: None,
+        note_amount: None,
+        note_credits: Vec::new(),
+        notes_read: Vec::new(),
+        missing: vec![
+            "chain_read_unavailable".to_string(),
+            "counterparty_note_unidentified".to_string(),
+        ],
     };
     SettlementReceiptV1 {
         schema: RECEIPT_SCHEMA,
@@ -585,7 +732,9 @@ fn unavailable_receipt(context: ReceiptContext) -> SettlementReceiptV1 {
             created_at: None,
             indexer_order: None,
         },
+        outcome,
         settlement_sequence: Vec::new(),
+        conservation: None,
         withdrawal: WithdrawalReceipt {
             status: "not_applicable",
             events: Vec::new(),
@@ -606,7 +755,6 @@ fn unavailable_receipt(context: ReceiptContext) -> SettlementReceiptV1 {
     }
 }
 
-#[cfg(feature = "shellnet")]
 fn reader_error_is_unavailable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
@@ -620,7 +768,6 @@ fn reader_error_is_unavailable(error: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(feature = "shellnet")]
 fn receipt_from_chain_result(
     context: ReceiptContext,
     result: Result<TokenContractReceiptChainData>,
@@ -632,7 +779,214 @@ fn receipt_from_chain_result(
     }
 }
 
-#[cfg(feature = "shellnet")]
+/// Build the conservation block from figures the receipt already reads.
+
+/// The payout term is taken from the DEAL's own terminal event wherever that event declares it,
+/// because the notes party to a destroyed deal cannot always be identified -- the seller's note is a
+/// current getter, and a destroyed deal has none. What the notes DO report is published beside it as
+/// an independent statement rather than folded into it.
+fn conservation_receipt(
+    events: &[TokenContractSettlementReceipt],
+    terminal: Option<&TokenContractSettlementEvent>,
+    chain: &TokenContractReceiptChainData,
+    buyer_address: Option<&str>,
+) -> ConservationReceipt {
+    let mut missing = Vec::<String>::new();
+    let mut funding = Vec::<ConservationTermReceipt>::new();
+    let mut funded_in = 0u128;
+    let mut funded_overflowed = false;
+    let mut deposit = None;
+    let mut buyer_bond = None;
+    for receipt in events {
+        let (kind, amount) = match &receipt.event {
+            TokenContractSettlementEvent::StreamFunded { deposit: paid, .. } => {
+                deposit = Some(*paid);
+                ("escrow_funded", *paid)
+            }
+            TokenContractSettlementEvent::SellerBondFunded { amount } => {
+                ("seller_bond_funded", *amount)
+            }
+            TokenContractSettlementEvent::BuyerBondFunded { amount } => {
+                buyer_bond = Some(*amount);
+                ("buyer_bond_funded", *amount)
+            }
+            _ => continue,
+        };
+        funding.push(ConservationTermReceipt {
+            kind,
+            amount: amount.to_string(),
+            message_id: receipt.message_id.clone(),
+            created_at: receipt.created_at,
+        });
+        match funded_in.checked_add(amount) {
+            Some(total) => funded_in = total,
+            None => funded_overflowed = true,
+        }
+    }
+    if funded_overflowed {
+        missing.push("funding_total_overflow".to_string());
+    }
+    if funding.is_empty() {
+        missing.push("no_funding_event_observed".to_string());
+    }
+
+    let mut credited_to_notes = 0u128;
+    let mut credit_overflowed = false;
+    for credit in &chain.note_credits {
+        match credited_to_notes.checked_add(credit.amount) {
+            Some(total) => credited_to_notes = total,
+            None => credit_overflowed = true,
+        }
+    }
+    if credit_overflowed {
+        missing.push("note_credit_total_overflow".to_string());
+    }
+
+    // What the deal itself said about the split. `StreamStopped`/`DisputeResolved` declare both
+    // payout legs; `ProbeBurned` declares the refund and the BURN instead, so on that path the burn
+    // is a chain statement and the payout is what the identity implies.
+    let (declared_payout, declared_write_off) = match terminal {
+        Some(TokenContractSettlementEvent::StreamStopped {
+            to_seller,
+            refund_to_buyer,
+            ..
+        })
+        | Some(TokenContractSettlementEvent::DisputeResolved {
+            to_seller,
+            refund_to_buyer,
+            ..
+        }) => (to_seller.checked_add(*refund_to_buyer), None),
+        Some(TokenContractSettlementEvent::ProbeBurned {
+            burned_probe,
+            burned_bond,
+            ..
+        }) => (None, burned_probe.checked_add(*burned_bond)),
+        _ => (None, None),
+    };
+
+    // Where the payout term comes from. The NOTES are preferred when both parties were read,
+    // because they are a statement by different accounts than the deal's own -- using the deal's
+    // figure on both sides of the identity would make it balance by construction and check nothing.
+    let credits_complete = chain.notes_read.len() >= 2 && !chain.note_credits.is_empty();
+    let payout = if credits_complete {
+        Some(credited_to_notes)
+    } else {
+        declared_payout
+    };
+    let payout_source = if credits_complete {
+        "note_deal_credited"
+    } else {
+        "deal_terminal_event"
+    };
+    // Named WITH the count, because "nobody cross-checked this" and "two accounts agreed" must not
+    // reach the reader as the same silence. One note read is a different fact from two that agreed.
+    if !credits_complete {
+        missing.push(format!(
+            "payout_not_cross_checked_notes_read_{}",
+            chain.notes_read.len()
+        ));
+    }
+    let (written_off, written_off_basis) = match (declared_write_off, payout) {
+        (Some(burned), _) => (Some(burned), "declared_by_terminal_event"),
+        (None, Some(paid)) => (
+            Some(funded_in.saturating_sub(paid)),
+            "implied_by_conservation",
+        ),
+        (None, None) => {
+            missing.push("terminal_settlement_event_absent".to_string());
+            (None, "unestablished")
+        }
+    };
+
+    // Signed, so a payout the funding cannot cover reads as the shortfall it is rather than
+    // saturating to a comforting zero.
+    let unexplained = match (written_off, payout) {
+        (Some(written_off), Some(paid)) => {
+            let signed = |value: u128| i128::try_from(value).unwrap_or(i128::MAX);
+            Some(
+                signed(funded_in)
+                    .saturating_sub(signed(paid))
+                    .saturating_sub(signed(written_off)),
+            )
+        }
+        _ => None,
+    };
+
+    // The deal's own terminal split against what the notes report. Two independent statements about
+    // one settlement: agreement is evidence, disagreement is a finding, and neither is resolved by
+    // preferring one of them.
+    let mut disagrees = false;
+    if let (Some(declared), true) = (declared_payout, credits_complete) {
+        if declared != credited_to_notes {
+            disagrees = true;
+            missing.push("declared_payout_disagrees_with_note_credits".to_string());
+        }
+    }
+    if payout.is_some_and(|paid| paid > funded_in) {
+        missing.push("declared_payout_exceeds_funding".to_string());
+    }
+
+    let buyer_position = match (deposit, buyer_address) {
+        (Some(deposit), Some(buyer)) => {
+            let bond = buyer_bond.unwrap_or(0);
+            let credited_back = chain
+                .note_credits
+                .iter()
+                .filter(|credit| credit.note == buyer)
+                .fold(0u128, |total, credit| total.saturating_add(credit.amount));
+            buyer_total_debit(deposit, bond).map(|total_debit| BuyerPositionReceipt {
+                deposit: deposit.to_string(),
+                bond: bond.to_string(),
+                total_debit: total_debit.to_string(),
+                credited_back: credited_back.to_string(),
+                net: buyer_net_result(credited_back, total_debit).to_string(),
+                net_excluding_bond: buyer_net_result(credited_back, deposit).to_string(),
+            })
+        }
+        _ => None,
+    };
+
+    let status = match unexplained {
+        _ if disagrees => "unbalanced",
+        None => "incomplete",
+        // follow-up, and it is a money-path defect rather than a wording one. With fewer than
+        // two notes read there is no second statement to check the deal's own figure against:
+        // `payout` IS `declared_payout`, `written_off` is `funded_in - payout`, and `unexplained`
+        // is therefore `funded_in - payout - (funded_in - payout)` -- exactly 0 for every input the
+        // chain can produce. Reporting that as `conserved` announces a cross-check that did not
+        // happen; the identity closed against itself, and a number compared with itself is not
+        // evidence about money.
+
+        // The guard was already written -- the comment above the `payout` selection says taking the
+        // deal's figure for both sides "would make it balance by construction and check nothing" --
+        // but it only covered the branch that reaches for the notes. This arm covers the branch
+        // that cannot.
+        Some(_) if !credits_complete => "unverified",
+        Some(0) => "conserved",
+        Some(_) => "unbalanced",
+    };
+    ConservationReceipt {
+        status,
+        covers: "ecc2_traded_asset_only",
+        funded_in: funded_in.to_string(),
+        funding,
+        credited_to_notes: credited_to_notes.to_string(),
+        written_off: written_off
+            .map(|amount| amount.to_string())
+            .unwrap_or_default(),
+        written_off_basis,
+        declared_write_off: declared_write_off.map(|amount| amount.to_string()),
+        declared_payout: declared_payout.map(|amount| amount.to_string()),
+        payout: payout.map(|amount| amount.to_string()),
+        payout_source,
+        unexplained: unexplained
+            .map(|amount| amount.to_string())
+            .unwrap_or_default(),
+        buyer_position,
+        missing,
+    }
+}
+
 fn build_receipt(
     context: ReceiptContext,
     chain: &TokenContractReceiptChainData,
@@ -868,6 +1222,117 @@ fn build_receipt(
         .map(|current| current.seller_note.clone());
     let seller_source = seller_address.as_ref().map(|_| "current_getter");
 
+    // the outcome is about the BUYER's escrow, so it is built from the two statements that
+    // are about the same money -- the deal's `refundToBuyer` and what the BUYER's note reports being
+    // credited. Seller credits are a different figure (bond back, proceeds) and summing them in
+    // would manufacture a disagreement out of two correct numbers.
+    let buyer_credits = buyer_address
+        .as_ref()
+        .map(|buyer| {
+            chain
+                .note_credits
+                .iter()
+                .filter(|credit| &credit.note == buyer)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut note_total = 0u128;
+    let mut note_total_overflowed = false;
+    for credit in &buyer_credits {
+        match note_total.checked_add(credit.amount) {
+            Some(total) => note_total = total,
+            None => note_total_overflowed = true,
+        }
+    }
+    if note_total_overflowed {
+        issues.push("note_credit_total_overflow".to_string());
+    }
+    let deal_refund = terminal_events
+        .first()
+        .and_then(|receipt| terminal_refund_to_buyer(&receipt.event));
+    let has_note_statement = !buyer_credits.is_empty() && !note_total_overflowed;
+    let outcome_status = match (deal_refund, has_note_statement) {
+        (Some(deal), true) if deal != note_total => {
+            // Both sides spoke and disagreed. Say so; do not choose.
+            issues.push("outcome_amount_divergence".to_string());
+            "divergent"
+        }
+        (Some(_), _) => "settled",
+        (None, true) => "returned",
+        (None, false) => "undetermined",
+    };
+    let mut missing = Vec::<String>::new();
+    if outcome_status == "undetermined" {
+        missing.push(if chain.account_active {
+            "deal_still_active".to_string()
+        } else {
+            "deal_posted_no_terminal_settlement_event".to_string()
+        });
+        missing.push(if chain.notes_read.is_empty() {
+            "counterparty_note_unidentified".to_string()
+        } else {
+            "note_reported_no_credit_for_this_deal".to_string()
+        });
+    }
+    let outcome = OutcomeReceipt {
+        status: outcome_status,
+        amount: match outcome_status {
+            "settled" | "divergent" => deal_refund.map(|amount| amount.to_string()),
+            "returned" => Some(note_total.to_string()),
+            _ => None,
+        },
+        source: match outcome_status {
+            "settled" | "divergent" => Some("deal_terminal_event"),
+            "returned" => Some("note_deal_credited"),
+            _ => None,
+        },
+        deal_amount: deal_refund.map(|amount| amount.to_string()),
+        note_amount: has_note_statement.then(|| note_total.to_string()),
+        note_credits: buyer_credits
+            .iter()
+            .map(|credit| NoteCreditReceipt {
+                note: credit.note.clone(),
+                amount: credit.amount.to_string(),
+                message_id: credit.message_id.clone(),
+                created_at: credit.created_at,
+                indexer_order: IndexerOrderReceipt {
+                    created_at: credit.created_at,
+                    cursor: credit.cursor.clone(),
+                    message_id: credit.message_id.clone(),
+                },
+            })
+            .collect(),
+        notes_read: chain.notes_read.clone(),
+        missing,
+    };
+    let conservation = conservation_receipt(
+        &events,
+        terminal_events.first().map(|receipt| &receipt.event),
+        chain,
+        buyer_address.as_deref(),
+    );
+    match conservation.status {
+        "unbalanced" => issues.push("deal_money_not_conserved".to_string()),
+        // Only once the deal is GONE. A live deal has not settled yet, so having no terminal split
+        // to check is its ordinary condition, not an inconsistency -- raising it here would put a
+        // permanent finding on every healthy in-flight deal.
+        "incomplete" if !chain.account_active => {
+            issues.push("deal_money_conservation_incomplete".to_string())
+        }
+        // Same gate and the same reason: on a live deal the counterparty note may simply not have
+        // been read yet. On a deal that is GONE, a settlement nobody could cross-check is a finding
+        // about that settlement, not a note about the reader.
+        "unverified" if !chain.account_active => {
+            issues.push("deal_money_conservation_unverified".to_string())
+        }
+        _ => {}
+    }
+    // Pushed after `terminal`/`withdrawal` were decided on purpose: a divergence between the two
+    // money statements is a finding about the OUTCOME, and must not silently restate the deal's own
+    // terminal event or its withdrawals as inconsistent.
+    issues.sort();
+    issues.dedup();
+
     SettlementReceiptV1 {
         schema: RECEIPT_SCHEMA,
         generated_at: context.generated_at,
@@ -914,7 +1379,9 @@ fn build_receipt(
         },
         current: parsed_current.map(|current| current.receipt),
         terminal: terminal_receipt,
+        outcome,
         settlement_sequence: events.iter().map(rendered_event).collect(),
+        conservation: Some(conservation),
         withdrawal: WithdrawalReceipt {
             status: withdrawal_status,
             events: withdrawal_receipts
@@ -938,20 +1405,146 @@ fn build_receipt(
     }
 }
 
-#[cfg(feature = "shellnet")]
+/// The machine-readable reasons this receipt gives for not being `conserved`, as one line.
+
+/// Read off the receipt rather than recomputed: `unexplained` and `missing` are what the
+/// conservation block already established, so the refusal names the same terms the JSON above it
+/// prints and cannot drift from them.
+fn conservation_detail(conservation: &ConservationReceipt) -> String {
+    let mut parts = Vec::<String>::new();
+    parts.push(if conservation.unexplained.is_empty() {
+        "unexplained: not established".to_string()
+    } else {
+        format!(
+            "unexplained {} raw ECC[2] SHELL",
+            conservation.unexplained
+        )
+    });
+    parts.extend(conservation.missing.iter().cloned());
+    parts.join("; ")
+}
+
+/// what this gate refuses with, as a fact about the condition rather than about the sentence.
+
+/// `classify_error` reads the message text, and these three refusals demonstrated in one place what
+/// that costs. Measured: `incomplete` matched "settlement" -- through the receipt's own reason code
+/// `terminal_settlement_event_absent` -- and came out `SETTLEMENT_FAILED` with `retryable: true`, so
+/// a caller was told to retry a permanent finding forever. `unbalanced` matched "balance", because
+/// the word "unbalanced" contains it, and came out `INSUFFICIENT_BALANCE`: money that does not
+/// conserve, reported as a note that needs topping up. The absent-block refusal matched no rule at
+/// all and came out `INTERNAL`, which tells a machine "this client has a bug".
+
+/// Three siblings of one check, three unrelated codes, none of them right. So the code is CHOSEN
+/// here and the envelope is printed here, and the refusal returns `machine::printed_error()`, which
+/// `main` exits on without consulting the classifier at all. That is the shape established and
+/// `subscription_machine_error` already uses; rewording any sentence below cannot move any code,
+/// which is the property the regressions assert.
+
+/// Deliberately NOT fixed by rewording these messages to miss the text rules. That would be a
+/// workaround for the classifier rather than a fix for the refusal, and it would break again the
+/// next time anyone improved the wording.
+
+/// One code covers every refusal, and it is exact only for `unbalanced`: two records really do
+/// contradict each other there. For the rest it is the deliberate safe side, because what decides
+/// retryability is a sub-cause INSIDE each verdict that the refusal cannot see -- a transient
+/// timeout and a permanent 404 reach the absent-block case as byte-identical receipts, the cause
+/// having been dropped before the receipt was built -- and naming the state imprecisely is cheaper
+/// than telling a caller to retry a destroyed deal forever.
+struct ConservationRefusal {
+    code: super::machine::ErrorCode,
+    cause: String,
+}
+
+/// The refusal this receipt earns under `--require-conserved`, or `None` when conservation is proven.
+
+/// Kept separate from the printing so a regression can assert the CODE a machine consumer reads
+/// rather than scraping stdout -- the same separation `machine_error` is split out for.
+fn conservation_refusal(receipt: &SettlementReceiptV1) -> Option<ConservationRefusal> {
+    use super::machine::ErrorCode;
+    let Some(conservation) = receipt.conservation.as_ref() else {
+        return Some(ConservationRefusal {
+            code: ErrorCode::ContradictoryState,
+            cause: "--require-conserved: no conservation block -- the chain read was unavailable, so this receipt carries no money identity to judge".to_string(),
+        });
+    };
+    match conservation.status {
+        "conserved" => None,
+        "unbalanced" => Some(ConservationRefusal {
+            code: ErrorCode::ContradictoryState,
+            cause: format!(
+                "--require-conserved: conservation unbalanced -- this deal's money does not conserve ({})",
+                conservation_detail(conservation)
+            ),
+        }),
+        // PR1787's fourth value. Named here rather than left to the catch-all below: we know this
+        // verdict is coming, and a generic sentence for a state we can name is a debt, not a
+        // default. Having its own arm also unlinks the two pull requests in both merge orders.
+        "unverified" => Some(ConservationRefusal {
+            code: ErrorCode::ContradictoryState,
+            cause: format!(
+                "--require-conserved: conservation unverified -- the identity had only one account's word for both of its sides, so it closed by construction and states nothing about the money ({})",
+                conservation_detail(conservation)
+            ),
+        }),
+        "incomplete" => Some(ConservationRefusal {
+            code: ErrorCode::ContradictoryState,
+            cause: format!(
+                "--require-conserved: conservation incomplete -- a term of the money identity could not be read, so conservation was never evaluated ({})",
+                conservation_detail(conservation)
+            ),
+        }),
+        other => Some(ConservationRefusal {
+            code: ErrorCode::ContradictoryState,
+            cause: format!(
+                "--require-conserved: conservation status {other} is not conserved"
+            ),
+        }),
+    }
+}
+
+/// the command's exit status, decided from the receipt it has just printed.
+
+/// The default is `Ok` on every verdict, and that is a decision rather than an omission. This
+/// command emits a stable reporting object whose consumers live outside this tree, and they need
+/// that object most when a deal is inconsistent; an exit code that flipped on content would stop
+/// those scripts mid-run for a change none of them asked for.
+
+/// `--require-conserved` is how an operator opts into the other rule, and that rule is strict: zero
+/// only when conservation was PROVEN. `incomplete` and an absent block fail exactly as `unbalanced`
+/// does, because "could not check" is not "checked and fine" -- a gate that passes what it could
+/// not verify teaches its operator that a green run means nothing.
+fn receipt_exit_status(receipt: &SettlementReceiptV1, require_conserved: bool) -> Result<()> {
+    if !require_conserved {
+        return Ok(());
+    }
+    let Some(refusal) = conservation_refusal(receipt) else {
+        return Ok(());
+    };
+    let envelope = super::machine::MachineError::new(
+        super::machine::OP_SETTLEMENT_RECEIPT,
+        refusal.code,
+    )
+    .with_cause(refusal.cause);
+    match super::machine::print_json(&envelope) {
+        Ok(()) => Err(super::machine::printed_error()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Result<()> {
     debug_assert!(args.json, "--json is required by clap");
     let token_contract = dexdo_core::Address::parse(&args.token_contract)
         .map_err(|error| anyhow::anyhow!("TOKEN_CONTRACT {}: {error}", args.token_contract))?;
     let token_contract_text = token_contract.with_workchain();
-    let deployed = Deployed::load(&args.contracts)
-        .with_context(|| format!("load {}", args.contracts.display()))?;
+    let manifest = crate::cli::commands::manifest_path()?;
+    let deployed = Deployed::load(&manifest)
+        .with_context(|| format!("load {}", manifest.display()))?;
     let endpoint = dexdo_core::resolve_endpoint(None, &deployed)?;
-    let expected_code_hash = deployed
-        .contract_hashes
-        .get("TokenContract")
-        .and_then(|value| normalized_code_hash(value));
-    let backend = RealChainBackend::connect(&args.contracts)?;
+    let expected_code_hash = dexdo_core::chain::compiled_contract_hash("TokenContract")
+        .ok()
+        .as_deref()
+        .and_then(normalized_code_hash);
+    let backend = RealChainBackend::connect(&crate::cli::commands::manifest_path()?)?;
     let generated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -972,15 +1565,14 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
             .await,
     )?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
-    Ok(())
+    // Printed IN FULL first, and only then does the verdict decide the exit code -- the shape
+    // `doctor` already uses, where the report is rendered before the run fails on its summary. A
+    // caller that asked for the gate still gets the data it came for..
+    receipt_exit_status(&receipt, args.require_conserved)
 }
 
-#[cfg(not(feature = "shellnet"))]
-pub(crate) async fn run_settlement_receipt(_args: SettlementReceiptArgs) -> Result<()> {
-    anyhow::bail!("settlement-receipt unavailable: build with `--features shellnet`")
-}
 
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use dexdo_core::{TokenContractSettlementEvent::*, TokenContractSettlementReceipts};
@@ -992,8 +1584,8 @@ mod tests {
     fn context(token_contract: &str) -> ReceiptContext {
         ReceiptContext {
             generated_at: 1_700_000_000,
-            network: "shellnet".to_string(),
-            chain_endpoint: "https://shellnet.example".to_string(),
+            network: "net-a".to_string(),
+            chain_endpoint: "https://net-a.example".to_string(),
             contracts_generation: Some("4.0.29".to_string()),
             expected_code_hash: Some("ab".repeat(32)),
             token_contract: token_contract.to_string(),
@@ -1124,6 +1716,43 @@ mod tests {
             code_hash: current.as_ref().map(|_| "ab".repeat(32)),
             current,
             receipts: TokenContractSettlementReceipts { events },
+            // this helper keeps meaning exactly what it meant -- a receipt built with no
+            // note-side statement read. The cases that DO read one use `chain_with_note_credits`.
+            note_credits: Vec::new(),
+            notes_read: Vec::new(),
+        }
+    }
+
+    /// The same fixture plus what the money-reporting side said. `notes_read` is separate from
+    /// `note_credits` on purpose: a note that was read and reported nothing is a different fact from
+    /// a note that was never identified, and the receipt has to be able to tell them apart.
+    fn chain_with_note_credits(
+        token_contract: &str,
+        current: Option<TokenContractCurrentFacts>,
+        events: Vec<TokenContractSettlementReceipt>,
+        notes_read: Vec<String>,
+        note_credits: Vec<dexdo_core::NoteDealCreditReceipt>,
+    ) -> TokenContractReceiptChainData {
+        TokenContractReceiptChainData {
+            note_credits,
+            notes_read,
+            ..chain(token_contract, current, events)
+        }
+    }
+
+    fn note_credit(
+        note: &str,
+        deal: &str,
+        amount: u128,
+        created_at: u64,
+    ) -> dexdo_core::NoteDealCreditReceipt {
+        dexdo_core::NoteDealCreditReceipt {
+            note: note.to_string(),
+            deal: deal.to_string(),
+            amount,
+            message_id: format!("credit-{created_at}"),
+            created_at,
+            cursor: format!("cursor-{created_at}"),
         }
     }
 
@@ -1398,6 +2027,166 @@ mod tests {
         assert_eq!(receipt.terminal.kind, None);
         assert_eq!(receipt.withdrawal.status, "not_applicable");
         assert!(receipt.current.is_none());
+    }
+
+    /// the receipt reads the side that reports the money.
+
+    /// `cleanupUnopened` -- the never-opened refund -- emits NO settlement event; the contract says so
+    /// where the event used to be declared. All the deal leaves behind is `ContractDestroyed`, so
+    /// `terminal.status` is honestly `not_final` and must stay that way: the deal really did not post
+    /// a settlement. What was missing is the answer to the owner's actual question, which the note
+    /// does report. These cases pin both ends of that and the disagreement between them.
+    mod outcome_reads_the_money_side {
+        use super::*;
+
+        /// The live shape of issue, in figures taken from that deal: the book funded 2.05, the
+        /// buyer bonded 2.00, the deal was destroyed silently, and the buyer's note announced a
+        /// credit of 4.05 -- deposit plus the bond `_releaseBuyerBond` folds back into it.
+        #[test]
+        fn destroyed_deal_with_a_note_credit_names_the_return_and_its_amount() {
+            let token_contract = address('a');
+            let buyer = address('c');
+            let receipt = build_receipt(
+                context(&token_contract),
+                &chain_with_note_credits(
+                    &token_contract,
+                    None,
+                    vec![
+                        event(
+                            "funded",
+                            1,
+                            StreamFunded {
+                                buyer: buyer.clone(),
+                                deposit: 2_050_000_000,
+                            },
+                        ),
+                        event("bond", 2, BuyerBondFunded { amount: 2_000_000_000 }),
+                        event(
+                            "destroyed",
+                            3,
+                            ContractDestroyed {
+                                token_contract: token_contract.clone(),
+                            },
+                        ),
+                    ],
+                    vec![buyer.clone()],
+                    vec![note_credit(&buyer, &token_contract, 4_050_000_000, 4)],
+                ),
+            );
+
+            // The deal genuinely posted no settlement event, and the receipt still says so.
+            assert_eq!(receipt.terminal.status, "not_final");
+            // What changed is that the receipt no longer stops there.
+            assert_eq!(receipt.outcome.status, "returned");
+            assert_eq!(receipt.outcome.amount.as_deref(), Some("4050000000"));
+            assert_eq!(receipt.outcome.source, Some("note_deal_credited"));
+            assert_eq!(receipt.outcome.note_amount.as_deref(), Some("4050000000"));
+            assert!(receipt.outcome.deal_amount.is_none());
+            assert!(receipt.outcome.missing.is_empty());
+            let value = as_value(&receipt);
+            assert_eq!(value["outcome"]["note_credits"][0]["message_id"], "credit-4");
+            assert_eq!(value["outcome"]["notes_read"][0], buyer);
+            // The buyer bond is now in the sequence: without it a reader sees a 4.05 return against
+            // a 2.05 deposit and cannot account for the difference.
+            assert_eq!(value["settlement_sequence"][1]["kind"], "BuyerBondFunded");
+            assert_eq!(
+                value["settlement_sequence"][1]["payload"]["amount"],
+                "2000000000"
+            );
+        }
+
+        /// Nothing was credited and no note was ever identified: the receipt says what is missing
+        /// instead of implying an outcome. This is the case the fix must NOT turn into a claim.
+        #[test]
+        fn destroyed_deal_with_no_note_statement_stays_undetermined_and_says_why() {
+            let token_contract = address('a');
+            let receipt = build_receipt(
+                context(&token_contract),
+                &chain(
+                    &token_contract,
+                    None,
+                    vec![event(
+                        "destroyed",
+                        1,
+                        ContractDestroyed {
+                            token_contract: token_contract.clone(),
+                        },
+                    )],
+                ),
+            );
+            assert_eq!(receipt.outcome.status, "undetermined");
+            assert!(receipt.outcome.amount.is_none());
+            assert_eq!(
+                receipt.outcome.missing,
+                vec![
+                    "deal_posted_no_terminal_settlement_event".to_string(),
+                    "counterparty_note_unidentified".to_string(),
+                ]
+            );
+        }
+
+        /// Both sides spoke and disagreed. The receipt reports the disagreement and carries BOTH
+        /// figures; it does not pick one. Choosing here would be inventing a third truth.
+        #[test]
+        fn two_statements_that_disagree_are_reported_as_a_divergence_not_resolved() {
+            let token_contract = address('a');
+            let buyer = address('c');
+            let receipt = build_receipt(
+                context(&token_contract),
+                &chain_with_note_credits(
+                    &token_contract,
+                    None,
+                    vec![event(
+                        "stopped",
+                        1,
+                        StreamStopped {
+                            buyer: buyer.clone(),
+                            to_seller: 1_000_000_000,
+                            refund_to_buyer: 3_000_000_000,
+                        },
+                    )],
+                    vec![buyer.clone()],
+                    vec![note_credit(&buyer, &token_contract, 4_050_000_000, 2)],
+                ),
+            );
+            assert_eq!(receipt.outcome.status, "divergent");
+            assert_eq!(receipt.outcome.deal_amount.as_deref(), Some("3000000000"));
+            assert_eq!(receipt.outcome.note_amount.as_deref(), Some("4050000000"));
+            assert!(receipt
+                .consistency_issues
+                .contains(&"outcome_amount_divergence".to_string()));
+        }
+
+        /// Agreement is not a divergence. The deal posted its settlement and the note confirms the
+        /// same figure, so the outcome is `settled` and nothing is flagged.
+        #[test]
+        fn a_note_credit_that_matches_the_deal_is_settled_and_flags_nothing() {
+            let token_contract = address('a');
+            let buyer = address('c');
+            let receipt = build_receipt(
+                context(&token_contract),
+                &chain_with_note_credits(
+                    &token_contract,
+                    None,
+                    vec![event(
+                        "stopped",
+                        1,
+                        StreamStopped {
+                            buyer: buyer.clone(),
+                            to_seller: 1_000_000_000,
+                            refund_to_buyer: 4_050_000_000,
+                        },
+                    )],
+                    vec![buyer.clone()],
+                    vec![note_credit(&buyer, &token_contract, 4_050_000_000, 2)],
+                ),
+            );
+            assert_eq!(receipt.outcome.status, "settled");
+            assert_eq!(receipt.outcome.source, Some("deal_terminal_event"));
+            assert!(!receipt
+                .consistency_issues
+                .contains(&"outcome_amount_divergence".to_string()));
+        }
     }
 
     #[test]

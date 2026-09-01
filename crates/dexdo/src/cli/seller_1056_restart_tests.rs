@@ -95,7 +95,7 @@ fn issue_1056_save_parent_handle(
 ) {
     let market = dexdo_core::MarketManifest {
         // A real persisted parent is not eligible for the mock-only missing-getDeal fallback.
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         frame_model: "mock".to_string(),
         model_hash: dexdo_core::model_hash_for("mock"),
         inference_order_book: "mock".to_string(),
@@ -112,7 +112,7 @@ fn issue_1056_save_parent_handle(
             version: deals::DEAL_HANDLE_VERSION,
             handle: deals::make_handle_id(parent_token_contract, deals::DealHandleRole::Seller),
             role: deals::DealHandleRole::Seller,
-            network: "shellnet".to_string(),
+            network: "net-a".to_string(),
             token_contract: parent_token_contract.to_string(),
             note_addr: seller_owner.to_string(),
             frame_model: market.frame_model.clone(),
@@ -165,7 +165,6 @@ fn issue_1056_seller_args(
         mock_token_count: 98,
         model: None,
         models: root.join("unused-models.json"),
-        contracts,
         policy: None,
     }
 }
@@ -220,9 +219,28 @@ async fn issue_1056_restart_child() {
         contracts,
     ));
     tokio::pin!(seller);
+    // The observation ends on the EVENT it is about -- the successor reaching the book -- and runs to
+    // its deadline only when there is no such event to wait for (the `full` case queues no successor).
+
+    // It used to stop 500 ms after the FRESH offer rested, which asked a different question. Nothing
+    // orders those two postings: the fresh offer is posted during startup, and the successor is
+    // provisioned only after `seller_ready`, so the window asked the successor to win a race against
+    // an unrelated offer. What that measures is the box, not the client. Measured 2026-08-27 under
+    // load (`--cpus=0.05`), the child printed `successor_rested=false` while `replacement_nonce` was
+    // `Some(5)` and the successor's address was already durable in the lineage -- the successor
+    // existed and had merely not reached the book yet -- and the assertion below fired on a client
+    // that had done everything right. A bigger fixed window would be the same defect with a larger
+    // number, so there is none: the loop waits for the thing it asserts.
+
+    // The bound is `OFFER_ACCEPTANCE_TIMEOUT`, this client's canonical maximum readback window for
+    // proving that a submitted SELL rested (`crates/core/src/params.rs`) -- the same question this
+    // loop asks, so no new timeout is introduced. It also makes the `full` case's
+    // negative exactly as strong as this case's positive: had a successor been posted, it would have
+    // been proven rested inside this window.
     let observe = async {
         let fresh = issue_1056_fresh_token_contract();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + dexdo_core::params::OFFER_ACCEPTANCE_TIMEOUT;
         let mut fresh_rested = false;
         let mut successor_rested = false;
         let mut fresh_seen_at = None;
@@ -238,14 +256,24 @@ async fn issue_1056_restart_child() {
                 chain.confirm_offer_outcome(&successor_token_contract).await,
                 Ok(Some(SellOfferOutcome::Rested { .. }))
             );
-            if successor_rested
-                || fresh_seen_at
-                    .is_some_and(|seen| seen.elapsed() >= std::time::Duration::from_millis(500))
-            {
+            if successor_rested {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        // What the fixed window used to decide silently, as a number. The next time this goes red on
+        // a loaded box the log says how long the successor actually took, instead of leaving it to be
+        // guessed: `after_fresh_ms` is the wait the old 500 ms cut was rationing.
+        println!(
+            "issue_1056_restart_observation_wait case={case} waited_ms={} after_fresh_ms={} successor_rested={successor_rested} deadline_reached={}",
+            started.elapsed().as_millis(),
+            fresh_seen_at.map_or_else(
+                || "never_rested".to_string(),
+                |seen| seen.elapsed().as_millis().to_string()
+            ),
+            !successor_rested,
+        );
+        let _ = std::io::stdout().flush();
         (fresh_rested, successor_rested)
     };
     tokio::pin!(observe);
@@ -300,7 +328,7 @@ fn issue_1056_restart_after_terminal_settlement_queues_exact_residual_and_names_
     assert!(
         output.contains(&format!(
             "seller_residual_queued token_contract={parent} order_id=98 offered_ticks=98 matched_ticks=2 residual_ticks=96 price_per_tick={} reason=restart_after_parent_settlement",
-            dexdo_core::PRICE_STEP
+            dexdo_core::shell_amount(dexdo_core::PRICE_STEP)
         )),
         "startup must name the queued parent and exact residual on the operator channel: {output}"
     );

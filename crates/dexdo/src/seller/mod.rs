@@ -1,5 +1,5 @@
 //! Seller client: gateway + authorization + mock upstream + stream opening.
-//! Headless(R12): starts without a GUI and serves the stream as a daemon.
+//! Headless (R12): starts without a GUI and serves the stream as a daemon.
 
 pub mod advance;
 pub mod advertise;
@@ -52,15 +52,16 @@ fn display_token_contract(token_contract: &str) -> String {
 pub struct SellerConfig {
     /// Contract -- the deal's handover point.
     pub token_contract: TokenContract,
-    /// Tick price `P` in raw ECC[2] units.
+    /// Tick price `P` in raw ECC[2] units. Stated on the command line in whole SHELL
+    /// (`--price-per-tick 3`) and converted once, at the argument.
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,
     /// Whether this SELL accepts only subscription BUYs.
     pub subscription: bool,
-    /// Public gateway host:port that will be encrypted to the buyer(R15).
+    /// Public gateway host:port that will be encrypted to the buyer (R15).
     pub gateway_advertise: String,
-    /// How many fake tokens to yield(mock model). `0` = a deliberate seller no-show.
+    /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show.
     /// Real upstreams are limited by the buyer request's `max_tokens` and the matched TC's strict
     /// `fundedTokens`/weekly cap, not by this debug fixture or the seller's advertised maximum.
     pub mock_token_count: u64,
@@ -83,9 +84,9 @@ pub enum SellerOfferInspection {
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
-    /// The seller's note -- **polymorphic**: `LocalNote`(mock path) OR `RealNote` (real shellnet,
+    /// The seller's note -- **polymorphic**: `LocalNote` (mock path) OR `RealNote` (a real chain,
     /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` -- on
-    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519(F1).
+    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519 (F1).
     pub note: Arc<dyn Note>,
     pub server_task: tokio::task::JoinHandle<()>,
     /// The socket address actually bound before the server task was spawned.
@@ -183,9 +184,10 @@ impl SellerMatchWatchCursor {
             .map_err(|_| anyhow!("seller fill price {} exceeds u64", fill.price_per_tick))?;
         if (cfg.price_per_tick, cfg.max_ticks) != (authoritative_price, authoritative_ticks) {
             bail!(
-                "seller config price/ticks ({},{}) do not match TokenContract.getDeal ({authoritative_price},{authoritative_ticks}) for {}",
-                cfg.price_per_tick,
+                "seller config price/ticks ({},{}) do not match TokenContract.getDeal ({},{authoritative_ticks}) for {}",
+                dexdo_core::shell_amount(cfg.price_per_tick),
                 cfg.max_ticks,
+                dexdo_core::shell_amount(authoritative_price),
                 display_token_contract(&cfg.token_contract)
             );
         }
@@ -345,7 +347,7 @@ fn now_unix() -> Result<u64> {
         .as_secs())
 }
 
-/// Bring up the seller's gRPC gateway(headless) **over TLS**: a self-signed certificate
+/// Bring up the seller's gRPC gateway (headless) **over TLS**: a self-signed certificate
 /// is generated at startup, its fingerprint is returned for recording in the handover. Returns
 /// handles for orchestrating the stream.
 pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
@@ -353,7 +355,7 @@ pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
 }
 
 /// Like [`start_gateway`], but with an upstream choice (mock model or real OpenAI-compatible,
-/// ). The mock path(`UpstreamConfig::Mock`) is identical to.
+/// ). The mock path (`UpstreamConfig::Mock`) is identical to.
 pub async fn start_gateway_with(
     addr: SocketAddr,
     upstream: UpstreamConfig,
@@ -363,7 +365,7 @@ pub async fn start_gateway_with(
 }
 
 /// Like [`start_gateway_with`], but with a **loaded persistent** seller note:
-/// the identity(from `--note-key`/wallet) is reused across runs -- its offer/deals are
+/// the identity (from `--note-key`/wallet) is reused across runs -- its offer/deals are
 /// visible in the next run. `start_gateway_with` substitutes an ephemeral `generate()` here.
 pub async fn start_gateway_with_note(
     addr: SocketAddr,
@@ -417,14 +419,20 @@ async fn start_gateway_with_note_and_capacity_dir(
     deals_dir: Option<PathBuf>,
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
+    // this process is about to serve buyers, and a buyer that hangs up mid-stream must give
+    // this gateway an `EPIPE` to handle rather than a signal that kills it. `main` restores the
+    // default SIGPIPE disposition for one-shot printers; a gateway needs it ignored. Do not delete
+    // this as a duplicate of the entry policy -- it is the opposite decision, for the opposite kind
+    // of process, and the cost of losing it is a seller that dies mid-delivery.
+    crate::serving_process_ignores_sigpipe();
     let state = Arc::new(match deals_dir {
         Some(deals_dir) => GatewayState::with_upstream_and_deals_dir(upstream, deals_dir),
         None => GatewayState::with_upstream(upstream),
     });
     let service = GatewayService::new(state.clone()).into_server();
 
-    // Both rustls providers(ring/aws-lc-rs) are present in the tree; pin the process
-    // default explicitly(ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
+    // Both rustls providers (ring/aws-lc-rs) are present in the tree; pin the process
+    // default explicitly (ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
     let tls_fingerprint = gw_tls.fingerprint.clone();
@@ -599,8 +607,10 @@ fn validate_resting_offer(
         return Err(resting_offer_error(
             &cfg.token_contract,
             format!(
-                "raw order {} price_per_tick {} does not match {}",
-                order.order_id, order.price_per_tick, cfg.price_per_tick
+                "book order {} price_per_tick {} does not match {}",
+                order.order_id,
+                dexdo_core::shell_amount(order.price_per_tick),
+                dexdo_core::shell_amount(cfg.price_per_tick)
             ),
         ));
     }
@@ -710,7 +720,7 @@ pub async fn prepare_seller_offer(
 }
 
 /// Open the stream for a match:
-/// 1. reads the match(the buyer's pubkey is recorded in the contract);
+/// 1. reads the match (the buyer's pubkey is recorded in the contract);
 /// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
 /// exact `2P` seller bond + writing the enc-endpoint into the endpoints file);
 /// 3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
@@ -774,7 +784,7 @@ pub async fn provision_match(
         );
     }
     // the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
-    // The endpoint points at the GATEWAY over TLS(R15); the buyer pins the fingerprint on connect.
+    // The endpoint points at the GATEWAY over TLS (R15); the buyer pins the fingerprint on connect.
     let handover = Handover {
         endpoint: format!("https://{}", cfg.gateway_advertise),
         tls_fingerprint: seller.tls_fingerprint.clone(),
@@ -788,9 +798,9 @@ pub async fn provision_match(
 
     // the gateway must authorize the matched buyer BEFORE that buyer can connect.
     // Register buyer+budget BEFORE writing the handover on-chain: the buyer learns the endpoint only
-    // after reading the on-chain ciphertext(written by `open_stream`), so register-before-open rules out a race. Otherwise on a
-    // real(slow) chain the buyer manages to knock in the window between open_stream and register_stream
-    // -> the gateway still has no pubkey -> `challenge-response failed`(the mock timing did not expose this).
+    // after reading the on-chain ciphertext (written by `open_stream`), so register-before-open rules out a race. Otherwise on a
+    // real (slow) chain the buyer manages to knock in the window between open_stream and register_stream
+    // -> the gateway still has no pubkey -> `challenge-response failed` (the mock timing did not expose this).
     let (state, deal) = read_coherent_deal_capacity(chain, &cfg.token_contract).await?;
     if cfg.subscription != deal.is_subscription() {
         let expected = if cfg.subscription {
@@ -954,6 +964,7 @@ pub async fn poll_match_and_maybe_open(
 }
 
 /// Wait for one authoritative match without beginning the on-chain handover write.
+
 /// Keeping this phase read-only lets the resting-offer supervisor select shutdown/health safely. Once a
 /// match is observed, [`serve_watched_match`] runs the existing handover path to completion outside that
 /// cancellable select.
@@ -1664,7 +1675,7 @@ mod tests {
     fn test_cfg(token_contract: &str) -> SellerConfig {
         SellerConfig {
             token_contract: token_contract.to_string(),
-            price_per_tick: 1000,
+            price_per_tick: 3_000_000_000,
             max_ticks: 8,
             subscription: false,
             gateway_advertise: "127.0.0.1:8443".to_string(),
@@ -1687,7 +1698,7 @@ mod tests {
         Match {
             token_contract: token_contract.to_string(),
             buyer_pubkey,
-            price_per_tick: 1000,
+            price_per_tick: 3_000_000_000,
         }
     }
 
@@ -1717,27 +1728,34 @@ mod tests {
     }
 
     /// Issues ** /** at a money-path consumer, where the equality DECIDES something.
+
     /// The helpers that drop the dapp id -- `to_chain_param`, `normalize_wallet_address`,
     /// `parse_chain_address` -- are all documented to yield the workchain form, so asserting that
     /// they preserve it would be asserting against intended behaviour. The defect is not the
     /// conversion; it is that consumers then treat two DIFFERENT accounts as one.
-    /// [`validate_resting_offer`](`seller/mod.rs:508`) is such a consumer, and the decision it
+
+    /// [`validate_resting_offer`] (`seller/mod.rs:508`) is such a consumer, and the decision it
     /// makes is whether this seller ADOPTS a resting SELL as its own. It normalises both sides
     /// through `normalize_wallet_address` (`core/src/wallet.rs:20-24`, which is
     /// `CanonicalAddress::parse(..).legacy()`) and compares:
+
     /// ```text
     /// if actual_tc != wanted_tc { return Err(..) } //:546
     /// if actual_owner != wanted_owner { return Err(..) } // the same shape, for the owner note
     /// ```
+
     /// Because both sides collapse to `0:<account_id>`, a resting order belonging to an account in
     /// a DIFFERENT DApp -- a different contract, with different code and different money -- compares
-    /// equal to this seller's own. `inspect_seller_offer`(`:650`) then classifies it `Resting` and
+    /// equal to this seller's own. `inspect_seller_offer` (`:650`) then classifies it `Resting` and
     /// `prepare_seller_offer` resumes it INSTEAD of posting: the seller ends up watching, and later
     /// serving a match against, a TokenContract that is not its own.
+
     /// Both operands are swept, because they are separate `require`-shaped comparisons and fixing
     /// one would leave the other: a foreign-dapp TOKEN CONTRACT, and a foreign-dapp OWNER NOTE.
+
     /// Asserted on the verdict `validate_resting_offer` returns -- the production decision -- not on
     /// the rendering of any address.
+
     /// RED on this head, for both operands.
     #[test]
     #[ignore = "issues : address identity collapses to the account id, so a foreign-dapp \
@@ -1933,7 +1951,7 @@ mod tests {
             70,
             &owner.to_ascii_uppercase(),
             Some(&tc.to_ascii_uppercase()),
-            1000,
+            3_000_000_000,
             8,
         );
         let backend = StartupBackend::new(
@@ -2062,7 +2080,7 @@ mod tests {
                 80 + u128::from(max_ticks),
                 &owner,
                 Some(&tc),
-                1000,
+                3_000_000_000,
                 u128::from(max_ticks),
             );
             resting.flags = SUBSCRIPTION_SELL_FLAGS;
@@ -2117,7 +2135,7 @@ mod tests {
         let mut subscription_cfg = test_cfg(&tc);
         subscription_cfg.subscription = true;
 
-        let mut flagged = raw_sell(71, &owner, Some(&tc), 1000, 8);
+        let mut flagged = raw_sell(71, &owner, Some(&tc), 3_000_000_000, 8);
         flagged.flags = order_flags::AON | order_flags::SUBSCRIPTION;
         let matching = StartupBackend::without_match(RawStartupRead::Orders(vec![flagged]));
         let startup = prepare_seller_offer(
@@ -2141,7 +2159,7 @@ mod tests {
             ),
             (76, 0x80),
         ] {
-            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 1000, 8);
+            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 3_000_000_000, 8);
             invalid.flags = invalid_flags;
             let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![invalid]));
             assert_startup_rejected(
@@ -2160,7 +2178,7 @@ mod tests {
             (79, order_flags::AON | order_flags::SUBSCRIPTION),
             (80, 0x80),
         ] {
-            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 1000, 8);
+            let mut invalid = raw_sell(order_id, &owner, Some(&tc), 3_000_000_000, 8);
             invalid.flags = invalid_flags;
             let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![invalid]));
             assert_startup_rejected(
@@ -2182,7 +2200,7 @@ mod tests {
         let matched = sample_match(&tc, buyer.pubkey());
         let backend =
             StartupBackend::new(RawStartupRead::ChainFailure, Some(matched.clone()), matched)
-                .with_resume_facts(resume_state(1000), 1000);
+                .with_resume_facts(resume_state(3_000_000_000), 3_000_000_000);
 
         let (startup, seller, _) =
             prepare_start_gateway_and_watch(&backend, &cfg, &owner, "funded-resume").await;
@@ -2286,7 +2304,7 @@ mod tests {
         let tc = chain_address('1');
         let owner = chain_address('2');
         let cfg = test_cfg(&tc);
-        let row = raw_sell(1, &owner, Some(&chain_address('3')), 1000, 8);
+        let row = raw_sell(1, &owner, Some(&chain_address('3')), 3_000_000_000, 8);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
         assert_startup_rejected(&backend, &cfg, &owner, "not this TC").await;
     }
@@ -2296,7 +2314,7 @@ mod tests {
         let tc = chain_address('4');
         let owner = chain_address('5');
         let cfg = test_cfg(&tc);
-        let row = raw_sell(2, &chain_address('6'), Some(&tc), 1000, 8);
+        let row = raw_sell(2, &chain_address('6'), Some(&tc), 3_000_000_000, 8);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
         assert_startup_rejected(&backend, &cfg, &owner, "does not match seller note").await;
     }
@@ -2306,9 +2324,9 @@ mod tests {
         let tc = chain_address('7');
         let owner = chain_address('8');
         let cfg = test_cfg(&tc);
-        let row = raw_sell(3, &owner, Some(&tc), 999, 8);
+        let row = raw_sell(3, &owner, Some(&tc), 2_000_000_000, 8);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
-        assert_startup_rejected(&backend, &cfg, &owner, "price_per_tick 999").await;
+        assert_startup_rejected(&backend, &cfg, &owner, "price_per_tick 2 does not match 3").await;
     }
 
     #[tokio::test]
@@ -2316,7 +2334,7 @@ mod tests {
         let tc = chain_address('9');
         let owner = chain_address('a');
         let cfg = test_cfg(&tc);
-        let row = raw_sell(4, &owner, Some(&tc), 1000, 7);
+        let row = raw_sell(4, &owner, Some(&tc), 3_000_000_000, 7);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
         assert_startup_rejected(&backend, &cfg, &owner, "remaining ticks 7").await;
     }
@@ -2326,7 +2344,7 @@ mod tests {
         let tc = chain_address('b');
         let owner = chain_address('c');
         let cfg = test_cfg(&tc);
-        let row = raw_sell(5, &owner, None, 1000, 8);
+        let row = raw_sell(5, &owner, None, 3_000_000_000, 8);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![row]));
         assert_startup_rejected(
             &backend,
@@ -2343,8 +2361,8 @@ mod tests {
         let owner = chain_address('e');
         let cfg = test_cfg(&tc);
         let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![
-            raw_sell(6, &owner, Some(&tc), 1000, 8),
-            raw_sell(7, &owner, Some(&tc), 1000, 8),
+            raw_sell(6, &owner, Some(&tc), 3_000_000_000, 8),
+            raw_sell(7, &owner, Some(&tc), 3_000_000_000, 8),
         ]));
         assert_startup_rejected(&backend, &cfg, &owner, "2 active SELL rows").await;
     }
@@ -2374,7 +2392,7 @@ mod tests {
         let cfg = test_cfg(&tc);
         let buyer = LocalNote::generate();
         let backend = StartupBackend::new(
-            RawStartupRead::Orders(vec![raw_sell(8, &owner, Some(&tc), 1000, 8)]),
+            RawStartupRead::Orders(vec![raw_sell(8, &owner, Some(&tc), 3_000_000_000, 8)]),
             None,
             sample_match(&tc, buyer.pubkey()),
         )
@@ -2436,7 +2454,7 @@ mod tests {
                 offered_ticks: 8,
                 matched_ticks: 8,
                 residual_ticks: 0,
-                price_per_tick: 1000,
+                price_per_tick: 3_000_000_000,
                 replacement_nonce: None,
                 replacement_token_contract: None,
             })
@@ -2488,7 +2506,7 @@ mod tests {
                 offered_ticks: 8,
                 matched_ticks: 8,
                 residual_ticks: 0,
-                price_per_tick: 1000,
+                price_per_tick: 3_000_000_000,
                 replacement_nonce: None,
                 replacement_token_contract: None,
             })
@@ -2527,7 +2545,7 @@ mod tests {
                 offered_ticks: 8,
                 matched_ticks: 3,
                 residual_ticks: 5,
-                price_per_tick: 1000,
+                price_per_tick: 3_000_000_000,
                 replacement_nonce: None,
                 replacement_token_contract: None,
             })

@@ -1,11 +1,15 @@
 //! Shell Accumulator: the SHELL <-> eccUSDC money arithmetic and the getter decoders.
+
 //! Pure types only - no networking, no chain calls. The CLI layer supplies chain facts and this
 //! module decides what may be moved.
-//! The accumulator exchanges at one fixed constant([`ACCUMULATOR_SHELL_PER_USDC_RAW`]) in both
+
+//! The accumulator exchanges at one fixed constant ([`ACCUMULATOR_SHELL_PER_USDC_RAW`]) in both
 //! directions and charges no fee, so nothing here is a quote or an estimate: every figure this
 //! module produces is exact and is what the contract will do.
+
 //! Three properties of the contract shape everything below, and each is load-bearing rather than
-//! incidental(contract v1.0.2, `ShellAccumulatorRootUSDC.sol`):
+//! incidental (contract v1.0.2, `ShellAccumulatorRootUSDC.sol`):
+
 //! 1. **A sell is one lot per message, in one of exactly four sizes.** `_processShellDeposit`
 //! refuses any SHELL figure that is not exactly `D * SHELL_PER_USDC` for `D` in
 //! {1, 10, 100, 1000} - it does not split a larger deposit and it does not keep the change. So a
@@ -22,11 +26,12 @@ use crate::params::{
 use serde_json::Value;
 
 /// ABI of `ShellAccumulatorRootUSDC`, vendored from the compiled artifact.
+
 /// Provenance: `ackinacki/ackinacki`
 /// `contracts/0.79.3_compiled/accumulator/ShellAccumulatorRootUSDC.abi.json`, byte-identical to the
 /// copy this client's getters were proven against. Proven rather than assumed: every getter used
-/// here was executed against the LIVE roots on both shellnet and mainnet and decoded, which is the
-/// check a file-level diff cannot make(the two live roots serve different code hashes).
+/// here was executed against the LIVE roots on both one chain and another and decoded, which is the
+/// check a file-level diff cannot make (the two live roots serve different code hashes).
 pub const ACCUMULATOR_ROOT_ABI: &str =
     include_str!("../contracts/accumulator/ShellAccumulatorRootUSDC.abi.json");
 
@@ -61,7 +66,7 @@ pub struct SellPlan {
 pub enum SellPlanError {
     /// The requested conversion is zero whole eccUSDC.
     ZeroAmount,
-    /// The requested conversion does not fit in the arithmetic used on chain(`uint128`).
+    /// The requested conversion does not fit in the arithmetic used on chain (`uint128`).
     Overflow,
     /// The wallet holds less SHELL than the plan commits.
     InsufficientShell {
@@ -104,6 +109,7 @@ impl std::error::Error for SellPlanError {}
 
 impl SellPlan {
     /// Plan the lots for exactly `usdc_whole` whole eccUSDC.
+
     /// The decomposition is exact for every whole figure, and that is a property of the
     /// denomination table rather than luck: {1, 10, 100, 1000} are consecutive powers of ten and
     /// include 1, so greedy largest-first decomposition is just the decimal expansion (thousands
@@ -208,8 +214,9 @@ pub struct BuyPlan {
     /// Raw micro-eccUSDC that will leave the wallet.
     pub usdc_raw: u128,
     /// Raw ECC[2] SHELL that will arrive.
+
     /// Exact, not an estimate: whatever the resting lots do not cover, the root mints, so a buyer
-    /// always receives the full amount at the fixed rate(`_processUsdcDeposit`).
+    /// always receives the full amount at the fixed rate (`_processUsdcDeposit`).
     pub shell_expected_raw: u128,
 }
 
@@ -218,7 +225,7 @@ pub struct BuyPlan {
 pub enum BuyPlanError {
     /// The requested buy is zero whole eccUSDC.
     ZeroAmount,
-    /// The requested buy does not fit in the arithmetic used on chain(`uint128`).
+    /// The requested buy does not fit in the arithmetic used on chain (`uint128`).
     Overflow,
     /// The wallet holds less eccUSDC than the plan spends.
     InsufficientUsdc {
@@ -313,6 +320,7 @@ fn decimal_units(raw: u128, unit: u128, decimals: usize) -> String {
 }
 
 /// Identity of one sell lot, and the only thing needed to find it again from the chain.
+
 /// The address is NOT derived locally. On chain it is
 /// `makeAddrStd(0, hash(stateInit))` over the lot code salted with `(versionLib, root)` plus the
 /// static pair `(_denom, _orderId)`, so recomputing it off-chain would mean reimplementing

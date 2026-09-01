@@ -1,4 +1,5 @@
 // a refusal must not spend.
+
 // Mainnet, 2026-08-16, contracts 4.0.35. `dexdo provision` deployed and funded the per-deal
 // `TokenContract` `0ba5349a...` and wrote it into `market.json`. The very next command, `dexdo seller`
 // with that manifest, declined it -- `seller startup did not take deal at max_open_deals` -- because
@@ -6,15 +7,16 @@
 // `getState`. The seller then deployed and funded `140d9cd8...` to carry that settled deal's residual
 // instead. The seller's note paid 32 000 000 000 raw ECC[2] -- two 16-SHELL deposits -- for one
 // deal, and the buyer was handed a manifest pointing at the contract nobody serves.
+
 // The refusal and the spend are one defect, not two symptoms: capacity the run had just told the
 // operator it did not have was spent on a contract the operator never asked for. This regression
-// drives the production entry(`run_seller`) over exactly that pre-state and asserts BOTH halves --
+// drives the production entry (`run_seller`) over exactly that pre-state and asserts BOTH halves --
 // the handed deal is not served AND nothing is funded in its place.
 
 /// The seller args this regression needs, in the shape `run_seller` reads them. Deliberately its
 /// own builder rather than a shared one: the sibling mock-pool tests build theirs behind
-/// `#[cfg(feature = "shellnet")]`, and a money regression has to run in the default-feature gate CI
-/// actually enforces(`cargo test --workspace --locked`), not only under `--features shellnet`.
+/// `#[cfg(feature = "net-a")]`, and a money regression has to run in the default-feature gate CI
+/// actually enforces (`cargo test --workspace --locked`), not only under the removed chain feature.
 fn refusal_seller_args(
     root: &std::path::Path,
     token_contract: String,
@@ -47,7 +49,6 @@ fn refusal_seller_args(
         mock_token_count: 4,
         model: None,
         models: root.join("unused-models.json"),
-        contracts: root.join("unused-contracts.json"),
         policy: Some(policy),
     }
 }

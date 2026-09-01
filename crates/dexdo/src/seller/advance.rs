@@ -1,11 +1,14 @@
 //! Seller-driven consumption-claim orchestrator.
+
 //! The seller is paid only for consumption he CLAIMS, and each claim promotes the previous one to trusted.
 //! Without this loop nothing is ever claimed, so a buyer STOP settles at zero and the delivered work is
 //! unpaid. `claimTokens()` is **seller-only** on-chain (`onlyOwnerPubkey(_sellerPubkey)`), so the seller
-//! process owns the loop; the buyer's role is to stay silent(no dispute) through the promotion window.
+//! process owns the loop; the buyer's role is to stay silent (no dispute) through the promotion window.
+
 //! Nothing is claimable until the PROBE is accepted. `open()` freezes one tick as a trial owed to nobody,
 //! and only after `PROBE_WINDOW` of buyer silence may the seller take it and start claiming -- a deal whose
 //! probe is never accepted pays the seller nothing at all, so this loop drives that step first.
+
 //! Three things bound a claim, and the driver must respect all of them because the contract REJECTS rather than
 //! trims an out-of-bounds claim:
 //! - `MIN_CLAIM_INTERVAL` between claims;
@@ -13,8 +16,10 @@
 //! the elapsed time could have produced;
 //! - hard per-call `MAX_CLAIM_DELTA == TICK_SIZE`. Waiting longer can satisfy the rate inequality but
 //! never permits a multi-tick single call; backlog is split across later claims.
+
 //! The last claim of a deal needs `finalize()`: nothing supersedes it, so without the permissionless
 //! promotion window it would stay contestable forever and never be paid.
+
 //! Bounds are read per-deal from `TokenContract.getConfig()` so a redeployed contract cannot desync the
 //! driver from what the chain will accept; tests inject short bounds.
 
@@ -34,13 +39,13 @@ fn display_token_contract(token_contract: &str) -> String {
 /// Per-deal claim cadence, mirrored from `TokenContract.getConfig()`.
 #[derive(Debug, Clone, Copy)]
 pub struct AdvanceWindows {
-    /// Minimum gap between accepted claims(`minClaimInterval`).
+    /// Minimum gap between accepted claims (`minClaimInterval`).
     pub claim_interval: Duration,
-    /// Generation floor per tick(`minSecondsPerTick`): bounds how large a claim may be for a given wait.
+    /// Generation floor per tick (`minSecondsPerTick`): bounds how large a claim may be for a given wait.
     pub seconds_per_tick: Duration,
-    /// Silence after which a pending claim is promotable by anyone(`finalize`).
+    /// Silence after which a pending claim is promotable by anyone (`finalize`).
     pub promote: Duration,
-    /// Buyer silence required before the probe tick may be accepted(`PROBE_WINDOW`).
+    /// Buyer silence required before the probe tick may be accepted (`PROBE_WINDOW`).
     pub probe: Duration,
 }
 
@@ -69,6 +74,7 @@ impl AdvanceWindows {
 }
 
 /// Observes the strict claim states already read by the ordinary-deal driver.
+
 /// The observer never polls or submits independently. Returning an error stops the driver before its next
 /// decision/write, which lets capacity persistence fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,14 +234,18 @@ fn delivery_target_from_probe_anchor(
 
 /// Drive one deal's claim loop: repeatedly claim the CUMULATIVE tokens actually delivered, then `finalize()`
 /// so the final claim becomes payable. Returns the cumulative tokens successfully claimed.
+
 /// After the paid probe seeds the first full tick, later claims never exceed delivered output: a
 /// timer firing does not entitle the seller to consumption the buyer never received. They are additionally
 /// clamped to the on-chain rate bound, because the contract rejects an over-rate claim outright -- an
 /// unclamped driver would lose the whole batch instead of claiming the permitted part of it.
-/// The loop ends on a clean external close(buyer STOP / self-destruct), on the deal's ceiling
+
+/// The loop ends on a clean external close (buyer STOP / self-destruct), on the deal's ceiling
 /// (`ChainError::Limit`), or once delivery is complete and everything delivered has been claimed and
 /// promoted. Any other failure is a genuine fault and MUST propagate -- never report success.
+
 /// Seller-only: `seller_note` authorizes the on-chain `claimTokens()`.
+
 /// `finalize_last_claim` is false only when the subscription keeper is running for this same deal;
 /// that keeper then remains the sole permissionless `finalize()` writer.
 #[allow(clippy::too_many_arguments)]
@@ -322,7 +332,7 @@ pub async fn drive_advance_with_observer(
             }
             // Acquire ordering: the producer publishes `delivered` then `delivery_done` with Release, so a
             // `done` observed here implies the matching count is visible -- re-read before giving up, or a
-            // token delivered just before `done` would lose its probe(no premature zero).
+            // token delivered just before `done` would lose its probe (no premature zero).
             if delivery_done.load(Ordering::Acquire) {
                 if delivered.load(Ordering::Acquire) > 0 {
                     break;
@@ -393,11 +403,11 @@ pub async fn drive_advance_with_observer(
             break;
         }
         if deal_closed_observed(chain, token_contract, observer).await? {
-            break; // closed externally(e.g. buyer STOP) -- nothing more to claim
+            break; // closed externally (e.g. buyer STOP) -- nothing more to claim
         }
 
         // Acquire ordering: the producer publishes `delivered` then `delivery_done` with Release, so a
-        // `done` observed here implies the matching `delivered` count is visible(no stale under-read).
+        // `done` observed here implies the matching `delivered` count is visible (no stale under-read).
         let deal_delivery_count = delivered.load(Ordering::Acquire);
         let target = delivery_target_from_probe_anchor(
             delivery_base,
@@ -446,6 +456,7 @@ pub async fn drive_advance_with_observer(
         // Claim as much of the delivered backlog as BOTH the elapsed-time rate and hard per-call cap permit.
         // Anything above the combined allowance stays for the next round rather than being asserted and
         // rejected.
+
         // A zero interval is the deterministic test seam: it bypasses only the elapsed-time rate calculation,
         // never the contract's hard one-tick-per-call bound.
         let allowance = if windows.claim_interval.is_zero() {
@@ -498,7 +509,7 @@ pub async fn drive_advance_with_observer(
             }
             Err(ChainError::Limit(_)) => break, // deal ceiling -- expected exhaustion
             Err(e) => {
-                // A close can race the claim(buyer STOP between the snapshot and the call); re-check
+                // A close can race the claim (buyer STOP between the snapshot and the call); re-check
                 // before surfacing. Otherwise propagate the real error -- do NOT claim success.
                 if deal_closed_observed(chain, token_contract, observer).await? {
                     break;
@@ -549,8 +560,8 @@ async fn wait_claim_or_closed(
     }
 }
 
-/// Whether the deal's stream is closed(settled / self-destructed) -- an expected, non-error terminal
-/// condition for the advance loop. A **missing** snapshot is treated as *not* a clean close(`false`), so
+/// Whether the deal's stream is closed (settled / self-destructed) -- an expected, non-error terminal
+/// condition for the advance loop. A **missing** snapshot is treated as *not* a clean close (`false`), so
 /// a `claim_tokens` failure with no observable close still propagates as a real error.
 async fn deal_closed(chain: &dyn ChainBackend, token_contract: &TokenContract) -> bool {
     chain
@@ -666,7 +677,7 @@ mod tests {
         }
     }
 
-    /// A fake backend whose `claim_tokens` fails with a **real** chain error(not a terminal condition),
+    /// A fake backend whose `claim_tokens` fails with a **real** chain error (not a terminal condition),
     /// used to prove `drive_advance` propagates it instead of reporting a successful loop ( money-path
     /// safety). The stream reports no snapshot, so the failure cannot be mistaken for a close.
     struct ExplodingBackend;
@@ -1518,6 +1529,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "shellnet"))]
+#[cfg(test)]
 #[path = "advance_1196_drift_tests.rs"]
 mod issue_1196_drift_tests;

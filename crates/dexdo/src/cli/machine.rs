@@ -3,27 +3,49 @@ use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v1";
-pub(crate) const QUOTE_SCHEMA: &str = "dexdo.quote.v1";
+// v2: every SHELL figure in these objects is stated in SHELL, not in raw ECC[2] units. A consumer
+// that kept reading `best_ask` as raw would be off by a factor of a billion, and a version is the
+// only thing that says so before it is read.
+pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v2";
+// v1: `markets address` carries no SHELL figure at all -- it names an address, a model hash and the
+// registry spelling the name resolved to, so the SHELL-unit revisions above do not apply to it.
+pub(crate) const MARKETS_ADDRESS_SCHEMA: &str = "dexdo.markets_address.v1";
+// v2: prices and costs in SHELL. See the note on MARKETS_SCHEMA.
+pub(crate) const QUOTE_SCHEMA: &str = "dexdo.quote.v2";
 pub(crate) const BUYER_EVENT_SCHEMA: &str = dexdo::runtime_events::BUYER_EVENT_SCHEMA;
-pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v2";
+// v3: the accounting figures are SHELL. See the note on MARKETS_SCHEMA.
+pub(crate) const STATUS_SCHEMA: &str = "dexdo.status.v3";
 pub(crate) const CLOSE_SCHEMA: &str = "dexdo.close.v1";
-#[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_SCHEMA: &str = "dexdo.note_deploy.v1";
 /// One schema for `subscription place`, `subscription status` and `subscription cancel`.
+
 /// Three commands, ONE object shape and ONE version, because they are three moves in a single
 /// pre-match lifecycle and an orchestrator branches on `operation`, not on a shape. A field that
 /// does not exist for this command at this moment is `null` -- never omitted, never a placeholder --
 /// so "no fill yet" and "no refund observed" are readable facts instead of missing keys.
-pub(crate) const SUBSCRIPTION_SCHEMA: &str = "dexdo.subscription.v1";
+// v2: terms, escrow and refunds in SHELL. See the note on MARKETS_SCHEMA.
+pub(crate) const SUBSCRIPTION_SCHEMA: &str = "dexdo.subscription.v2";
+/// The three readers a runtime asks first: what do I have, what is on it, what of mine is open.
+
+/// Declared HERE with the others rather than inline at the print site, so the schema gates below
+/// see them: one asserts the constants against the normative document, the other stops the
+/// document drifting from the code. A name that exists only as a literal in the command that
+/// prints it is outside both.
+pub(crate) const DEALS_SCHEMA: &str = "dexdo.deals.v1";
+pub(crate) const NOTE_LIST_SCHEMA: &str = "dexdo.note_list.v1";
+pub(crate) const NOTE_BALANCE_SCHEMA: &str = "dexdo.note_balance.v1";
+/// The on-chain model registry, read out whole.
+
+/// Kept beside the other schema constants so the pin and document-drift gates cover it.
+pub(crate) const MODEL_REGISTRY_SCHEMA: &str = "dexdo.model_registry.v1";
 pub(crate) const ERROR_SCHEMA: &str = "dexdo.error.v1";
 
 /// The structured form of the Hot-funding outcome carried inside a command's ONE success object.
+
 /// It deliberately carries only the stable lifecycle fact. Provider responses and local paths can
 /// contain sensitive material, while an orchestrator only needs to know which funding state the
 /// command observed. Keeping this type in `machine.rs` makes it part of the same explicit machine
 /// contract as the neighbouring response/event types.
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum MachineFundingNotice {
@@ -35,9 +57,9 @@ pub(crate) enum MachineFundingNotice {
     ManualTopUpRequested,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 impl MachineFundingNotice {
     /// The same stable name `serde` writes into the `event` field, for the human-facing rendering.
+
     /// Kept beside the enum so the two spellings live in one file, and pinned to the serialized
     /// form by a regression rather than by convention.
     pub(crate) fn event(self) -> &'static str {
@@ -53,22 +75,23 @@ impl MachineFundingNotice {
 }
 
 /// The funding state a money command had already reached when it failed.
+
 /// A `note deploy` that creates a Vault -> Hot request and then times out waiting for the balance
 /// leaves an orchestrator with the one question it cannot answer from an exit code: has money
 /// already left the Vault? The success object answers it with `funding_notice`; before this, the
 /// failure answered it only in `stderr` prose.
+
 /// Carried as a typed cause rather than as wording, so the envelope is built by matching a type -
 /// the same way `classify_error` reads every other machine-relevant fact - and the operator-facing
 /// message above it is free to change without changing the machine contract.
+
 /// It holds ONLY the stable event. No address, no provider response, no local path, no key.
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Debug)]
 pub(crate) struct FundingContext {
     notice: MachineFundingNotice,
     source: anyhow::Error,
 }
 
-#[cfg(any(feature = "shellnet", test))]
 impl FundingContext {
     /// Carry `notice` alongside `source` without changing what `source` says or loses.
     pub(crate) fn wrap(notice: MachineFundingNotice, source: anyhow::Error) -> anyhow::Error {
@@ -85,9 +108,9 @@ impl FundingContext {
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
 impl std::fmt::Display for FundingContext {
     /// The source's FIRST line, and deliberately not `{source:#}`.
+
     /// Written through a plain `{}` rather than by forwarding `f`, so this holds however the
     /// wrapper itself is formatted: forwarding would let a `{context:#}` render the source's whole
     /// flattened chain here, and that chain is already rendered below this node.
@@ -96,10 +119,62 @@ impl std::fmt::Display for FundingContext {
     }
 }
 
-#[cfg(any(feature = "shellnet", test))]
 impl std::error::Error for FundingContext {
+    /// The wrapped failure, whole.
+
+    /// Tried skipping one level here to stop a renderer printing this node's text twice; that
+    /// broke the classifier, which walks this chain to downcast the typed cause it codes by, and a
+    /// transport fault started coding as `Internal`. The duplicate is a rendering problem and is
+    /// solved where rendering happens; the chain stays exactly as it was.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
+    }
+}
+
+/// one fact, said once.
+#[cfg(test)]
+mod funding_context_1432_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Deeper;
+
+    impl std::fmt::Display for Deeper {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("the transport gave up")
+        }
+    }
+
+    impl std::error::Error for Deeper {}
+
+    /// The chain this wrapper hands on must stay walkable and downcastable: the classifier reads it
+    /// to find the typed cause it codes by, and shortening it turned a transport fault into
+    /// `Internal`. The duplicate text this wrapper produces is dealt with at render time.
+    #[test]
+    fn the_typed_cause_stays_reachable_through_the_chain() {
+        let inner = anyhow::Error::new(Deeper).context("Hot is still short 100 SHELL");
+        let wrapped = FundingContext::wrap(MachineFundingNotice::RequestSubmitted, inner);
+
+        assert!(
+            wrapped.chain().any(|cause| cause.downcast_ref::<Deeper>().is_some()),
+            "the typed cause fell out of the chain"
+        );
+        assert!(format!("{wrapped:#}").contains("the transport gave up"));
+    }
+
+    /// The machine path reads its own accessor and must not notice any of this.
+    #[test]
+    fn the_machine_path_still_sees_the_whole_source() {
+        let inner = anyhow::Error::new(Deeper).context("Hot is still short 100 SHELL");
+        let wrapped = FundingContext::wrap(MachineFundingNotice::RequestSubmitted, inner);
+        let context = wrapped
+            .downcast_ref::<FundingContext>()
+            .expect("the wrapper is what was built");
+
+        let source = format!("{:#}", context.source_error());
+        assert!(source.contains("Hot is still short 100 SHELL"), "{source}");
+        assert!(source.contains("the transport gave up"), "{source}");
+        assert_eq!(context.notice(), MachineFundingNotice::RequestSubmitted);
     }
 }
 
@@ -112,19 +187,23 @@ pub(crate) const OP_STATUS: &str = "status";
 pub(crate) const OP_CLOSE: &str = "close";
 pub(crate) const OP_NOTE_DEPLOY: &str = "note_deploy";
 pub(crate) const OP_SETTLEMENT_RECEIPT: &str = "settlement_receipt";
+pub(crate) const OP_DEALS: &str = "deals";
+pub(crate) const OP_NOTE_LIST: &str = "note_list";
+pub(crate) const OP_NOTE_BALANCE: &str = "note_balance";
+pub(crate) const OP_MODEL_REGISTRY: &str = "model_registry";
 pub(crate) const OP_SUBSCRIPTION_PLACE: &str = "subscription_place";
 pub(crate) const OP_SUBSCRIPTION_STATUS: &str = "subscription_status";
 pub(crate) const OP_SUBSCRIPTION_CANCEL: &str = "subscription_cancel";
-#[cfg(feature = "shellnet")]
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MARKER: &str = "NETWORK_GENERATION_MISMATCH";
 pub(crate) const NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE: &str =
-    "NETWORK_GENERATION_MISMATCH: upgrade dexdo or use a matching --contracts manifest, then retry; \
+    "NETWORK_GENERATION_MISMATCH: upgrade dexdo or point DEXDO_MANIFEST at a matching manifest, then retry; \
      no wallet transaction was signed or submitted, no voucher was generated, and no funds were spent";
 
 /// the stable machine-readable name for "this instance has no funding wallet bound".
 pub(crate) const WALLET_NOT_CONFIGURED_CODE: &str = "wallet_not_configured";
 
 /// The remediation, carried on `message` rather than only inside `cause`.
+
 /// `message` is the field an orchestrator surfaces to a human, so it carries one directly
 /// executable setup command. The general onboarding command still lets the operator choose another
 /// provider; the remediation itself contains no placeholder or prose-only provider list.
@@ -187,6 +266,22 @@ pub(crate) enum ErrorCode {
     GatewayConnectFailed,
     GatewayAuthFailed,
     ChainTransport,
+    /// the account could not be READ, and reading it again will not change that.
+
+    /// Non-retryable by construction, not by a separate setting: `retryable()` is a closed list of
+    /// the codes worth retrying and this one is deliberately absent from it. A code whose whole
+    /// meaning is "a retry will not change this" cannot be retryable without contradicting its own
+    /// name.
+
+    /// What it does NOT cover, said here so it does not quietly become a second `Internal`:
+
+    /// - a read that failed TRANSIENTLY -- that is `ChainTransport`, and that one IS retryable;
+    /// - a read that succeeded and found no such account -- answering "absent" is not failing to read;
+    /// - anything about what the account HOLDS. This is the whole point of: a wallet that
+    /// could not be read used to report as `InsufficientBalance`, sending an operator to top up an
+    /// account that was never short. This code states nothing about funds;
+    /// - a submit, a contract result or a revert. Nothing was sent.
+    AccountUnreadable,
     ChainRevert,
     AmbiguousSubmit,
     SettlementFailed,
@@ -195,17 +290,21 @@ pub(crate) enum ErrorCode {
     /// The named order is not a resting order this note owns. Covers absent, wrong owner
     /// and wrong shape together, because an orchestrator's next move is the same for all three and
     /// telling them apart would leak whose order it is.
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     OrderNotFound,
     /// A cancel lost the race: the order filled before the book removed it. Distinct from
     /// `AMBIGUOUS_SUBMIT` -- the outcome is known, and it is not a refund.
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     OrderAlreadyMatched,
     /// Durable and on-chain facts disagree, e.g. one order id is simultaneously resting and
     /// filled. Distinct from `AMBIGUOUS_SUBMIT`: nothing is in flight, the two records conflict.
-    #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
     ContradictoryState,
-    /// the command needs a funding(Hot) wallet and this instance has none bound. It is the
+    /// This note already has a buy resting in the book, so nothing was sent. Its own code
+    /// because it is the one outcome an orchestrator must NOT retry and must not read as a fault
+    /// either: the earlier order is working exactly as it was asked to, and the next move is to look
+    /// at it (`dexdo orders journal`) rather than to place a second one. Without this it fell through
+    /// the text rules to `INTERNAL` -- "escalate a client bug" for a healthy order -- or, worse, the
+    /// human path's early exit reported success with nothing placed.
+    BuyAlreadyResting,
+    /// the command needs a funding (Hot) wallet and this instance has none bound. It is the
     /// operator's own configuration state, not a client fault, and the fix is a setup command -- so
     /// it is its own code rather than `INTERNAL`, which tells an orchestrator to escalate a bug.
     WalletNotConfigured,
@@ -229,6 +328,7 @@ impl ErrorCode {
             Self::GatewayConnectFailed => "GATEWAY_CONNECT_FAILED",
             Self::GatewayAuthFailed => "GATEWAY_AUTH_FAILED",
             Self::ChainTransport => "CHAIN_TRANSPORT",
+            Self::AccountUnreadable => "ACCOUNT_UNREADABLE",
             Self::ChainRevert => "CHAIN_REVERT",
             Self::AmbiguousSubmit => "AMBIGUOUS_SUBMIT",
             Self::SettlementFailed => "SETTLEMENT_FAILED",
@@ -237,6 +337,7 @@ impl ErrorCode {
             Self::OrderNotFound => "ORDER_NOT_FOUND",
             Self::OrderAlreadyMatched => "ORDER_ALREADY_MATCHED",
             Self::ContradictoryState => "CONTRADICTORY_STATE",
+            Self::BuyAlreadyResting => "BUY_ALREADY_RESTING",
             Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_CODE,
             Self::Internal => "INTERNAL",
         }
@@ -273,6 +374,7 @@ impl ErrorCode {
             Self::GatewayConnectFailed => "seller gateway connection failed",
             Self::GatewayAuthFailed => "seller gateway authentication failed",
             Self::ChainTransport => "chain transport failed before a by-fact result",
+            Self::AccountUnreadable => "the account could not be read, and retrying will not change that",
             Self::ChainRevert => "chain returned a non-success contract result",
             Self::AmbiguousSubmit => "money submit outcome is unknown and must not be retried",
             Self::SettlementFailed => "settlement submission failed",
@@ -281,11 +383,16 @@ impl ErrorCode {
             Self::OrderNotFound => "order is not resting under this owner in this book",
             Self::OrderAlreadyMatched => "order matched before it could be cancelled",
             Self::ContradictoryState => "durable and on-chain records contradict each other",
+            Self::BuyAlreadyResting => "a buy from this note is already resting in the book",
             Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_MESSAGE,
             Self::Internal => "internal invariant failed",
         }
     }
 }
+
+#[cfg(test)]
+#[path = "machine_classifier_conformance_1795.rs"]
+mod machine_classifier_conformance_1795;
 
 pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode {
     for cause in err.chain() {
@@ -294,6 +401,27 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
             .is_some()
         {
             return ErrorCode::DealRecordSchemaTooNew;
+        }
+        // and it is typed on purpose. The defect being fixed here was a wallet READ failure
+        // that matched the substring "balance" and reported as INSUFFICIENT_BALANCE, sending the
+        // operator to top up an account that was never short. Answering a text-matching defect with
+        // another text match would move the disease onto a new sentinel word rather than cure it,
+        // so the carrier is a type and the message is free to say whatever reads best.
+        if cause
+            .downcast_ref::<super::note_cmd::FundingWalletUnreadable>()
+            .is_some()
+        {
+            return ErrorCode::AccountUnreadable;
+        }
+        // The refusal that says the deal is NOT disputed. `:1067` reserves DISPUTED_DEAL for
+        // "Deal is disputed and cannot be closed", so the old verdict told the consumer the reverse
+        // of the fact -- the word matched inside its own negation, after the message was lower-cased.
+        // `:1049` INVALID_ARGUMENT: the request named a deal with no dispute to resolve.
+        if cause
+            .downcast_ref::<super::recover::DealIsNotDisputed>()
+            .is_some()
+        {
+            return ErrorCode::InvalidArgument;
         }
         if let Some(gateway) = cause.downcast_ref::<dexdo_core::DexdoError>() {
             if gateway.code() == dexdo_core::error_codes::E_GATEWAY_UNREACHABLE.code() {
@@ -343,9 +471,6 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if operation == OP_NOTE_DEPLOY && msg.contains("network_generation_mismatch") {
         return ErrorCode::StaleClient;
     }
-    if msg.contains("unavailable: build with") {
-        return ErrorCode::FeatureUnavailable;
-    }
     if msg.contains("no liquidity") {
         return ErrorCode::NoLiquidity;
     }
@@ -376,6 +501,14 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("insufficient") || msg.contains("balance") || msg.contains("deposit") {
         return ErrorCode::InsufficientBalance;
     }
+    // and this one is an ORDER defect rather than a wording one. The message the client
+    // actually emits is "malformed handover: invalid bytes"; with the `invalid` rule first, the rule
+    // written for exactly this condition (`runtime-machine-contract.md:1057`, "Handover is present
+    // but malformed or not decryptable by this note") could never fire, and the operator was told
+    // their command INPUT was invalid. Moved above the generic argument rule.
+    if msg.contains("malformed handover") || msg.contains("handover decrypt failed") {
+        return ErrorCode::HandoverDecryptFailed;
+    }
     if msg.contains("requires exactly one")
         || msg.contains("required")
         || msg.contains("mutually exclusive")
@@ -388,9 +521,6 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     }
     if msg.contains("did not open the stream") || msg.contains("handover within") {
         return ErrorCode::HandoverTimeout;
-    }
-    if msg.contains("malformed handover") || msg.contains("handover decrypt failed") {
-        return ErrorCode::HandoverDecryptFailed;
     }
     if operation == OP_BUYER_START && msg.contains("bind") {
         return ErrorCode::EndpointBindFailed;
@@ -455,11 +585,12 @@ pub(crate) struct MachineError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) retryable_after_unix: Option<u64>,
     /// re-audit item 8: the funding state the command had already reached when it failed.
+
     /// Present only when this run created a Vault -> Hot request or found one of its own still
     /// pending - the states in which a failure cannot tell an orchestrator whether money has left
     /// the Vault. Absent means no funding request of this run exists, which is itself the answer.
+
     /// It carries the same stable event the success object carries, and nothing else.
-    #[cfg(any(feature = "shellnet", test))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) funding_notice: Option<MachineFundingNotice>,
 }
@@ -480,7 +611,6 @@ impl MachineError {
             deal_handle: None,
             failure_class: None,
             retryable_after_unix: None,
-            #[cfg(any(feature = "shellnet", test))]
             funding_notice: None,
         }
     }
@@ -491,10 +621,10 @@ impl MachineError {
     }
 
     /// Attach the public identity the failing command already had in hand.
+
     /// A cancel that loses its race must hand the orchestrator the deal it lost to -- the contract
     /// already reserves `token_contract`/`deal_handle` on the error object for exactly that, and a
     /// consumer driving the lifecycle from JSON alone has no other way to reach it.
-    #[cfg(feature = "shellnet")]
     pub(crate) fn with_market(
         mut self,
         network: &str,
@@ -507,7 +637,6 @@ impl MachineError {
         self
     }
 
-    #[cfg(feature = "shellnet")]
     pub(crate) fn with_deal(mut self, token_contract: &str, deal_handle: &str) -> Self {
         self.token_contract = Some(token_contract.to_string());
         self.deal_handle = Some(deal_handle.to_string());
@@ -533,6 +662,7 @@ pub(crate) fn print_error(
 }
 
 /// The exact envelope [`print_error`] writes, built rather than printed.
+
 /// Separated so a regression can assert the FIELDS a machine consumer reads instead of scraping the
 /// process's stdout, and so the one place that decides what a failure carries stays one place.
 pub(crate) fn machine_error(
@@ -545,12 +675,12 @@ pub(crate) fn machine_error(
     // re-audit item 8: a failed money command carries the funding state it had already
     // reached. Read from the typed cause the funding wait attaches, so the fact survives any
     // rewording of the message it travels under.
+
     // `Error::downcast_ref` and NOT a `chain()` scan: the state is attached with `.context(..)`, so
     // that the original error keeps being an error and its own typed causes stay downcastable for
     // `classify_error`. A `chain()` element for a context layer is anyhow's `ContextError<C, E>`,
     // never the `C` inside it, so a chain scan cannot see it - measured, not assumed.
     // `Error::downcast_ref` walks the context chain itself and does find it.
-    #[cfg(any(feature = "shellnet", test))]
     {
         error.funding_notice = err
             .chain()
@@ -660,6 +790,22 @@ pub(crate) fn now_unix() -> Result<u64> {
 
 pub(crate) fn amount<T: ToString>(value: T) -> String {
     value.to_string()
+}
+
+/// The answer to "where does this market live", as one document.
+
+/// `requested_model` and `registry_model` are both carried because they routinely differ: 4.0.36
+/// registers a model WITHOUT its producer, so an operator asking for `openai/gpt-5.2-pro` is
+/// answered about `gpt-5.2-pro`, and a consumer that only saw the address could not tell that the
+/// name it holds is not the name the registry knows.
+#[derive(Serialize)]
+pub(crate) struct MarketsAddressResponse {
+    pub(crate) schema: &'static str,
+    pub(crate) network: String,
+    pub(crate) requested_model: String,
+    pub(crate) registry_model: String,
+    pub(crate) model_hash: String,
+    pub(crate) order_book: String,
 }
 
 #[derive(Serialize)]
@@ -787,9 +933,11 @@ pub(crate) struct CloseResponse {
 }
 
 /// The one machine object all three `dexdo subscription` lifecycle commands emit.
+
 /// `operation` says which command produced it; `action` says what that command did; `submitted`
 /// says whether THIS invocation put a message on the chain. Those three together are what stops an
 /// orchestrator from sending a second BUY after an ambiguous first one.
+
 /// Every field is always present. `null` is the honest answer for a value that does not exist at
 /// this moment -- no fill yet, no refund observed, no live deal to read -- and never a placeholder
 /// standing in for one.
@@ -811,6 +959,7 @@ pub(crate) struct SubscriptionResponse {
     pub(crate) order_id: String,
     /// `resting`, `matched`, `cancelled`, `expired`, `terminal` or
     /// `absent_without_authenticated_fill`.
+
     /// The human line's separate `resting=` boolean is deliberately not mirrored here: it is
     /// `state == "resting"` in every case the CLI can produce, and a second spelling of one fact is
     /// a second thing that can drift.
@@ -847,6 +996,7 @@ pub(crate) struct SubscriptionTerms {
 }
 
 /// The deal one fill produced.
+
 /// It carries no separate seller order id: the fill's own order id is asserted equal to this
 /// buyer's order id before the record is ever persisted, so a second id field would be either
 /// redundant or the foreign id removed from the preflight line.
@@ -863,6 +1013,7 @@ pub(crate) struct SubscriptionMatched {
 
 /// The evidence behind an `expired` verdict, and -- when there is not enough of it -- the name of the
 /// fact that is missing.
+
 /// A passed `deadline_unix` proves an order is ELIGIBLE for expiry and nothing more. Two further
 /// facts decide it, and the book announces them separately on purpose
 /// (`InferenceOrderBook.sol:387-393`): that the book removed the row, and that the escrow came
@@ -931,7 +1082,7 @@ pub(crate) struct SubscriptionLive {
 pub(crate) struct BuyerEventWriter {
     seq: u64,
     session_id: String,
-    #[cfg(all(test, feature = "shellnet"))]
+    #[cfg(test)]
     captured: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
 }
 
@@ -942,12 +1093,12 @@ impl BuyerEventWriter {
         Self {
             seq: 0,
             session_id: format!("buyer-{}", hex::encode(bytes)),
-            #[cfg(all(test, feature = "shellnet"))]
+            #[cfg(test)]
             captured: None,
         }
     }
 
-    #[cfg(all(test, feature = "shellnet"))]
+    #[cfg(test)]
     pub(crate) fn capturing() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer = Self::new();
@@ -1031,7 +1182,7 @@ impl BuyerEventWriter {
     }
 
     fn write(&self, value: Value) -> Result<()> {
-        #[cfg(all(test, feature = "shellnet"))]
+        #[cfg(test)]
         if let Some(captured) = &self.captured {
             captured
                 .lock()
@@ -1104,12 +1255,14 @@ mod tests {
 
     #[test]
     fn stable_schema_constants_match_contract() {
-        assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v1");
-        assert_eq!(QUOTE_SCHEMA, "dexdo.quote.v1");
-        assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v1");
-        assert_eq!(STATUS_SCHEMA, "dexdo.status.v2");
+        assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v2");
+        assert_eq!(QUOTE_SCHEMA, "dexdo.quote.v2");
+        assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v2");
+        assert_eq!(STATUS_SCHEMA, "dexdo.status.v3");
+        assert_eq!(DEALS_SCHEMA, "dexdo.deals.v1");
         assert_eq!(CLOSE_SCHEMA, "dexdo.close.v1");
-        assert_eq!(SUBSCRIPTION_SCHEMA, "dexdo.subscription.v1");
+        assert_eq!(SUBSCRIPTION_SCHEMA, "dexdo.subscription.v2");
+        assert_eq!(MODEL_REGISTRY_SCHEMA, "dexdo.model_registry.v1");
         assert_eq!(ERROR_SCHEMA, "dexdo.error.v1");
         assert_eq!(OP_SUBSCRIPTION_PLACE, "subscription_place");
         assert_eq!(OP_SUBSCRIPTION_STATUS, "subscription_status");
@@ -1130,6 +1283,17 @@ mod tests {
             assert!(!code.retryable(), "{text}");
             assert!(!code.safe_message().is_empty(), "{text}");
         }
+    }
+
+    /// The code for "you already have one of these waiting" is stable and not retryable.
+    #[test]
+    fn a_resting_buy_has_its_own_stable_code() {
+        assert_eq!(ErrorCode::BuyAlreadyResting.as_str(), "BUY_ALREADY_RESTING");
+        assert!(
+            !ErrorCode::BuyAlreadyResting.retryable(),
+            "a second run would place a duplicate, not a retry"
+        );
+        assert!(!ErrorCode::BuyAlreadyResting.safe_message().is_empty());
     }
 
     #[test]
@@ -1228,7 +1392,7 @@ mod tests {
             ),
             (
                 anyhow::anyhow!(
-                    "buyer explicit-token quote preflight: shellnet: buyer target preflight failed for InferenceOrderBook 0:book: refusing multi-ask fill"
+                    format!("buyer explicit-token quote preflight: {}: buyer target preflight failed for InferenceOrderBook 0:book: refusing multi-ask fill", dexdo_core::params::current_network())
                 ),
                 ErrorCode::NoLiquidity,
             ),
@@ -1263,9 +1427,12 @@ mod tests {
     }
 
     #[test]
-    fn classifier_does_not_map_our_own_shellnet_prefixed_errors_to_chain_transport() {
+    fn classifier_does_not_map_our_own_chain_prefixed_errors_to_chain_transport() {
         let err =
-            anyhow::anyhow!("shellnet: seller offer did not rest after accepted postSellOffer");
+            anyhow::anyhow!(format!(
+                "{}: seller offer did not rest after accepted postSellOffer",
+                dexdo_core::params::current_network()
+            ));
         assert_eq!(classify_error(OP_BUYER_START, &err), ErrorCode::Internal);
     }
 
@@ -1331,7 +1498,7 @@ mod tests {
     #[test]
     fn transport_failure_is_chain_transport() {
         let err = anyhow::Error::new(dexdo_core::ChainError::Transport(
-            "connect timed out at https://dd-shellnet.ackinacki.org/graphql".to_string(),
+            "connect timed out at https://net-a.example/graphql".to_string(),
         ));
         assert_eq!(
             classify_error(OP_BUYER_START, &err),
@@ -1344,7 +1511,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered["cause"],
-            "shellnet transport: connect timed out at https://dd-shellnet.ackinacki.org/graphql"
+            // `chain transport`, not a hard-coded network name: the variant belongs to the market type
+            // and fires for a transport fault on WHATEVER chain the operator is on. The test name
+            // already said `is_chain_transport`; only its expected string had the test network in
+            // it, which is the wording removes.
+            // The network is DERIVED, not spelled: it comes from the manifest DEXDO_MANIFEST
+            // names, through the same call production uses. A test pinned to the literal would put
+            // a network name back into the sources -- the very thing removes -- and would
+            // fail for anyone running it against a different manifest.
+            format!(
+                "{} transport: connect timed out at https://net-a.example/graphql",
+                dexdo_core::params::current_network()
+            )
         );
 
         let wrapped = anyhow::Error::new(dexdo_core::ChainError::Transport(
@@ -1353,7 +1531,10 @@ mod tests {
         .context("buyer startup failed");
         assert_eq!(
             error_cause(&wrapped),
-            "buyer startup failed: shellnet transport: connection reset by peer"
+            format!(
+                "buyer startup failed: {} transport: connection reset by peer",
+                dexdo_core::params::current_network()
+            )
         );
     }
 
@@ -1439,7 +1620,7 @@ mod tests {
 
     #[test]
     fn machine_error_path_redaction_preserves_public_urls_and_relative_paths() {
-        let cause = "request https://dd-shellnet.ackinacki.org/graphql failed in cache/state.json";
+        let cause = "request https://net-a.example/graphql failed in cache/state.json";
         assert_eq!(sanitize_error_cause(cause), cause);
         assert!(forbidden_machine_fragment(cause).is_none());
     }

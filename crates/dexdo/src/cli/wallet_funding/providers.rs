@@ -1,9 +1,12 @@
 //! The production [`HotFundingProvider`] implementations.
+
 //! One per `WalletProvider`, because the specification is explicit that the funding flow is selected
 //! from the binding and never inferred: `gosh-ai` and `manual` have no request to create and are
 //! served by [`DirectTopUpProvider`], while `ackinacki-wallet` has a Vault and is served by
 //! [`AckinackiVaultProvider`].
+
 //! # Why the Vault provider is built around a seam
+
 //! [`VaultChain`] is the whole of what the Acki Nacki flow needs from the chain: the live queue, the
 //! finalized queue history, the wallet's own expiry window, the chain clock, and the submit. It is a
 //! trait for the reason every money path in this client uses one - the decisions taken from those
@@ -31,6 +34,7 @@ const EMPTY_PAYLOAD_CELL: &str = "te6ccgEBAQEAAgAAAA==";
 // ---------------------------------------------------------------------------------------------
 
 /// The providers that have no funding request to create.
+
 /// Gosh.ai offers no server-side top-up request and no response to wait for, and `manual` is a Hot
 /// the operator already controls. Both therefore do exactly one thing when the Hot is short: say
 /// what is missing, say where to send it, and let the shared mechanism wait for the balance. The
@@ -82,18 +86,23 @@ impl HotFundingProvider for DirectTopUpProvider {
     fn manual_instruction(&self, request: &FundingRequest) -> String {
         let shortfall = render_native_and_ecc_amounts(request.native_shortfall, &request.shortfall);
         match self.provider {
-            // The same placeholder the Gosh.ai onboarding flow prints, and deliberately the same
-            // constant: when the real sub-wallet screen exists there must be one link to replace.
+            // No link here. The one that used to be printed was the onboarding
+            // placeholder, and this operator reached this line BY onboarding through Gosh.ai --
+            // they have the page. Where Gosh.ai lives is now the manifest's to say, and repeating
+            // a copy of it in a second sentence is how the two come to disagree.
             WalletProvider::GoshAi => format!(
-                "Hot wallet {} is short {shortfall}. Top it up in Gosh.ai at {}, then leave this \
+                "Hot wallet {} on {} is short {shortfall}. Top it up in Gosh.ai, then leave this \
                  command running: it continues by itself as soon as the balance arrives on chain.",
-                request.hot_address,
-                crate::cli::wallet_goshai::GOSHAI_PLACEHOLDER_URL,
+                request.hot_address, request.network,
             ),
+            // The network is named because a QR is printed directly under this line and the
+            // canonical address is the SAME STRING on both chains. Without it the operator
+            // reads an address they cannot tell apart, scans, and their own wallet supplies
+            // whichever network its switch happens to be set to.
             _ => format!(
-                "Hot wallet {} is short {shortfall}. Send it to that address; this command \
+                "Hot wallet {} is short {shortfall}. Send it to that address on {}; this command \
                  continues by itself as soon as the balance arrives on chain.",
-                request.hot_address
+                request.hot_address, request.network
             ),
         }
     }
@@ -104,8 +113,9 @@ impl HotFundingProvider for DirectTopUpProvider {
 // ---------------------------------------------------------------------------------------------
 
 /// One transaction resting in a Vault's `getTransactions` queue.
+
 /// Deliberately plain owned values rather than the SDK's types: everything the reconciliation
-/// decides is decided from these fields, and a seam that only exists in a `shellnet` build cannot be
+/// decides is decided from these fields, and a seam that only exists in a chain build cannot be
 /// driven by a test that proves the decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueuedTransfer {
@@ -153,11 +163,13 @@ pub(crate) trait VaultChain {
 
     /// The INTERNAL message that carried an executed queue transfer to `destination`, proven by the
     /// destination's own finalized receipt.
+
     /// `sent_event_message_id` is a `TransactionSent` message id, and that message is an EVENT: the
     /// wallet emits it on a hardcoded event channel, so its own destination is that channel and
     /// never the transfer's. What binds them is the queued path executing `txn.dest.transfer(...)`
     /// and then `emit TransactionSent(...)` in ONE Vault transaction - so the event anchors that
     /// transaction and the delivery is its sibling out-message addressed to `destination`.
+
     /// `Ok(None)` is "cannot be established from chain fact", which every caller must read as
     /// unknown: no sibling, more than one, or no finalized receipt for it. It is never "no
     /// delivery", and it never authorizes anything.
@@ -185,12 +197,15 @@ pub(crate) trait VaultChain {
 /// The `ackinacki-wallet` funding flow: a `submitTransaction` resting in the Vault's queue with the
 /// agent's single signature IS the funding request, and the human supplies the second signature in
 /// the wallet application.
+
 /// # What this refuses to conclude
+
 /// The request leaving the queue is NOT a fact about money. It leaves both when the human confirms
 /// it - the transfer executes - and when it expires unconfirmed - the transfer never happens - and
 /// the two are opposite: after the first, a second request would transfer twice; after the second, a
 /// fresh request is the only way the Hot is ever funded. This provider therefore never answers
 /// `Absent` for a request that has been in the queue. It answers from finalized history:
+
 /// - a `TransactionSent` for the request's id is a POSITIVE proof of execution;
 /// - `TransactionSubmitted` gives the id and the CHAIN time the request was queued at, so the
 /// expiry deadline is `that + getParameters.expirationTime`, read off the wallet itself;
@@ -214,6 +229,7 @@ impl<C: VaultChain> AckinackiVaultProvider<C> {
     }
 
     /// The frozen fingerprint of the generation being reconciled.
+
     /// From the record when there is one - a later run whose shortfall has moved must still look
     /// for the transfer the earlier run described - and derived from the request only when this is
     /// the first attempt.
@@ -235,6 +251,7 @@ impl<C: VaultChain> AckinackiVaultProvider<C> {
 }
 
 /// The request in the terms an operator can look it up by in the wallet application.
+
 /// A refusal that says only "something could not be established" leaves the operator with nothing to
 /// do. This names the transfer the client was looking for, so they can go and see for themselves
 /// whether it is sitting in the Vault's pending list - which is the one observation that settles it.
@@ -259,6 +276,7 @@ pub(crate) fn describe_recorded_request(
 }
 
 /// Whether a queued transaction is the transfer `expected` describes.
+
 /// Every field of the fingerprint, and the creator key among them: a transaction to the same
 /// destination for the same amount created by a DIFFERENT custodian is not ours to de-duplicate
 /// against, and treating it as ours would leave our own request never made.
@@ -278,6 +296,7 @@ pub(crate) fn queue_entry_matches(entry: &QueuedTransfer, expected: &FundingFing
 }
 
 /// The payload hash of a queued transaction, in the fingerprint's own terms.
+
 /// Every transfer this client creates carries the empty payload, which the queue reports either as
 /// an absent cell or as the empty cell. Both are hashed as the empty payload so that the recorded
 /// fingerprint and the queue agree; anything else is hashed as itself and will therefore not match,
@@ -310,6 +329,7 @@ fn dapp_ids_equal(left: &str, right: &str) -> bool {
 }
 
 /// A `uint256` in the one spelling this client compares them in.
+
 /// The same normalization `note_cmd`'s `normalize_multisig_pubkey` already applies to the custodian
 /// keys read out of this very contract - strip `0x`, lowercase, left-pad to 64 - because that is the
 /// form the SDK renders a `uint256` getter output in, and two spellings of one DApp id comparing
@@ -476,12 +496,14 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             }
         };
         // ONLY the wallet's own record of the queue admission may date this deadline.
+
         // A local clock may never conclude expiry. The asymmetry is what decides it: concluding
         // "expired" for a request that in fact EXECUTED authorizes a second transfer out of a cold
         // Vault, and that is unrecoverable; concluding "I cannot tell" costs the operator one more
         // run of the same command. So when the finalized history carries no `TransactionSubmitted`
         // for this fingerprint there is no chain time to measure from, and that is absence of
         // evidence - not evidence of expiry. It refuses.
+
         // The local deadline is still REPORTED, because an operator wants to know it. Reported and
         // acted upon are kept apart deliberately, here and in the message: nothing below the report
         // reads it, and no branch returns a verdict from it.
@@ -567,10 +589,10 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
 
     fn manual_instruction(&self, request: &FundingRequest) -> String {
         format!(
-            "Hot wallet {} is short {}. Confirm the pending Vault -> Hot transaction in Acki Nacki \
-             Wallet.",
+            "Hot wallet {} is short {}. Confirm the pending Vault -> Hot transaction in {}.",
             request.hot_address,
-            render_native_and_ecc_amounts(request.native_shortfall, &request.shortfall)
+            render_native_and_ecc_amounts(request.native_shortfall, &request.shortfall),
+            crate::cli::link::wallet_app()
         )
     }
 }
@@ -590,10 +612,8 @@ pub(crate) const fn bounce_argument() -> bool {
     VAULT_TO_HOT_BOUNCE
 }
 
-#[cfg(feature = "shellnet")]
 mod chain;
 
-#[cfg(feature = "shellnet")]
 pub(crate) use chain::RealVaultChain;
 
 #[cfg(test)]

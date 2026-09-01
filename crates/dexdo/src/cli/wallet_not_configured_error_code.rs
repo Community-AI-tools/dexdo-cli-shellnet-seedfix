@@ -1,16 +1,22 @@
 //! "no wallet is bound" is its own machine-readable code, never `INTERNAL`.
+
 //! # The defect this holds shut
+
 //! A note deploy in `--json` mode with no binding and no `--multisig-address` emitted
+
 //! ```text
 //! {"schema":"dexdo.error.v1","operation":"note_deploy","code":"INTERNAL",
 //! "message":"internal invariant failed","cause":"error[E_WALLET_NOT_CONFIGURED]..."}
 //! ```
+
 //! The one instruction the operator needed was buried in `cause`, while `code` and `message` said
 //! the client had a bug. To a human those are different instructions; to a machine `INTERNAL` is an
 //! unhandled branch -- a code that means "escalate", not "run one setup command". The refusal is
 //! raised before anything reaches the chain, so it is also the cheapest possible outcome to report
 //! correctly.
+
 //! # Why the error here is produced, not written
+
 //! Every case builds its error by calling [`resolve_funding_wallet`] on an empty store -- the exact
 //! call `run_note_deploy` and `run_note_topup` make, in the exact state the live run was in. An
 //! `anyhow!("...")` with the same words would prove only that the words classify, which is what the
@@ -30,7 +36,7 @@ const OP_NOTE_TOPUP: &str = "note_topup";
 fn wallet_fail_fast() -> (tempfile::TempDir, anyhow::Error) {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = WalletStore::at(dir.path().join("wallet"));
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a command that spends the Hot cannot proceed without one");
     (dir, error)
 }
@@ -55,6 +61,7 @@ fn the_wallet_fail_fast_classifies_as_its_own_code_and_never_as_internal() {
 }
 
 /// The emitted envelope, field by field, as `--json` prints it.
+
 /// `message` has to carry the remediation itself: it is the field an orchestrator shows a human,
 /// and `internal invariant failed` told them to file a bug. The full hint stays on `cause`.
 #[test]
@@ -102,6 +109,7 @@ fn the_emitted_envelope_names_the_code_and_the_remediation() {
 }
 
 /// The fix is a TYPED match on one code, so it must not have moved anything else onto it.
+
 /// The two neighbours in the same downcast block, a chain error and the fall-through that legitimately
 /// stays `INTERNAL` are all checked here: if the new arm had been placed so that it swallowed them,
 /// or written as another text rule, one of these would come back `wallet_not_configured`.

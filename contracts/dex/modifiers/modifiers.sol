@@ -1,0 +1,422 @@
+/*
+ * Copyright (c) GOSH Technology Ltd. All rights reserved.
+ * 
+ * Acki Nacki and GOSH are either registered trademarks or trademarks of GOSH
+ * 
+ * Licensed under the ANNL. See License.txt in the project root for license information.
+*/
+pragma gosh-solidity >=0.76.1;
+
+import "./errors.sol";
+
+/// @title Modifiers and Constants Contract
+/// @notice Provides common modifiers, constants and configuration for PMP contracts
+abstract contract Modifiers is Errors {
+    /// @notice Bit length used for external event destination addresses.
+    uint constant bitCntAddress = 256;
+    
+    // RootPN events
+    /// @notice External event id for `RootPN.PrivateNoteDeployed`.
+    uint128 constant ROOTPN_PRIVATE_NOTE_DEPLOYED = 101;
+    /// @notice External event id for `RootPN.NullifierDeployed`.
+    uint128 constant ROOTPN_NULLIFIER_DEPLOYED = 102;
+    /// @notice External event id for `RootPN.TokensWithdrawn`.
+    uint128 constant ROOTPN_TOKENS_WITHDRAWN = 154;
+    /// @notice External event id for `RootPN.ProtocolFeeCollected`.
+    uint128 constant ROOTPN_PROTOCOL_FEE_COLLECTED = 155;
+    /// @notice External event id for `RootPN.ProtocolFeeWithdrawn`.
+    uint128 constant ROOTPN_PROTOCOL_FEE_WITHDRAWN = 156;
+    /// @notice External event id for `RootPN.DealWriteOffReported` (task H).
+    uint128 constant ROOTPN_DEAL_WRITE_OFF = 170;
+
+    // Oracle events
+    /// @notice External event id for `Oracle.OracleEventListDeployed`.
+    uint128 constant ORACLE_DEPLOYED = 104;
+    /// @notice External event id for `OracleEventList.EventConfirmed`.
+    uint128 constant ORACLE_EVENT_CONFIRMED = 106;
+    /// @notice External event id for `OracleEventList.DescriptionUpdated`.
+    uint128 constant ORACLE_LIST_DESCRIPTION_UPDATED = 107;
+
+    // PrivateNote events
+    /// @notice External event id for `PrivateNote.PMPDeployed`.
+    uint128 constant PRIVATENOTE_PMP_DEPLOYED = 111;
+    /// @notice External event id for `PrivateNote.OwnerChanged`.
+    uint128 constant PRIVATENOTE_OWNER_CHANGED = 112;
+    /// @notice External event id for `PrivateNote.StakeConfirmed`.
+    uint128 constant PRIVATENOTE_STAKE_CONFIRMED = 113;
+    /// @notice External event id for `PrivateNote.InferenceOrderPlacedConfirmed` (owner-facing mirror of the OB placement).
+    uint128 constant PRIVATENOTE_INFERENCE_PLACED = 1100;
+    /// @notice External event id for `PrivateNote.InferenceFilledConfirmed` (owner-facing mirror carrying the deal TC).
+    uint128 constant PRIVATENOTE_INFERENCE_FILLED = 1101;
+    /// @notice External event id for `PrivateNote.InferenceOrderRejectedMirror` (owner-facing mirror of a refusal).
+    /// @dev It had none. When the rejection mirror was added (task Q) the `emit` line was copied
+    /// from `InferenceOrderRemoved` and brought that event's destination with it, so two
+    /// different events left on 165. A consumer filtering by `dst` then received both, and
+    /// the two bodies do not even have the same shape -- `(address, uint128)` against
+    /// `(address, uint64, uint8, uint128)` -- so reading one as the other yields rubbish.
+    /// 1102 continues 1100/1101; the inference family sits in the 1100s deliberately.
+    uint128 constant PRIVATENOTE_INFERENCE_REJECTED = 1102;
+    /// @notice External event id for `PrivateNote.ClaimAccepted`.
+    uint128 constant PRIVATENOTE_CLAIM_ACCEPTED = 114;
+    /// @notice External event id for `PrivateNote.StakeCancelled`.
+    uint128 constant PRIVATENOTE_STAKE_CANCELLED = 115;
+    // PMP events
+    /// @notice External event id for `PMP.StakeAccepted`.
+    uint128 constant PMP_STAKE_ACCEPTED = 118;
+    /// @notice External event id for `PMP.ApprovedByOracle`.
+    uint128 constant PMP_APPROVED_BY_ORACLE = 119;
+    /// @notice External event id for `PMP.Resolved`.
+    uint128 constant PMP_RESOLVED = 120;
+    /// @notice External event id for `PMP.ClaimProcessed`.
+    uint128 constant PMP_CLAIM_PROCESSED = 121;
+    /// @notice Reserved external event id for network fee burn accounting.
+    uint128 constant PMP_NETWORK_FEE_BURNED = 122;
+    /// @notice External event id for `PMP.TimingsSet`.
+    uint128 constant PMP_SET_TIMINGS = 124;
+    /// @notice External event id for `PMP.EventCancelled`.
+    uint128 constant PMP_EVENT_CANCELLED = 126;
+    /// @notice External event id for `PMP.PMPRejected`.
+    uint128 constant PMP_REJECTED_BY_ORACLE = 132;
+    /// @notice External event id for `PMP.StakeForfeited` (task E) -- the one place an owner
+    /// deliberately gives up money, previously invisible from outside.
+    uint128 constant PMP_STAKE_FORFEITED = 167;
+
+    // OracleList events
+    /// @notice External event id for `OracleEventList.EventAdded`.
+    uint128 constant ORACLE_EVENT_ADDED = 133;
+    /// @notice External event id for `OracleEventList.RangeEventAdded` (PMP<->OB binding).
+    uint128 constant ORACLE_RANGE_EVENT_ADDED = 162;
+
+    // Vault events
+    /// @notice External event id for `RootPN.VoucherGenerated`.
+    uint128 constant VAULT_voucher_GENERATED = 135;
+    // Root Oracle event
+    /// @notice External event id for `RootOracle.OracleDeployed`.
+    uint128 constant ROOTORACLE_ORACLE_DEPLOYED = 136;
+
+    // Creator fee event
+    /// @notice External event id for `PMP.CreatorFeeCollected`.
+    uint128 constant PMP_CREATOR_FEE_COLLECTED = 137;
+
+    // Split/Merge events
+    /// @notice External event id for `PrivateNote.SplitConfirmed`.
+    uint128 constant PRIVATENOTE_SPLIT_CONFIRMED = 138;
+    /// @notice External event id for `PrivateNote.MergeConfirmed`.
+    uint128 constant PRIVATENOTE_MERGE_CONFIRMED = 139;
+    /// @notice External event id for `PMP.PoolsFrozen`.
+    uint128 constant PMP_POOLS_FROZEN = 140;
+    /// @notice External event id for `PMP.SplitProcessed`.
+    uint128 constant PMP_SPLIT_PROCESSED = 141;
+    /// @notice External event id for `PMP.MergeProcessed`.
+    uint128 constant PMP_MERGE_PROCESSED = 142;
+
+    // OrderBook events
+    /// @notice External event id for `OrderBook.OrderPlaced`.
+    uint128 constant OB_ORDER_PLACED = 143;
+    /// @notice External event id for `OrderBook.OrderCancelled`.
+    uint128 constant OB_ORDER_CANCELLED = 144;
+    /// @notice External event id for `OrderBook.OrderFilled`.
+    uint128 constant OB_ORDER_FILLED = 146;
+    /// @notice External event ids for OrderBook events that previously shared dst=0.
+    uint128 constant OB_PARTIAL_FILL = 157;
+    uint128 constant OB_FULLY_FILLED = 158;
+    uint128 constant OB_QUEUED = 159;
+    uint128 constant OB_REJECTED = 160;
+    uint128 constant OB_CALLBACK_BOUNCED = 161;
+    /// @notice External event id for `PrivateNote.OrderPlaced`.
+    uint128 constant PRIVATENOTE_ORDER_PLACED = 147;
+    /// @notice External event id for `PrivateNote.OrderFilled`.
+    uint128 constant PRIVATENOTE_ORDER_FILLED = 148;
+
+    /// @notice External event id for `PrivateNote.OrderSubmitted`.
+    uint128 constant PRIVATENOTE_ORDER_SUBMITTED = 151;
+    /// @notice External event id for `PrivateNote.OrderCancelledConfirmed`.
+    uint128 constant PRIVATENOTE_ORDER_CANCELLED = 152;
+    /// @notice External event id for `PrivateNote.OrderPlaceRejected`.
+    uint128 constant PRIVATENOTE_ORDER_REJECTED = 153;
+
+    // Transfer events
+    /// @notice External event id for `PrivateNote.TransferInitiated`.
+    uint128 constant PRIVATENOTE_TRANSFER_INITIATED = 149;
+    /// @notice External event id for `PrivateNote.TransferReceived`.
+    uint128 constant PRIVATENOTE_TRANSFER_CONFIRMED = 150;
+    /// @notice External event id for `PrivateNote.DealCredited` (generation 4.0.33).
+    /// @dev 163, the first free id past the contiguous 132-162 block; 180 is taken further down.
+    uint128 constant PRIVATENOTE_DEAL_CREDITED = 163;
+    /// @notice External event id for `PrivateNote.BookCredited` (generation 4.0.33).
+    uint128 constant PRIVATENOTE_BOOK_CREDITED = 164;
+    /// @notice External event id for `PrivateNote.InferenceOrderRemoved` (task E).
+    uint128 constant PRIVATENOTE_INFERENCE_REMOVED = 165;
+    /// @notice External event id for `PrivateNote.InferenceDealClosed` (task E).
+    uint128 constant PRIVATENOTE_INFERENCE_DEAL_CLOSED = 166;
+    /// @notice External event id for `PrivateNote.StakeForfeitConfirmed` (task E).
+    uint128 constant PRIVATENOTE_STAKE_FORFEITED = 168;
+    /// @notice External event id for `PrivateNote.StakeDroppedLocally` (task E).
+    uint128 constant PRIVATENOTE_STAKE_DROPPED = 169;
+
+    /// @notice Minimum native balance required for contract operation
+    uint64 constant MIN_BALANCE = 100 vmshell;
+
+    /// @notice Minimum allowed deposit value for NACKL tokens (9 decimals)
+    uint64 constant MIN_VALUE = 10_000_000; // 0.01 NACKL
+
+    /// @notice Minimum allowed deposit value for Shell tokens (9 decimals)
+    uint64 constant MIN_VALUE_SHELL = 10_000_000; // 0.01 Shell
+
+    /// @notice Minimum allowed deposit value for USDC tokens (6 decimals)
+    uint64 constant MIN_VALUE_USDC = 10_000; // 0.01 USDC
+
+    /// @notice Minimum order NOTIONAL (total value in quote currency) per token type.
+    /// An order's value = amount * price / FULL_PERCENT must be >= this.
+    /// For market buy the full `amount` is locked as quote collateral so
+    /// `amount` itself is compared directly. Market sells skip this check
+    /// since the price is unknown until fill time.
+    uint128 constant MIN_ORDER_NOTIONAL_NACKL = 10_000_000_000; // 10 NACKL
+    uint128 constant MIN_ORDER_NOTIONAL_SHELL = 100_000_000_000; // 100 Shell
+    uint128 constant MIN_ORDER_NOTIONAL_USDC  = 1_000_000; // 1 USDC
+
+    /// @notice Lot size (amount quantisation step) per token type.
+    /// Order amount must be an integer multiple of lot size.
+    /// Uniform value of 0.01 token across all token types, scaled by decimals.
+    uint128 constant LOT_SIZE_NACKL = 10_000_000; // 0.01 NACKL (9 decimals)
+    uint128 constant LOT_SIZE_SHELL = 10_000_000; // 0.01 Shell (9 decimals)
+    uint128 constant LOT_SIZE_USDC  = 10_000; // 0.01 USDC (6 decimals)
+
+    /// @notice Tick size (price quantisation step) in basis points.
+    /// Limit order price must be an integer multiple of tick size.
+    /// Market orders (FLAG_MARKET) skip this check since price is ignored.
+    /// Common across all token types.
+    uint256 constant TICK_SIZE = 10; // 10 bps = 0.1%
+
+    /// @notice Maximum number of orders (or cancels) in a single batch.
+    /// Applies independently to the `orders` and `cancelIds` arrays of
+    /// PrivateNote.placeBatch / OrderBook.executeBatch -- keeping the
+    /// limit in one place prevents PN from accepting more than OB can
+    /// dispatch (truncation on OB side would leak collateral / stake).
+    uint32 constant MAX_BATCH_SIZE = 10;
+
+    /// @notice Currency ID used for PMP pools (staking tokens)
+    uint32 constant CURRENCIES_ID = 1;
+
+    /// @notice Currency ID used for shell tokens 
+    uint32 constant CURRENCIES_ID_SHELL = 2;
+
+    /// @notice Currency ID used for shell tokens (network fees)
+    uint32 constant CURRENCIES_ID_SHELL_FEE = 300;
+
+    /// @notice Currency ID used for USDC tokens
+    uint32 constant CURRENCIES_ID_USDC = 3;
+
+    /// @notice SHELL taken from every non-gas deposit and handed to the note it deploys.
+    /// @dev A PrivateNote is deployed CROSS-DAPP, and a plain native value does not cross a dapp
+    /// boundary -- ECC[2] does, converting to native on arrival. So this is not a courtesy:
+    /// it is the mechanism by which a new note gets any gas at all, and without it a note
+    /// exists but cannot act.
+
+    /// Collected in `RootPN.generateVoucher` and paid out in `RootPN.deployPrivateNote`.
+    /// The two balance IN AGGREGATE and deliberately not per note: one non-gas voucher
+    /// yields exactly one deploy, so as many deposits as were taken from, that many notes
+    /// were funded. Tying a particular deposit to a particular deploy is exactly what the
+    /// privacy of this scheme rests on NOT being possible.
+    uint128 constant GAS_DEPOSIT = 250_000_000_000; // 250 SHELL
+
+    /// @notice What a note attaches to a deal call to pay for that call -- a mirror of the deal's
+    /// own `GAS_*` table (airegistry/modifiers), which a note cannot import.
+    /// @dev A deal burns ECC[2] on every entry and can mint none of it, so somebody has to put
+    /// that ECC there. Until now nobody did per call: the reserve was seeded at deploy and
+    /// topped up only by the SELLER (`fundDeployShell` is `onlyOwnerPubkey`), which meant
+    /// the seller paid for the calls his counterparty makes, and a dry reserve locked both
+    /// bonds and the deposit inside -- `burnecc` does not skip a charge it cannot afford,
+    /// it fails the action phase (RESULT_CODE_NOT_ENOUGH_EXTRA).
+
+    /// So the charge rides WITH the call that incurs it: exact amount, `flag: 1` so it
+    /// arrives as ECC[2] rather than converting to native, burned by `_chargeGas` in the
+    /// same transaction. Nothing has to be parked in advance, and each side pays its own
+    /// entries. Keep these in step with the deal's table.
+    uint128 constant DEAL_GAS_FUND     = 10_000_000; // GAS_FUND_DEAL -- fundBuyerBond
+    uint128 constant DEAL_GAS_TERMINAL = 45_000_000; // GAS_TERMINAL -- stop / dispute / cleanupUnopened
+
+    /// @notice What a buy order costs the buyer, in ECC[2] -- the mirror of what a SELL offer costs
+    /// the seller (`GAS_POST_FROM_NOTE`).
+    /// @dev Posting a sell offer goes through the deal and burns GAS_POST_FROM_NOTE there, so
+    /// the seller pays to put a side of the book up. A buy order put nothing up: the buyer
+    /// rested in the same book for free, and every charge his side caused later fell on a
+    /// reserve the seller funded. This is the symmetric charge, same amount, taken where
+    /// the order is placed.
+
+    /// At PLACEMENT, not at match: the book takes the order there and then, and an order
+    /// that rests unfilled still occupied the book. Burned outright, like its mirror --
+    /// there is no deal yet to hold it for, and an order may match against several.
+
+    /// Taken from this note's OWN ECC[2]: the recorded balance is money owed to the owner,
+    /// gas is not.
+    uint128 constant BUY_ORDER_GAS = 25_000_000; // GAS_POST_FROM_NOTE -- mirrored from airegistry
+
+    /// @notice Fixed network fee to burn on approval
+    uint64 constant NETWORK_FEE_AMOUNT = 1_000_000_000; // 1 shell tokens
+
+    /// @notice Address of RootPN contract
+    address constant ROOT_PN_ADDRESS = address.makeAddrStd(0, 0x1010101010101010101010101010101010101010101010101010101010101010);
+
+    /// @notice Address of RootOracle contract
+    address constant ROOT_ORACLE_ADDRESS = address.makeAddrStd(0, 0x1515151515151515151515151515151515151515151515151515151515151515);
+
+    /// @notice DApp identifier for the PMPRoot ("rootPN") system -- RootPN, PrivateNote,
+    /// PMP, and OrderBook all share this dapp_id. Used as `dest_dapp_id` on
+    /// cross-contract message sends targeted at any of these contracts.
+    uint256 constant ROOT_PN_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000004;
+
+    /// @notice DApp identifier for the Oracle system -- RootOracle, Oracle, and
+    /// OracleEventList all share this dapp_id. Used as `dest_dapp_id` on
+    /// cross-contract message sends targeted at any of these contracts.
+    uint256 constant ORACLE_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000004;
+
+    /// @notice Voting threshold for OracleUnion decisions
+    uint32 constant THRESHOLD = 6600; // 66% = 6600
+
+    /// @notice Full percentage constant
+    uint128 constant FULL_PERCENT = 10000; // 100% = 10000
+
+    /// @notice Grace period for oracle resolve (24 hours in seconds)
+    uint64 constant GRACE_PERIOD = 86400;
+
+    /// @notice Minimum lead time from now to resultStart on first setTimings call.
+    uint64 constant MIN_RESULT_GAP = 120;
+
+    /// @notice Fee percentage for staking operations
+    uint128 constant FEE_PERCENT = 1; // 0.01% = 1
+
+    /// @notice Trading fee denominator (0.001% precision)
+    uint128 constant FEE_DENOMINATOR = 100000;
+
+    /// @notice Taker fee rate. Maker pays no fee -- instead receives a rebate
+    /// funded from the taker fee (see MAKER_REBATE_NUM / _DEN).
+    /// @dev 45 / 100000 = 0.045%
+    uint128 constant TAKER_FEE_RATE = 45;
+
+    /// @notice Maker rebate as a fraction of the taker fee on each fill.
+    /// @dev 3 / 4 = 75% -> maker gets 0.03375% of notional, the contract
+    /// retains 0.01125% (= takerFee - makerRebate) as protocol revenue.
+    uint128 constant MAKER_REBATE_NUM = 3;
+    uint128 constant MAKER_REBATE_DEN = 4;
+
+    /// @notice Bet type identifiers
+    uint8 constant BET_TYPE_CLEAN = 0; // Stake without debt
+    uint8 constant BET_TYPE_DEBT = 1; // Stake with debt
+    uint8 constant BET_TYPE_COUPON = 2; // Stake with free coupon
+    uint8 constant BET_TYPE_OB_SELL = 3; // OrderBook sell order (bounce restores stake.amount)
+    uint8 constant BET_TYPE_MERGE = 4; // mergeFullSet (bounce: no-op on _balance, just clear candidate)
+
+    /// @notice Maximum coupon pool as percentage of total pool
+    /// @dev 500 = 5% (of 10000 = 100%)
+    uint128 constant COUPON_POOL_LIMIT_PERCENT = 500;
+
+    /// @notice Maximum coupon payout multiplier
+    /// @dev Maximum win = couponSize * COUPON_MAX_PAYOUT_MULTIPLIER
+    uint128 constant COUPON_MAX_PAYOUT_MULTIPLIER = 20000;
+
+    /// @notice Redistribution percentage from debt bets to clean bets
+    /// @dev 500 = 5% (of 10000 = 100%)
+    uint128 constant DEBT_REDISTRIBUTION_PERCENT = 500;
+
+    /// @notice Base allowed nominals for vault (without decimals)
+    uint128[] constant ALLOWED_NOMINALS = [
+        uint128(100),
+        uint128(1000),
+        uint128(10000),
+        uint128(100000),
+        uint128(1000000)
+    ];
+
+    /// @notice Returns decimals for a given token type
+    /// @param tokenType Currency identifier.
+    /// @return decimals Token decimals multiplier (1e6 for USDC, 1e9 otherwise).
+    function tokenDecimals(uint32 tokenType) internal pure returns (uint128) {
+        if (tokenType == CURRENCIES_ID_USDC) return 1_000_000;
+        return 1_000_000_000;
+    }
+
+    /// @notice Shell token coupon value
+    uint128 constant SHELL_COUPON_VALUE = 100000000000; // 100 shell token
+
+    /// @notice NACKL token coupon value
+    uint128 constant NACKL_COUPON_VALUE = 100000000000; // 100 NACKL token
+
+    /// @notice USDC token coupon value
+    uint128 constant USDC_COUPON_VALUE = 100000000; // 100 USDC (6 decimals)
+ 
+    /// @notice Returns the minimum allowed stake value for a given token type
+    /// @param tokenType Currency identifier
+    /// @return minValue Minimum allowed stake amount for the token type.
+    function minStakeValue(uint32 tokenType) internal pure returns (uint128) {
+        if (tokenType == CURRENCIES_ID_SHELL) return uint128(MIN_VALUE_SHELL);
+        if (tokenType == CURRENCIES_ID_USDC)  return uint128(MIN_VALUE_USDC);
+        return uint128(MIN_VALUE);
+    }
+
+    /// @notice Returns the minimum allowed order size for a given token type
+    function minOrderNotional(uint32 tokenType) internal pure returns (uint128) {
+        if (tokenType == CURRENCIES_ID_SHELL) return MIN_ORDER_NOTIONAL_SHELL;
+        if (tokenType == CURRENCIES_ID_USDC)  return MIN_ORDER_NOTIONAL_USDC;
+        return MIN_ORDER_NOTIONAL_NACKL;
+    }
+
+    /// @notice Returns the lot size (amount quantisation step) for a token type.
+    function lotSize(uint32 tokenType) internal pure returns (uint128) {
+        if (tokenType == CURRENCIES_ID_SHELL) return LOT_SIZE_SHELL;
+        if (tokenType == CURRENCIES_ID_USDC)  return LOT_SIZE_USDC;
+        return LOT_SIZE_NACKL;
+    }
+
+    /// @notice Modifier for owner authorization using public key
+    /// @param rootpubkey Expected owner public key
+    modifier onlyOwnerPubkey(uint256 rootpubkey) {
+        require(msg.pubkey() == rootpubkey, ERR_INVALID_SENDER);
+        _;
+    }
+
+    /// @notice Modifier for accepting incoming messages
+    modifier accept() {
+        tvm.accept();
+        _;
+    }
+
+    /// @notice Modifier for sender address validation
+    /// @param sender Expected sender address
+    modifier senderIs(address sender) {
+        require(msg.sender == sender, ERR_INVALID_SENDER);
+        _;
+    }
+
+    /// @notice Stake information per PMP
+    struct StakeInfo {
+        uint128[] amount; // confirmed stakes per outcome
+        uint128[] debtAmount; // confirmed stakes with debt
+        uint128[] couponsAmount; // confirmed coupon stakes per outcome
+        uint128 candidateAmount; // pending stakes per outcome
+        uint32 candidateOutcome; // pending stake outcome
+        uint8 candidateBetType; // bet type for pending stake (0=clean, 1=debt, 2=coupon)
+        /// @notice Token type used by the stake record.
+        uint32 tokenType;
+        /// @notice Hash of oracle set used by related PMP.
+        uint256 oracleListHash;
+    }
+
+    /// @notice Event information structure
+    struct EventInfo {
+        /// @notice Human-readable oracle event name.
+        string eventName;
+        /// @notice Oracle service fee required for confirmation.
+        uint128 oracleFee;
+        /// @notice Service deadline as Unix timestamp.
+        uint64 deadline;
+        /// @notice Human-readable event description.
+        string describe;
+        /// @notice Mapping outcome id => human-readable outcome name.
+        mapping(uint32 => string) outcomeNames;
+        /// @notice Number of active PMP confirmations bound to this event.
+        uint128 count;
+        /// @notice Optional trusted internal address for oracle governance calls.
+        optional(uint256) trustAddr;
+    }
+}

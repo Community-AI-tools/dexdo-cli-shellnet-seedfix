@@ -1,17 +1,21 @@
 //! The gosh-ai provider of `dexdo wallet onboard`: adopt a Hot the user already owns at
 //! Gosh.ai.
+
 //! Every mention of the command here names it without its provider argument on purpose. The lint in
-//! `main.rs`(`no_command_line_in_these_sources_is_rejected_by_the_parser`) requires any backticked
+//! `main.rs` (`no_command_line_in_these_sources_is_rejected_by_the_parser`) requires any backticked
 //! command line to be one the shipped parser accepts, and until `wallet onboard <provider>` exists
 //! the two-word form is the only honest thing to print: telling a user to run a line this binary
 //! rejects is a dead end. Once the provider subcommands land, these spans can take the provider
 //! argument back inside the backticks, and that same lint will keep them true.
+
 //! Gosh.ai provides a Hot and no Vault. It establishes no session with the CLI: there is no one-time
 //! code, no API exchange, no authentication of dexdo to Gosh.ai and no message back. The whole
 //! handoff is one string the user copies out of the Gosh.ai UI, holding the Hot's canonical
 //! self-dApp address and a 12-word recovery phrase separated by one ASCII space, in either order.
+
 //! Everything security-relevant about that is in this file and is written to be provable without a
 //! chain:
+
 //! - [`parse_wallet_string`] and the two single-part parsers are total functions over the pasted
 //! text. They return the two extracted values or a [`PasteFault`] - a closed set of `'static`
 //! error classes. **No variant of `PasteFault` carries any part of what the user typed**, so no
@@ -23,33 +27,135 @@
 //! derive, only then touch the disk" is a property a test can hold rather than a convention;
 //! - [`classify_hot_poll`] decides what an account read means while an asynchronous deploy is in
 //! flight, and [`verify_active_hot`] is the refusal list applied once it is `Active`.
+
 //! Where this module stops: it does not own the `WalletProvider` vocabulary, the durable
 //! `wallet/binding.json` schema, the interactive provider chooser, `wallet rebind`, the manual
 //! provider or the funding journal. [`GoshAiBinding`] is the minimum this flow must be able to
 //! write and is expected to be replaced by the shared binding type when the two land together.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use dexdo_core::CanonicalAddress;
+use qrcode::QrCode;
 use zeroize::Zeroizing;
 
-// the shared provider vocabulary. `network` and `provider` are these types and not strings,
-// so a binding cannot claim a chain nothing validated -- a Hot bound on shellnet must never be
-// spendable as though it were on mainnet, and an unvalidated string("Mainnet", "main", a typo)
-// makes exactly that binding.
-#[cfg(any(feature = "shellnet", test))]
+// the shared provider vocabulary. `provider` is a closed type and not a string, so a binding
+// cannot claim a provider nothing validated.
+
+// `network` was a closed type here too, and made it the manifest's own label, because which
+// chains exist is not this client's to know. What the closed pair used to buy is now bought
+// differently: the label is not checked against a list -- there is none -- but it IS checked to be
+// a plain file name (`WalletNetwork::from_manifest_label`), because that is what it is used as, and
+// a binding is only ever read back out of `wallet/active/`. A Hot bound under one label still
+// cannot be spent as though it were under another: the label is part of the PATH, so the two
+// records are different files, and no field comparison has to be trusted for that to hold.
 use crate::cli::wallet::{WalletNetwork, WalletProvider};
 
 /// A Gosh.ai recovery phrase is 12 words today. The spec states the count explicitly rather than
 /// "whatever BIP-39 allows", so the parser states it too: a 24-word phrase is not a Gosh.ai phrase.
 pub(crate) const GOSHAI_PHRASE_WORDS: usize = 12;
 
-/// PLACEHOLDER, and deliberately the only place this URL appears.
-/// The wallet-team spec, "Onboarding via Gosh.ai" step 1, says in as many words that the temporary
-/// link and the QR rendered from it are a placeholder that must be replaced, before release, with a
-/// direct link to the real sub-wallet screen once that screen exists. Nothing in this flow parses
-/// or follows the URL - it is shown to the user and rendered as a QR, nothing more - so replacing
-/// it is a one-line change here and needs no other edit. Do not ship believing it is final.
-pub(crate) const GOSHAI_PLACEHOLDER_URL: &str = "https://gosh.ai";
+/// Where this deployment says an operator gets a Gosh.ai wallet, or why they cannot.
+
+/// The link used to be a constant in this file, and a temporary one at that -- the wallet-team spec
+/// called it a placeholder to be replaced before release. replaced it, and moved it: it is
+/// the manifest that says whether Gosh.ai issues wallets for the chain the operator is pointed at,
+/// because that is a fact about the deployment and not about a name the client keeps a list of
+/// .
+
+/// A named decision rather than an `if` at the call site, so it can be TESTED: the refusal must
+/// happen BEFORE anything is printed or encoded, and the only way to prove that is to drive the
+/// decision on its own.
+
+/// Nothing here parses or follows the URL -- it is shown and rendered as a QR, nothing more.
+/// The manifest's own network label, made safe to print.
+
+/// The label comes out of the same downloaded file as the URL, and `Deployed::load` is a plain
+/// deserialize with no field validation -- so a document that can carry a hostile link can carry a
+/// hostile label. These refusals put it on the screen that immediately precedes a recovery-phrase
+/// prompt, so it goes through the same filter the link does. Anything outside printable ASCII is
+/// replaced rather than dropped: a label rendered as `net?a` still tells the operator which
+/// deployment answered, and silently deleting characters would not.
+fn display_label(network: &str) -> String {
+    network
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .take(64)
+        .collect()
+}
+
+pub(crate) fn goshai_invitation_url(manifest: &dexdo_core::Deployed) -> Result<&str> {
+    match manifest.goshai_onboarding_url.as_deref().map(str::trim) {
+        Some(url) if !url.is_empty() => {
+            // CHECKED, because the value now comes from a file the operator DOWNLOADS, and the
+            // next thing this flow does is ask for a recovery phrase. It used to be a compiled
+            // constant that no input could reach; moving it into the manifest is what makes these
+            // three checks necessary rather than fussy.
+
+            // The control-character one is the one worth spelling out: a `\r` or an escape
+            // sequence in this string makes the terminal rewrite the line, so what the operator
+            // READS stops being what the QR ENCODES -- and a byte comparison in a captured buffer
+            // cannot see that, because the divergence happens in the terminal.
+            if !url.starts_with("https://") {
+                bail!(
+                    "the manifest for {network} declares a Gosh.ai onboarding link that is not \
+                     https. A wallet invitation is followed with a phone and answered with a \
+                     recovery phrase, so it is not shown unless the transport is.",
+                    network = display_label(&manifest.network),
+                );
+            }
+            // `is_ascii_graphic()`, not `is_control() || is_whitespace()`. Those two are Cc and
+            // White_Space, and neither covers Cf: measured, `U+202E` (right-to-left override),
+            // `U+200B` (zero-width space) and `U+202D` all passed the pair. A bidi override is the
+            // textbook way to make a terminal render something other than its bytes, which is
+            // exactly the "what is READ stops being what the QR ENCODES" failure this check exists
+            // to prevent. URLs are ASCII by specification -- an international domain arrives as
+            // punycode -- so the whole class goes at once.
+            if !url.chars().all(|c| c.is_ascii_graphic()) {
+                bail!(
+                    "the manifest for {network} declares a Gosh.ai onboarding link containing \
+                     characters a URL cannot carry -- whitespace, control or formatting. Shown on \
+                     a terminal such a string can rewrite or reorder its own line, so what is read \
+                     and what the QR encodes stop being the same thing.",
+                    network = display_label(&manifest.network),
+                );
+            }
+            // A scheme with nothing after it is not a link: it would be printed and QR-encoded as
+            // an invitation to nowhere.
+            if url.len() <= "https://".len() {
+                bail!(
+                    "the manifest for {network} declares a Gosh.ai onboarding link with no host.",
+                    network = display_label(&manifest.network),
+                );
+            }
+            Ok(url)
+        }
+        _ => bail!(
+            "Gosh.ai does not issue wallets on {network}, so there is no sub-wallet to onboard \
+             from -- or this manifest predates the field that says where it does. Nothing was \
+             asked for and nothing was written. Bind a wallet you control on {network} with \
+             `dexdo wallet onboard`, or point DEXDO_MANIFEST at a deployment whose manifest \
+             declares Gosh.ai onboarding.",
+            network = display_label(&manifest.network),
+        ),
+    }
+}
+
+/// Show the invitation: one string, read by the eye and by the camera.
+
+/// Both come from the same argument on purpose. A QR whose payload differs from the text beside it
+/// is trusted without being read -- that is what a printed code is for -- so there is no second
+/// place for the two to disagree.
+pub(crate) fn render_goshai_invitation(out: &mut dyn std::io::Write, url: &str) -> Result<()> {
+    let code = QrCode::new(url.as_bytes()).context("render the Gosh.ai link as a QR code")?;
+    writeln!(
+        out,
+        "Open Gosh.ai and copy the one-line wallet string for your sub-wallet."
+    )?;
+    crate::cli::qr_display::write_qr(out, &code).context("render the Gosh.ai QR code")?;
+    writeln!(out, "{url}")?;
+    out.flush().context("flush the Gosh.ai invitation")
+}
 
 /// The prompts. They are `'static` text: a prompt is never built from user input.
 pub(crate) const PROMPT_WHOLE_STRING: &str =
@@ -64,6 +170,7 @@ pub(crate) const PROMPT_PHRASE_ONLY: &str =
 // ---------------------------------------------------------------------------------------------
 
 /// The classes of fault a paste can have.
+
 /// Every message below is a compile-time constant. That is the point: the user's clipboard held a
 /// recovery phrase, so the one thing this program must never do is repeat it - not on the terminal,
 /// not in a log line, not inside an error that some outer layer will render. Keeping the fault set
@@ -72,7 +179,7 @@ pub(crate) const PROMPT_PHRASE_ONLY: &str =
 pub(crate) enum PasteFault {
     /// Nothing but whitespace was entered.
     Empty,
-    /// Something other than single ASCII spaces separates the blocks(tab, newline, double space).
+    /// Something other than single ASCII spaces separates the blocks (tab, newline, double space).
     Separator,
     /// Both halves were recognised, but not as the two accepted shapes.
     Shape,
@@ -208,6 +315,7 @@ pub(crate) enum PasteOutcome {
 }
 
 /// Split the paste into tokens under the separator rule.
+
 /// Only the outer edges of the whole pasted string are trimmed, because a terminal paste routinely
 /// carries a trailing newline that the user did not choose to add. Inside, the contract is exactly
 /// single ASCII spaces: a tab, a line break or a double space means the copy did not come from the
@@ -225,6 +333,7 @@ fn tokens_of(input: &str) -> Result<Vec<&str>, PasteFault> {
 }
 
 /// A Hot wallet is a self-dApp account: its dApp id equals its account id.
+
 /// Operational wallets are not children of the dexdo DApp, so an address whose halves differ is
 /// some other account - possibly a dexdo contract - and adopting it as a Hot would point every
 /// later `note deploy`/`note topup` at the wrong place.
@@ -233,6 +342,7 @@ fn is_self_dapp(address: &CanonicalAddress) -> bool {
 }
 
 /// Locate the single address token.
+
 /// A token is treated as an *attempted* address when it contains `::`, and an attempted address
 /// that does not parse is reported as malformed rather than as absent. That distinction is what
 /// tells a user who mangled the copy from a user who pasted only the phrase, without either message
@@ -269,6 +379,7 @@ fn is_valid_phrase(words: &[&str]) -> bool {
 }
 
 /// Locate the single 12-word phrase.
+
 /// Every window of 12 consecutive tokens that does not overlap the address is tried, which is what
 /// makes the order of the two blocks irrelevant without the parser having to know which order it is
 /// looking at. Two distinct valid windows - a phrase pasted twice, or 24 words - is ambiguity, and
@@ -307,6 +418,7 @@ fn phrase_in(tokens: &[&str], address_index: Option<usize>) -> Result<(usize, St
 }
 
 /// The two accepted shapes, and only those: address then phrase, or phrase then address.
+
 /// Rejecting anything else is what keeps a label, a stray word or a glued
 /// `<dapp_id>::<account_id><word>` from being quietly accepted because the parts it contains
 /// happened to be extractable.
@@ -382,19 +494,23 @@ pub(crate) fn parse_phrase_input(input: &str) -> Result<Zeroizing<String>, Paste
 // ---------------------------------------------------------------------------------------------
 
 /// One non-echoing read.
+
 /// The seam exists so the loop below can be driven by a test without a terminal. Production's
 /// implementation is [`TerminalHiddenPrompt`]; there is no implementation anywhere that echoes.
 pub(crate) trait HiddenPrompt {
     /// Show `prompt` and read one line without displaying it.
+
     /// Implementations must not return the entered text inside an error, and must not log it.
     fn read_hidden(&mut self, prompt: &'static str) -> Result<Zeroizing<String>>;
 }
 
 /// Ask for what is missing until both halves are held, echoing nothing on the way.
+
 /// The loop has no attempt limit and no timer: the spec asks it to wait for the user, and `Ctrl-C`
 /// cancels safely because nothing has been written and no chain write has been submitted by this
 /// point. It ends when both halves are held, or when the prompt itself fails - end of input in
 /// production, script exhausted in a test.
+
 /// `notices` receives one line per rejected attempt. That line is [`PasteFault`]'s `Display`, so it
 /// is `'static` text by construction.
 pub(crate) fn collect_wallet_string(
@@ -488,6 +604,7 @@ pub(crate) enum PollVerdict {
 pub(crate) const EXPECTED_DEPLOY_STATES: [&str; 3] = ["NotFound", "NonExist", "Uninit"];
 
 /// Decide what one read means.
+
 /// Deliberately total, with no failing verdict. Gosh.ai creates the sub-wallet after the user
 /// copies the string, so for the length of that deploy the account legitimately reads as absent,
 /// `NonExist` or `Uninit`, and a transient read error means the CLI learned nothing rather than
@@ -528,8 +645,9 @@ pub(crate) struct ActiveHotFacts {
     /// `getParameters().requiredTxnConfirms`.
     pub(crate) required_txn_confirms: u8,
     /// `getParameters().requiredDataConfirms` - the threshold for changing the custodian set itself.
+
     /// Read as its own fact rather than assumed from `requiredTxnConfirms`: the compiled ABI
-    /// declares the two separately(`getParameters` returns both as `uint8`), and they govern
+    /// declares the two separately (`getParameters` returns both as `uint8`), and they govern
     /// different powers. One says who may spend; this one says who may rewrite the list of who may
     /// spend.
     pub(crate) required_data_confirms: u8,
@@ -704,27 +822,34 @@ fn custodian_public_keys(custodians: &serde_json::Value) -> Option<Vec<String>> 
 }
 
 /// The refusal list of the wallet-team spec, "Onboarding via Gosh.ai" step 9.
+
 /// The Gosh.ai Hot must be the same contract the Acki Nacki Wallet hands over, so the identity is
 /// pinned to exactly the constants `wallet_onboarding.rs` pins the Acki Nacki Hot to - the canonical
 /// `UpdateCustodianMultisigWallet_v2` 2.4.0 - rather than to a second, drifting copy of them. Two
 /// checks are applied to the same fact on purpose: `code_hash` is what the account *is*, while
 /// `getVersion` is what the contract *says*, and a mismatch between them is itself a finding.
+
 /// The custodian check is the one that ties the two halves of the pasted string together. Nothing
 /// else can: a recovery phrase does not determine the Gosh.ai Hot's address, because the address is
 /// derived from a separate service custodian key. Only the chain can confirm that the phrase the
 /// user pasted controls the address the user pasted.
+
 /// # The exact shape, and why membership alone is not enough
+
 /// The owner froze the Gosh.ai Hot as: exactly two distinct pubkey custodians -- the Gosh.ai service
 /// key and the user's -- with `requiredTxnConfirms=1` and `requiredDataConfirms=2`. All four facts
 /// are REFUSED when they differ, never warned about, because each one names somebody who can take
 /// the money:
+
 /// - a third custodian is a third party who, at `reqConfirms=1`, can empty the Hot alone;
 /// - a sole custodian means this is not the managed sub-wallet the provider is defined to hand over,
 /// so whatever the operator is about to fund is not what they think they are funding;
 /// - `requiredDataConfirms` below two lets one custodian rewrite the custodian set by itself, which
 /// is the power to give the wallet away and is not reversible from this side.
+
 /// The service key being able to spend on its own is INTENDED and is accepted: that is what a
 /// managed sub-wallet is. What is refused is a set that is not exactly those two.
+
 /// Only pubkey custodians are counted, which is what the specification fixes and what the compiled
 /// ABI makes readable: `owner_pubkey` is an `optional(uint256)`, so an address-only custodian is
 /// absent from this list entirely rather than appearing as some other value.
@@ -804,6 +929,7 @@ pub(crate) fn verify_active_hot(
 // ---------------------------------------------------------------------------------------------
 
 /// The resumable onboarding draft, as a TYPE rather than a hand-spelled JSON literal.
+
 /// This file is what the resume path reads after a timeout or a `Ctrl-C`, so it names the same
 /// provider and the same network as the binding that will eventually be committed. It used to be
 /// built with `serde_json::json!` and a `&str` provider constant, which is the shape that drifts: a
@@ -813,8 +939,8 @@ pub(crate) fn verify_active_hot(
 /// impossible - one change, both files - and
 /// `a_draft_written_by_draft_of_round_trips_through_the_typed_reader` is the assertion that keeps it
 /// true.
+
 /// It holds no secret: `hot_seed_file` is the PATH of the file that does.
-#[cfg(any(feature = "shellnet", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GoshAiOnboardingDraft {
     pub(crate) version: u32,
@@ -828,10 +954,8 @@ pub(crate) struct GoshAiOnboardingDraft {
 
 /// The one phase this draft can be in: everything before it is in memory, and everything after it
 /// has produced a binding.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) const GOSHAI_DRAFT_PHASE_AWAITING_HOT: &str = "awaiting_hot_activation";
 
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) mod files {
     use super::{GoshAiOnboardingDraft, GoshAiWalletString, GOSHAI_DRAFT_PHASE_AWAITING_HOT};
     use crate::cli::wallet::{WalletBinding, WalletNetwork, WalletProvider, BINDING_VERSION};
@@ -839,6 +963,7 @@ pub(crate) mod files {
     use std::path::{Path, PathBuf};
 
     /// Every path this flow writes, derived from one effective data directory and one binding id.
+
     /// The binding id is generated before any key material exists, so re-onboarding the same
     /// provider lands in a fresh directory and cannot overwrite the secret files of a binding whose
     /// Hot may still hold funds.
@@ -868,7 +993,7 @@ pub(crate) mod files {
                 seed_file: binding_dir.join("hot.seed"),
                 draft_file: binding_dir.join(DRAFT_FILE_NAME),
                 active_binding_file: crate::cli::wallet::WalletStore::at(&wallet_root)
-                    .binding_path(network),
+                    .binding_path(&network),
                 binding_dir,
                 wallet_root,
             }
@@ -891,9 +1016,11 @@ pub(crate) mod files {
     }
 
     /// Persist the recovery phrase and a resumable draft, both owner-only, both atomically.
+
     /// This is the last thing that happens before the first network wait and the first thing that
     /// must survive it: a timeout or `Ctrl-C` while waiting for the Hot leaves these two files in
     /// place, so re-running the command resumes without asking for the phrase again.
+
     /// The writer is `note::write_private_atomic` - the one this repository already uses for note
     /// owner keys and pools. It creates an exclusive 0600 temp in the destination directory and
     /// renames over the target, which a plain write does not: a plain write inherits the umask, and
@@ -923,6 +1050,7 @@ pub(crate) mod files {
     }
 
     /// The resumable draft. It holds no secret of its own - only the path of the file that does.
+
     /// Built from the same typed `provider`/`network` values [`active_binding`] puts in the binding,
     /// so the two cannot describe different things: there is no second spelling to keep in step.
     pub(crate) fn draft_of(
@@ -942,6 +1070,7 @@ pub(crate) mod files {
     }
 
     /// The draft this binding id already has, if it has one and it is readable.
+
     /// A draft that does not parse is `None` and not an error: it can only make this attempt fall
     /// back to asking for the wallet string, which is exactly what happens today, whereas failing
     /// would put a corrupt file between the operator and their own onboarding.
@@ -951,18 +1080,19 @@ pub(crate) mod files {
     }
 
     /// Is this draft one THIS command may continue?
+
     /// Every field is checked rather than trusted, because the answer decides which Hot the
     /// operator ends up bound to. The network in particular: a draft written for one chain must
     /// never be resumed by a command configured for the other, or the phrase would be proved
     /// against an address on a chain nobody asked about.
     pub(crate) fn is_resumable_draft(
         draft: &GoshAiOnboardingDraft,
-        network: WalletNetwork,
+        network: &WalletNetwork,
         dir_name: &str,
     ) -> bool {
         draft.version == BINDING_VERSION
             && draft.provider == WalletProvider::GoshAi
-            && draft.network == network
+            && &draft.network == network
             && draft.phase == GOSHAI_DRAFT_PHASE_AWAITING_HOT
             // The draft names the directory it lives in. A mismatch means the two disagree about
             // whose secrets these are, and the resume would carry an id the commit then refuses.
@@ -971,13 +1101,15 @@ pub(crate) mod files {
     }
 
     /// The binding id of an onboarding attempt that can be continued, if one is on disk.
+
     /// Scans the per-binding directories rather than keeping a pointer file: the directories ARE
     /// the record, so there is no second thing to keep in step and nothing to leave stale when an
     /// attempt is committed or removed.
+
     /// The most recently written draft wins when there is more than one, because that is the
     /// attempt the operator was last making; the caller prints the Hot address it resumed, so the
     /// choice is never silent.
-    pub(crate) fn find_resumable(wallet_root: &Path, network: WalletNetwork) -> Option<String> {
+    pub(crate) fn find_resumable(wallet_root: &Path, network: &WalletNetwork) -> Option<String> {
         let mut best: Option<(std::time::SystemTime, String)> = None;
         for entry in std::fs::read_dir(wallet_root.join("bindings")).ok()?.flatten() {
             let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
@@ -1004,13 +1136,16 @@ pub(crate) mod files {
     }
 
     /// Retire the draft once its binding is committed, so nothing can resume a finished attempt.
+
     /// Only the draft goes: `hot.seed` is the committed binding's own secret and stays exactly
     /// where `binding.json` points at it. Removing the draft is what makes "resumable" mean
     /// "unfinished" instead of "was ever started" -- without it a later attempt would adopt the id
     /// of the ACTIVE binding and write over the wallet the operator is already using.
+
     /// Takes the directory rather than [`GoshAiPaths`] because the caller that has to do this is
     /// the one holding the store's reserved `BindingDraft`, which knows its directory and not this
     /// provider's file layout.
+
     /// Best effort: the binding is already committed, and failing to tidy up must not turn a
     /// successful onboarding into an error.
     pub(crate) fn discard_draft_in(binding_dir: &Path) {
@@ -1027,11 +1162,13 @@ pub(crate) mod files {
     }
 
     /// The verified binding, BUILT and not written. Called only after [`super::verify_active_hot`].
+
     /// This flow deliberately no longer writes `wallet/binding.json` itself. `WalletStore` is the
     /// single writer, and it archives whatever it replaces before the atomic swap; a second writer
     /// that renamed over the file would destroy the only local record of a Hot that can still hold
     /// funds, leaving the operator with a balance on chain and no address to reach it. So the flow
     /// returns the binding and `run_selected` commits it through the store, once.
+
     /// No `vault_address`: Gosh.ai provides no Vault, and a field naming one would be a lie a later
     /// funding flow could act on. `hot_seed_file` is a path; the secret is referenced, never copied.
     pub(crate) fn active_binding(
@@ -1059,7 +1196,6 @@ pub(crate) mod files {
 // ---------------------------------------------------------------------------------------------
 
 /// What the pre-network stage produced.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) struct PreparedOnboarding {
     pub(crate) paths: files::GoshAiPaths,
     pub(crate) hot_address: CanonicalAddress,
@@ -1070,14 +1206,15 @@ pub(crate) struct PreparedOnboarding {
 }
 
 /// Collect, validate, derive, and only then write - in that order, in one function.
+
 /// The order is the security property, so it is one function rather than a sequence a caller is
 /// trusted to keep: no path is touched until the paste has parsed, the phrase has proved to be a
 /// valid phrase, and the custodian key has actually derived from it. A failure at any of those
 /// three points returns with the data directory exactly as it was found.
+
 /// `derive_public_key` is a parameter because the real derivation is TVM-SDK work that only exists
-/// in the shellnet build, while the ordering above must be provable in the default build that CI
+/// in a chain build, while the ordering above must be provable in the default build that CI
 /// runs. Production passes [`derive_custodian_public_key`].
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn prepare_onboarding(
     data_dir: &std::path::Path,
     network: WalletNetwork,
@@ -1088,7 +1225,7 @@ pub(crate) fn prepare_onboarding(
 ) -> Result<PreparedOnboarding> {
     let wallet = collect_wallet_string(prompt, notices)?;
     let derived_public_key = derive_public_key(&wallet.phrase)?;
-    let paths = files::GoshAiPaths::new(data_dir, network, binding_id);
+    let paths = files::GoshAiPaths::new(data_dir, network.clone(), binding_id);
     files::persist_secret_and_draft(&paths, network, &wallet)?;
     Ok(PreparedOnboarding {
         paths,
@@ -1098,17 +1235,19 @@ pub(crate) fn prepare_onboarding(
 }
 
 /// Continue an onboarding attempt that already stored its phrase, WITHOUT asking for it again.
+
 /// This is the promise the activation-timeout error makes, kept. The phrase and the draft were
 /// written before the first network wait precisely so that a timeout or a `Ctrl-C` costs the
 /// operator nothing; re-prompting for a 12-word recovery phrase they have already proved is not a
 /// small annoyance, it is the point at which somebody reaches for the clipboard, a text file or a
 /// screenshot to avoid typing it a third time.
+
 /// It returns `None` rather than an error when there is nothing to resume, so the caller falls back
 /// to a normal first attempt. The only failure it raises is a phrase that is on disk but no longer
 /// derives, which is a corrupt secret and must not be passed off as "start again".
+
 /// The address is re-parsed from the draft and the key re-derived from the stored phrase, so a
 /// resumed attempt proves exactly what a fresh one proves: nothing is carried across as trusted.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn resume_onboarding(
     data_dir: &std::path::Path,
     network: WalletNetwork,
@@ -1118,11 +1257,11 @@ pub(crate) fn resume_onboarding(
     // The SAME network this resume is for: bindings are kept per network, so the paths a resumed
     // attempt carries must name the active-binding file of the chain it is being resumed on, not
     // another one. `is_resumable_draft` then refuses a draft that disagrees.
-    let paths = files::GoshAiPaths::new(data_dir, network, binding_id);
+    let paths = files::GoshAiPaths::new(data_dir, network.clone(), binding_id);
     let Some(draft) = files::read_draft(&paths) else {
         return Ok(None);
     };
-    if !files::is_resumable_draft(&draft, network, binding_id) {
+    if !files::is_resumable_draft(&draft, &network, binding_id) {
         return Ok(None);
     }
     let phrase = Zeroizing::new(
@@ -1153,7 +1292,6 @@ pub(crate) fn resume_onboarding(
 }
 
 /// A binding id, generated before any key material exists.
-#[cfg(any(feature = "shellnet", test))]
 pub(crate) fn new_binding_id() -> String {
     let bytes: [u8; 16] = rand::random();
     hex::encode(bytes)
@@ -1167,29 +1305,26 @@ pub(crate) fn new_binding_id() -> String {
 /// `allow(dead_code)` on the module declaration: these four names are what the gosh-ai provider of
 /// `dexdo wallet onboard` will call, and until that dispatch exists nothing in the crate names
 /// them. `dead_code` does not cover a re-export, so it is spelled out here as well.
-#[cfg(feature = "shellnet")]
 #[allow(unused_imports)]
-pub(crate) use shellnet::{
+pub(crate) use live::{
     derive_custodian_public_key, run_wallet_onboard_goshai, GoshAiOnboardOptions,
     TerminalHiddenPrompt,
 };
 
-#[cfg(feature = "shellnet")]
-mod shellnet {
+mod live {
     use std::io::{IsTerminal as _, Write as _};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context as _, Result};
     use dexdo_core::params::{GOSHAI_HOT_ACTIVATION_POLL_INTERVAL, GOSHAI_HOT_ACTIVATION_TIMEOUT};
-    use dexdo_core::shellnet::RetryingReads as _;
+    use dexdo_core::chain::RetryingReads as _;
     use dexdo_core::{Address, CanonicalAddress};
-    use qrcode::QrCode;
     use zeroize::Zeroizing;
 
     use super::{
         classify_hot_poll, files, prepare_onboarding, resume_onboarding, verify_active_hot,
-        ActiveHotFacts, HiddenPrompt, HotPoll, PollVerdict, GOSHAI_PLACEHOLDER_URL,
+        ActiveHotFacts, HiddenPrompt, HotPoll, PollVerdict,
     };
     use crate::cli::wallet::{WalletBinding, WalletNetwork};
 
@@ -1203,7 +1338,6 @@ mod shellnet {
         /// so a second id would leave that directory empty and put the secrets somewhere the store
         /// does not know about.
         pub(crate) binding_id: String,
-        pub(crate) endpoint: Option<String>,
         /// `--activation-timeout`, defaulting to
         /// [`GoshAiOnboardOptions::DEFAULT_ACTIVATION_TIMEOUT`].
         pub(crate) activation_timeout: Duration,
@@ -1217,6 +1351,7 @@ mod shellnet {
     }
 
     /// The production hidden input.
+
     /// The prompt goes to stderr, so machine-readable stdout is never polluted by it; the answer is
     /// read with terminal echo disabled and lands in a `Zeroizing<String>` that is wiped on drop.
     /// The pasted string therefore never reaches the terminal, and - because this flow takes no
@@ -1258,34 +1393,15 @@ mod shellnet {
     }
 
     /// Derive the user's custodian public key from the phrase, locally.
+
     /// The secret half is dropped here: `DerivedMultisigKey` zeroizes it, and nothing past this
     /// point needs it. Onboarding only has to prove that the phrase controls the pasted Hot, and the
     /// public key is enough to ask the chain that question.
     pub(crate) fn derive_custodian_public_key(phrase: &str) -> Result<String> {
-        let derived = dexdo::wallet_seed::derive_multisig_key_from_seed_phrase(phrase)
+        let derived = dexdo::wallet_seed::derive_multisig_private_key_from_seed_phrase(phrase)
             // The SDK error is replaced, not wrapped: its payload is derived from the phrase.
             .map_err(|error| anyhow::anyhow!("derive the custodian key: {error}"))?;
         Ok(derived.public_hex().to_string())
-    }
-
-    /// Step 1 of the spec, and a placeholder. See [`GOSHAI_PLACEHOLDER_URL`].
-    fn print_placeholder_invitation() -> Result<()> {
-        let code = QrCode::new(GOSHAI_PLACEHOLDER_URL.as_bytes())
-            .context("render the Gosh.ai placeholder link as a QR code")?;
-        let mut stdout = std::io::stdout();
-        writeln!(
-            stdout,
-            "Open Gosh.ai and copy the one-line wallet string for your sub-wallet."
-        )?;
-        crate::cli::qr_display::write_qr(&mut stdout, &code)
-            .context("render the Gosh.ai placeholder QR code")?;
-        writeln!(stdout, "{GOSHAI_PLACEHOLDER_URL}")?;
-        writeln!(
-            stdout,
-            "This link is a placeholder for the direct sub-wallet screen and will change before \
-             release."
-        )?;
-        stdout.flush().context("flush the Gosh.ai invitation")
     }
 
     async fn poll_hot(client: &dexdo_core::ChainClient, address: &Address) -> HotPoll {
@@ -1371,6 +1487,7 @@ mod shellnet {
     }
 
     /// One `getParameters()` `uint8`, by the name the compiled ABI declares.
+
     /// A missing field is an ERROR and never a zero: both thresholds this reads are refused unless
     /// they hold an exact value, so silently defaulting would turn "the getter did not answer" into
     /// a policy verdict about a wallet that holds money.
@@ -1416,13 +1533,34 @@ mod shellnet {
             );
         }
         let binding_id = options.binding_id.clone();
+        // WHERE TO DIAL IS RESOLVED BEFORE ANYTHING IS ASKED OR WRITTEN.
+
+        // Proving the Hot is three read-only account queries on the selected network, and the
+        // manifest names none of the accounts they read: the address arrives in the Gosh.ai string.
+        // What the manifest does name is where to dial, which is the whole input here.
+
+        // Read through `manifest_path()`, the same seam `wallet onboard manual` uses. It used to
+        // come from `options.contracts`, and the one site building these options had nothing to put
+        // there since `--contracts` was removed: it passed `None` unconditionally, so this
+        // call took the no-endpoint branch on EVERY run. The path did not work for some manifests --
+        // it did not work at all, and said the manifest was at fault.
+
+        // It stood BELOW the block that follows, which is why that mattered so much: the refusal
+        // arrived after the recovery phrase and the resumable draft were already owner-only on
+        // disk, so an operator whose setup was fine was told their manifest was broken at the one
+        // moment they had most reason to believe otherwise. Resolved here, a manifest that cannot
+        // answer stops the flow before it asks for a secret it has nowhere to send.
+        let endpoint = crate::cli::wallet::wallet_read_endpoint(
+            Some(&crate::cli::commands::manifest_path()?),
+            options.network.clone(),
+        )?;
         // The resume comes FIRST, before the invitation is printed and before anything is asked.
         // `run_selected` hands this flow the id of a resumable attempt when one exists, so finding
         // a draft here means the operator is continuing the wait they already started -- they have
         // the wallet open in front of them and need neither the QR nor the prompt again.
         let prepared = match resume_onboarding(
             &options.data_dir,
-            options.network,
+            options.network.clone(),
             &binding_id,
             &derive_custodian_public_key,
         )? {
@@ -1436,12 +1574,27 @@ mod shellnet {
                 resumed
             }
             None => {
-                print_placeholder_invitation()?;
+                // Whether this deployment has Gosh.ai onboarding at all, resolved HERE and not
+                // above the resume fork. Above, it refused a RESUMING operator with "nothing was
+                // asked for and nothing was written" while their recovery phrase was already
+                // owner-only on disk from the first attempt -- a false sentence at the worst
+                // moment. The resume path needs no invitation: it is continuing a wait, not
+                // starting one.
+
+                // For a fresh attempt this is still before anything is printed, encoded, prompted
+                // or written, which is the ordering asks for: the line below is the first
+                // thing that reaches the screen.
+                let invitation_url = {
+                    let manifest =
+                        dexdo_core::Deployed::load(&crate::cli::commands::manifest_path()?)?;
+                    super::goshai_invitation_url(&manifest)?.to_string()
+                };
+                super::render_goshai_invitation(&mut std::io::stdout(), &invitation_url)?;
                 let mut prompt = TerminalHiddenPrompt;
                 let mut notices = std::io::stderr();
                 let prepared = prepare_onboarding(
                     &options.data_dir,
-                    options.network,
+                    options.network.clone(),
                     &binding_id,
                     &mut prompt,
                     &mut notices,
@@ -1459,14 +1612,6 @@ mod shellnet {
             }
         };
 
-        // Proving the Hot is three read-only account queries on the selected network, and the
-        // deployed-contracts manifest names none of the accounts they read: the address arrives in
-        // the Gosh.ai string. So the endpoint is the whole input here, exactly as it is for
-        // `wallet onboard ackinacki-wallet`.
-        let endpoint = crate::cli::wallet::wallet_read_endpoint(
-            options.endpoint.as_deref(),
-            options.network,
-        )?;
         let chain = dexdo_core::ChainClient::connect(&endpoint)
             .map_err(|error| anyhow::anyhow!("connect verification endpoint {endpoint}: {error}"))?;
         let address = chain_address(&prepared.hot_address)?;
@@ -1488,7 +1633,7 @@ mod shellnet {
         // binding it replaces -- see `files::active_binding`.
         Ok(files::active_binding(
             &prepared.paths,
-            options.network,
+            options.network.clone(),
             &prepared.hot_address,
         ))
     }
@@ -1949,7 +2094,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let outcome = prepare_onboarding(
             root.path(),
-            WalletNetwork::Shellnet,
+            crate::cli::wallet::test_network_a(),
             "binding-under-test",
             &mut prompt,
             &mut notices,
@@ -1970,7 +2115,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let outcome = prepare_onboarding(
             root.path(),
-            WalletNetwork::Shellnet,
+            crate::cli::wallet::test_network_a(),
             "binding-under-test",
             &mut prompt,
             &mut notices,
@@ -1992,7 +2137,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let prepared = prepare_onboarding(
             root.path(),
-            WalletNetwork::Shellnet,
+            crate::cli::wallet::test_network_a(),
             "binding-under-test",
             &mut prompt,
             &mut notices,
@@ -2048,13 +2193,13 @@ mod tests {
     #[test]
     fn each_binding_id_gets_its_own_directory_so_a_rebind_cannot_overwrite_old_secrets() {
         let root = tempfile::tempdir().expect("tempdir");
-        let first = files::GoshAiPaths::new(root.path(), WalletNetwork::Shellnet, "binding-one");
-        let second = files::GoshAiPaths::new(root.path(), WalletNetwork::Shellnet, "binding-two");
+        let first = files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), "binding-one");
+        let second = files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), "binding-two");
         assert_ne!(first.seed_file, second.seed_file);
         assert_ne!(first.draft_file, second.draft_file);
         // One active binding, whichever directory it points at.
         assert_eq!(first.active_binding_file, second.active_binding_file);
-        assert!(first.active_binding_file.ends_with("wallet/active/shellnet.json"));
+        assert!(first.active_binding_file.ends_with("wallet/active/net-a.json"));
     }
 
     #[test]
@@ -2239,7 +2384,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let prepared = prepare_onboarding(
             root.path(),
-            WalletNetwork::Shellnet,
+            crate::cli::wallet::test_network_a(),
             "binding-under-test",
             &mut prompt,
             &mut notices,
@@ -2279,7 +2424,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let prepared = prepare_onboarding(
             root.path(),
-            WalletNetwork::Shellnet,
+            crate::cli::wallet::test_network_a(),
             "binding-under-test",
             &mut prompt,
             &mut notices,
@@ -2296,10 +2441,10 @@ mod tests {
         // The flow BUILDS the binding; the store is the single writer and archives what it
         // replaces. Committing here is what the production path does in `run_selected`.
         let binding =
-            files::active_binding(&prepared.paths, WalletNetwork::Shellnet, &prepared.hot_address);
+            files::active_binding(&prepared.paths, crate::cli::wallet::test_network_a(), &prepared.hot_address);
         let store = crate::cli::wallet::WalletStore::at(&prepared.paths.wallet_root);
         assert_eq!(
-            store.binding_path(WalletNetwork::Shellnet),
+            store.binding_path(&crate::cli::wallet::test_network_a()),
             prepared.paths.active_binding_file,
             "the store and this flow must name the same active binding file"
         );
@@ -2327,6 +2472,7 @@ mod tests {
 
     /// Decision 3 of the integration: the resume file and the binding must be spelled by the
     /// SAME types, so a change to one cannot leave the other behind.
+
     /// The draft used to be a `serde_json::json!` literal with a `&str` provider constant. A literal
     /// does not follow a type change, so the binding could become typed while the file the resume
     /// path reads stayed hand-spelled and the two would drift the first time anyone touched either.
@@ -2339,7 +2485,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let prepared = prepare_onboarding(
             root.path(),
-            WalletNetwork::Mainnet,
+            crate::cli::wallet::test_network_b(),
             "binding-round-trip",
             &mut prompt,
             &mut notices,
@@ -2354,7 +2500,7 @@ mod tests {
         assert_eq!(read_back.provider, WalletProvider::GoshAi);
         assert_eq!(
             read_back.network,
-            WalletNetwork::Mainnet,
+            crate::cli::wallet::test_network_b(),
             "the network the operator chose must survive the round trip, not a default"
         );
         assert_eq!(read_back.id, "binding-round-trip");
@@ -2366,7 +2512,7 @@ mod tests {
         // The wire spelling is the binding's spelling, because it is the binding's type.
         let raw: serde_json::Value = serde_json::from_slice(&written).expect("draft is json");
         assert_eq!(raw["provider"], "gosh-ai");
-        assert_eq!(raw["network"], "mainnet");
+        assert_eq!(raw["network"], "net-b");
         assert!(
             !String::from_utf8_lossy(&written).contains(&phrase_a()),
             "the draft references the secret file and never copies the secret"
@@ -2382,7 +2528,7 @@ mod tests {
         let mut notices: Vec<u8> = Vec::new();
         let prepared = prepare_onboarding(
             root.path(),
-            WalletNetwork::Mainnet,
+            crate::cli::wallet::test_network_b(),
             "binding-agreement",
             &mut prompt,
             &mut notices,
@@ -2393,7 +2539,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&prepared.paths.draft_file).expect("draft"))
                 .expect("typed draft");
         let binding =
-            files::active_binding(&prepared.paths, WalletNetwork::Mainnet, &prepared.hot_address);
+            files::active_binding(&prepared.paths, crate::cli::wallet::test_network_b(), &prepared.hot_address);
 
         assert_eq!(draft.provider, binding.provider);
         assert_eq!(draft.network, binding.network);
@@ -2411,8 +2557,8 @@ mod tests {
 
         let reserved_first = store.open_draft().expect("reserve the first binding's id");
         let first = files::active_binding(
-            &files::GoshAiPaths::new(root.path(), WalletNetwork::Shellnet, reserved_first.id()),
-            WalletNetwork::Shellnet,
+            &files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), reserved_first.id()),
+            crate::cli::wallet::test_network_a(),
             &dexdo_core::CanonicalAddress::parse(&hot_address()).expect("hot"),
         );
         assert!(
@@ -2422,8 +2568,8 @@ mod tests {
 
         let reserved_second = store.open_draft().expect("reserve the second binding's id");
         let second = files::active_binding(
-            &files::GoshAiPaths::new(root.path(), WalletNetwork::Shellnet, reserved_second.id()),
-            WalletNetwork::Shellnet,
+            &files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), reserved_second.id()),
+            crate::cli::wallet::test_network_a(),
             &dexdo_core::CanonicalAddress::parse(&hot_address()).expect("hot"),
         );
         let archived = store
@@ -2439,15 +2585,46 @@ mod tests {
             "funds can still sit in the old Hot, so its address must remain recoverable"
         );
         assert_eq!(
-            store.load_active(WalletNetwork::Shellnet).expect("load").expect("active").id,
+            store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("active").id,
             second.id
         );
     }
 
+    /// The link is the deployment's to state, and the client keeps no copy of it.
+
+    /// This replaced `the_gosh_ai_link_is_a_single_placeholder_constant`, which pinned the
+    /// placeholder and was correct while the URL lived in this file. moved it into the
+    /// manifest, so what is worth holding now is the opposite: that no URL survives here to be
+    /// picked up again by whoever next needs "the Gosh.ai link".
     #[test]
-    fn the_gosh_ai_link_is_a_single_placeholder_constant() {
-        // If this ever needs changing, it is one line, and this test is the reminder that it is a
-        // placeholder rather than a released URL. See `GOSHAI_PLACEHOLDER_URL`.
-        assert_eq!(GOSHAI_PLACEHOLDER_URL, "https://gosh.ai");
+    fn no_goshai_url_is_compiled_into_this_module() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/wallet_goshai.rs"),
+        )
+        .expect("read this module");
+
+        // The HOST, built at runtime so this guard does not match its own source line. The host is
+        // what makes a string a link: `"https://` alone would also match the scheme CHECK in
+        // `goshai_invitation_url`, which is code doing its job rather than a link left behind.
+        // Every spelling that puts the removed link back trips this -- the literal,
+        // `concat!("https", "://gosh.ai")`, and `format!("{scheme}://gosh.ai")` alike, because all
+        // three have to name the host somewhere.
+        // The host, lowercase and whole, built at runtime so this guard does not match its own
+        // source line. `://gosh` was weaker than its own claim: `concat!("https:", "//gosh.ai")`
+        // splits at a different point and slips through. The module's prose says `Gosh.ai` with a
+        // capital G, so the lowercase form has no false positives here.
+        let host = format!("gosh{}ai", '.');
+
+        for line in source.lines() {
+            let statement = line.trim_start();
+            if statement.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !statement.contains(&host),
+                "a Gosh.ai link is back in this module as code, and the manifest is where it \
+                 belongs: {line}"
+            );
+        }
     }
 }

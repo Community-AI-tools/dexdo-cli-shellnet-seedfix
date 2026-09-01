@@ -1,5 +1,5 @@
 //! OpenAI-compatible consumer endpoint: the primary unified interface, as in
-//! OpenRouter. `POST /v1/chat/completions`(SSE when `stream:true`, otherwise a single JSON) and
+//! OpenRouter. `POST /v1/chat/completions` (SSE when `stream:true`, otherwise a single JSON) and
 //! `GET /v1/models`. The model is forced by the frame; the request's `model` field is not trusted.
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
@@ -20,7 +20,7 @@ use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `GET /v1/models`(B19): lists the model id of the buyer's configured frame/market.
+/// `GET /v1/models` (B19): lists the model id of the buyer's configured frame/market.
 pub async fn models(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "object": "list",
@@ -32,13 +32,13 @@ pub async fn models(State(state): State<ApiState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// `POST /v1/chat/completions`(B19). `stream:true` -> SSE deltas + `[DONE]`; otherwise a single
+/// `POST /v1/chat/completions` (B19). `stream:true` -> SSE deltas + `[DONE]`; otherwise a single
 /// aggregated `chat.completion` JSON.
 pub async fn chat_completions(
     State(state): State<ApiState>,
     Json(req): Json<OpenAiChatRequest>,
 ) -> Response {
-    // The model is forced by the market(B2/B19): a request outside the frame -- reject BEFORE opening the stream.
+    // The model is forced by the market (B2/B19): a request outside the frame -- reject BEFORE opening the stream.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
@@ -68,10 +68,11 @@ pub async fn chat_completions(
         }
         RouteBudget::Exhausted(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
     }
-    // one-per-deal content-identity gate(B8 + B7-full), run ONCE before the first paid stream. The inline
+    // one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream. The inline
     // StreamVerifier below only runs B5/B6 + the cheap declared-NAME B7; a seller declaring the correct model
     // NAME while serving a cheaper model is caught only here. On a bail the gate closes the deal and attempts
     // policy recovery; a transport error is not cached, so a later request retries.
+
     // this runs AFTER admission and inside the reservation it granted. Verification is paid
     // output on this deal - the seller serves it and claims it like any other - so a request with no
     // quota must not reach it, and the tokens it does consume come out of the same grant as the
@@ -104,7 +105,7 @@ pub async fn chat_completions(
     let reclaim_heartbeat = deal.accepted_output_guard();
     request_guard.arm_upstream_failure();
 
-    // Open an authorized TLS gRPC stream to the(mock) seller with the canonical request(R1).
+    // Open an authorized TLS gRPC stream to the (mock) seller with the canonical request (R1).
     let retry_limit = if deal.session.dead_gateway_action() == DeadGatewayAction::RetryThenReclaim {
         BUYER_UPSTREAM_OPEN_RETRIES
     } else {
@@ -178,8 +179,8 @@ pub async fn chat_completions(
     };
 
     // Session-scoped: the deal is NOT STOPped at this request's end -- it lives for the next
-    // request and is settled once at session end(graceful shutdown) or on a verification-bail. The handler
-    // settles the shared session ONLY on a bail(the seller cheated -> end the session, bail off B3/B10).
+    // request and is settled once at session end (graceful shutdown) or on a verification-bail. The handler
+    // settles the shared session ONLY on a bail (the seller cheated -> end the session, bail off B3/B10).
     let delivery_events = state.delivery_events.clone();
     if stream {
         sse_response(
@@ -209,7 +210,7 @@ pub async fn chat_completions(
     }
 }
 
-/// Re-render the canonical stream to OpenAI-SSE(B19, R6): `chat.completion.chunk` deltas ->
+/// Re-render the canonical stream to OpenAI-SSE (B19, R6): `chat.completion.chunk` deltas ->
 /// terminal chunk with `finish_reason` -> `data: [DONE]`. Accounting/verification happen before
 /// re-rendering.
 #[allow(clippy::too_many_arguments)]
@@ -236,7 +237,7 @@ fn sse_response(
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
-                // upstream transport error -- do NOT pass it off as a clean stop(see finish_reason below).
+                // upstream transport error -- do NOT pass it off as a clean stop (see finish_reason below).
                 CanonStreamNext::Errored(e) => {
                     stream_error = Some(e);
                     break;
@@ -296,6 +297,7 @@ fn sse_response(
         // the terminal chunk does NOT pass off a bail or an upstream error as a clean
         // `stop` -- bail -> `content_filter`, capacity refusal -> `capacity`, other transport error ->
         // `error`, otherwise an honest `stop`.
+
         // `length` used to require `received == 0`, so every truncation that had already
         // rendered a token fell through to `stop`. A stream cut at 1,972,000 of a 2,000,000 grant
         // was then byte-identical to a finished answer, and a consumer paying per token had no way
@@ -351,7 +353,7 @@ pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Ev
     }
 }
 
-/// Non-streaming(B19): collect the entire canonical stream into a single `chat.completion`.
+/// Non-streaming (B19): collect the entire canonical stream into a single `chat.completion`.
 #[allow(clippy::too_many_arguments)]
 async fn aggregate_response(
     upstream: tonic::Streaming<CanonChunk>,
@@ -406,7 +408,7 @@ async fn aggregate_response(
         }
     }
     // Session-scoped: a clean completion / max_tokens does NOT STOP -- the deal lives for the next
-    // request. ONLY a verification-bail ends the session early(STOP + bail off, B3/B10).
+    // request. ONLY a verification-bail ends the session early (STOP + bail off, B3/B10).
     let bailed = driver.bailed();
     let received = driver.received();
     drop(driver);

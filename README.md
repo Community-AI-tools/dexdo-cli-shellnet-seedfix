@@ -69,7 +69,7 @@ against `SHA256SUMS`, extract it, and move `dexdo` onto your PATH.
 ### Build from source
 
 ```sh
-cargo build --release -p dexdo --features shellnet
+cargo build --release -p dexdo
 ```
 
 The release binary is written to `target/release/dexdo`.
@@ -117,9 +117,43 @@ Run `dexdo <command> --help` for the flags of any command.
 
 ## Configuration
 
-`dexdo` reads its model configuration from `models.json` and the deployed
-contract pins from `contracts/deployed.shellnet.json` in the working directory.
-Both paths are overridable with per-command flags.
+`dexdo` reads its model configuration from `models.json` in the working
+directory, and the deployed contract pins from the manifest that
+`DEXDO_MANIFEST` names.
+
+The manifest names the network it pins, and the client takes the network from
+it, endpoint and all: which file you point at is which network you work on.
+There is no flag and no default -- with the variable unset, every on-chain
+command refuses instead of choosing a network for you.
+
+```sh
+export DEXDO_MANIFEST=~/dexdo/mainnet.manifest.json
+```
+
+### Output detail
+
+Without `RUST_LOG` the client prints four kinds of line and nothing else: what it
+is doing now, what it has finished, the result, and refusals. Records at `info`
+are off for **every** command, `dexdo seller` included.
+
+This matters most for the seller. Its readiness components are `info` records:
+
+```text
+component="gateway_task" status="pass"
+component="advertised_gateway" status="pass"
+component="upstream_authentication_and_model" status="pass"
+```
+
+A healthy seller prints none of them, so their absence is not a fault. Set
+`RUST_LOG=info` to get them back.
+
+Reading a seller with a program: do not depend on those records even with
+`RUST_LOG`. Use the printed readiness line, which needs no `RUST_LOG` and carries
+the whole verdict:
+
+```text
+seller_ready token_contract=<addr> gateway=<host:port> gateway_listen=<addr> order_id=<n> readiness=exact_tc_offer_accepted
+```
 
 ## License
 

@@ -82,9 +82,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools clang cmake nasm perl binutils
 
-      # The production binary is built WITHOUT the test faucet: `shellnet` only.
+      # One build: this tree has no cargo features, and the test faucet that used to be one of
+      # them is not in the binary at all.
       - name: Build
-        run: cargo build --release --locked -p dexdo --features shellnet --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dexdo --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ contains(matrix.target, 'unknown-linux-musl') && '-C target-feature=+crt-static' || '' }}
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -153,8 +154,8 @@ jobs:
           NAME="dexdo-${VER}-${ARCH}-${OS}"
           mkdir -p "stage/${NAME}"
           cp "target/${{ matrix.target }}/release/dexdo" "stage/${NAME}/"
-          mkdir -p "stage/${NAME}/contracts"
-          cp contracts/deployed.shellnet.json "stage/${NAME}/contracts/"
+          mkdir -p "stage/${NAME}/manifest"
+          cp manifest/mainnet.manifest.json "stage/${NAME}/manifest/"
           cp models.json README.md LICENSE "stage/${NAME}/"
           tar -C stage -czf "${NAME}.tar.gz" "${NAME}"
           hash="$(shasum -a 256 "${NAME}.tar.gz" | awk '{print $1}')"
@@ -166,9 +167,9 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           NAME="dexdo-${VER}-x86_64-windows"
-          mkdir -p "stage/${NAME}/contracts"
+          mkdir -p "stage/${NAME}/manifest"
           cp "target/${{ matrix.target }}/release/dexdo.exe" "stage/${NAME}/"
-          cp contracts/deployed.shellnet.json "stage/${NAME}/contracts/"
+          cp manifest/mainnet.manifest.json "stage/${NAME}/manifest/"
           cp models.json README.md LICENSE "stage/${NAME}/"
           (cd stage && 7z a -tzip "../${NAME}.zip" "${NAME}" >/dev/null)
           hash="$(certutil -hashfile "${NAME}.zip" SHA256 | sed -n 2p | tr -d '[:space:]')"

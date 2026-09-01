@@ -106,6 +106,7 @@ impl CanonStreamDriver {
     }
 
     /// Whether this chunk fits inside what is left of the grant, asked BEFORE it is rendered.
+
     /// The grant is the request's reservation against the authoritative weekly ceiling, so it is a
     /// hard cap on what may be shown, not a stopping condition to notice afterwards. A chunk carries
     /// as many tokens as the seller chose to put in it: accounting first and rendering second would

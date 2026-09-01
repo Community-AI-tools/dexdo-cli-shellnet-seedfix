@@ -1,7 +1,8 @@
 /// The canonical funding-wallet identity, as `getVersion()` reports it.
+
 /// These two live beside the code-hash allowlist rather than in `canonical_multisig`, which is
-/// `shellnet`-gated because it embeds the ABI and the TVC: the identity a client REFUSES on is plain
-/// text, so a wallet check that only compiles in the shellnet build is a check the default-features
+/// the chain build-gated because it embeds the ABI and the TVC: the identity a client REFUSES on is plain
+/// text, so a wallet check that only compiles in a chain build is a check the default-features
 /// test run cannot exercise. `canonical_multisig` re-exports both under either feature, so
 /// `canonical_multisig::VERSION` keeps naming exactly one value.
 pub const CONTRACT_NAME: &str = "UpdateCustodianMultisigWallet_v2";

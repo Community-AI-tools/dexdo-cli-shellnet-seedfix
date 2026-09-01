@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.23"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -16,7 +16,7 @@ license = "MIT"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 tonic = { version = "0.12", features = ["tls"] }
 # self-signed TLS certificate of the gateway + fingerprint in the handover, pinned by the buyer.
-# We reuse the rustls stack that tonic already pulls in(tokio-rustls/hyper-util), without a new TLS stack.
+# We reuse the rustls stack that tonic already pulls in (tokio-rustls/hyper-util), without a new TLS stack.
 rcgen = "0.14"
 sha2 = "0.10"
 tokio-rustls = "0.26"
@@ -57,17 +57,17 @@ async-stream = "0.3"
 # In-process HTTP client for the e2e consumer interface -- the same hyper-1 stack as tonic/axum.
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
-# real OpenAI-compatible upstream(Groq), streaming SSE. rustls (not native
-# OpenSSL), without a blocking stack; SSE parsing -- manually on top of bytes_stream(without a second HTTP stack).
+# real OpenAI-compatible upstream (Groq), streaming SSE. rustls (not native
+# OpenSSL), without a blocking stack; SSE parsing -- manually on top of bytes_stream (without a second HTTP stack).
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 httpdate = "1"
-# D6: platform config/data directories(Linux XDG / macOS App Support / Windows APPDATA)
+# D6: platform config/data directories (Linux XDG / macOS App Support / Windows APPDATA)
 # for the default endpoints-file path -- without hardcoding cwd and without assuming a separator.
 directories = "5"
 # regression tests compare the in-process derivation against the pinned TVM SDK default directly.
 tvm_client = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.3-rc.an" }
 
-# D6: the Windows blocker(tvm-sdk carried test files with ':' in the path, NTFS-invalid) is fixed upstream.
+# D6: the Windows blocker (tvm-sdk carried test files with ':' in the path, NTFS-invalid) is fixed upstream.
 # Pin the entire tvmlabs source at v3.0.4-rc.an so direct dependencies and gosh-ackinacki's transitive
 # v3.0.3-rc.an dependencies resolve to one revision with ExtOutMsgInfoV2 action support.
 [patch."https://github.com/tvmlabs/tvm-sdk.git"]

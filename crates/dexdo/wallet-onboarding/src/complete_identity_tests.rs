@@ -1,9 +1,11 @@
 //! Completing an onboarding must not drop the identity it proved.
-//! The recorded answer on(2026-08-12) separates the two Bee addresses: `hello.profile_address`
+
+//! The recorded answer on (2026-08-12) separates the two Bee addresses: `hello.profile_address`
 //! is the Connect `AuthProfile` address and "we save it separately in the completed onboarding
 //! state". Completion used to discard it -- `ResponseReceived` carried it, `Complete` did not -- so
 //! a session that finished no longer knew which profile it had been onboarded through, and the
 //! value cannot be recovered afterwards: the invitation is spent and cannot be scanned twice.
+
 //! Driven through the real durable file format rather than a constructed phase, because that is
 //! what is actually at risk: the CLI writes the session after `mark_complete` and reads it back on
 //! the next run. Every value here is synthetic -- a live session's signing and DH secrets must
@@ -32,7 +34,7 @@ fn wallet() -> String {
 fn response() -> AgentWalletsResponse {
     AgentWalletsResponse {
         version: AGENT_WALLETS_BODY_VERSION,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         vault: parse_scoped_address(&format!("{0}::{0}", filler('c'))).unwrap(),
         hot: parse_scoped_address(&format!("{0}::{0}", filler('d'))).unwrap(),
     }
@@ -72,8 +74,8 @@ fn state_with_phase(phase: serde_json::Value) -> String {
     serde_json::json!({
         "file_version": SESSION_FILE_VERSION,
         "agent_name": "fixture-agent",
-        "network": "shellnet",
-        "endpoint": "https://dd-shellnet.ackinacki.org",
+        "network": "net-a",
+        "endpoint": "https://net-a.example",
         "hot_pubkey": filler('a'),
         "phase": phase,
     })

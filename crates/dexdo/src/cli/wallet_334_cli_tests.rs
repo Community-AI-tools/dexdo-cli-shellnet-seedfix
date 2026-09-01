@@ -1,4 +1,5 @@
 //! stage one: the `dexdo wallet` parse surface.
+
 //! The provider is a subcommand of the two setup commands and appears nowhere else. These tests pin
 //! that shape, because a provider flag on a working command is exactly the thing the spec forbids:
 //! it would let a spend name a provider that the recorded binding contradicts.
@@ -11,7 +12,10 @@ fn provider_of(cli: Cli) -> Option<&'static str> {
     };
     let bind = match wallet.command {
         WalletCommand::Onboard(bind) | WalletCommand::Rebind(bind) => bind,
-        WalletCommand::RemoveArchived(_) => return None,
+        // Neither takes a provider: `remove-archived` names an existing binding by id, and
+        // `show` reads whatever is recorded. This helper answers "which provider did the parse
+        // select", so both are None rather than a panic.
+        WalletCommand::RemoveArchived(_) | WalletCommand::Show(_) => return None,
     };
     bind.provider.as_ref().map(|provider| match provider {
         WalletProviderCommand::AckinackiWallet(_) => "ackinacki-wallet",
@@ -21,6 +25,7 @@ fn provider_of(cli: Cli) -> Option<&'static str> {
 }
 
 /// The argument shape each provider actually has.
+
 /// `ackinacki-wallet` carries the onboarding arguments, and none of `--agent-name`, `--state` or
 /// `--hot-key` has a default, so its row supplies them. The other two take no payload yet and their
 /// rows stay bare. The table still sweeps all three: what changed is that each provider is pinned
@@ -138,7 +143,7 @@ fn working_commands_never_take_a_provider() {
             "gosh-ai",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
             "--nominal",
             "N100",
@@ -153,11 +158,11 @@ fn working_commands_never_take_a_provider() {
             "gosh-ai",
             "--note-addr",
             "0:note",
-            "--to-raw",
+            "--to",
             "1",
             "--multisig-address",
             "0:wallet",
-            "--multisig-key",
+            "--multisig-private-key",
             "w.keys.json",
         ],
     ] {
@@ -178,7 +183,7 @@ fn the_passed_in_wallet_flags_still_work_unchanged() {
         "deploy",
         "--multisig-address",
         "0:wallet",
-        "--multisig-key",
+        "--multisig-private-key",
         "w.keys.json",
         "--nominal",
         "N100",
@@ -192,7 +197,7 @@ fn the_passed_in_wallet_flags_still_work_unchanged() {
         "topup",
         "--note-addr",
         "0:note",
-        "--to-raw",
+        "--to",
         "1",
         "--multisig-address",
         "0:wallet",
@@ -229,7 +234,6 @@ fn gosh_ai_takes_activation_timeout_and_only_gosh_ai_does() {
         goshai.activation_timeout,
         Some(std::time::Duration::from_secs(20 * 60))
     );
-    assert_eq!(goshai.network, crate::cli::args::WalletNetworkArg::Shellnet);
 
     // Absent means the specification's default, decided at the call site rather than by clap, so
     // there is one figure and not two.
@@ -283,6 +287,7 @@ fn activation_timeout_accepts_the_documented_forms_and_refuses_the_rest() {
 }
 
 /// `wallet onboard ackinacki-wallet` must keep reaching PR715's onboarding.
+
 /// It used to reach it through a dedicated arm in `main.rs`, one line above a general arm that
 /// matched everything it did -- so deleting that arm compiled cleanly and silently re-routed the
 /// provider. That arm is now GONE, deliberately: it bypassed `run_selected`, which is the only
@@ -324,6 +329,7 @@ fn wallet_onboard_ackinacki_wallet_routes_to_the_onboarding_entry_point() {
 }
 
 /// The payload the route carries is the real onboarding request, not an empty marker.
+
 /// `ackinacki_flow` destructures `WalletProviderCommand::AckinackiWallet(args)` out of `explicit`
 /// and rebuilds `WalletOnboardArgs` from it, so what this proves is that the three required flags
 /// survive parsing into the value that reconstruction reads.
@@ -347,6 +353,7 @@ fn the_ackinacki_wallet_payload_reaches_the_dispatch_arm_intact() {
         command:
             WalletCommand::Onboard(WalletBindArgs {
                 provider: Some(WalletProviderCommand::AckinackiWallet(onboard)),
+                ..
             }),
     }) = cli.command
     else {
@@ -358,6 +365,7 @@ fn the_ackinacki_wallet_payload_reaches_the_dispatch_arm_intact() {
 }
 
 /// What actually ships, as a single readable statement.
+
 /// `onboard` works for two providers and `rebind` for none. This is here because the claim is easy
 /// to get wrong in both directions -- the routing is split across two dispatchers -- and a wrong
 /// claim about which money paths work is worse than a missing one.

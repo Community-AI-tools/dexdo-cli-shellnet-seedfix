@@ -1,16 +1,21 @@
 //! audit item 3: a wallet bound on one network never funds a spend on another.
+
 //! The shipped code kept ONE `wallet/binding.json` and `resolve_funding_wallet` was never told
-//! which chain the command was running on. A Hot bound on shellnet was therefore the wallet a
-//! mainnet `note deploy` or `note topup` resolved and spent from -- real money, out of a wallet the
+//! which chain the command was running on. A Hot bound on the chain was therefore the wallet a
+//! net_b `note deploy` or `note topup` resolved and spent from -- real money, out of a wallet the
 //! operator bound for a test chain, with nothing anywhere that could notice.
+
 //! Two independent guarantees are asserted here, because each covers what the other cannot.
-//! The PATH is keyed by network, so a mainnet command does not name the shellnet record at all.
+
+//! The PATH is keyed by network, so a net_b command does not name the net_a record at all.
 //! That is what stops the ordinary case, where nothing is corrupt and the operator simply has one
 //! binding and two chains.
+
 //! And the RECORD is checked against the network that was asked for, so a file that arrived in the
 //! wrong slot -- copied, restored from a backup, hand-edited -- is refused rather than spent. That is
 //! what stops the case the path alone cannot see.
-//! Every case drives the real writer(`commit_active`) and the real reader
+
+//! Every case drives the real writer (`commit_active`) and the real reader
 //! (`resolve_funding_wallet`), never a hand-placed end state, so what is proved is what a command
 //! actually does.
 
@@ -20,13 +25,13 @@ use super::{
 };
 use std::path::{Path, PathBuf};
 
-const SHELLNET_HOT: &str = "4::5he11";
-const MAINNET_HOT: &str = "0::4a12e7";
-const SHELLNET_KEY: &str = "/secrets/shellnet-hot.key";
-const MAINNET_KEY: &str = "/secrets/mainnet-hot.key";
+const NET_A_HOT: &str = "4::5he11";
+const NET_B_HOT: &str = "0::4a12e7";
+const NET_A_KEY: &str = "/secrets/net_a-hot.key";
+const NET_B_KEY: &str = "/secrets/net_b-hot.key";
 
-const SHELLNET_ID: &str = "0123456789abcdef0123456789abcdef";
-const MAINNET_ID: &str = "fedcba9876543210fedcba9876543210";
+const NET_A_ID: &str = "0123456789abcdef0123456789abcdef";
+const NET_B_ID: &str = "fedcba9876543210fedcba9876543210";
 
 fn binding(id: &str, network: WalletNetwork, hot: &str, key: &str) -> WalletBinding {
     WalletBinding {
@@ -43,17 +48,17 @@ fn binding(id: &str, network: WalletNetwork, hot: &str, key: &str) -> WalletBind
     }
 }
 
-fn shellnet_binding() -> WalletBinding {
+fn chain_binding() -> WalletBinding {
     binding(
-        SHELLNET_ID,
-        WalletNetwork::Shellnet,
-        SHELLNET_HOT,
-        SHELLNET_KEY,
+        NET_A_ID,
+        crate::cli::wallet::test_network_a(),
+        NET_A_HOT,
+        NET_A_KEY,
     )
 }
 
-fn mainnet_binding() -> WalletBinding {
-    binding(MAINNET_ID, WalletNetwork::Mainnet, MAINNET_HOT, MAINNET_KEY)
+fn net_b_binding() -> WalletBinding {
+    binding(NET_B_ID, crate::cli::wallet::test_network_b(), NET_B_HOT, NET_B_KEY)
 }
 
 /// The secrets directory the id names. `open_draft` creates one before any key exists and the
@@ -96,48 +101,49 @@ fn is_wallet_not_configured(error: &anyhow::Error) -> bool {
     })
 }
 
-/// THE defect. A shellnet binding is the only one on this machine, and a command running on mainnet
-/// asks for a wallet. It must not get the shellnet one.
+/// THE defect. A net_a binding is the only one on this machine, and a command running on net_b
+/// asks for a wallet. It must not get the net_a one.
+
 /// The assertion is on the resolved VALUE and not only on the error: what made this a money-safety
-/// blocker is that the shellnet Hot address and its key file were handed to a mainnet spend, so the
-/// test refuses to pass if either ever appears in a mainnet answer.
+/// blocker is that the net_a Hot address and its key file were handed to a net_b spend, so the
+/// test refuses to pass if either ever appears in a net_b answer.
 #[test]
-fn a_mainnet_command_refuses_the_shellnet_binding_instead_of_spending_it() {
+fn a_net_b_command_refuses_the_chain_binding_instead_of_spending_it() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding()]);
+    let store = store_with(&root, &[chain_binding()]);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Mainnet, None, &None, &None)
-        .expect_err("a wallet bound on shellnet must never fund a mainnet spend");
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
+        .expect_err("a wallet bound on the chain must never fund a net_b spend");
 
     let rendered = format!("{error:#}");
     assert!(
-        !rendered.contains(SHELLNET_HOT),
-        "the shellnet Hot must not be offered to a mainnet command: {rendered}"
+        !rendered.contains(NET_A_HOT),
+        "the net_a Hot must not be offered to a net_b command: {rendered}"
     );
     assert!(
-        !rendered.contains(SHELLNET_KEY),
-        "the shellnet signing key must not be offered to a mainnet command: {rendered}"
+        !rendered.contains(NET_A_KEY),
+        "the net_a signing key must not be offered to a net_b command: {rendered}"
     );
     assert!(
-        rendered.contains("mainnet"),
+        rendered.contains("net-b"),
         "the refusal must name the network the command is running on: {rendered}"
     );
 }
 
-/// The mirror image, so the refusal above is not simply "mainnet never resolves".
+/// The mirror image, so the refusal above is not simply "net_b never resolves".
 #[test]
-fn a_shellnet_command_refuses_the_mainnet_binding_instead_of_spending_it() {
+fn a_net_a_command_refuses_the_net_b_binding_instead_of_spending_it() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[mainnet_binding()]);
+    let store = store_with(&root, &[net_b_binding()]);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
-        .expect_err("a wallet bound on mainnet must never fund a shellnet spend");
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+        .expect_err("a wallet bound on net_b must never fund a net_a spend");
     let rendered = format!("{error:#}");
     assert!(
-        !rendered.contains(MAINNET_HOT),
-        "the mainnet Hot must not be offered to a shellnet command: {rendered}"
+        !rendered.contains(NET_B_HOT),
+        "the net_b Hot must not be offered to a net_a command: {rendered}"
     );
 }
 
@@ -147,12 +153,12 @@ fn a_shellnet_command_refuses_the_mainnet_binding_instead_of_spending_it() {
 fn a_matching_network_resolves_the_binding_it_is_bound_to() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding()]);
+    let store = store_with(&root, &[chain_binding()]);
 
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
-        .expect("a shellnet command resolves the shellnet binding");
-    assert_eq!(resolved.address, SHELLNET_HOT);
-    assert_eq!(resolved.key, Some(PathBuf::from(SHELLNET_KEY)));
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+        .expect("a net_a command resolves the net_a binding");
+    assert_eq!(resolved.address, NET_A_HOT);
+    assert_eq!(resolved.key, Some(PathBuf::from(NET_A_KEY)));
 }
 
 /// Both networks bound at once, which is the state the per-network layout exists to allow. Each
@@ -161,22 +167,22 @@ fn a_matching_network_resolves_the_binding_it_is_bound_to() {
 fn two_networks_are_bound_side_by_side_and_each_resolves_its_own_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding(), mainnet_binding()]);
+    let store = store_with(&root, &[chain_binding(), net_b_binding()]);
 
-    let shellnet = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
-        .expect("the shellnet binding survived the mainnet commit");
-    let mainnet = resolve_funding_wallet(&store, WalletNetwork::Mainnet, None, &None, &None)
-        .expect("the mainnet binding resolves on mainnet");
+    let net_a = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+        .expect("the net_a binding survived the net_b commit");
+    let net_b = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
+        .expect("the net_b binding resolves on net_b");
 
-    assert_eq!(shellnet.address, SHELLNET_HOT);
-    assert_eq!(mainnet.address, MAINNET_HOT);
+    assert_eq!(net_a.address, NET_A_HOT);
+    assert_eq!(net_b.address, NET_B_HOT);
     assert_ne!(
-        shellnet.address, mainnet.address,
+        net_a.address, net_b.address,
         "each network must resolve its own Hot, never one shared record"
     );
     assert_eq!(
-        store.binding_path(WalletNetwork::Shellnet).exists(),
-        store.binding_path(WalletNetwork::Mainnet).exists(),
+        store.binding_path(&crate::cli::wallet::test_network_a()).exists(),
+        store.binding_path(&crate::cli::wallet::test_network_b()).exists(),
         "both active files must exist: binding one network must not replace the other"
     );
 }
@@ -189,7 +195,7 @@ fn a_network_with_no_binding_of_its_own_is_the_ordinary_fail_fast() {
     let root = dir.path().join("wallet");
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Mainnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
         .expect_err("no binding at all is still no binding");
     assert!(
         is_wallet_not_configured(&error),
@@ -200,31 +206,32 @@ fn a_network_with_no_binding_of_its_own_is_the_ordinary_fail_fast() {
 /// The record found under one network SAYS another. Only a copy, a restore or a hand edit produces
 /// this, and it is exactly the state the network-keyed path cannot see by itself: the file is in
 /// the right place and lies about itself.
+
 /// It is refused rather than obeyed. Following the record's own field would mean the command spends
 /// on the chain the FILE chose instead of the chain the operator pointed it at.
 #[test]
 fn a_record_sitting_in_the_wrong_networks_slot_is_refused_and_not_obeyed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding()]);
+    let store = store_with(&root, &[chain_binding()]);
 
-    // Copy the shellnet record verbatim into the mainnet slot, the way restoring a backup or
+    // Copy the net_a record verbatim into the net_b slot, the way restoring a backup or
     // copying a data directory between machines would.
     std::fs::copy(
-        store.binding_path(WalletNetwork::Shellnet),
-        store.binding_path(WalletNetwork::Mainnet),
+        store.binding_path(&crate::cli::wallet::test_network_a()),
+        store.binding_path(&crate::cli::wallet::test_network_b()),
     )
     .expect("copy the record into the other network's slot");
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Mainnet, None, &None, &None)
-        .expect_err("a record that says shellnet must not fund a mainnet spend from a mainnet slot");
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
+        .expect_err("a record that says net_a must not fund a net_b spend from a net_b slot");
     let rendered = format!("{error:#}");
     assert!(
-        !rendered.contains(SHELLNET_HOT),
-        "the Hot in a mismatched record must not reach a mainnet spend: {rendered}"
+        !rendered.contains(NET_A_HOT),
+        "the Hot in a mismatched record must not reach a net_b spend: {rendered}"
     );
     assert!(
-        rendered.contains("shellnet") && rendered.contains("mainnet"),
+        rendered.contains("net-a") && rendered.contains("net-b"),
         "the refusal must name both the binding's network and the command's: {rendered}"
     );
 }
@@ -235,12 +242,12 @@ fn a_record_sitting_in_the_wrong_networks_slot_is_refused_and_not_obeyed() {
 fn an_explicit_wallet_still_wins_and_is_unaffected_by_the_network() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding()]);
+    let store = store_with(&root, &[chain_binding()]);
 
-    for network in [WalletNetwork::Shellnet, WalletNetwork::Mainnet] {
+    for network in [crate::cli::wallet::test_network_a(), crate::cli::wallet::test_network_b()] {
         let resolved = resolve_funding_wallet(
             &store,
-            network,
+            &network,
             Some("0:explicit"),
             &Some(PathBuf::from("explicit.key")),
             &None,
@@ -261,7 +268,7 @@ fn the_active_directory_and_the_wallet_root_are_owner_only() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    store_with(&root, &[shellnet_binding()]);
+    store_with(&root, &[chain_binding()]);
 
     for path in [root.clone(), root.join("active")] {
         let mode = std::fs::metadata(&path)
@@ -276,29 +283,30 @@ fn the_active_directory_and_the_wallet_root_are_owner_only() {
 // --- the legacy `wallet/binding.json` an operator already has -------------------------------
 
 /// MIGRATION, and the one rule it follows: the destination comes from the record's OWN `network`.
-/// The legacy file is a shellnet binding and the command asking is a MAINNET one. The record must
-/// land in the shellnet slot, and the mainnet command must still be refused. Migrating it into
+
+/// The legacy file is a net_a binding and the command asking is a MAINNET one. The record must
+/// land in the net_a slot, and the net_b command must still be refused. Migrating it into
 /// whichever network happened to ask would be the original defect with a longer path.
 #[test]
 fn a_legacy_binding_migrates_by_its_own_network_and_not_by_the_asking_one() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let legacy_path = write_legacy(&root, &shellnet_binding());
+    let legacy_path = write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Mainnet, None, &None, &None)
-        .expect_err("a legacy shellnet binding must not answer a mainnet command");
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
+        .expect_err("a legacy net_a binding must not answer a net_b command");
     assert!(
-        !format!("{error:#}").contains(SHELLNET_HOT),
-        "the legacy shellnet Hot must not reach a mainnet spend: {error:#}"
+        !format!("{error:#}").contains(NET_A_HOT),
+        "the legacy net_a Hot must not reach a net_b spend: {error:#}"
     );
 
     assert!(
-        store.binding_path(WalletNetwork::Shellnet).exists(),
+        store.binding_path(&crate::cli::wallet::test_network_a()).exists(),
         "the legacy record must be migrated into the slot its own network names"
     );
     assert!(
-        !store.binding_path(WalletNetwork::Mainnet).exists(),
+        !store.binding_path(&crate::cli::wallet::test_network_b()).exists(),
         "it must NOT be migrated into the slot of the network that happened to ask"
     );
     assert!(
@@ -307,10 +315,10 @@ fn a_legacy_binding_migrates_by_its_own_network_and_not_by_the_asking_one() {
     );
 
     // And it is still the operator's wallet on the network it was bound for.
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
-        .expect("the migrated binding still funds shellnet");
-    assert_eq!(resolved.address, SHELLNET_HOT);
-    assert_eq!(resolved.key, Some(PathBuf::from(SHELLNET_KEY)));
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
+        .expect("the migrated binding still funds net_a");
+    assert_eq!(resolved.address, NET_A_HOT);
+    assert_eq!(resolved.key, Some(PathBuf::from(NET_A_KEY)));
 }
 
 /// The ordinary upgrade: the operator's legacy binding is for the network they use, and the first
@@ -319,14 +327,14 @@ fn a_legacy_binding_migrates_by_its_own_network_and_not_by_the_asking_one() {
 fn a_legacy_binding_keeps_working_on_the_network_it_was_bound_for() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let legacy_path = write_legacy(&root, &shellnet_binding());
+    let legacy_path = write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("an existing operator is not locked out by the upgrade");
-    assert_eq!(resolved.address, SHELLNET_HOT);
+    assert_eq!(resolved.address, NET_A_HOT);
     assert!(!legacy_path.exists());
-    assert!(store.binding_path(WalletNetwork::Shellnet).exists());
+    assert!(store.binding_path(&crate::cli::wallet::test_network_a()).exists());
 }
 
 /// Migration runs once and is safe to repeat: the second read finds no legacy file and the same
@@ -335,12 +343,12 @@ fn a_legacy_binding_keeps_working_on_the_network_it_was_bound_for() {
 fn migrating_twice_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    write_legacy(&root, &shellnet_binding());
+    write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let first = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let first = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("first read migrates");
-    let second = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let second = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("second read finds the migrated record");
     assert_eq!(first, second);
 }
@@ -351,13 +359,13 @@ fn migrating_twice_changes_nothing() {
 fn an_interrupted_migration_is_completed_rather_than_reported() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let record = shellnet_binding();
+    let record = chain_binding();
     let store = store_with(&root, &[record.clone()]);
     let legacy_path = write_legacy(&root, &record);
 
-    let resolved = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("identical records are not a conflict");
-    assert_eq!(resolved.address, SHELLNET_HOT);
+    assert_eq!(resolved.address, NET_A_HOT);
     assert!(!legacy_path.exists(), "the duplicate must be cleared");
 }
 
@@ -368,20 +376,20 @@ fn an_interrupted_migration_is_completed_rather_than_reported() {
 fn a_legacy_binding_that_disagrees_with_a_migrated_one_refuses_rather_than_picking() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
-    let store = store_with(&root, &[shellnet_binding()]);
+    let store = store_with(&root, &[chain_binding()]);
     let other = binding(
-        MAINNET_ID,
-        WalletNetwork::Shellnet,
+        NET_B_ID,
+        crate::cli::wallet::test_network_a(),
         "4::a-different-hot",
         "/secrets/other.key",
     );
     let legacy_path = write_legacy(&root, &other);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("two different records for one network must not be silently ranked");
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains("4::a-different-hot") && rendered.contains(SHELLNET_HOT),
+        rendered.contains("4::a-different-hot") && rendered.contains(NET_A_HOT),
         "the operator must be told about both wallets: {rendered}"
     );
     assert!(
@@ -400,7 +408,7 @@ fn an_unparseable_legacy_binding_is_refused_rather_than_treated_as_absent() {
     std::fs::write(root.join("binding.json"), b"{ this is not json").unwrap();
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect_err("a legacy record that cannot be read must not be treated as absent");
     assert!(
         !is_wallet_not_configured(&error),
@@ -420,52 +428,76 @@ fn an_unparseable_legacy_binding_is_refused_rather_than_treated_as_absent() {
 #[test]
 fn the_manifest_network_label_maps_to_the_binding_network() {
     assert_eq!(
-        WalletNetwork::from_manifest_label("shellnet").expect("shellnet is known"),
-        WalletNetwork::Shellnet
+        WalletNetwork::from_manifest_label("net-a").expect("net-a is known"),
+        crate::cli::wallet::test_network_a()
     );
     assert_eq!(
-        WalletNetwork::from_manifest_label("mainnet").expect("mainnet is known"),
-        WalletNetwork::Mainnet
+        WalletNetwork::from_manifest_label("net-b").expect("net-b is known"),
+        crate::cli::wallet::test_network_b()
     );
 }
 
-/// An unrecognised manifest label REFUSES. Defaulting to shellnet would mean a manifest this build
-/// does not understand quietly resolving the shellnet wallet, which is the cross-network spend
-/// being prevented.
+/// A label this build has never seen resolves NOTHING, rather than falling through to a wallet
+/// bound for some other network.
+
+/// This test used to assert the opposite: that an unfamiliar label was refused BY NAME, because the
+/// build carried a list of the labels it accepted. The list is gone -- it made a manifest
+/// for a chain deployed after this binary was built unusable for no reason except its own newness.
+
+/// What the test was actually protecting is untouched, and is asserted here directly: the danger
+/// was never the unfamiliar name, it was one network's Hot answering another network's command.
+/// The binding is keyed by label, so an unknown label simply keys nothing.
 #[test]
-fn an_unknown_manifest_network_refuses_rather_than_defaulting() {
-    let error = WalletNetwork::from_manifest_label("devnet")
-        .expect_err("an unknown network must not resolve a wallet");
+fn an_unfamiliar_network_resolves_no_wallet_instead_of_another_networks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wallet");
+    let store = store_with(&root, &[chain_binding(), net_b_binding()]);
+
+    let unfamiliar =
+        WalletNetwork::from_manifest_label("devnet").expect("any non-empty label is a label");
+    let error = resolve_funding_wallet(&store, &unfamiliar, None, &None, &None)
+        .expect_err("nothing is bound on devnet, so nothing resolves");
     let rendered = format!("{error:#}");
-    assert!(rendered.contains("devnet"), "{rendered}");
+
     assert!(
-        rendered.contains("shellnet") && rendered.contains("mainnet"),
-        "the refusal must name the networks this build does know: {rendered}"
+        !rendered.contains(NET_A_HOT) && !rendered.contains(NET_B_HOT),
+        "no other network's Hot may be offered to a devnet command: {rendered}"
+    );
+    assert!(
+        !rendered.contains(NET_A_KEY) && !rendered.contains(NET_B_KEY),
+        "no other network's signing key may be offered to a devnet command: {rendered}"
     );
 }
 
-/// The two deployed manifests in this repository are what production actually reads, so the labels
-/// they carry must be the ones the mapping accepts. A rename on either side would otherwise turn
-/// every money command into the refusal above.
-/// `Deployed` is re-exported from `dexdo_core` only under `shellnet`, and the manifest is only ever
-/// read by the two shellnet-gated money commands, so this pin is gated the same way. The rest of
-/// this module deliberately is not: it must run in CI's default-feature build too.
-#[cfg(feature = "shellnet")]
+/// Every committed manifest carries a label the wallet layer can key a binding by, and two
+/// manifests never key the same one.
+
+/// The previous form asserted that the repository's manifests carried labels from a list this build
+/// accepted. With the list gone the interesting property is the one that keeps money apart: two
+/// different manifests must not resolve to one binding, or a command on either chain could spend
+/// the other's wallet.
 #[test]
-fn the_repository_manifests_carry_labels_this_build_accepts() {
-    for (path, expected) in [
-        ("contracts/deployed.shellnet.json", WalletNetwork::Shellnet),
-        ("contracts/deployed.mainnet.json", WalletNetwork::Mainnet),
-    ] {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(path);
-        let deployed = dexdo_core::Deployed::load(&manifest)
-            .unwrap_or_else(|error| panic!("load {}: {error}", manifest.display()));
-        assert_eq!(
-            WalletNetwork::from_manifest_label(&deployed.network)
-                .unwrap_or_else(|error| panic!("{path} declares a network this build refuses: {error}")),
-            expected,
-        );
+fn every_committed_manifest_keys_a_binding_of_its_own() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifest");
+    let mut seen = std::collections::BTreeMap::new();
+
+    for entry in std::fs::read_dir(&dir).expect("read the committed manifest directory") {
+        let path = entry.expect("read a manifest directory entry").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".manifest.json") {
+            continue;
+        }
+        let deployed = dexdo_core::Deployed::load(&path)
+            .unwrap_or_else(|error| panic!("load {name}: {error}"));
+        let network = WalletNetwork::from_manifest_label(&deployed.network)
+            .unwrap_or_else(|error| panic!("{name} declares a label the wallet layer refuses: {error}"));
+
+        if let Some(other) = seen.insert(network.as_str().to_string(), name.to_string()) {
+            panic!("{name} and {other} both key the binding `{}`", network.as_str());
+        }
     }
+
+    assert!(!seen.is_empty(), "no committed manifest was found in {}", dir.display());
 }

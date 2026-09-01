@@ -1,8 +1,10 @@
 //! item 2: how a funding request leaves the Vault's queue, and what may follow each way.
+
 //! A request vanishing from the queue means either that it EXECUTED or that it EXPIRED, and the two
 //! are opposite in money terms: after the first, another submit transfers a second time out of a
 //! cold Vault; after the second, another submit is the only way the Hot is ever funded. The rule the
 //! specification fixes is that queue disappearance ALONE must never authorize another submit.
+
 //! Every test here drives the real entry point [`ensure_hot_funded_with_turn`] through the real
 //! production provider [`AckinackiVaultProvider`], composed exactly as a money command composes it -
 //! the journal is read first and what it recorded is handed to the provider, then the mechanism runs.
@@ -40,7 +42,7 @@ fn creator() -> String {
 fn binding() -> HotFundingBinding {
     HotFundingBinding {
         provider: WalletProvider::AckinackiWallet,
-        network: "shellnet".to_string(),
+        network: "net-a".to_string(),
         hot_address: hot_address(),
         vault_address: Some(vault_address()),
     }
@@ -260,7 +262,7 @@ impl HotBalanceReader for FakeHot {
 }
 
 fn record_of(dir: &Path) -> Option<FundingJournalRecord> {
-    load_funding_journal(dir, "shellnet", &hot_address()).expect("read journal")
+    load_funding_journal(dir, "net-a", &hot_address()).expect("read journal")
 }
 
 /// One run of a money command's funding step, composed exactly as production composes it: read the
@@ -526,6 +528,7 @@ async fn an_unobserved_submit_is_recovered_from_the_wallets_own_submitted_event(
 }
 
 /// The verdict a LOCAL clock is never allowed to reach.
+
 /// The submit's result was never observed, so no queue id was recorded, and the wallet's finalized
 /// history carries no `TransactionSubmitted` for it either. There is therefore no chain time to date
 /// an expiry deadline from. Dating it from the journal's own creation time instead would let a
@@ -581,6 +584,7 @@ async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_ret
 }
 
 /// The refusal has to be actionable, and it has to keep reporting apart from deciding.
+
 /// An operator told only that something "could not be established" has nothing to do. They are told
 /// which transfer to look for, so they can settle it by looking at the Vault's pending list - the
 /// one observation that actually resolves this. The local deadline is reported alongside, because it
@@ -781,13 +785,13 @@ async fn a_moved_shortfall_does_not_move_the_frozen_fingerprint() {
 fn a_record_from_before_the_fingerprint_is_refused_rather_than_migrated() {
     let dir = temp();
     ensure_funding_requests_dir(dir.path()).expect("dir");
-    let path = funding_journal_path(dir.path(), "shellnet", &hot_address());
+    let path = funding_journal_path(dir.path(), "net-a", &hot_address());
     std::fs::write(
         &path,
-        br#"{"version":1,"provider":"ackinacki-wallet","network":"shellnet","hot_address":"x"}"#,
+        br#"{"version":1,"provider":"ackinacki-wallet","network":"net-a","hot_address":"x"}"#,
     )
     .expect("write");
-    let error = load_funding_journal(dir.path(), "shellnet", &hot_address())
+    let error = load_funding_journal(dir.path(), "net-a", &hot_address())
         .expect_err("a record this client cannot read must not be acted on");
     let message = error.to_string();
     assert!(message.contains("version 1"), "{message}");
@@ -804,7 +808,7 @@ async fn the_extended_record_carries_no_secret() {
 
     let raw = std::fs::read_to_string(funding_journal_path(
         dir.path(),
-        "shellnet",
+        "net-a",
         &hot_address(),
     ))
     .expect("read raw");

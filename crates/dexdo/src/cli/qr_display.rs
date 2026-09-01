@@ -1,21 +1,28 @@
 //! QR output that upgrades itself to a real image when the terminal can show one.
-//! The two invitation flows(`wallet onboard` and the Gosh.ai provider) print a QR the user must
+
+//! The two invitation flows (`wallet onboard` and the Gosh.ai provider) print a QR the user must
 //! scan with a phone camera. Unicode pseudo-graphics survive everywhere but scan poorly on small
 //! cells and dark themes; kitty-, iTerm2- and sixel-capable terminals can show a crisp bitmap.
-//! Detection is probe-first, environment-second(agreed design):
-//! 1. An active capability probe writes a kitty graphics query(`ESC _G... a=q... ESC \`)
-//! followed by DA1(`CSI c`) to the controlling terminal and reads the answer with a short
+
+//! Detection is probe-first, environment-second (agreed design):
+
+//! 1. An active capability probe writes a kitty graphics query (`ESC _G... a=q... ESC \`)
+//! followed by DA1 (`CSI c`) to the controlling terminal and reads the answer with a short
 //! timeout. Every terminal answers DA1, so it doubles as the stop marker; a kitty `OK` reply
 //! proves the kitty protocol, DA1 attribute `4` proves sixel.
 //! 2. Environment variables answer only when the probe could not (`KITTY_WINDOW_ID`,
 //! `TERM_PROGRAM`,...).
+
 //! Inside a multiplexer or an embedded terminal neither source is trusted -- see
 //! [`TerminalEnv::mux`] for the measurement behind that rule.
+
 //! Anything short of a confirmed protocol falls back to the unicode rendering this module
-//! replaced, and `DEXDO_QR`(`auto|text|kitty|iterm2|sixel`) forces either direction.
+//! replaced, and `DEXDO_QR` (`auto|text|kitty|iterm2|sixel`) forces either direction.
+
 //! The parsing, the protocol decision and the three encoders are pure and compile under every
-//! test build(the `wallet_manual` pattern); the probe compiles there too so every CI OS
-//! type-checks its platform half, and only the `qrcode` entry point sits behind `shellnet`.
+//! test build (the `wallet_manual` pattern); the probe compiles there too so every CI OS
+//! type-checks its platform half, and only the `qrcode` entry point sits behind the chain build.
+
 //! NOTE: `cli` is mounted from `main.rs`, so this file's tests run under
 //! `cargo test -p dexdo --bin dexdo` -- a `--lib` filter matches nothing and reports "ok".
 
@@ -29,13 +36,13 @@ pub(crate) struct ProbeReply {
     /// DA1 attributes, present once the terminal answered `CSI c`.
     pub(crate) da1: Option<Vec<u16>>,
     /// `(width, height)` of one character cell in pixels, from the terminal's `CSI 16 t` answer.
-    /// The OS often does not know it(`TIOCGWINSZ` reports zeroes), and it is what decides how
+    /// The OS often does not know it (`TIOCGWINSZ` reports zeroes), and it is what decides how
     /// large an image may be; a terminal that ignores the request simply leaves this `None`.
     pub(crate) cell_px: Option<(usize, usize)>,
 }
 
 impl ProbeReply {
-    /// DA1 attribute `4` is the sixel advertisement(DEC STD-070).
+    /// DA1 attribute `4` is the sixel advertisement (DEC STD-070).
     pub(crate) fn sixel(&self) -> bool {
         self.da1.as_ref().is_some_and(|attrs| attrs.contains(&4))
     }
@@ -48,6 +55,7 @@ impl ProbeReply {
 }
 
 /// Scan the probe answer for the kitty reply and DA1, at ANY position.
+
 /// The read races the operator's fingers: type-ahead pressed while the probe is listening lands
 /// in the same buffer as the answers. Prefix-scanning instead of strict matching survives that
 /// garbage -- bytes before, between and after the recognised sequences are ignored.
@@ -59,7 +67,8 @@ pub(crate) fn parse_probe_reply(bytes: &[u8]) -> ProbeReply {
     }
 }
 
-/// The `CSI 16 t` answer is `CSI 6; height; width t`(XTWINOPS), pixels of one cell.
+/// The `CSI 16 t` answer is `CSI 6; height; width t` (XTWINOPS), pixels of one cell.
+
 /// Scanned at any offset like the other answers, and required to end in `t`: `CSI 6;... R` is
 /// a cursor report, which carries rows and columns and would be read as a comically small cell.
 fn find_cell_size(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -95,7 +104,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// A kitty reply is `ESC _ G <id-keys>; <answer> ESC \`, and only `OK` is support: a terminal
-/// that answers but rejects the probe's format(`;EINVAL...`) cannot show the QR either.
+/// that answers but rejects the probe's format (`;EINVAL...`) cannot show the QR either.
 fn kitty_confirmed(bytes: &[u8]) -> bool {
     let mut rest = bytes;
     while let Some(start) = find(rest, b"\x1b_G") {
@@ -116,7 +125,7 @@ fn kitty_confirmed(bytes: &[u8]) -> bool {
     false
 }
 
-/// DA1 is `ESC [ ? <attr>; <attr>... c`. Other `CSI ?` replies(DECRPM and friends) end in a
+/// DA1 is `ESC [ ? <attr>; <attr>... c`. Other `CSI ?` replies (DECRPM and friends) end in a
 /// different final byte, so a candidate that runs into one is skipped, not misread.
 fn find_da1(bytes: &[u8]) -> Option<Vec<u16>> {
     let mut rest = bytes;
@@ -173,7 +182,7 @@ pub(crate) struct TerminalEnv {
     pub(crate) mux: bool,
     /// The kitty protocol advertised by identity: kitty, Ghostty, or Konsole >= 22.04.
     pub(crate) kitty_env: bool,
-    /// The iTerm2 protocol advertised by identity: iTerm2(also over ssh) or WezTerm.
+    /// The iTerm2 protocol advertised by identity: iTerm2 (also over ssh) or WezTerm.
     pub(crate) iterm2_env: bool,
 }
 
@@ -215,6 +224,7 @@ impl TerminalEnv {
 }
 
 /// The one decision: probe first, environment as fallback, text when nothing is proven.
+
 /// A forced protocol wins even over the tty check -- it exists to debug exactly the situations
 /// detection refuses.
 pub(crate) fn choose_display(env: &TerminalEnv, probe: &ProbeReply) -> QrDisplay {
@@ -246,7 +256,8 @@ pub(crate) fn choose_display(env: &TerminalEnv, probe: &ProbeReply) -> QrDisplay
 }
 
 /// What the window can spare for the image.
-/// `rows`/`cols` come from the OS(`TIOCGWINSZ` and its Windows counterpart), which every
+
+/// `rows`/`cols` come from the OS (`TIOCGWINSZ` and its Windows counterpart), which every
 /// terminal fills in; the pixel size of one character cell is the datum that is often missing --
 /// WezTerm under WSL, for one, reports `(45, 190, 0, 0)`. It is taken from the OS when non-zero,
 /// from the terminal's own `CSI 16 t` answer when it gives one, and assumed otherwise.
@@ -260,6 +271,7 @@ pub(crate) struct TerminalGeometry {
 
 /// The largest whole number of pixels per module that keeps a `modules`-wide image (quiet zone
 /// included) inside the window's share, clamped to the scale range.
+
 /// Whole numbers only: fractional scaling, or handing the resize to the terminal through kitty's
 /// `c=`/`r=` or iTerm2's `width=`, interpolates the module edges, and a blurred QR is one a phone
 /// gives up on. Smaller with crisp edges beats bigger and smeared.
@@ -291,7 +303,7 @@ pub(crate) fn probe_can_matter(env: &TerminalEnv) -> bool {
 }
 
 /// The QR as pixels: modules scaled up and wrapped in the light quiet zone the standard requires
-/// for scanning(4 modules; the caller passes it explicitly so tests stay small).
+/// for scanning (4 modules; the caller passes it explicitly so tests stay small).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QrBitmap {
     width: usize,
@@ -363,13 +375,13 @@ pub(crate) fn encode_kitty(bitmap: &QrBitmap) -> String {
     // Chunked on the INPUT at 3072 bytes rather than on the base64 text: 3072 is both a multiple
     // of 3 -- so every chunk but the last encodes without padding and the concatenation is the
     // base64 of the whole image -- and exactly the 4096 output characters the kitty protocol
-    // fixes as its chunk size(not a tunable). Encoding each chunk to its own `String` also
+    // fixes as its chunk size (not a tunable). Encoding each chunk to its own `String` also
     // leaves no byte slice to convert back into text.
     let mut chunks: Vec<String> = rgb
         .chunks(3072)
         .map(|chunk| base64::engine::general_purpose::STANDARD.encode(chunk))
         .collect();
-    // An empty image(empty bitmap) still emits one chunk, keeping the function total.
+    // An empty image (empty bitmap) still emits one chunk, keeping the function total.
     if chunks.is_empty() {
         chunks.push(String::new());
     }
@@ -378,7 +390,7 @@ pub(crate) fn encode_kitty(bitmap: &QrBitmap) -> String {
     for (index, chunk) in chunks.iter().enumerate() {
         if index == 0 {
             // `q=2` suppresses the terminal's transmission responses, which would otherwise land
-            // in the same tty queue later readers(the hidden wallet prompt) consume.
+            // in the same tty queue later readers (the hidden wallet prompt) consume.
             out.push_str(&format!(
                 "\x1b_Ga=T,q=2,f=24,s={},v={}",
                 bitmap.width, bitmap.height
@@ -417,20 +429,21 @@ pub(crate) fn encode_iterm2(bitmap: &QrBitmap) -> anyhow::Result<String> {
 }
 
 /// A monochrome sixel: white pass, carriage return, black pass, per 6-row band.
+
 /// The white pass is not optional decoration: sixel leaves unpainted pixels at the terminal's
 /// background colour, and a QR on a dark theme without its painted-white quiet zone does not scan.
 pub(crate) fn encode_sixel(bitmap: &QrBitmap) -> String {
     let mut out = format!(
-        "\x1bPq\"1;1;{};{};2;100;100;100;2;0;0;0",
+        "\x1bPq\"1;1;{};{}\x230;2;100;100;100\x231;2;0;0;0",
         bitmap.width, bitmap.height
     );
     for band_top in (0..bitmap.height).step_by(6) {
         if band_top > 0 {
             out.push('-');
         }
-        out.push_str("");
+        out.push_str("\x230");
         sixel_band_pass(&mut out, bitmap, band_top, false);
-        out.push_str("$");
+        out.push_str("$\x231");
         sixel_band_pass(&mut out, bitmap, band_top, true);
     }
     out.push_str("\x1b\\");
@@ -470,21 +483,22 @@ fn sixel_band_pass(out: &mut String, bitmap: &QrBitmap, band_top: usize, wants_d
 }
 
 /// The active capability probe: ask the terminal itself, before believing any variable.
+
 /// Compiled wherever the tests are, so the cross-OS CI matrix type-checks both platform halves
-/// (Windows included, which nothing on a Linux host can cross-check -- the shellnet graph's C
-/// build scripts need MSVC tooling); it RUNS only from the `shellnet` entry point below.
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+/// (Windows included, which nothing on a Linux host can cross-check -- the chain graph's C
+/// build scripts need MSVC tooling); it RUNS only from the chain entry point below.
 mod probe {
     use dexdo_core::params::QR_PROBE_TIMEOUT;
 
     use super::ProbeReply;
 
     /// Three questions in one round trip, answered in order:
+
     /// - the kitty graphics query (`a=q`, one dummy RGB pixel; `i=31` because the protocol
     /// addresses replies by id -- the parser itself accepts any `ESC _G` reply, ours being the
     /// only query in flight);
     /// - `CSI 16 t`, the cell size in pixels, which decides how large an image may be and which
-    /// the OS frequently does not know(`TIOCGWINSZ` reports zeroes under WSL);
+    /// the OS frequently does not know (`TIOCGWINSZ` reports zeroes under WSL);
     /// - DA1, the stop marker every terminal answers, and therefore last.
     const QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
 
@@ -543,7 +557,7 @@ mod probe {
         }
 
         pub(super) fn probe(query: &[u8], timeout: Duration) -> Option<ProbeReply> {
-            // The controlling terminal, NOT stdin: the hidden wallet prompts(rpassword) read
+            // The controlling terminal, NOT stdin: the hidden wallet prompts (rpassword) read
             // `/dev/tty` as their own file description, and `StdinLock` is an 8 KiB BufReader
             // whose over-read would strand bytes -- the operator's type-ahead -- where no later
             // reader could ever see them. One unbuffered fd carries both the query and the
@@ -717,36 +731,35 @@ mod probe {
     }
 }
 
-#[cfg(feature = "shellnet")]
 pub(crate) use io::write_qr;
 
-/// The `shellnet` half: the probe-driven choice and the actual writing. Everything above is
+/// The the chain build half: the probe-driven choice and the actual writing. Everything above is
 /// pure or probe-only; this half talks to `qrcode` and the caller's writer, and exists only next
 /// to its callers.
-#[cfg(feature = "shellnet")]
 mod io {
     use std::io::IsTerminal as _;
 
     use anyhow::Result;
-    use qrcode::render::unicode;
-    use qrcode::QrCode;
+        use qrcode::QrCode;
 
     use super::{
         choose_display, encode_iterm2, encode_kitty, encode_sixel, fit_module_scale, probe,
         probe_can_matter, ProbeReply, QrBitmap, QrDisplay, TerminalEnv, TerminalGeometry,
     };
 
-    /// The QR standard's quiet zone(ISO/IEC 18004): 4 light modules on every side. A protocol
+    /// The QR standard's quiet zone (ISO/IEC 18004): 4 light modules on every side. A protocol
     /// fact like kitty's 4096 chunk, not a tunable -- hence not in `params.rs`.
     const QUIET_ZONE: usize = 4;
 
     /// Write `code` to `output`: an image when the terminal proved it can show one, PR1362's
     /// unicode pseudo-graphics otherwise. Every rendering misfortune degrades to that text.
+
     /// Everything goes through the caller's writer, never `println!`: the invitation output is
     /// pinned by tests that read it back from a `Vec<u8>`, and a renderer that wrote to stdout
     /// behind their backs would make those tests stop seeing what the operator sees. Detection
     /// still asks the real terminal -- a captured writer means a captured stdout, which is not a
     /// tty, which selects the text rendering anyway.
+
     /// Blocks the calling thread for up to two probe timeouts. Both callers are interactive
     /// commands that go on to wait for the operator, so a briefly blocked tokio worker is
     /// accepted over threading `spawn_blocking` through their synchronous call chains.
@@ -862,11 +875,15 @@ mod io {
         }
     }
 
-    /// PR1362's unicode rendering, byte for byte, on the writer it was given.
+    /// The text fallback, for every terminal that did not prove it can show an image.
+
+    /// `qr_compact` rather than this module's own `Dense1x2` line: the same one-module-per-column
+    /// shape, two fewer modules of quiet zone on each side, and a polarity the rendering paints
+    /// rather than inherits from the colour scheme. Colour is emitted only to a real terminal, so
+    /// captured output stays plain.
     fn write_text(output: &mut dyn std::io::Write, code: &QrCode) -> Result<()> {
-        let qr = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
-        writeln!(output, "{qr}")?;
-        Ok(())
+        let colour = std::io::stdout().is_terminal();
+        crate::cli::qr_compact::write(output, code, colour)
     }
 
     #[cfg(test)]
@@ -900,8 +917,8 @@ mod io {
         #[test]
         fn render_image_frames_a_real_qr_with_scale_and_quiet_zone() {
             // The only place `to_colors()` meets `from_modules`: verify the wiring against a
-            // real QrCode -- the frame is(modules + 2 quiet zones) scaled, and the first pixel
-            // row is quiet-zone white(base64 of 0xFF RGB rows starts with `/`).
+            // real QrCode -- the frame is (modules + 2 quiet zones) scaled, and the first pixel
+            // row is quiet-zone white (base64 of 0xFF RGB rows starts with `/`).
             let code = QrCode::new(b"dexdo").expect("payload fits");
             let expected = (code.width() + 2 * QUIET_ZONE) * 8;
             let escape = render_image(&code, QrDisplay::Kitty, 8).expect("encode");
@@ -1099,7 +1116,7 @@ mod tests {
 
     #[test]
     fn env_iterm2_when_probe_names_no_protocol() {
-        // The probe completed(DA1 came back) but proved nothing; iTerm2 has no query protocol,
+        // The probe completed (DA1 came back) but proved nothing; iTerm2 has no query protocol,
         // so its environment identity must still count.
         let env = TerminalEnv {
             iterm2_env: true,
@@ -1267,7 +1284,7 @@ mod tests {
     #[test]
     fn a_large_code_shrinks_to_the_window_share() {
         // The bee deep link: 97 modules + 2x4 quiet zone = 105. 45 rows * 66% * 16px = 464px of
-        // budget, so 4px per module(420px) fits and 5(525px) does not.
+        // budget, so 4px per module (420px) fits and 5 (525px) does not.
         assert_eq!(fit_module_scale(105, &window(45, 190)), 4);
     }
 
@@ -1286,7 +1303,7 @@ mod tests {
 
     #[test]
     fn an_unreported_cell_falls_back_to_the_assumed_one() {
-        // WezTerm under WSL reports(45, 190, 0, 0): rows and columns, no pixels. The assumed
+        // WezTerm under WSL reports (45, 190, 0, 0): rows and columns, no pixels. The assumed
         // 8x16 must produce the same answer as if the terminal had said so.
         let assumed = TerminalGeometry {
             rows: 45,
@@ -1301,7 +1318,7 @@ mod tests {
 
     #[test]
     fn a_reported_cell_is_used_over_the_assumption() {
-        // A 32px-tall cell(HiDPI) doubles the pixel budget of the same 45 rows, and the scale
+        // A 32px-tall cell (HiDPI) doubles the pixel budget of the same 45 rows, and the scale
         // follows it up to the maximum.
         let hidpi = TerminalGeometry {
             rows: 45,
@@ -1313,7 +1330,7 @@ mod tests {
 
     #[test]
     fn an_unknown_window_keeps_the_maximum() {
-        // No window report at all(not a tty, or an OS that answered nothing): invent no limit.
+        // No window report at all (not a tty, or an OS that answered nothing): invent no limit.
         assert_eq!(fit_module_scale(105, &TerminalGeometry::default()), 8);
     }
 
@@ -1388,7 +1405,7 @@ mod tests {
     #[test]
     fn kitty_three_chunks_mark_middle_and_last() {
         // 64x40 px all dark -> 7680 raw bytes -> 10240 base64 chars -> 4096+4096+2048. The
-        // middle chunk is the dominant kind for a real QR(53+ chunks at production scale) and
+        // middle chunk is the dominant kind for a real QR (53+ chunks at production scale) and
         // must carry m=1 exactly like the first.
         let bitmap = QrBitmap::from_modules(&[true; 640], 32, 2, 0);
         let chunks = kitty_chunks(&encode_kitty(&bitmap));
@@ -1456,7 +1473,7 @@ mod tests {
         // col: 0 1 2 3
         // row 0: D L L D
         // row 1: L D D L
-        // Column bits(bit0 = top row): white pass A@@A, black pass @AA@.
+        // Column bits (bit0 = top row): white pass A@@A, black pass @AA@.
         let bitmap = QrBitmap {
             width: 4,
             height: 2,
@@ -1464,7 +1481,7 @@ mod tests {
         };
         assert_eq!(
             encode_sixel(&bitmap),
-            "\x1bPq\"1;1;4;2;2;100;100;100;2;0;0;0#0A@@A$@AA@\x1b\\"
+            "\x1bPq\"1;1;4;2\x230;2;100;100;100\x231;2;0;0;0\x230A@@A$\x231@AA@\x1b\\"
         );
     }
 
@@ -1478,7 +1495,7 @@ mod tests {
         };
         assert_eq!(
             encode_sixel(&bitmap),
-            "\x1bPq\"1;1;6;1;2;100;100;100;2;0;0;0!6?$!6@\x1b\\"
+            "\x1bPq\"1;1;6;1\x230;2;100;100;100\x231;2;0;0;0\x230!6?$\x231!6@\x1b\\"
         );
     }
 
@@ -1492,7 +1509,7 @@ mod tests {
         };
         assert_eq!(
             encode_sixel(&bitmap),
-            "\x1bPq\"1;1;1;12;2;100;100;100;2;0;0;0?$~-?$~\x1b\\"
+            "\x1bPq\"1;1;1;12\x230;2;100;100;100\x231;2;0;0;0\x230?$\x231~-\x230?$\x231~\x1b\\"
         );
     }
 }

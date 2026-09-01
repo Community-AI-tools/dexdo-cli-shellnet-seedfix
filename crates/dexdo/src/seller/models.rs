@@ -1,8 +1,9 @@
 //! Seller model config layer: model-agnosticism is achieved through
 //! provider adapters + config. Models are described by a **config entry** and selected **by name**.
-//! The format is **JSON**(not yaml/toml): `serde_json` is already in the build graph, we don't
+
+//! The format is **JSON** (not yaml/toml): `serde_json` is already in the build graph, we don't
 //! introduce a new dependency, and it is consistent with the rest of the repo's configs
-//! (`deployed.shellnet.json`, `endpoints.json`). Loading/selection is **fail-loud**: a corrupt file,
+//! (the deployment manifest, `endpoints.json`). Loading/selection is **fail-loud**: a corrupt file,
 //! an empty config, an unknown model -> an explicit error, not a silent degradation.
 
 use anyhow::{bail, Context, Result};
@@ -11,12 +12,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Model capabilities -- what the endpoint actually supports.
+
 /// Unlike the rest of the config this struct does NOT deny unknown fields: the retired `logprobs` /
 /// `top_logprobs` keys are still present in already-deployed `models.json` files, and rejecting them
 /// would take every such seller off the market on upgrade. They are ignored, not honoured.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Capabilities {
-    /// The model's **own** maximum output length(completion tokens) at this endpoint. The outbound
+    /// The model's **own** maximum output length (completion tokens) at this endpoint. The outbound
     /// generation limit is clamped to it in addition to the deal budget: a deal budget is
     /// `ticks * TICK_SIZE` tokens, which every real provider rejects with `400` (Groq answers
     /// `` `max_tokens` must be less than or equal to `40960` ``), so a deal-only clamp made every
@@ -32,11 +34,11 @@ pub struct Capabilities {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintCfg {
-    /// The deterministic probe prompt the buyer sends(B8).
+    /// The deterministic probe prompt the buyer sends (B8).
     pub probe_prompt: String,
-    /// A marker the model's response characteristically contains(e.g. qwen `<think>`).
+    /// A marker the model's response characteristically contains (e.g. qwen `<think>`).
     pub expected_contains: String,
-    /// Some providers expose the thinking out-of-band(reasoning side channel) instead of embedding
+    /// Some providers expose the thinking out-of-band (reasoning side channel) instead of embedding
     /// the marker in `content`; when true, non-empty provider reasoning is accepted as the same signal.
     #[serde(default)]
     pub accepts_reasoning_side_channel: bool,
@@ -46,23 +48,26 @@ pub struct FingerprintCfg {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// The canonical market id(R1): the seller **forces** it; the buyer's `model` is not trusted.
+    /// The canonical market id (R1): the seller **forces** it; the buyer's `model` is not trusted.
     pub frame_model: String,
     /// Provider API base URL, without the operation path.
     pub base_url: String,
     /// The model id at the upstream -- what to send in the request's `model` field.
     pub served_model: String,
-    /// Name of the env variable holding the key -- **per-model/provider**(not one global `GROQ_API_KEY`).
+    /// Name of the env variable holding the key -- **per-model/provider** (not one global `GROQ_API_KEY`).
     pub api_key_env: String,
     /// The tokenizer family for `SignalManifest.tokenizer_family` -- instead of
     /// a substring hardcode. The buyer's profile matches by family.
     pub tokenizer_family: String,
-    /// Default tick price in raw ECC[2] units(`PRICE_STEP = 1_000_000_000` raw = 1 SHELL).
+    /// Default tick price in whole SHELL: `3` is three SHELL a tick, the same figure
+    /// `--price-per-tick` takes. No runtime path reads it -- the price a seller offers at comes
+    /// from `--price-per-tick` or from the market manifest -- so it is a declaration in the file
+    /// and nothing more.
     pub price_per_tick: u64,
     /// Upstream capabilities.
     #[serde(default)]
     pub capabilities: Capabilities,
-    /// Extra content-identity spellings the served model self-reports(e.g. qwen `["Qwen/Qwen3-32B"]`),
+    /// Extra content-identity spellings the served model self-reports (e.g. qwen `["Qwen/Qwen3-32B"]`),
     /// used to resolve fingerprints/vocab for the registry/provider name. Empty by default.
     #[serde(default)]
     pub identity_aliases: Vec<String>,
@@ -70,15 +75,15 @@ pub struct ModelConfig {
     /// `tokenizer_family` mapping. qwen 152064, llama 128256, gpt 100352.
     #[serde(default)]
     pub vocab_size: Option<u32>,
-    /// Behavioral fingerprints for the exact model. Empty -> no B8(degradation R3).
+    /// Behavioral fingerprints for the exact model. Empty -> no B8 (degradation R3).
     #[serde(default)]
     pub fingerprints: Vec<FingerprintCfg>,
 }
 
 impl ModelConfig {
     /// The B7-full reference endpoint **derived** from the upstream fields -- the reference IS
-    /// the configured upstream(`base_url` + `served_model` + `api_key_env`). No dedicated config field.
-    /// The key is read from env at runtime by `api_key_env` and is never stored here(masked in logs).
+    /// the configured upstream (`base_url` + `served_model` + `api_key_env`). No dedicated config field.
+    /// The key is read from env at runtime by `api_key_env` and is never stored here (masked in logs).
     pub fn reference_endpoint(&self) -> crate::buyer::verify::ReferenceEndpoint {
         crate::buyer::verify::ReferenceEndpoint {
             base_url: self.base_url.clone(),
@@ -88,7 +93,7 @@ impl ModelConfig {
     }
 }
 
-/// The models config file: key(name/alias) -> entry. The key may coincide with `frame_model`.
+/// The models config file: key (name/alias) -> entry. The key may coincide with `frame_model`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsConfig {
@@ -96,8 +101,8 @@ pub struct ModelsConfig {
 }
 
 impl ModelsConfig {
-    /// An empty config(no models). Used by the **buyer** when no `--models` file is present: every model then
-    /// has no verification data -> the content-identity policy fails closed(unless `--allow-unverified-model`).
+    /// An empty config (no models). Used by the **buyer** when no `--models` file is present: every model then
+    /// has no verification data -> the content-identity policy fails closed (unless `--allow-unverified-model`).
     /// Distinct from a present-but-empty config file, which [`from_json`](Self::from_json) still rejects.
     pub fn empty() -> Self {
         Self {
@@ -105,8 +110,8 @@ impl ModelsConfig {
         }
     }
 
-    /// Buyer-side lenient load: an ABSENT `--models` path yields an empty config(fail-closed per model),
-    /// while a present file must parse and be non-empty(**fail-loud** on corrupt/empty). The seller path uses
+    /// Buyer-side lenient load: an ABSENT `--models` path yields an empty config (fail-closed per model),
+    /// while a present file must parse and be non-empty (**fail-loud** on corrupt/empty). The seller path uses
     /// the strict [`load`](Self::load) -- it must always have a model to serve.
     pub fn load_or_empty(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -116,7 +121,7 @@ impl ModelsConfig {
         }
     }
 
-    /// Load and validate the config -- **fail-loud**(no file / corrupt JSON / empty -> error).
+    /// Load and validate the config -- **fail-loud** (no file / corrupt JSON / empty -> error).
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read models config {}", path.display()))?;
@@ -132,8 +137,8 @@ impl ModelsConfig {
         Ok(cfg)
     }
 
-    /// Select a model by name(config key **or** `frame_model`) -- **fail-loud**: an unknown
-    /// model -> an error with the list of available ones(not a silent default).
+    /// Select a model by name (config key **or** `frame_model`) -- **fail-loud**: an unknown
+    /// model -> an error with the list of available ones (not a silent default).
     pub fn get(&self, name: &str) -> Result<&ModelConfig> {
         if let Some(m) = self.models.get(name) {
             return Ok(m);
@@ -149,7 +154,7 @@ impl ModelsConfig {
 impl ModelConfig {
     /// Check that the key's env variable is set and non-empty -- **fail-loud** (:
     /// "a missing key env variable -> an explicit error"). The key value is neither returned nor
-    /// logged -- only the fact of its presence(read at runtime by the adapter via `api_key_env`).
+    /// logged -- only the fact of its presence (read at runtime by the adapter via `api_key_env`).
     pub fn require_api_key_present(&self) -> Result<()> {
         match std::env::var(&self.api_key_env) {
             Ok(v) if !v.is_empty() => Ok(()),
@@ -193,7 +198,7 @@ mod tests {
           "served_model": "qwen/qwen3-32b",
           "api_key_env": "GROQ_API_KEY",
           "tokenizer_family": "qwen",
-          "price_per_tick": 1000000000,
+          "price_per_tick": 1,
           "capabilities": { "logprobs": true, "top_logprobs": 5, "max_output_tokens": 40960 }
         }
       }
@@ -269,7 +274,7 @@ mod tests {
     fn missing_api_key_env_fails_loud() {
         let cfg = ModelsConfig::from_json(SAMPLE).unwrap();
         let m = cfg.get("qwen").unwrap();
-        // The env variable is definitely absent in the test environment(the name is unique).
+        // The env variable is definitely absent in the test environment (the name is unique).
         let mut m2 = m.clone();
         m2.api_key_env = "DEXDO_TEST_NO_SUCH_KEY_ENV_X9".into();
         assert!(m2.require_api_key_present().is_err());
@@ -293,8 +298,8 @@ mod tests {
 
     #[test]
     fn verification_fields_default_when_absent_backward_compatible() {
-        // The SAMPLE(and any pre-existing single-model models.json) has no identity_aliases / vocab_size /
-        // fingerprints -- it MUST still load, with the new fields defaulting to empty/None(backward-compat).
+        // The SAMPLE (and any pre-existing single-model models.json) has no identity_aliases / vocab_size /
+        // fingerprints -- it MUST still load, with the new fields defaulting to empty/None (backward-compat).
         let cfg = ModelsConfig::from_json(SAMPLE)
             .expect("legacy config without verification fields loads");
         let m = cfg.get("qwen").unwrap();
@@ -316,7 +321,7 @@ mod tests {
               "served_model": "qwen/qwen3-32b",
               "api_key_env": "GROQ_API_KEY",
               "tokenizer_family": "qwen",
-              "price_per_tick": 1000000000,
+              "price_per_tick": 1,
               "identity_aliases": ["Qwen/Qwen3-32B"],
               "vocab_size": 152064,
               "fingerprints": [
@@ -336,7 +341,7 @@ mod tests {
         );
         assert_eq!(m.fingerprints[0].expected_contains, "<think>");
         assert!(m.fingerprints[0].accepts_reasoning_side_channel);
-        // The B7-full reference is derived from the upstream fields(no dedicated field).
+        // The B7-full reference is derived from the upstream fields (no dedicated field).
         let r = m.reference_endpoint();
         assert_eq!(r.base_url, "https://api.groq.com/openai/v1");
         assert_eq!(r.model, "qwen/qwen3-32b");

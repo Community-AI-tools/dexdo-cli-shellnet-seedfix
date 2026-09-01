@@ -1,10 +1,13 @@
 //! follow-up items 5 and 6: the resume the error message promises, and the exact Hot policy.
+
 //! Two defects from the post-merge audit, held shut here.
+
 //! **The resume did not resume.** The activation-timeout error tells the operator that the phrase
 //! and the draft are already stored and that running the command again "continues waiting without
 //! asking for the phrase again". It did not: the store minted a fresh binding id and the flow always
 //! called `prepare_onboarding`, so every timeout cost another paste of a 12-word recovery phrase --
 //! which is exactly the pressure that makes somebody keep it in a file or the clipboard.
+
 //! **The Hot policy was under-enforced.** Membership of the derived key was checked, but not the
 //! shape the owner froze: exactly two distinct pubkey custodians, `requiredTxnConfirms=1` and
 //! `requiredDataConfirms=2`. Each missing check names somebody who can take the money, so each is
@@ -73,6 +76,7 @@ fn the_frozen_gosh_ai_hot_shape_is_accepted() {
 }
 
 /// Invariant 1: `requiredDataConfirms = 2`.
+
 /// Below two, ONE custodian can rewrite the custodian set by itself -- the power to hand the wallet
 /// to somebody else. `0` and `1` are both refused; the loop also covers a wallet that merely reports
 /// something unexpected.
@@ -92,6 +96,7 @@ fn a_hot_that_lets_fewer_than_two_custodians_rewrite_the_custodian_set_is_refuse
 }
 
 /// Invariant 2: exactly two DISTINCT pubkey custodians.
+
 /// A third custodian is a third party, and at `reqConfirms=1` they can empty the Hot alone.
 #[test]
 fn a_hot_carrying_a_third_custodian_is_refused() {
@@ -106,6 +111,7 @@ fn a_hot_carrying_a_third_custodian_is_refused() {
 }
 
 /// Invariant 3: the second, Gosh.ai service custodian must be there.
+
 /// A wallet whose only pubkey custodian is the user's key is not the managed sub-wallet this
 /// provider is defined to hand over, so whatever the operator is about to fund is not what they
 /// think they are funding.
@@ -204,7 +210,8 @@ impl super::HiddenPrompt for OneShotPrompt {
     }
 }
 
-/// A stand-in for the TVM-SDK derivation, which only exists in the shellnet build.
+/// A stand-in for the TVM-SDK derivation, which only exists in a chain build.
+
 /// Deterministic and phrase-DEPENDENT, which is the property the resume test needs: a resume that
 /// read the wrong file, or no file at all, cannot produce the same key by accident.
 fn derive_stub(phrase: &str) -> anyhow::Result<String> {
@@ -222,7 +229,7 @@ fn timed_out_attempt(
     let mut notices = Vec::new();
     super::prepare_onboarding(
         data_dir,
-        WalletNetwork::Shellnet,
+        crate::cli::wallet::test_network_a(),
         binding_id,
         &mut prompt,
         &mut notices,
@@ -233,10 +240,12 @@ fn timed_out_attempt(
 
 /// THE DEFECT. A second `wallet onboard gosh-ai` after a timeout continues the attempt already on
 /// disk instead of asking for the recovery phrase again.
+
 /// Both halves are asserted, because either alone would still leave the promise broken:
-/// - the STORE must hand the flow the id the first attempt reserved(`find_resumable`), or the flow
+
+/// - the STORE must hand the flow the id the first attempt reserved (`find_resumable`), or the flow
 /// would resume under a fresh id and `commit_onboarded` would refuse the binding at the last step;
-/// - the FLOW must rebuild its facts from that directory without a prompt(`resume_onboarding`).
+/// - the FLOW must rebuild its facts from that directory without a prompt (`resume_onboarding`).
 #[test]
 fn a_second_onboarding_after_a_timeout_resumes_instead_of_asking_for_the_phrase_again() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -244,7 +253,7 @@ fn a_second_onboarding_after_a_timeout_resumes_instead_of_asking_for_the_phrase_
     let first = timed_out_attempt(dir.path(), &binding_id);
 
     // The unfinished attempt is discoverable, and it is the one the store reserved.
-    let found = files::find_resumable(&dir.path().join("wallet"), WalletNetwork::Shellnet);
+    let found = files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a());
     assert_eq!(
         found.as_deref(),
         Some(binding_id.as_str()),
@@ -255,7 +264,7 @@ fn a_second_onboarding_after_a_timeout_resumes_instead_of_asking_for_the_phrase_
     // reproduces exactly what the first attempt proved.
     let resumed = resume_onboarding(
         dir.path(),
-        WalletNetwork::Shellnet,
+        crate::cli::wallet::test_network_a(),
         &binding_id,
         &derive_stub,
     )
@@ -286,14 +295,14 @@ fn a_draft_from_another_network_is_not_resumed() {
     timed_out_attempt(dir.path(), &binding_id);
 
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), WalletNetwork::Mainnet),
+        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_b()),
         None,
-        "a shellnet draft is not a mainnet attempt"
+        "a draft for one network is not an attempt on another"
     );
     assert!(
         resume_onboarding(
             dir.path(),
-            WalletNetwork::Mainnet,
+            crate::cli::wallet::test_network_b(),
             &binding_id,
             &derive_stub
         )
@@ -308,12 +317,12 @@ fn a_draft_from_another_network_is_not_resumed() {
 fn an_untouched_data_directory_has_nothing_to_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), WalletNetwork::Shellnet),
+        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a()),
         None
     );
     assert!(resume_onboarding(
         dir.path(),
-        WalletNetwork::Shellnet,
+        crate::cli::wallet::test_network_a(),
         &"c".repeat(32),
         &derive_stub
     )
@@ -322,6 +331,7 @@ fn an_untouched_data_directory_has_nothing_to_resume() {
 }
 
 /// A FINISHED attempt must not look unfinished.
+
 /// Without retiring the draft, a later `wallet onboard` would adopt the id of the binding that is
 /// already active and write over the wallet the operator is using. `run_selected` calls
 /// `discard_draft_in` after the commit; this is that contract.
@@ -334,7 +344,7 @@ fn a_committed_attempt_is_no_longer_resumable() {
     files::discard_draft_in(&prepared.paths.binding_dir);
 
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), WalletNetwork::Shellnet),
+        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a()),
         None,
         "a committed attempt must never be adopted by a later onboarding"
     );

@@ -1,4 +1,5 @@
 //! Buyer continuity planner for the long-running local API mode.
+
 //! The planner is deliberately side-effect free: callers read chain facts, pass them in, and execute the
 //! returned action through existing primitives (`place_buy`, handover resolution, `streamCleanup`,
 //! `SessionSettle`). This keeps duplicate monitor ticks and process restarts idempotent.

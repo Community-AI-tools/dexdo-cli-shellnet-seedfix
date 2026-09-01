@@ -1,4 +1,5 @@
 //! Crash-safe seller delivery capacity for one funded TokenContract.
+
 //! The chain is authoritative for the funded total, the current no-rollover subscription cap and the
 //! cumulative `tokensPending` high-water. The gateway persists only the delivery debt that the chain cannot
 //! know yet: exact authoritative tokens forwarded after that high-water and request capacity reserved before
@@ -90,15 +91,17 @@ impl CapacitySnapshot {
 }
 
 /// How many delivered tokens may sit in memory before the durable record is rewritten.
+
 /// `record_delivered` moves tokens from `outstanding_reservation` to `local_delivered_after_anchor`;
 /// their SUM -- `CapacitySnapshot::committed` -- is unchanged, and the whole request reservation was
 /// already made durable by `reserve` BEFORE the first token could be delivered. So the funded-capacity
 /// ceiling, the only invariant `validate_record` enforces against the chain, never depends on how often
 /// this split reaches disk. Rewriting the record per token bought no safety and cost two fsyncs, a file
 /// create and a rename per token, which floors delivery at roughly 13k tokens/min on a real disk.
+
 /// What a coalesced write does risk is losing the SPLIT on a crash: up to this many delivered tokens
 /// stay classified as outstanding reservation. That direction is conservative -- capacity is retained,
-/// never released(see [`CapacityReservation`]), so the seller can only under-claim its own revenue,
+/// never released (see [`CapacityReservation`]), so the seller can only under-claim its own revenue,
 /// and the buyer is never exposed to over-delivery. Every request terminal flushes, so the loss window
 /// exists only for a crash mid-request.
 const CAPACITY_PERSIST_TOKEN_INTERVAL: u128 = 1_000;
@@ -117,6 +120,7 @@ struct CapacityEntry {
 
 impl CapacityEntry {
     /// Apply any coalesced delivered tokens to the record and make it durable.
+
     /// Until this runs the tokens stay classified as outstanding reservation, so `committed` -- and
     /// therefore the funded ceiling -- reads the same either way; only the split moves. Returns how
     /// many delivered tokens became durable, which is the amount the caller may now claim against.
@@ -166,6 +170,7 @@ impl CapacityManager {
 
     /// Register or refresh one funded deal from a strict paired
     /// `getState()` / `getSubscription()` read.
+
     /// `tokensPending` is the only chain anchor: promotion lag must never make an already delivered token
     /// available again. A later anchor advance consumes exactly the corresponding prefix of durable local
     /// delivery. Outstanding/ambiguous reservations are never guessed away.
@@ -466,6 +471,7 @@ impl CapacityReservation {
     }
 
     /// Authorize output whose authoritative token count can only arrive AFTER it.
+
     /// The separate-usage shape -- content deltas first, one usage figure at the end -- is what every
     /// shipped adapter produces, so on that branch there is no number to record before the chunk
     /// crosses to the buyer. What there always is, is this reservation: it was made durable before the
@@ -473,6 +479,7 @@ impl CapacityReservation {
     /// bill. Once it holds nothing, every further token is output the seller can never claim
     /// ([`Self::record_delivered`] refuses it), so the exposure must stop at the last token that could
     /// still be paid for rather than continue and be reconciled into a refusal afterwards.
+
     /// `min_billable` is what this upstream has already charged for one run of unaccounted output on
     /// this stream, and zero before it has charged anything. Asking only whether the reservation is
     /// non-empty refuses at exactly zero and nowhere else, so a reservation that lands short of the
@@ -492,6 +499,7 @@ impl CapacityReservation {
     }
 
     /// Record delivered tokens and return how many became DURABLE in this call.
+
     /// The caller must not advance the claim-driving counter past the returned total: `reconcile_deal`
     /// refuses a `tokensPending` that ran beyond durable local delivery, so claiming a token whose
     /// delivery a crash could erase would strand the deal. Coalescing therefore delays the counter, it
@@ -547,7 +555,7 @@ impl CapacityReservation {
 
     /// Release a request's exact unused remainder. Used for both clean completion and an interrupted stream
     /// whose every successfully forwarded output already had an authoritative token count.
-    /// Returns the delivered tokens that became durable in this call(see [`Self::record_delivered`]).
+    /// Returns the delivered tokens that became durable in this call (see [`Self::record_delivered`]).
     pub fn finish_exact(&self) -> Result<u64> {
         let mut request = self
             .request
@@ -585,7 +593,7 @@ impl CapacityReservation {
 
     /// Preserve all unresolved capacity. This is the only safe terminal when some output may have reached the
     /// buyer without a valid authoritative usage count.
-    /// Returns the delivered tokens that became durable in this call(see [`Self::record_delivered`]).
+    /// Returns the delivered tokens that became durable in this call (see [`Self::record_delivered`]).
     pub fn finish_ambiguous(&self) -> Result<u64> {
         let mut request = self
             .request
@@ -961,6 +969,7 @@ mod tests {
     }
 
     /// Delivery must not rewrite the durable record once per token.
+
     /// The pre-fix path fsynced the capacity file twice -- plus a file create and a rename -- for every
     /// delivered token, which floored the gateway at ~13k tokens/min on a real disk no matter how fast
     /// the model produced. Coalescing is only sound because `record_delivered` reclassifies reserved
@@ -1055,12 +1064,14 @@ mod tests {
         assert_invariant(CapacitySnapshot::from(&durable));
     }
 
-    /// MEASUREMENT INSTRUMENT(not a CI gate): per-delivered-token cost of the durable capacity
+    /// MEASUREMENT INSTRUMENT (not a CI gate): per-delivered-token cost of the durable capacity
     /// record, reported by decade. `record_delivered(1)` is exactly what the gateway relay calls
     /// once per forwarded chunk, and an OpenAI-compatible SSE stream is one token per chunk.
+
     /// PERF_N=200000 cargo test -p dexdo --release --lib \
     /// seller::capacity::tests::measure_delivery_persist_by_decade -- --ignored --nocapture
-    /// `PERF_INMEM=1` switches the store off(`CapacityManager::in_memory`) -- the A/B that
+
+    /// `PERF_INMEM=1` switches the store off (`CapacityManager::in_memory`) -- the A/B that
     /// separates the disk cost from everything else.
     #[test]
     #[ignore = "measurement instrument; run explicitly with --ignored --nocapture"]
@@ -1965,10 +1976,10 @@ mod tests {
         (address, handle)
     }
 
-    /// The gateway's own recorder(`seller::gateway::CapacityDeliveryRecorder`) is private to that module,
+    /// The gateway's own recorder (`seller::gateway::CapacityDeliveryRecorder`) is private to that module,
     /// so this reproduces exactly its reservation contract and nothing else: a delivered delta advances the
     /// reservation, and the terminal CLASSIFICATION decides whether the unused remainder comes back
-    /// (`finish_exact`) or stays committed forever(`finish_ambiguous`). The classification itself is
+    /// (`finish_exact`) or stays committed forever (`finish_ambiguous`). The classification itself is
     /// asserted separately, so neither half can drift unnoticed.
     #[derive(Clone)]
     struct RelayRecorder {
@@ -2080,6 +2091,7 @@ mod tests {
     }
 
     /// (money): the served-model check must not fire once the buyer's capacity is in flight.
+
     /// An error returned from the adapter after a chunk has been forwarded reaches the relay with output
     /// delivered and its authoritative usage still outstanding -- which is `AmbiguousUsage`, and that
     /// terminal deliberately keeps the unresolved remainder COMMITTED (pinned by
@@ -2087,9 +2099,10 @@ mod tests {
     /// paid for and the seller could not claim the tokens it had already delivered: two-sided loss, in
     /// answer to a misspelled `served_model`. So past the first delivered output the divergence is a
     /// diagnostic, and the stream is carried to its honest terminal.
+
     /// Nothing is given up by that bound: an OpenAI-compatible provider names the model in its FIRST frame,
     /// so a real mismatch is always seen before any output -- including in seller readiness, where
-    /// E2E-ADV-02 refuses before `postSellOffer`(`upstream::tests`).
+    /// E2E-ADV-02 refuses before `postSellOffer` (`upstream::tests`).
     #[tokio::test]
     async fn late_served_model_divergence_does_not_strand_the_reservation() {
         let (received, finish, durable) = relay_one_request(
@@ -2132,6 +2145,7 @@ mod tests {
 
     /// an operator who declared the provider's own spelling the one supported way (`identity_aliases`
     /// in `models.json`, the same field the buyer reconciles identity through) is served, not refused.
+
     /// Here the provider answers `Qwen/Qwen3-32B` while the seller sends the slug `qwen3-32b` upstream and
     /// sells under `alibaba--qwen3--32b`: the reported spelling is reachable ONLY through the declared
     /// alias, so this fails the moment `identity_aliases` stops being part of the accepted set -- and it

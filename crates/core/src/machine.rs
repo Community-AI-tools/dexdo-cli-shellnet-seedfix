@@ -1,15 +1,18 @@
 //! Stream state machine and the contested-tail invariant. Pure, no network -- fit for `proptest`.
+
 //! States: `Opening` -> `Streaming` -> `Stopping`/`Disputed` -> `Closed`.
+
 //! Opening a stream moves NO money beyond freezing the probe. Once accepted, that probe is both paid and
 //! seeded as the first trusted tick of the cumulative claim pipeline; every later claim therefore includes
 //! it instead of adding another first tick on top.
+
 //! INVARIANT: the buyer's at-risk amount is exactly the CONTESTED TAIL -- the newest claim minus what is
 //! already trusted. Trusted value is settled and no longer at risk; the tail is what a dispute puts at
 //! stake. Unlike the old fixed `2*P` bound this is not a constant, because the seller may batch a larger
 //! claim after a longer silence; what bounds it is the on-chain rate limit plus the buyer's own attention.
 //! Every transition checks that the tail never goes negative and that trusted consumption never regresses.
 
-use crate::chain::{BuyerStopTerminalReceipt, SettlementActionReceipt};
+use crate::market::{BuyerStopTerminalReceipt, SettlementActionReceipt};
 use crate::params::{DobParams, Shell};
 use crate::settle::{contested_burn, probe_burn, ContestedBurn};
 use serde::{Deserialize, Serialize};
@@ -54,7 +57,7 @@ pub enum StreamState {
 /// Settlement on completion/stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
-    /// A production shellnet action proved by one new immutable TokenContract event plus a strict
+    /// A production the chain action proved by one new immutable TokenContract event plus a strict
     /// post-read. The pure state-machine variants below remain mock-only projections.
     AuthoritativeReceipt(Box<SettlementActionReceipt>),
     /// A terminal chain event observed by a buyer STOP path, carrying the exact attribution fact
@@ -66,20 +69,21 @@ pub enum Settlement {
     /// Settlement BY FACT -- the shape of every clean terminal path: buyer `stop()`, seller
     /// `sellerStop()`, `finalize()` on an exhausted deal, and a conceded dispute. Trusted consumption goes
     /// to the seller, everything else returns to the buyer, and the bond comes back whole.
+
     /// The contested tail is NOT paid here: it never had its window, and the party leaving is precisely the
     /// one who would have had to defend or accept it.
     AmicableSplit {
-        /// Ticks credited to the seller(trusted consumption, plus whole take-or-pay weeks).
+        /// Ticks credited to the seller (trusted consumption, plus whole take-or-pay weeks).
         to_seller_ticks: u64,
-        /// Refunded to the buyer(unspent escrow).
+        /// Refunded to the buyer (unspent escrow).
         to_buyer_refund: u128,
     },
     /// The seller never opened the deal: the buyer's whole deposit returns and the seller's bond returns
     /// too -- nothing was delivered, so there is no fee and no penalty. A no-show is not slashed.
     SellerNoShow {
-        /// Refund to the buyer(the whole deposit).
+        /// Refund to the buyer (the whole deposit).
         to_buyer_refund: u128,
-        /// Return of the seller's bond(not burned on a no-show).
+        /// Return of the seller's bond (not burned on a no-show).
         seller_bond_returned: u128,
     },
 }
@@ -154,7 +158,7 @@ impl StreamMachine {
         self.price
     }
 
-    /// Promoted(trusted) consumption in ticks -- what the seller has actually earned.
+    /// Promoted (trusted) consumption in ticks -- what the seller has actually earned.
     pub fn trusted_ticks(&self) -> u64 {
         match &self.state {
             StreamState::Streaming { trusted, .. } | StreamState::Disputed { trusted, .. } => {
@@ -166,6 +170,7 @@ impl StreamMachine {
 
     /// The seller claims a new CUMULATIVE consumption total. Landing a claim promotes the previous one:
     /// nobody contested it, and an open dispute blocks this path entirely.
+
     /// Rejects a regressing total -- claims are cumulative by contract, and a decreasing figure would let a
     /// seller retract a claim the buyer had already accepted.
     pub fn on_claim(&mut self, cumulative: u64) -> Result<(), InvariantError> {
@@ -185,7 +190,7 @@ impl StreamMachine {
         }
     }
 
-    /// The promotion window elapsed with no dispute: the newest claim becomes trusted(`finalize`).
+    /// The promotion window elapsed with no dispute: the newest claim becomes trusted (`finalize`).
     pub fn on_promote(&mut self) -> Result<(), InvariantError> {
         match &self.state {
             StreamState::Streaming { pending, .. } => {
@@ -201,12 +206,14 @@ impl StreamMachine {
     }
 
     /// Refuse a transition the current state has no room for, leaving that state untouched.
+
     /// `Opening` was never opened and `Stopping`/`Closed` are ends, so a terminal transition taken from one
     /// of them would mint a SECOND terminal record for one deal -- and, with `trusted_ticks()` reading 0
     /// there, one whose zero amounts are indistinguishable from a legitimate clean close. The
     /// contract refuses the same calls outright: `stop`, `sellerStop` and `releaseDispute` each open with
-    /// `require(_opened, ERR_NOT_OPEN)`(`contracts/airegistry/TokenContract.sol`), so refusing here keeps
+    /// `require(_opened, ERR_NOT_OPEN)` (`contracts/airegistry/TokenContract.sol`), so refusing here keeps
     /// the projection on the contract's own footing instead of answering where the chain would revert.
+
     /// It panics rather than returning an error because these transitions answer with `Settlement`, not
     /// `Result`: there is no settlement to hand back, and a well-formed zero-amount one is precisely the
     /// fail-open being closed. It is the same refusal the machine's own `Result` guards
@@ -219,11 +226,12 @@ impl StreamMachine {
     }
 
     /// Buyer STOP.
+
     /// On the PROBE the buyer is walking away from the trial itself, so the tick burns together with a mirror
     /// tick of the bond: a seller who meant to take the first tick and vanish collects nothing and
     /// pays a tick for the attempt. After acceptance it settles by fact -- trusted consumption to the
     /// seller, the rest refunded, and the contested tail dropped, since walking away IS the statement that it
-    /// is disputed. From a state that is not a live deal it is refused(see `refuse_when_not_live`).
+    /// is disputed. From a state that is not a live deal it is refused (see `refuse_when_not_live`).
     pub fn buyer_stop(&mut self) -> Settlement {
         let settlement = match &self.state {
             StreamState::Probe { tick } => {
@@ -245,9 +253,10 @@ impl StreamMachine {
         settlement
     }
 
-    /// The seller abandons the deal(`sellerStop`). Pay the trusted consumption, refund the rest. He
+    /// The seller abandons the deal (`sellerStop`). Pay the trusted consumption, refund the rest. He
     /// forfeits the pending tail exactly as the buyer would, so quitting never pays better than delivering,
     /// and from a state that is not a live deal it is refused just like a buyer stop.
+
     /// On the PROBE the settlement shape stays this one and does NOT mirror the buyer's `BurnBoth`. The
     /// walk-out still costs the seller the same one tick -- the contract burns it out of his bond
     /// (`sellerStop`, `bondBurn = min(P, _sellerBond)`) -- but the trial tick itself is the buyer's until
@@ -272,7 +281,7 @@ impl StreamMachine {
         settlement
     }
 
-    /// The seller never opened the deal(`cleanupUnopened`): full refund both ways, no burn.
+    /// The seller never opened the deal (`cleanupUnopened`): full refund both ways, no burn.
     pub fn seller_no_show(&mut self) -> Settlement {
         let settlement = Settlement::SellerNoShow {
             to_buyer_refund: 0,
@@ -295,9 +304,9 @@ impl StreamMachine {
         };
     }
 
-    /// The seller CONCEDES the dispute(`releaseDispute`): the contested tail is dropped, the bond returns
+    /// The seller CONCEDES the dispute (`releaseDispute`): the contested tail is dropped, the bond returns
     /// in full and nothing burns. Everything already trusted stays his -- it was never in dispute. From a
-    /// state that is not a live deal it is refused(see `refuse_when_not_live`).
+    /// state that is not a live deal it is refused (see `refuse_when_not_live`).
     pub fn release_dispute(&mut self) -> Settlement {
         let settlement = match &self.state {
             StreamState::Probe { .. }
@@ -314,8 +323,9 @@ impl StreamMachine {
         settlement
     }
 
-    /// `DISPUTE_WINDOW` passed with nobody conceding(`resolveDisputeTimeout`): the seller's whole bond burns
+    /// `DISPUTE_WINDOW` passed with nobody conceding (`resolveDisputeTimeout`): the seller's whole bond burns
     /// and an equal amount of the buyer's escrow with it. Trusted value is untouched.
+
     /// The burn is FIXED at the bond, not scaled to what was claimed -- a claim-sized burn would be asymmetric,
     /// since the rate allowance lets one claim assert far more than the bond covers.
     pub fn resolve_dispute_timeout(&mut self) -> Settlement {
@@ -333,6 +343,7 @@ impl StreamMachine {
     }
 
     /// The buyer's at-risk value in the current state: the contested tail, valued at the tick price.
+
     /// Trusted consumption is already settled and therefore not a loss; the unspent escrow is refundable at
     /// any moment via `stop()`. So what the buyer can still lose to a dishonest counterparty is exactly the
     /// claim that has not yet been through its window.

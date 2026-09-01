@@ -15,10 +15,15 @@ fn token_contract() -> String {
 fn write_fixture(dir: &std::path::Path, schema_version: Option<u32>) -> String {
     let token_contract = token_contract();
     let handle = deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer);
+    // The record names the network the fixture's OWN backend reports. `resolve_buyer_spot_resume`
+    // filters durable deals by `chain.network()` (`buyer.rs:8323`), which is what keeps one chain's
+    // deal from being resumed on another, and this fixture's backend is a mock -- so the record is a
+    // mock's record. It used to say the test chain's name because the trait default did; a mock
+    // reporting itself as being on a real chain is the confusion removes.
     let mut record = serde_json::json!({
         "handle": handle,
         "role": "buyer",
-        "network": "shellnet",
+        "network": ResumeSelectorChain::new().network(),
         "token_contract": token_contract,
         "note_addr": note_addr(),
         "frame_model": FRAME_MODEL,
@@ -285,7 +290,10 @@ fn freshly_written_runtime_record_carries_current_schema_version() {
     let dir = tempfile::tempdir().expect("writer fixture tempdir");
     let token_contract = token_contract();
     let note_addr = note_addr();
-    let written = crate::cli::commands::save_runtime_deal_handle(
+    // The network is passed, not resolved: production takes it from the manifest this run is on
+    // (`save_runtime_deal_handle_for_network`), and a test that let it resolve from an unset
+    // environment was asserting the fallback label rather than the record's contract.
+    let written = crate::cli::commands::save_runtime_deal_handle_for_network(
         crate::cli::commands::RuntimeDealHandleInput {
             role: deals::DealHandleRole::Buyer,
             deals_dir: Some(dir.path()),
@@ -301,6 +309,7 @@ fn freshly_written_runtime_record_carries_current_schema_version() {
             }),
             created_order_ids: vec![ORDER_ID],
         },
+        "net-a",
         false,
     )
     .expect("production runtime handle writer succeeds");
@@ -310,7 +319,7 @@ fn freshly_written_runtime_record_carries_current_schema_version() {
     )
     .expect("fresh handle is JSON");
     assert_eq!(record["version"], deals::DEAL_HANDLE_VERSION);
-    assert_eq!(record["network"], "shellnet");
+    assert_eq!(record["network"], "net-a");
 }
 
 #[test]

@@ -1,4 +1,5 @@
 //! stage one: the provider model, the durable binding, and the fail-fast.
+
 //! Each test names the property it is holding, because every one of them exists to stop a specific
 //! money-path mistake: a provider guessed after the fact, a rebind that overwrites or deletes the
 //! secrets of a Hot that still holds funds, a half-written active binding, or a command that starts
@@ -16,10 +17,10 @@ fn store() -> (tempfile::TempDir, WalletStore) {
 
 fn binding(id: &str, provider: WalletProvider, hot: &str) -> WalletBinding {
     WalletBinding {
+        network: crate::cli::wallet::test_network_a(),
         version: BINDING_VERSION,
         id: id.to_string(),
         provider,
-        network: WalletNetwork::Shellnet,
         hot_address: hot.to_string(),
         vault_address: None,
         hot_key_file: None,
@@ -33,9 +34,8 @@ fn binding(id: &str, provider: WalletProvider, hot: &str) -> WalletBinding {
 /// provider is chosen by which subcommand was named - so this exists only to construct the variant.
 fn sample_onboard_args() -> crate::cli::args::WalletOnboardArgs {
     crate::cli::args::WalletOnboardArgs {
+        // The manifest a run finds for itself; these fixtures never dial.
         agent_name: "build-agent".to_string(),
-        network: crate::cli::args::WalletNetworkArg::Shellnet,
-        endpoint: None,
         state: Some(std::path::PathBuf::from("session.json")),
         hot_key: Some(std::path::PathBuf::from("hot.key")),
         vault_key: None,
@@ -48,8 +48,6 @@ fn sample_onboard_args() -> crate::cli::args::WalletOnboardArgs {
 /// identity -- every field has a default because the menu can also choose this provider.
 fn goshai_args() -> crate::cli::args::WalletGoshAiArgs {
     crate::cli::args::WalletGoshAiArgs {
-        network: crate::cli::args::WalletNetworkArg::Shellnet,
-        endpoint: None,
         activation_timeout: None,
     }
 }
@@ -58,10 +56,8 @@ fn goshai_args() -> crate::cli::args::WalletGoshAiArgs {
 fn manual_args() -> crate::cli::args::WalletOnboardManualArgs {
     crate::cli::args::WalletOnboardManualArgs {
         multisig_address: None,
-        multisig_key: None,
+        multisig_private_key: None,
         multisig_seed_file: None,
-        network: crate::cli::args::WalletNetworkArg::Shellnet,
-        endpoint: None,
     }
 }
 
@@ -191,11 +187,11 @@ fn the_provider_is_a_recorded_field_and_survives_a_round_trip() {
         let reserved = store.open_draft().expect("reserve the fixture's id");
         let written = binding(reserved.id(), provider, "4::abc");
         store.commit_active(&written).expect("commit");
-        let read = store.load_active(WalletNetwork::Shellnet).expect("load").expect("present");
+        let read = store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present");
         assert_eq!(read, written);
         assert_eq!(read.provider, provider);
         let json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(store.binding_path(WalletNetwork::Shellnet)).expect("read"))
+            serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read"))
                 .expect("json");
         assert_eq!(json["provider"], provider.as_str());
     }
@@ -214,7 +210,7 @@ fn the_same_hot_address_can_carry_a_different_provider() {
         .expect("commit gosh-ai");
     assert_eq!(
         store
-            .load_active(WalletNetwork::Shellnet)
+            .load_active(&crate::cli::wallet::test_network_a())
             .expect("load")
             .expect("present")
             .provider,
@@ -225,7 +221,7 @@ fn the_same_hot_address_can_carry_a_different_provider() {
         .expect("commit manual");
     assert_eq!(
         store
-            .load_active(WalletNetwork::Shellnet)
+            .load_active(&crate::cli::wallet::test_network_a())
             .expect("load")
             .expect("present")
             .provider,
@@ -238,16 +234,16 @@ fn the_same_hot_address_can_carry_a_different_provider() {
 #[test]
 fn a_binding_without_a_provider_field_is_refused_not_defaulted() {
     let (_temp, store) = store();
-    std::fs::create_dir_all(store.binding_path(WalletNetwork::Shellnet).parent().expect("parent")).expect("mkdir");
+    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
     std::fs::write(
-        store.binding_path(WalletNetwork::Shellnet),
-        br#"{"version":1,"id":"x","network":"shellnet","hot_address":"4::abc"}"#,
+        store.binding_path(&crate::cli::wallet::test_network_a()),
+        br#"{"version":1,"id":"x","network":"net-a","hot_address":"4::abc"}"#,
     )
     .expect("write");
     let error = format!(
         "{:#}",
         store
-            .load_active(WalletNetwork::Shellnet)
+            .load_active(&crate::cli::wallet::test_network_a())
             .expect_err("a binding with no provider must not load")
     );
     assert!(error.contains("provider"), "{error}");
@@ -259,14 +255,14 @@ fn a_future_binding_version_is_refused() {
     let (_temp, store) = store();
     let mut future = binding("id", WalletProvider::Manual, "4::abc");
     future.version = BINDING_VERSION + 1;
-    std::fs::create_dir_all(store.binding_path(WalletNetwork::Shellnet).parent().expect("parent")).expect("mkdir");
+    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
     std::fs::write(
-        store.binding_path(WalletNetwork::Shellnet),
+        store.binding_path(&crate::cli::wallet::test_network_a()),
         serde_json::to_vec(&future).expect("serialize"),
     )
     .expect("write");
     let error = store
-        .load_active(WalletNetwork::Shellnet)
+        .load_active(&crate::cli::wallet::test_network_a())
         .expect_err("a future version must not load")
         .to_string();
     assert!(error.contains("version"), "{error}");
@@ -286,7 +282,7 @@ fn the_binding_file_holds_no_secret_material() {
     store.commit_active(&full).expect("commit");
 
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(WalletNetwork::Shellnet)).expect("read")).expect("json");
+        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read")).expect("json");
     let mut keys: Vec<&str> = json
         .as_object()
         .expect("object")
@@ -321,7 +317,7 @@ fn absent_optional_fields_are_omitted() {
         .commit_active(&binding("id", WalletProvider::GoshAi, "4::hot"))
         .expect("commit");
     let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(WalletNetwork::Shellnet)).expect("read")).expect("json");
+        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read")).expect("json");
     let object = json.as_object().expect("object");
     assert!(!object.contains_key("vault_address"), "{json}");
     assert!(!object.contains_key("vault_key_file"), "{json}");
@@ -360,7 +356,7 @@ fn a_replaced_binding_is_archived_with_its_provider_intact() {
         archived.display()
     );
     assert_eq!(
-        store.load_active(WalletNetwork::Shellnet).expect("load").expect("present"),
+        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
         second,
         "the active binding is the new one"
     );
@@ -451,11 +447,11 @@ fn an_empty_draft_is_discarded_and_a_used_one_is_kept() {
 fn a_missing_binding_fails_fast_with_the_stable_code() {
     let (_temp, store) = store();
     assert!(
-        store.load_active(WalletNetwork::Shellnet).expect("load").is_none(),
+        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").is_none(),
         "nothing is bound yet"
     );
     let error = store
-        .require_active(WalletNetwork::Shellnet)
+        .require_active(&crate::cli::wallet::test_network_a())
         .expect_err("a missing binding must not resolve to a wallet");
     let structured = error
         .downcast_ref::<dexdo_core::DexdoError>()
@@ -485,7 +481,7 @@ fn require_active_returns_the_recorded_binding() {
     let reserved = store.open_draft().expect("reserve the fixture's id");
     let written = binding(reserved.id(), WalletProvider::Manual, "4::hot");
     store.commit_active(&written).expect("commit");
-    assert_eq!(store.require_active(WalletNetwork::Shellnet).expect("resolve"), written);
+    assert_eq!(store.require_active(&crate::cli::wallet::test_network_a()).expect("resolve"), written);
 }
 
 /// A binding file that exists but cannot be read is an error, never a silent "no wallet": treating
@@ -493,10 +489,10 @@ fn require_active_returns_the_recorded_binding() {
 #[test]
 fn an_unreadable_binding_is_an_error_not_an_absent_one() {
     let (_temp, store) = store();
-    std::fs::create_dir_all(store.binding_path(WalletNetwork::Shellnet).parent().expect("parent")).expect("mkdir");
-    std::fs::write(store.binding_path(WalletNetwork::Shellnet), b"{ this is not json").expect("write");
-    assert!(store.load_active(WalletNetwork::Shellnet).is_err());
-    let error = store.require_active(WalletNetwork::Shellnet).expect_err("must not resolve");
+    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
+    std::fs::write(store.binding_path(&crate::cli::wallet::test_network_a()), b"{ this is not json").expect("write");
+    assert!(store.load_active(&crate::cli::wallet::test_network_a()).is_err());
+    let error = store.require_active(&crate::cli::wallet::test_network_a()).expect_err("must not resolve");
     assert!(
         error.downcast_ref::<dexdo_core::DexdoError>().is_none(),
         "a corrupt binding is not the not-configured code: {error}"
@@ -514,10 +510,12 @@ fn binding_ids_do_not_repeat() {
 }
 
 /// A rebind that FAILS leaves the previous binding active and still usable as the funding wallet.
+
 /// Asserted by resolving it the way a money command does, not by looking at the filesystem. "The
 /// file is still there" is not the property: the property is that `note deploy` and `note topup`
 /// still find a Hot to spend from, and a binding can be present and still unresolvable -- one with
 /// no local key or seed file resolves to a refusal, not to a wallet.
+
 /// The failure path is driven, not simulated: `run_selected` reserves a draft, runs the provider
 /// flow, and on error discards the draft and returns WITHOUT committing. That is exactly the
 /// sequence here, with the provider flow's error standing in for a wallet that failed verification.
@@ -540,12 +538,12 @@ fn a_failed_rebind_leaves_the_previous_binding_active_and_resolvable() {
 
     // Nothing was committed, so the previous binding is untouched...
     assert_eq!(
-        store.load_active(WalletNetwork::Shellnet).expect("load").expect("present"),
+        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
         previous,
         "a failed rebind must not replace the binding it was going to replace"
     );
     // ...and it still resolves as the wallet a money command would spend from.
-    let resolved = super::resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let resolved = super::resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("the previous binding must still resolve as the funding wallet");
     assert_eq!(resolved.address, "4::hot-previous");
     assert_eq!(resolved.key, Some(key));
@@ -554,6 +552,7 @@ fn a_failed_rebind_leaves_the_previous_binding_active_and_resolvable() {
 }
 
 /// The archived binding's ADDRESS survives, which is the whole reason archiving exists.
+
 /// `a_replaced_binding_is_archived_with_its_provider_intact` above already compares the whole
 /// struct, which subsumes this. It is asserted separately anyway because the address is the part
 /// that makes stranded funds recoverable, and a future change that narrowed the archive to a
@@ -581,6 +580,7 @@ fn the_archived_binding_still_names_the_hot_that_may_hold_funds() {
 /// With step 9 landed, `rebind ackinacki-wallet` is a real operation and must behave like the
 /// other two: archive the previous binding and produce a new one, or leave the previous one
 /// active and resolvable.
+
 /// The prohibition on wiring it existed because a rebind through a flow that could not write a
 /// binding would replace a good binding with nothing. That condition is gone: the flow now returns
 /// a `WalletBinding` and `run_selected` commits it through the one writer.
@@ -618,10 +618,10 @@ fn rebinding_to_ackinacki_wallet_archives_the_previous_binding_and_activates_the
         "funds can still sit in the replaced Hot, so its address must remain readable"
     );
 
-    let active = store.load_active(WalletNetwork::Shellnet).expect("load").expect("present");
+    let active = store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present");
     assert_eq!(active, replacement);
     // The binding names the Hot as the wallet to spend from -- never the Vault.
-    let resolved = super::resolve_funding_wallet(&store, WalletNetwork::Shellnet, None, &None, &None)
+    let resolved = super::resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
         .expect("the new binding resolves as the funding wallet");
     assert_eq!(
         resolved.address, "4::hot-new",

@@ -1,10 +1,12 @@
 //! Real OpenAI-compatible upstream.
-//! The gateway connects to an OpenAI-compatible API(by default **Groq**, `qwen/qwen3-32b`),
-//! sends the buyer's canonical request(R1), reads the **streaming SSE** and normalizes each
-//! delta into a `CanonChunk` incrementally(R6).
+//! The gateway connects to an OpenAI-compatible API (by default **Groq**, `qwen/qwen3-32b`),
+//! sends the buyer's canonical request (R1), reads the **streaming SSE** and normalizes each
+//! delta into a `CanonChunk` incrementally (R6).
+
 //! **Billing authority:** exactly one number authorizes money -- the provider's own
 //! terminal `usage.completion_tokens`. SSE event boundaries and delta text length are never a token count.
-//! The key is taken **from the environment at runtime**([`api_key`]) and is never stored/logged
+
+//! The key is taken **from the environment at runtime** ([`api_key`]) and is never stored/logged
 //! . Without a key the adapter does not start -- the stream
 //! closes with `Status::failed_precondition`, which yields a clean skip in e2e.
 
@@ -23,16 +25,16 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-/// Name of the env variable holding the upstream key(Groq OpenAI-compatible API). Creds come from "seahorse".
+/// Name of the env variable holding the upstream key (Groq OpenAI-compatible API). Creds come from "seahorse".
 pub const API_KEY_ENV: &str = "GROQ_API_KEY";
 
 /// Default base of the Groq OpenAI-compatible API.
 pub const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
-/// Default model id -- Qwen 32B on Groq(canonical id from the Groq model list).
+/// Default model id -- Qwen 32B on Groq (canonical id from the Groq model list).
 pub const DEFAULT_MODEL: &str = "qwen/qwen3-32b";
 
-/// Maximum output length of the built-in demo default([`DEFAULT_MODEL`] on Groq), measured against the live
+/// Maximum output length of the built-in demo default ([`DEFAULT_MODEL`] on Groq), measured against the live
 /// provider: `max_tokens=40960` -> HTTP 200, `max_tokens=40961` -> HTTP 400
 /// `` `max_tokens` must be less than or equal to `40960` ``. Only the built-in default carries it;
 /// every configured model declares its own `capabilities.max_output_tokens`.
@@ -45,21 +47,21 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 40_960;
 /// (Groq/qwen) for tests and `live_groq`.
 #[derive(Clone, Debug)]
 pub struct OpenAiConfig {
-    /// Base URL of the OpenAI-compatible API(without the trailing `/chat/completions`).
+    /// Base URL of the OpenAI-compatible API (without the trailing `/chat/completions`).
     pub base_url: String,
-    /// Upstream model id(`served_model`; forced by the market R1, the buyer's `model` is not trusted).
-    /// Sent to the upstream(Groq); an internal detail, NOT the on-wire declared model.
+    /// Upstream model id (`served_model`; forced by the market R1, the buyer's `model` is not trusted).
+    /// Sent to the upstream (Groq); an internal detail, NOT the on-wire declared model.
     pub model: String,
-    /// **Canonical market id**(`producer--model--version`, e.g. `qwen--qwen3--32b`) -- the protocol-facing model
-    /// identity the buyer paid for(B2) and verifies the declaration against. Declared as
-    /// `claimed_model`. It is DISTINCT from [`Self::model`](the upstream slug like `qwen/qwen3-32b`): the buyer's
+    /// **Canonical market id** (`producer--model--version`, e.g. `qwen--qwen3--32b`) -- the protocol-facing model
+    /// identity the buyer paid for (B2) and verifies the declaration against. Declared as
+    /// `claimed_model`. It is DISTINCT from [`Self::model`] (the upstream slug like `qwen/qwen3-32b`): the buyer's
     /// frame is canonical, so declaring the served slug here would false-trip the substitution check.
     pub frame_model: String,
     /// **Test-only seam:** declare a DIFFERENT `claimed_model` in the
     /// `SignalManifest` while the real upstream still serves [`Self::model`]. `None` (default / production path,
-    /// [`Self::from_model`]) -> `claimed_model == frame_model`(honest declaration of the canonical market id).
+    /// [`Self::from_model`]) -> `claimed_model == frame_model` (honest declaration of the canonical market id).
     /// `Some(name)` -> emit `name` as the declared model while serving `model` -- reproduces a served!=declared
-    /// substitution so the buyer's content gate(B8 + B7-full) can be proven against a REAL divergent upstream.
+    /// substitution so the buyer's content gate (B8 + B7-full) can be proven against a REAL divergent upstream.
     pub claimed_model_override: Option<String>,
     /// Name of the env variable holding the key -- **per-model/provider**, not a single global one.
     pub api_key_env: String,
@@ -69,7 +71,7 @@ pub struct OpenAiConfig {
     pub capabilities: Capabilities,
     /// The operator's declared extra spellings for this SAME model --
     /// e.g. `Qwen/Qwen3-32B` for the slug `qwen/qwen3-32b`. The buyer already reconciles identity across
-    /// all three spellings through this field([`crate::buyer::verify`]); the seller's served-model check
+    /// all three spellings through this field ([`crate::buyer::verify`]); the seller's served-model check
     /// reads the same one, so an operator who declared the provider's own spelling the supported way is
     /// not refused for it.
     pub identity_aliases: Vec<String>,
@@ -93,15 +95,15 @@ impl Default for OpenAiConfig {
 }
 
 impl OpenAiConfig {
-    /// Build from a model config entry -- the operational CLI path(`--model`).
+    /// Build from a model config entry -- the operational CLI path (`--model`).
     pub fn from_model(m: &ModelConfig, registry_frame_model: Option<&str>) -> Self {
         Self {
             base_url: m.base_url.clone(),
             model: m.served_model.clone(),
-            // The on-wire declared model is the CANONICAL frame(what the buyer paid for / verifies against),
+            // The on-wire declared model is the CANONICAL frame (what the buyer paid for / verifies against),
             // not the upstream served slug -- else the buyer's check false-trips a substitution.
             frame_model: registry_frame_model.unwrap_or(&m.frame_model).to_string(),
-            // Production path: honest declaration(`claimed_model == frame_model`). The override is test-only.
+            // Production path: honest declaration (`claimed_model == frame_model`). The override is test-only.
             claimed_model_override: None,
             api_key_env: m.api_key_env.clone(),
             tokenizer_family: m.tokenizer_family.clone(),
@@ -111,14 +113,14 @@ impl OpenAiConfig {
     }
 }
 
-/// Read the upstream key from the environment(runtime) by the **env-variable name from the model config**
-/// . `None` means no key(the live path is unavailable). The value is never
+/// Read the upstream key from the environment (runtime) by the **env-variable name from the model config**
+/// . `None` means no key (the live path is unavailable). The value is never
 /// logged and never persisted to disk.
 pub fn api_key(env_name: &str) -> Option<String> {
     std::env::var(env_name).ok().filter(|k| !k.is_empty())
 }
 
-// --- Request/response shape of OpenAI-compatible chat-completions(subset for the adapter) ---
+// --- Request/response shape of OpenAI-compatible chat-completions (subset for the adapter) ---
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
@@ -235,6 +237,7 @@ struct ReasoningDetailWire {
 /// Build the upstream request body from the buyer's canonical request (R1: normalizing the
 /// request into the upstream format). `model` is forced by the market from configuration -- the buyer's `model`
 /// is absent from `CanonRequest` by design.
+
 /// `model_output_cap` is the model's own maximum output length, already resolved fail-closed by the caller
 /// ([`resolve_model_output_cap`]); the outbound generation limit is the minimum of all three bounds.
 #[cfg(test)]
@@ -264,7 +267,7 @@ fn build_request_with_startup_capabilities<'a>(
         .collect();
     let (temperature, requested_max_tokens, stop, seed) = match &req.params {
         Some(p) => (
-            // `greedy`(B7 spot-check) forcibly sets temp=0(distinct from 0="not set").
+            // `greedy` (B7 spot-check) forcibly sets temp=0 (distinct from 0="not set").
             if p.greedy {
                 Some(0.0)
             } else {
@@ -272,14 +275,14 @@ fn build_request_with_startup_capabilities<'a>(
             },
             (p.max_tokens != 0).then_some(p.max_tokens),
             p.stop.clone(),
-            // Groq exposes a random seed even at temperature=0 for some models(notably gpt-oss). Pin the
+            // Groq exposes a random seed even at temperature=0 for some models (notably gpt-oss). Pin the
             // sampled B7 greedy probe so the seller stream and the reference endpoint compare the same run.
             p.greedy.then_some(0),
         ),
         None => (None, None, Vec::new(), None),
     };
     // the outbound limit is bounded by ALL THREE of the buyer's request, the deal budget and the
-    // model's own output cap. A missing buyer value is not "unbounded"(it used to become `u32::MAX`) and a
+    // model's own output cap. A missing buyer value is not "unbounded" (it used to become `u32::MAX`) and a
     // deal budget is `ticks * TICK_SIZE` tokens, so without the model cap every provider answered `400`.
     let deal_max_tokens = u32::try_from(count).unwrap_or(u32::MAX);
     let max_tokens = requested_max_tokens
@@ -335,10 +338,11 @@ fn openrouter_qwen_reasoning(cfg: &OpenAiConfig) -> bool {
 }
 
 /// Run the real upstream: POST `.../chat/completions` with `stream:true`, parse the SSE and
-/// normalize deltas into `CanonChunk`, yielding incrementally into `tx`(R6). No more than `count`
+/// normalize deltas into `CanonChunk`, yielding incrementally into `tx` (R6). No more than `count`
 /// delivered tokens are requested/forwarded. A canonical request is mandatory
 /// . On a missing key/error we
-/// close the stream with an error status(the response buffer does not accumulate).
+/// close the stream with an error status (the response buffer does not accumulate).
+
 /// `market` is the identity of the market this call is being made for, when the caller knows one
 /// (seller readiness). `None` is "no market is in question" -- buyer traffic and the bare provider-health
 /// probe. It selects which question the served-model check answers; see [`offered_model_aliases`].
@@ -419,12 +423,13 @@ async fn run_with_startup_capabilities(
     )
     .await
     {
-        // Send the error into the channel(if the buyer is still listening) -- without leaking the key into the text.
+        // Send the error into the channel (if the buyer is still listening) -- without leaking the key into the text.
         let _ = tx.send(Err(status)).await;
     }
 }
 
 /// Provider statuses that mean **later**, before the provider emitted an answer.
+
 /// `429` is an explicit rate-limit instruction. `502` and `503` mean the provider gateway or
 /// service is momentarily unavailable. Those three may be retried before any output crosses to the
 /// buyer. Every other non-success status is an answer and is terminal here: `400` is a request
@@ -639,7 +644,7 @@ struct StreamEnding {
     answered_without_framing: bool,
     /// bounded prefix of the raw response body, accumulated only while nothing has been
     /// delivered. The bound is the one this adapter already reads an untrusted provider error body
-    /// with([`UPSTREAM_ERROR_BODY_MAX_BYTES`], [`upstream_http_error`]) -- the same question, asked
+    /// with ([`UPSTREAM_ERROR_BODY_MAX_BYTES`], [`upstream_http_error`]) -- the same question, asked
     /// of a `200` instead of a `4xx`.
     unframed_body: Vec<u8>,
 }
@@ -661,6 +666,7 @@ impl StreamEnding {
     /// response stopped, and asking the same question again gets the same answer: it costs the
     /// operator a full supervision cycle before they are told, and on an open deal it spends the
     /// buyer's delivery window.
+
     /// There are two ways that answer reaches us and this is the one place that decides between
     /// them and silence. An `event: error` frame is already recorded by the time this is called
     /// . A bare JSON error object under a `200` never becomes a frame -- `parse_event` reads
@@ -679,11 +685,13 @@ impl StreamEnding {
     }
 
     /// Carry the provider's own sentence into OUR refusal.
+
     /// The class stays ours, first and unchanged: it says what the SELLER did with the stream, and
     /// every caller and test that reads it keeps reading the same thing. What follows is what the
     /// provider said, which is the part that tells an operator whether to fix `tool_choice` or go
     /// and debug the network ( -- reporting our own view of a stream as the whole diagnosis is
     /// the confusion that cost a day in).
+
     /// The provider's text is attacker-controlled, so it goes through the SAME redaction and the
     /// SAME length bound as every other provider string this adapter surfaces
     /// ([`sanitize_error_detail`] and [`bound_error_detail`], `UPSTREAM_ERROR_ECHO_PREFIX_CHARS` /
@@ -898,7 +906,7 @@ async fn stream_response(
 ) -> Result<(), Status> {
     use futures::StreamExt;
 
-    // Incremental SSE parsing over the body's byte stream(R6): accumulate a buffer, split on
+    // Incremental SSE parsing over the body's byte stream (R6): accumulate a buffer, split on
     // `\n\n` boundaries, parse `data:` lines. `data: [DONE]` ends the stream.
     let mut byte_stream = resp.bytes_stream();
     // accumulate BYTES. A network read ends wherever the network chose, which is routinely inside a
@@ -956,8 +964,8 @@ async fn stream_response(
             ending.observe_body(&bytes);
         }
 
-        // Flush complete SSE events(separated by `\n\n`); an unfinished frame must not grow
-        // the gateway buffer without bound -- a hostile/broken upstream is untrusted(Y3, R6).
+        // Flush complete SSE events (separated by `\n\n`); an unfinished frame must not grow
+        // the gateway buffer without bound -- a hostile/broken upstream is untrusted (Y3, R6).
         for event in drain_complete_events(&mut buf)? {
             let capability_event = match (requirements, capability_observation.as_mut()) {
                 (Some(requirements), Some(observation)) => {
@@ -985,6 +993,7 @@ async fn stream_response(
                     // in the readiness probe (`UpstreamConfig::check_health`, the
                     // `upstream_authentication_and_model` component) that refusal happens BEFORE
                     // `postSellOffer`, so a foreign model never reaches the book or a buyer.
+
                     // HOW FAR THIS GOES, so nobody reads more into it than it carries: the seller PROXIES
                     // the provider, so a dishonest seller can rewrite this field before the buyer sees
                     // anything. What this catches is a MISCONFIGURED seller -- the wrong `served_model`, a
@@ -992,20 +1001,23 @@ async fn stream_response(
                     // deliberate substitution. The only defence against that is the buyer's content
                     // spot-check, where the buyer obtains the reference itself and never
                     // through the seller.
+
                     // A frame that states no model is not a mismatch: OpenAI-compatible chunks carry
                     // `model`, but an endpoint that omits it gives no identity signal at all, and inventing
                     // a verdict from silence would take honest sellers off the market.
+
                     // WHY THE REFUSAL IS BOUNDED BY THE FIRST DELIVERED OUTPUT: once a chunk
                     // has been forwarded, an error returned from here reaches `relay_counting` with output
                     // already delivered and its authoritative usage still outstanding, which classifies the
-                    // request `AmbiguousUsage`(`seller::gateway`) -> `finish_ambiguous`
+                    // request `AmbiguousUsage` (`seller::gateway`) -> `finish_ambiguous`
                     // (`seller::capacity`), and that terminal deliberately keeps the unresolved remainder
                     // COMMITTED: the buyer loses the capacity it paid for and the seller cannot claim the
                     // tokens it already delivered. Burning both sides' money is not a proportionate answer
                     // to a misconfigured `served_model`, so past that point the divergence is recorded as a
                     // diagnostic and the stream is carried to its honest terminal.
+
                     // This costs the check nothing it could have had: an OpenAI-compatible provider names
-                    // the model in its FIRST frame(Groq states it on the role delta, before any content),
+                    // the model in its FIRST frame (Groq states it on the role delta, before any content),
                     // so a real mismatch is always seen at `seq == 0` -- including in the readiness probe
                     // (`check_health`), where E2E-ADV-02 refuses BEFORE `postSellOffer` and no buyer, deal
                     // or reservation exists yet.
@@ -1063,7 +1075,7 @@ async fn stream_response(
                         // UPS-24: one request carries exactly one authoritative aggregate, and it is billed
                         // exactly once. Real OpenAI-compatible endpoints RESTATE that one aggregate rather
                         // than send it once: a live Groq stream carries the total on the `finish_reason`
-                        // chunk(as both `usage` and `x_groq.usage`) and again on the dedicated
+                        // chunk (as both `usage` and `x_groq.usage`) and again on the dedicated
                         // `stream_options.include_usage` chunk that closes the stream. An identical
                         // restatement is the same number said twice -- it is held once, cannot move the bill,
                         // and refusing it would take a correctly-reported seller off the market for saying
@@ -1102,7 +1114,7 @@ async fn stream_response(
                             // Family comes from the model config; the buyer matches the profile.
                             tokenizer_family: cfg.tokenizer_family.clone(),
                             has_token_ids: false,
-                            // Declare the CANONICAL frame model(what the buyer paid for / verifies, B2/B7), NOT
+                            // Declare the CANONICAL frame model (what the buyer paid for / verifies, B2/B7), NOT
                             // the upstream served slug -- declaring the slug false-trips. The test-only
                             // override emits a different declared name to prove a real substitution.
                             claimed_model: cfg
@@ -1120,7 +1132,7 @@ async fn stream_response(
                         .await
                         .is_err()
                     {
-                        return Ok(()); // buyer disconnected(STOP)
+                        return Ok(()); // buyer disconnected (STOP)
                     }
                 }
                 // the provider ANSWERED, in band, on a `200 OK` stream. It is not a delta and
@@ -1295,11 +1307,13 @@ fn safe_error_detail(
 }
 
 /// The error this JSON STATES, if it states one.
+
 /// `serde_json::Value::get` answers "is this key PRESENT", not "does it hold anything": it returns
 /// `Some(Value::Null)` for `{"error": null}`. That shape is not exotic -- it is what a nullable
 /// member looks like when a gateway serialises a fixed envelope instead of omitting its absent
 /// members, and several OpenAI-compatible proxies put it on every chunk they send. So `is_some()` is
 /// the wrong question wherever this is asked: the member must be present AND hold something.
+
 /// This is the one place that answers it, so the frame parser, the detail reader and the unframed
 /// body reader cannot drift apart on what an error is -- the drift that produced, where two
 /// layers asked the same question and only one of them had been taught the answer.
@@ -1324,22 +1338,26 @@ fn json_error_detail(value: &serde_json::Value) -> Option<String> {
 
 /// Is this whole response body the provider ANSWERING with an error, rather than a stream that went
 /// quiet?
+
 /// The shape: `200 OK`, `content-type: text/event-stream`, and a body that is a bare JSON error
 /// object -- no `data:` prefix, no SSE framing at all. A gateway sends it when it has already
 /// committed the status line and only then learns the upstream failed. `parse_event` recognizes a
 /// frame by its `data:` lines and nothing else, so this body produces no frame, and the stream used
 /// to end at `seq == 0` looking exactly like a body that vanished.
+
 /// **The rule is the one the in-band frame layer already applies**: `parse_event` treats a JSON
 /// object carrying an `error` member as the provider stating why it stopped. The only difference is
 /// where the bytes were found -- there, inside a `data:` frame; here, as the entire body. Nothing
 /// about what a FRAME is changes, and `a_bare_error_object_with_no_data_prefix_is_not_a_frame` still
 /// holds: this is read from the body, after the stream has ended, not from the parser.
+
 /// **A present-but-null `error` is not a stated reason.** `serde_json::Value::get` answers
 /// "is this key present", not "does it hold anything": it returns `Some(Value::Null)` for
 /// `{"error": null}`, a shape several OpenAI-compatible proxies put on every chunk they send. Asking
 /// `is_some()` here would read that as the provider having answered -- refusing to retry, and
 /// reporting an empty reason to the operator. So the member must be present AND non-null, which is
 /// what [`stated_error`] answers for every layer that asks.
+
 /// **Deliberately narrow, and it fails towards today's behaviour.** Only a body that parses whole as
 /// JSON and carries an `error` member qualifies. A partial SSE stream does not parse (`data: ` is
 /// not JSON), an HTML error page does not parse, a JSON body with no `error` states no reason, and a
@@ -1438,12 +1456,12 @@ fn bound_error_detail(mut detail: String, body_truncated: bool) -> String {
     detail
 }
 
-/// Cap on an unfinished SSE frame(Y3): a hostile/broken upstream sending bytes without
+/// Cap on an unfinished SSE frame (Y3): a hostile/broken upstream sending bytes without
 /// a `\n\n` separator must not grow the gateway buffer without bound. Legitimate events (a text
 /// delta) are 2-3 orders of magnitude smaller -- 1 MiB does not touch them.
-/// Drain complete SSE events(`\n\n`-separated) from the buffer in order. If the REMAINDER
+/// Drain complete SSE events (`\n\n`-separated) from the buffer in order. If the REMAINDER
 /// (unfinished frame) exceeds the cap -- `resource_exhausted` instead of uncontrolled buffer
-/// growth(Y3, R6). Complete events are always drained before the cap check.
+/// growth (Y3, R6). Complete events are always drained before the cap check.
 // `tonic::Status` is the standard gRPC error type of the whole upstream module; boxing it in a single helper
 // would break `?`-propagation into the loop's `Result<_, Status>`. The large Err variant here is deliberate.
 #[allow(clippy::result_large_err)]
@@ -1472,7 +1490,7 @@ fn drain_complete_events(buf: &mut Vec<u8>) -> Result<Vec<String>, Status> {
 enum ParsedEvent {
     /// Terminal `data: [DONE]`.
     Done,
-    /// `data: {...}`: content/reasoning deltas(possibly empty), the provider's own native output total
+    /// `data: {...}`: content/reasoning deltas (possibly empty), the provider's own native output total
     /// when this frame carries one and the model the provider says actually answered (`model`,
     /// ) when the frame states one.
     Frame {
@@ -1480,22 +1498,23 @@ enum ParsedEvent {
         reasoning: String,
         usage: Option<u64>,
         /// Top-level `model` of an OpenAI-compatible chunk -- the provider's own name for what served
-        /// this frame. `None` = the frame stated nothing(see [`stream_upstream`]).
+        /// this frame. `None` = the frame stated nothing (see [`stream_upstream`]).
         model: Option<String>,
     },
-    /// An in-band `event: error` frame on an otherwise successful(`200 OK`) response: the
+    /// An in-band `event: error` frame on an otherwise successful (`200 OK`) response: the
     /// provider's own statement of why it stopped, carrying its message. The native
-    /// Anthropic adapter models the same thing the same way(`anthropic::ParsedEvent::Error`).
+    /// Anthropic adapter models the same thing the same way (`anthropic::ParsedEvent::Error`).
     ProviderError(String),
-    /// Carries no delta(comment, keep-alive, etc.).
+    /// Carries no delta (comment, keep-alive, etc.).
     Other,
 }
 
 /// Read one native output total out of a `usage`-shaped container.
+
 /// Untrusted input: a container that is not an object, and a `completion_tokens` that is not a
-/// non-negative integer that fits `u64`(string, float, negative, overflowing), are rejected outright
+/// non-negative integer that fits `u64` (string, float, negative, overflowing), are rejected outright
 /// (E2E-UPS-18/22). An absent field is "this frame carries no total", which is not an error here -- the
-/// stream then simply never reaches an authoritative amount(E2E-UPS-07).
+/// stream then simply never reaches an authoritative amount (E2E-UPS-07).
 #[allow(clippy::result_large_err)]
 fn native_output_total(container: Option<&serde_json::Value>) -> Result<Option<u64>, Status> {
     let Some(container) = container else {
@@ -1519,7 +1538,7 @@ fn native_output_total(container: Option<&serde_json::Value>) -> Result<Option<u
 }
 
 /// The frame's terminal native total: the standard `usage` and the Groq mirror `x_groq.usage` are BOTH
-/// read, and a disagreement between them is rejected instead of resolved(E2E-UPS-19) -- choosing the
+/// read, and a disagreement between them is rejected instead of resolved (E2E-UPS-19) -- choosing the
 /// first, last, smaller or larger value would monetize contradictory provider metadata.
 #[allow(clippy::result_large_err)]
 fn frame_native_usage(value: &serde_json::Value) -> Result<Option<u64>, Status> {
@@ -1568,6 +1587,7 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
     // is a terminal record first, whatever else it says, so recognizing the error here can neither
     // drop a bill nor create one. Groq's error frame carries no usage; this ordering is what
     // guarantees the rule rather than the observation.
+
     // the frame must STATE an error, not merely have room for one. `named_error` is the SSE
     // event NAME -- a positive statement made in the event stream's own syntax, which has no null to
     // be blind to -- so it needs no such guard; the JSON member does, and [`stated_error`] is where
@@ -1622,21 +1642,24 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
 
 /// Read the frame's own `model` -- an OpenAI-compatible `chat.completion.chunk` states the model that
 /// actually produced it. A missing/non-string field is "this frame said nothing about identity", which is
-/// not by itself an error(see the refusal in [`stream_upstream`]).
+/// not by itself an error (see the refusal in [`stream_upstream`]).
 fn frame_served_model(value: &serde_json::Value) -> Option<String> {
     let reported = value.get("model")?.as_str()?.trim();
     (!reported.is_empty()).then(|| reported.to_string())
 }
 
 /// Every spelling that may name the model that just answered -- **for the question the caller is asking**.
+
 /// Two layers ask two different things of the same response field, and they are not interchangeable:
-/// * `market == None` -- **provider health**([`super::UpstreamConfig::check_health`], and buyer traffic).
+
+/// * `market == None` -- **provider health** ([`super::UpstreamConfig::check_health`], and buyer traffic).
 /// "Did my provider serve a model my own config names?" The set is the seller's own declared spellings:
-/// the slug it sends(`served_model`), the id it sells under(`frame_model`) and `identity_aliases`.
+/// the slug it sends (`served_model`), the id it sells under (`frame_model`) and `identity_aliases`.
 /// This catches a mistyped `served_model` and a provider that quietly routed the request elsewhere.
-/// * `market == Some(id)` -- **market readiness**([`super::UpstreamConfig::check_market_readiness`]).
+/// * `market == Some(id)` -- **market readiness** ([`super::UpstreamConfig::check_market_readiness`]).
 /// "Is the model that answered the model THIS MARKET sells?" The set is the market id and
 /// `identity_aliases` -- nothing else. This is the verdict that decides whether an offer may rest.
+
 /// **Why `served_model` is absent from the market set, and why that is the whole point (,
 /// E2E-ADV-02/L2).** [`OpenAiConfig::model`] is the slug this seller PUTS IN the request, and an
 /// OpenAI-compatible provider echoes the model it was asked for. While it sat in the only set there was,
@@ -1644,17 +1667,19 @@ fn frame_served_model(value: &serde_json::Value) -> Option<String> {
 /// provider, so it could certify without ever being able to fire. A real Groq `qwen/qwen3-32b` under a
 /// market claiming `adv--real-foreign--...` (production's own shape -- the market id overrides the config
 /// frame in [`OpenAiConfig::from_model`]) answered honestly, matched the slug we sent, and readiness posted
-/// the SELL. The market id is the identity the buyer pays for(B2/B7), so it is the identity a market
+/// the SELL. The market id is the identity the buyer pays for (B2/B7), so it is the identity a market
 /// verdict measures the answer against.
-/// The same model is spelled several ways across this system -- the provider slug(`qwen/qwen3-32b`), the
-/// canonical market id in the frame(`qwen--qwen3--32b`) and the registry's display case
+
+/// The same model is spelled several ways across this system -- the provider slug (`qwen/qwen3-32b`), the
+/// canonical market id in the frame (`qwen--qwen3--32b`) and the registry's display case
 /// (`Qwen/Qwen3-32B`). [`crate::registry::model_id_alias`] is the repo's one normalization between them
 /// (lowercase + `producer--model--version` -> `producer/model-version`); it is reused for both sets rather
 /// than duplicated, so "same model, other spelling" can never read as a substitution -- and for an honest
 /// entry the market id and the provider slug normalize to the SAME alias.
+
 /// `identity_aliases` is in both sets because it is the config field this repo already gives an operator to
 /// declare "the model I sell self-reports under that name": the buyer reconciles identity through exactly
-/// this field([`crate::buyer::verify`]) and the shipped `models.json` uses it. Reading anything less would
+/// this field ([`crate::buyer::verify`]) and the shipped `models.json` uses it. Reading anything less would
 /// refuse an operator whose provider spells the model its own way, and the refusal text names this field.
 fn offered_model_aliases(cfg: &OpenAiConfig, market: Option<&str>) -> Vec<String> {
     let mut offered = Vec::with_capacity(2 + cfg.identity_aliases.len());
@@ -1697,19 +1722,20 @@ fn collect_reasoning(
 /// A VERBATIM capture of a live Groq `qwen/qwen3-32b` stream, recorded by sending exactly the request
 /// this adapter builds for the readiness probe (`stream: true`,
 /// `stream_options.include_usage: true`, `temperature: 0`, `max_tokens: 1`). The capture predates the
-/// log-probability retirement(`ef6a8611`), so the recorded frames still carry the `logprobs` payload
+/// log-probability retirement (`ef6a8611`), so the recorded frames still carry the `logprobs` payload
 /// the probe asked for then; `ChatRequest` sends no such key now. Nothing is trimmed, reordered or
 /// reformatted.
+
 /// It is the fixture because the hand-written ones were the reason a whole campaign of offline rows
 /// went green while every live seller on this model failed readiness: the modelled streams close with
 /// ONE terminal record, and this provider closes with the same total stated TWICE -- once on the
-/// `finish_reason` chunk(mirrored in `usage` and `x_groq.usage`) and once on the dedicated
+/// `finish_reason` chunk (mirrored in `usage` and `x_groq.usage`) and once on the dedicated
 /// `stream_options.include_usage` chunk that carries `choices: []`. It also shows the two facts
 /// depends on for this provider: content frames carry log probabilities and carry no token ids, so
 /// `usage.completion_tokens` is the only authoritative count there is.
 #[cfg(test)]
 /// the starvation capture: the SAME model answering the SAME readiness prompt at the OLD
-/// one-token budget(live, 2026-08-12). Four frames, `content` present once and empty, `reasoning`
+/// one-token budget (live, 2026-08-12). Four frames, `content` present once and empty, `reasoning`
 /// absent entirely, terminal `completion_tokens` = 1 -- a positive bill with nothing delivered.
 /// This one must stay REFUSED: UPS-28 is what catches a provider billing without delivering, and
 /// the fix is the probe budget, not the guard.
@@ -1792,7 +1818,7 @@ mod tests {
         start_test_server_with_response(body, "200 OK", "text/event-stream").await
     }
 
-    /// Read one complete HTTP request(headers plus declared body) off the socket.
+    /// Read one complete HTTP request (headers plus declared body) off the socket.
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;
 
@@ -2018,7 +2044,7 @@ mod tests {
         format!("data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{tokens}}}}}\n\n")
     }
 
-    /// A terminal record whose `usage` container is spelled by the caller(malformed grids, UPS-18).
+    /// A terminal record whose `usage` container is spelled by the caller (malformed grids, UPS-18).
     fn raw_usage_frame(usage: &str) -> String {
         format!("data: {{\"choices\":[],\"usage\":{usage}}}\n\n")
     }
@@ -2084,10 +2110,12 @@ mod tests {
 
     // ---------------------------------------------------------------------------------------
     // (E2E-UPS-41..49): the terminator, the identity latch and the shapes with no output
-    // The second batch of provider shapes, after UPS-B3..UPS-B12(PR1277). Each one names the
+
+    // The second batch of provider shapes, after UPS-B3..UPS-B12 (PR1277). Each one names the
     // branch of `stream_response`/`parse_event` it exercises and what would break if that branch
     // gave the other answer -- a mock that passes without pinning a behaviour reports coverage
     // that does not exist.
+
     // Placed here, between the helpers and the first test, rather than at the end of this module:
     // PR1280 appends its own block at the end, and two appends at one anchor is a conflict
     // for whoever merges second. Nothing here depends on file order.
@@ -2105,7 +2133,7 @@ mod tests {
     }
 
     /// A delta carrying ONLY a tool call: no `content`, no reasoning, no usage. The live shape is
-    /// `TOOL_CALL_CAPTURE`(PR1277); this is the same delta with the capability tool's name replaced
+    /// `TOOL_CALL_CAPTURE` (PR1277); this is the same delta with the capability tool's name replaced
     /// by an ordinary one, because ordinary buyer traffic asks for no capability tool.
     fn tool_call_only_frame() -> String {
         concat!(
@@ -2119,15 +2147,18 @@ mod tests {
     const DONE: &str = "data: [DONE]\n\n";
 
     /// E2E-ROW: E2E-UPS-41/L0
+
     /// `[DONE]` is the end of the response, and `ParsedEvent::Done` leaves the read loop by
     /// `break 'provider_stream` -- so every byte after it, complete frames included, is never
     /// parsed. This pins that: the post-terminator delta reaches no buyer, and the bill stays the
     /// total the provider stated while the stream was still open.
+
     /// If the branch instead kept reading, one of two things would happen and both are worse than
     /// the silence. Either the delta is forwarded, and the buyer receives content after the record
     /// that closed its bill -- the precise hazard UPS-30 exists to refuse; or it is refused, and a
     /// complete, correctly-billed, fully-terminated response becomes a seller-side failure because
     /// the provider appended a byte after saying it was finished.
+
     /// What is NOT claimed here: that the dropped content was free. The provider's total was stated
     /// before `[DONE]`, so the buyer pays that number and receives everything that preceded it; the
     /// discarded tail is output the buyer never paid for. The exposure runs against the seller, not
@@ -2153,10 +2184,12 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-42/L0
+
     /// The same branch from the money side: a terminal usage record that arrives AFTER `[DONE]` is
     /// never read, so the stream reaches its end with `native_usage == None` and delivered output,
     /// which is the UPS-07 refusal. Nothing is billed and the delivered chunk still reached the
     /// buyer.
+
     /// If the branch read it, the seller would bill on an aggregate that arrived after the
     /// response's own terminator -- authority from transport position, which is exactly what UPS-29
     /// refuses one frame earlier. A provider could then state a small total, close the stream, and
@@ -2177,9 +2210,11 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-43/L0
+
     /// A provider that answers nothing, states no total and terminates properly is not a failure.
     /// The end-of-stream branch reads `seq == 0` with `native_usage.unwrap_or(0) == 0` and returns
     /// `Ok(())` before the positive-total requirement is ever reached.
+
     /// Both halves of that matter. If it returned an error, every legitimately empty completion --
     /// a model given a budget too small to say anything, a prompt it declines -- would be reported
     /// as a broken seller and would fail readiness. If it emitted `Accounted(0)`, a zero would be
@@ -2201,11 +2236,13 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-44/L0
+
     /// A tool call is delivered service, and UPS-B8 proves the startup capability probe reads it as
     /// such. This is the OTHER caller: ordinary buyer traffic, where `requirements` is `None`, so
     /// `StartupCapabilityEvent::default()` leaves `tool_call` false and the delta carries no
     /// `content` and no reasoning. `has_output` is therefore false, the frame is skipped, and the
     /// positive total meets `seq == 0` at the end of the stream -- the UPS-28 refusal.
+
     /// This is the current, deliberate answer, not an oversight: `CanonChunk` has no field a tool
     /// call could travel in, which is why E2E-UPS-36 is `blocked` on defining one. Billing it would
     /// charge the buyer for output the wire provably cannot carry. Delivering it is impossible
@@ -2227,9 +2264,11 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-45/L0
+
     /// `model_identity_settled` answers the served-model question ONCE, on the first frame that
     /// states a model, and never re-opens it. A stream whose opening frame names the model this
     /// seller sells is served to its end even if a later frame names another.
+
     /// If the latch were dropped and every frame re-asked, this stream would be refused midway --
     /// after output had already crossed. That refusal reaches `relay_counting` with delivered
     /// output and no authoritative total, which classifies `AmbiguousUsage` and settles through
@@ -2249,13 +2288,16 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-46/L0
+
     /// The other side of the same money rule: a served-model mismatch found once output has
     /// already been delivered is recorded and the stream is carried to its honest terminal, because
     /// the refusal at that point costs the buyer the capacity it paid for.
+
     /// Reaching that branch needs the identity to still be open at `seq > 0`, so the first frame
     /// states no model at all -- the shape an endpoint that omits `model` sends -- and the foreign
     /// name arrives on the second. A frame stating nothing is not a mismatch, so it neither settles
     /// the question nor refuses.
+
     /// The bound is the whole protection. If this branch refused like the `seq == 0` one, a typo in
     /// `served_model` would strand paid capacity on every request rather than print a diagnostic;
     /// if the `seq == 0` branch stopped refusing, a foreign model would reach the book and a buyer.
@@ -2287,21 +2329,26 @@ mod tests {
         "{\"error\":{\"message\":\"model decommissioned\",\"type\":\"invalid_request_error\"}}\n\n";
 
     /// E2E-ROW: E2E-UPS-47/L0
+
     /// `parse_event` recognizes a frame by its `data:` lines and nothing else. A body with none --
     /// the bare error object above -- collects no data, returns `Other` before any JSON is even
     /// looked at, and therefore contributes no delta, no total and no model identity.
+
     /// That is the branch the whole-stream outcome rests on. If such a frame were read as a delta,
     /// a `{"error":...}` object would have to become content or usage, and the seller would forward
     /// or bill an error; UPS-B7 pins the neighbouring rule that an unrecognized field inside a real
     /// delta is ignored, and this is the same discipline one level out.
+
     /// Scope: this pins what the frame IS. What the seller then DOES with a stream made only of such
     /// frames is measured in the ignored test below, and is not settled behaviour.
+
     /// WHAT THIS ROW DELIBERATELY DOES NOT ASSERT, and why the omission is the point. It says only
     /// what a body with no `data:` line parses to. It says nothing about what the SAME bytes parse
     /// to once a provider frames them with `data:`, because that is's subject and the answer
     /// is expected to change: before it, a framed `{"error":...}` object is `Other` -- the delta
     /// parser does not recognise it and it carries no total -- and after it, the same bytes are the
     /// provider's answer, carried out of the stream as its stated reason.
+
     /// An earlier draft of this test did assert the framed case, as
     /// `matches!(.., Frame {.. } | Other)`, meaning to show that framing is what makes a frame.
     /// That assertion was worse than useless: on this base the framed and unframed forms BOTH parse
@@ -2318,9 +2365,11 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-47/L0
+
     /// The other half of the same boundary: an SSE `event:` line alone does not manufacture a frame.
     /// `parse_event` decides on the `data:` lines and nothing else, and returns before any other
     /// line of the event is given meaning.
+
     /// This is the assertion the framed case above should have been. It is non-vacuous -- it fails
     /// if an `event:` line is ever allowed to produce a parse on its own -- and it is stable across
     /// which reads `event: error` only to classify a body that already carries `data:`.
@@ -2370,19 +2419,23 @@ mod tests {
     }
 
     /// DEFECT, reported and not fixed here.
+
     /// A `200 OK` carrying a bare JSON error object is treated as transport silence and RE-ASKED.
     /// `stream_response` ends it with `seq == 0` and no `[DONE]`, which sets
     /// `retryable_pre_output_non_answer`, and the caller asks the same question again -- for the
     /// whole supervision cycle -- before the operator is told anything.
+
     /// Measured, not inferred: against the one-shot fixture this shape consumed the body on attempt
     /// one and then hit a closed listener, surfacing `Unavailable: upstream connect failed` after
     /// ~40s instead of the `DataLoss` the first attempt had already established. A second attempt
     /// is the only way that status can exist.
+
     /// The money outcome is safe -- nothing is delivered and nothing is billed -- so this is an
     /// operational defect, not a loss path: the cost is a wasted supervision cycle and a diagnosis
     /// that points at the network while the provider has plainly said the model is gone. That is
     /// the same complaint makes about the in-band `event: error` frame; PR1280 fixes it for
     /// bodies that carry `data:` lines, and a body with none reaches none of that machinery.
+
     /// Left `#[ignore]`d rather than adjusted to today's behaviour: an error answer must be asked
     /// exactly once, and asserting the retry instead would pin the defect as the contract. The
     /// reason string deliberately avoids `EXPECTED TO FAIL`, which is the marker
@@ -2423,11 +2476,13 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-48/L0
+
     /// SSE comment frames -- the keep-alives every long-lived stream carries -- reach
     /// `ParsedEvent::Other` and are dropped without touching `seq`. That is load-bearing for a
     /// reason that has nothing to do with text: the `SignalManifest` rides on `seq == 0`, and it is
     /// the only place the buyer learns the declared model and the tokenizer family it verifies
-    /// against(B2/B7).
+    /// against (B2/B7).
+
     /// A comment that consumed the counter would leave the manifest on a frame that carries no
     /// output, or nowhere at all, and the buyer would have no declaration to check a substitution
     /// against. UPS-B5 pins the same property against an empty content delta; this pins it against
@@ -2458,10 +2513,12 @@ mod tests {
     }
 
     /// E2E-ROW: E2E-UPS-49/L0
+
     /// `frame_native_usage` reads the standard `usage` and the Groq mirror `x_groq.usage` and has a
     /// distinct arm for each combination. UPS-19 pins the arm where both are present and disagree.
     /// This pins the arm where the standard container is absent and only the vendor mirror states
     /// the total: it is authoritative, and the stream bills it.
+
     /// If that arm returned `None`, a provider that reports its total only under `x_groq` would end
     /// every stream without a total and be refused by UPS-07 -- output delivered, nothing billable,
     /// the model unsellable for a reason no message would name. That is the same class of outage as
@@ -2574,9 +2631,11 @@ mod tests {
 
     /// A seller whose model reports no per-word probabilities still reaches the provider, streams
     /// its output and is charged the provider's own reported count.
+
     /// E2E-UPS-01, `tests/e2e/test-specification.md`.
+
     /// Partial: covers the seller upstream path only, not start-to-settlement payment; the
-    /// adversary half(corrupted terminal usage) is E2E-UPS-07.
+    /// adversary half (corrupted terminal usage) is E2E-UPS-07.
     #[tokio::test]
     async fn a_model_without_logprobs_is_sellable_and_reaches_the_provider() {
         const KEY_ENV: &str = "DEXDO_861_NO_LOGPROBS_SELLABLE_KEY";
@@ -2622,7 +2681,9 @@ mod tests {
 
     /// Only the provider's terminal native output-usage total authorizes what the seller bills for
     /// one OpenAI-compatible response.
+
     /// E2E-UPS-02, `tests/e2e/test-specification.md`.
+
     /// Partial: the OpenAI-compatible protocol only; the Anthropic half of the row is proved by
     /// `crates/dexdo/src/seller/upstream/anthropic.rs`.
     #[tokio::test]
@@ -3247,7 +3308,7 @@ mod tests {
             parse_event(": keep-alive").unwrap(),
             ParsedEvent::Other
         ));
-        // A delta without content(role-only first frame) -> empty string, not accounted.
+        // A delta without content (role-only first frame) -> empty string, not accounted.
         let empty = parse_event("data: {\"choices\":[{\"delta\":{}}]}").unwrap();
         assert!(
             matches!(empty, ParsedEvent::Frame { text, reasoning, .. } if text.is_empty() && reasoning.is_empty())
@@ -3275,7 +3336,7 @@ mod tests {
         }
     }
 
-    /// Y3(regression): complete events are drained in order, the unfinished tail is preserved.
+    /// Y3 (regression): complete events are drained in order, the unfinished tail is preserved.
     /// the tail stays a BYTE remainder, so a character split across it survives intact.
     #[test]
     fn drain_keeps_partial_frame() {
@@ -3315,7 +3376,7 @@ mod tests {
         );
     }
 
-    /// Y3(negative): an upstream without a `\n\n` separator does not grow the gateway buffer without bound --
+    /// Y3 (negative): an upstream without a `\n\n` separator does not grow the gateway buffer without bound --
     /// when the cap is exceeded the stream closes with `resource_exhausted`, not OOM.
     #[test]
     fn frame_without_separator_is_capped() {
@@ -3399,7 +3460,7 @@ mod tests {
         // The cap is the tightest bound only when it is: a smaller cap wins over a smaller deal budget.
         assert_eq!(build_request(&cfg, &request(), 5, CAP).max_tokens, 5);
         assert_eq!(build_request(&cfg, &request(), 5, 2).max_tokens, 2);
-        // Never zero(a provider rejects `max_tokens: 0`).
+        // Never zero (a provider rejects `max_tokens: 0`).
         assert_eq!(build_request(&cfg, &request(), 0, CAP).max_tokens, 1);
     }
 
@@ -3510,7 +3571,7 @@ mod tests {
         let json = format!(
             r#"{{"models":{{"qwen":{{"frame_model":"qwen--qwen3--32b","base_url":"http://{address}",
               "served_model":"qwen/qwen3-32b","api_key_env":"PATH","tokenizer_family":"qwen",
-              "price_per_tick":1000000000,"capabilities":{{"logprobs":true,"top_logprobs":5}}}}}}}}"#
+              "price_per_tick":1,"capabilities":{{"logprobs":true,"top_logprobs":5}}}}}}}}"#
         );
         let models = crate::seller::models::ModelsConfig::from_json(&json).expect("fixture parses");
         let cfg = OpenAiConfig::from_model(models.get("qwen").expect("model"), None);
@@ -3669,12 +3730,14 @@ mod tests {
         assert!(body.reasoning.is_none());
     }
 
-    // ---(UPS-B3..UPS-B12): the stream shapes real providers actually send ---
+    // --- (UPS-B3..UPS-B12): the stream shapes real providers actually send ---
+
     // WHY THIS SECTION EXISTS. Every provider quirk this client has met so far arrived as a
-    // production fire:(one aggregate restated across two frames), (per-token log
-    // probabilities), and(a model whose whole answer is reasoning). The live acceptance
+    // production fire: (one aggregate restated across two frames), (per-token log
+    // probabilities), and (a model whose whole answer is reasoning). The live acceptance
     // campaign runs on ONE model family, so "a provider that does not behave like qwen" was absent
     // from acceptance entirely. These rows put that class in a mock, where it costs seconds.
+
     // The fixtures below are VERBATIM captures from the live Groq OpenAI-compatible endpoint,
     // recorded on 2026-08-12 with exactly the request this adapter builds (`stream: true`,
     // `stream_options.include_usage: true`, `temperature: 0`, `seed: 0`, the canonical
@@ -3701,6 +3764,7 @@ mod tests {
     const TOOL_CALL_TOTAL: u64 = 5;
 
     /// The terminal total [`LIVE_GROQ_READINESS_CAPTURE`] itself reports.
+
     /// It is a property of the CAPTURE and of nothing else. This row first spelled it
     /// `UPSTREAM_HEALTH_PROBE_MAX_TOKENS`, which was the budget the request ASKED for, and the two
     /// numbers happened to both be 1 -- so the row went green while asserting something it never
@@ -3735,7 +3799,7 @@ data: [DONE]
 "#;
 
     /// A live `llama-3.3-70b-versatile` answering the same prompt with the seller's own
-    /// `dexdo_capability_probe` tool forced(`tool_choice`) -- the exact request the startup
+    /// `dexdo_capability_probe` tool forced (`tool_choice`) -- the exact request the startup
     /// capability probe of a `--tools` market builds. Five events: the role delta carries
     /// `content: null`, ONE delta carries the tool call and no content of any kind, and the total is
     /// five tokens. This is what "delivered service" looks like when the delivery is a tool call.
@@ -3796,7 +3860,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
 
 "#;
 
-    /// The budget a startup capability probe sends(`CONTENT_PROBE_MAX_TOKENS`) -- the same canonical
+    /// The budget a startup capability probe sends (`CONTENT_PROBE_MAX_TOKENS`) -- the same canonical
     /// number the tool captures above were recorded with.
     fn capability_probe_budget() -> u64 {
         dexdo_core::params::CONTENT_PROBE_MAX_TOKENS
@@ -3811,6 +3875,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     }
 
     /// One stream against a captured provider body, for a seller configured to serve `model`.
+
     /// `market` selects which question the served-model check answers (`None` = provider health and
     /// buyer traffic; `Some` = market readiness). `requirements` is the startup capability probe
     /// (`None` = ordinary traffic). The default config sells qwen, so a capture from another family
@@ -3870,7 +3935,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         }
     }
 
-    /// Reasoning of every forwarded chunk, in order(the buyer-visible thinking channel).
+    /// Reasoning of every forwarded chunk, in order (the buyer-visible thinking channel).
     fn forwarded_reasoning(events: &[UpstreamEvent]) -> Vec<String> {
         events
             .iter()
@@ -3999,7 +4064,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     }
 
     /// UPS-B4: the same answer under OpenRouter's `reasoning_details[]`, in both of the shapes that
-    /// carry text(`.text` and `.summary`). Same verdict as UPS-B3: it is delivered output.
+    /// carry text (`.text` and `.summary`). Same verdict as UPS-B3: it is delivered output.
     #[tokio::test]
     async fn the_whole_answer_in_reasoning_details_is_delivered_and_billed() {
         let shapes: [(&str, fn(&str) -> serde_json::Value); 2] = [
@@ -4034,10 +4099,11 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     /// UPS-B5: `content` arrives once, EMPTY, on the role delta, and never again -- the first frame
     /// of every OpenAI-compatible provider measured for, and the only `content` a thinking
     /// model sends at a short budget.
+
     /// Two things must hold here and neither is obvious. The empty delta is not delivered output, so
     /// it may not be forwarded as a chunk; and it may not consume `seq == 0` either, because that is
     /// the slot the `SignalManifest` rides in. A stream that spent its manifest on an empty frame
-    /// would leave the buyer with no declared model and no tokenizer family to verify(B2/B7).
+    /// would leave the buyer with no declared model and no tokenizer family to verify (B2/B7).
     #[tokio::test]
     async fn an_empty_first_content_delta_delivers_nothing_and_keeps_the_manifest() {
         assert!(
@@ -4139,6 +4205,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
 
     /// UPS-B7, the capability-probe half: the delivered output of a `--tools` probe is the tool call
     /// itself, so a usage record riding the tool-call frame is not terminal either.
+
     /// The contrast is asserted with it, because it is the whole point: the SAME bytes with the probe
     /// off carry no canonical output at all, and are refused for the other reason. Only a row that
     /// shows both can tell "the tool call counted as delivery" from "something was refused".
@@ -4295,7 +4362,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         );
     }
 
-    /// UPS-B11: an unknown field in the delta(`channel`, which gpt-oss sends beside every fragment)
+    /// UPS-B11: an unknown field in the delta (`channel`, which gpt-oss sends beside every fragment)
     /// is ignored, and its value never reaches the buyer. A parser that concatenated whatever strings
     /// it found in the delta would ship the provider's routing metadata as model output.
     #[test]
@@ -4395,7 +4462,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     // ---: an in-band `event: error` is the provider's ANSWER, not our view of a broken stream ---
 
     /// The exact bytes a live Groq `qwen/qwen3-32b` returned for the seller's OWN `--tools`
-    /// capability probe(2026-08-12, the request `build_request_with_startup_capabilities` builds):
+    /// capability probe (2026-08-12, the request `build_request_with_startup_capabilities` builds):
     /// HTTP `200 OK`, one `event: error` frame, and then nothing. No `[DONE]`, no delta, no usage
     /// record. The provider states why it stopped; that sentence is the only diagnosis that exists.
     const LIVE_GROQ_INBAND_ERROR_CAPTURE: &str = r#"event: error
@@ -4495,6 +4562,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     /// defect 1: the operator is told what the SELLER did and what the PROVIDER said, in that
     /// order. Before this, the whole diagnosis was our own class, which sends the reader to debug the
     /// network while the provider is plainly naming a `tool_choice` it could not satisfy.
+
     /// The refusal itself does not move: same code, same class, nothing billed.
     #[tokio::test]
     async fn an_in_band_provider_error_is_refused_in_the_providers_own_words() {
@@ -4517,6 +4585,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
 
     /// defect 2: an in-band error is an ANSWER. Asking the same question again gets the same
     /// answer, so the provider is asked exactly ONCE.
+
     /// Before this fix the same capture was treated as transport silence: the seller re-sent the
     /// identical request every `health_interval` for the whole `health_cycle_timeout`, and only then
     /// showed the operator the message from defect 1. The count is the assertion because the count is
@@ -4546,7 +4615,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     }
 
     /// The provider's text is attacker-controlled, so it is bounded by the SAME policy every other
-    /// provider string here is bounded by(`UPSTREAM_ERROR_DETAIL_MAX_BYTES`). A refusal is a log
+    /// provider string here is bounded by (`UPSTREAM_ERROR_DETAIL_MAX_BYTES`). A refusal is a log
     /// line and an operator-facing message; an upstream must not be able to make it arbitrarily long.
     #[tokio::test]
     async fn an_oversized_provider_error_is_bounded_not_pasted_whole() {
@@ -4673,6 +4742,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
 
     /// a `200 OK` whose whole body is a bare JSON error object is an ANSWER, and an answer is
     /// not silence.
+
     /// The defect these cover: such a body carries no `data:` line, so it reaches no frame, the
     /// stream ends at `seq == 0`, and that used to set `retryable_pre_output_non_answer` -- the
     /// classification reserved for a body that vanished. The seller then re-asked a provider that
@@ -4686,8 +4756,10 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
         /// provider that answers EVERY connection, so a retry is a countable fact rather than an
         /// inference. A one-shot server cannot see this: its second attempt finds nobody listening,
         /// and "connection refused" is indistinguishable from "never retried".
+
         /// Three separable claims, because a fix that merely stopped retrying everything would
         /// satisfy only the first:
+
         /// 1. the provider is asked exactly ONCE;
         /// 2. it returns promptly -- inside a single health interval, where the un-fixed path spent
         /// the whole supervision cycle sleeping between attempts;
@@ -4754,6 +4826,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
 
         /// The distinction is the fix, so the other side of it is pinned too: everything that is NOT
         /// a stated error answer stays the retryable transport non-answer it has always been.
+
         /// Asserted through `StreamEnding` itself, which is where the verdict is taken -- so this
         /// fails if the retry gate is ever satisfied by something weaker than the provider saying
         /// why it stopped. A truncated prefix is in the list deliberately: reading half an error
@@ -4829,6 +4902,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     }
 
     /// an `error` member that is present and HOLDS NOTHING states no error.
+
     /// The defect these cover: `serde_json::Value::get` answers "is this key present", not "does it
     /// hold anything", so `value.get("error").is_some()` was true for `{"error": null}` -- the shape
     /// a gateway emits when it serialises a fixed envelope instead of omitting its absent members,
@@ -4837,6 +4911,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     /// and the stream ended, on the FIRST content chunk of every request, against a provider the
     /// seller was serving correctly. The operator was shown a provider error with no words, which is
     /// exactly what an outage looks like.
+
     /// Both directions are pinned, because a fix that merely stopped believing `error` members would
     /// satisfy only the first: a null member must deliver its content, and a STATED error must still
     /// terminate the stream in the provider's own words.

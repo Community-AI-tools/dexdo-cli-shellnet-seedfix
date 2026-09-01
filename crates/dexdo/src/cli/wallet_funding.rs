@@ -1,30 +1,36 @@
 //! The shared Hot check-and-fund mechanism and its durable funding journal.
+
 //! Checking the Hot's balance and asking the Vault for a top-up is not `note deploy`'s business, or
 //! `wallet onboard`'s: every operation that spends Hot funds directly needs the same eight steps, so
 //! they live here once. The specification names the entry point `ensure_hot_funded(binding,
 //! requirements, operation)` and that is [`ensure_hot_funded`].
+
 //! Two commands spend a Hot directly - `note deploy` and `note topup`. Everything else in dexdo is
 //! note-funded. Those two are therefore the callers this is built for, and both of them reach this
 //! module through [`ensure_hot_funded_with_turn`] while already holding the funding-wallet lock they
 //! have shared since.
+
 //! What this module owns:
+
 //! - the preflight read of the Hot's on-chain balances and the per-currency shortfall;
 //! - the bounded wait for those balances to reach the required level;
 //! - the re-check immediately before the caller spends, serialized per Hot;
 //! - the durable journal that stops a repeat of the command from creating a second Vault request.
+
 //! What this module does NOT own: how any particular provider gets money into the Hot. That is
 //! [`HotFundingProvider`], one implementation per provider, in [`providers`]. The specification is
 //! explicit that a provider's own answer is never proof of funding - in the Gosh.ai flow there is no
 //! answer at all - so the only thing this module will accept as proof is the Hot's observed
 //! on-chain balance.
+
 //! # The binding this reads
+
 //! [`HotFundingBinding`] is a VIEW of the production binding in [`crate::cli::wallet`], built by
 //! [`HotFundingBinding::from_active`], and [`WalletProvider`] IS the production enum re-exported.
 //! There is no second binding schema and no second provider enum: a funding flow chosen from a
 //! provider this module invented for itself would be a funding flow the operator never bound.
 
 use std::collections::BTreeMap;
-#[cfg(any(feature = "shellnet", test))]
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +45,7 @@ use sha2::{Digest, Sha256};
 pub(crate) use crate::cli::wallet::WalletProvider;
 
 /// Journal schema version. Bumped only when an older file can no longer be read safely.
+
 /// Version 2 adds the request generation, the immutable transfer fingerprint and the `executed` /
 /// `expired` states. A version-1 record cannot be upgraded in place by guessing those fields: its
 /// fingerprint is exactly what a repeat needs in order to recognise a request already on chain, and
@@ -52,6 +59,7 @@ const FUNDING_JOURNAL_VERSION: u32 = 2;
 // ---------------------------------------------------------------------------------------------
 
 /// `sendFlags` for the Vault -> Hot transfer.
+
 /// Flag 1 pays the message's fees from the Vault's balance rather than out of the amount being
 /// sent, so the Hot receives exactly the figure the operator confirmed in the wallet application.
 /// Flag 16 - the one the uninit-deploy funding path uses - would collapse the ECC[2] SHELL into the
@@ -65,6 +73,7 @@ pub(crate) const VAULT_TO_HOT_SEND_FLAGS: u16 = 1;
 pub(crate) const VAULT_TO_HOT_BOUNCE: bool = true;
 
 /// The payload of the Vault -> Hot transfer: empty.
+
 /// An empty body is what makes this a plain currency transfer - the Hot sees no function to run, so
 /// its `receive()` takes the message and the ECC[2] stays ECC[2].
 pub(crate) const VAULT_TO_HOT_PAYLOAD: &str = "";
@@ -74,6 +83,7 @@ pub(crate) const VAULT_TO_HOT_PAYLOAD: &str = "";
 // ---------------------------------------------------------------------------------------------
 
 /// The four facts the shared funding mechanism needs from the active binding.
+
 /// Derived from [`crate::cli::wallet::WalletBinding`] and never assembled from anywhere else. It is
 /// a view rather than the binding itself because everything else the binding carries - its id, its
 /// schema version, the PATHS to owner-only secret files - is either irrelevant to the decision made
@@ -96,7 +106,6 @@ pub(crate) type WalletBinding = HotFundingBinding;
 
 impl HotFundingBinding {
     /// The view of the binding the operator actually committed.
-    #[cfg(any(feature = "shellnet", test))]
     pub(crate) fn from_active(binding: &crate::cli::wallet::WalletBinding) -> Self {
         Self {
             provider: binding.provider,
@@ -107,6 +116,7 @@ impl HotFundingBinding {
     }
 
     /// The Hot as a parsed canonical address.
+
     /// Parsing is not a formality here: the DApp id half is what a Vault -> Hot transfer has to be
     /// addressed into, and it is only available because the binding stores the canonical form
     /// rather than the legacy `0:<account_id>` one.
@@ -130,6 +140,7 @@ impl HotFundingBinding {
 
 impl WalletProvider {
     /// Whether this provider can put a durable funding request on chain.
+
     /// Only the Acki Nacki Wallet flow can: it has a Vault, and a `submitTransaction` sitting in
     /// that Vault's queue with one signature IS the request. Gosh.ai and manual have no server-side
     /// request to create, so for them there is nothing that a repeat of the command could
@@ -144,6 +155,7 @@ impl WalletProvider {
 // ---------------------------------------------------------------------------------------------
 
 /// What the calling operation needs the Hot to hold, per currency, at the moment it spends.
+
 /// These are required FINAL balances, not deltas: the specification asks the caller to compute "the
 /// exact need per currency", and a final balance is the only form of that which stays correct while
 /// the balance is moving underneath the wait.
@@ -217,6 +229,7 @@ impl HotBalances {
 // ---------------------------------------------------------------------------------------------
 
 /// Reads a Hot's balances from the chain.
+
 /// A read failure must surface as `Err`. It must never be reported as a zero balance: a zero
 /// balance is a fact that keeps the wait going, whereas an unreadable chain is the state in which
 /// nothing may be concluded and nothing may be submitted.
@@ -226,6 +239,7 @@ pub(crate) trait HotBalanceReader {
 }
 
 /// Everything a provider needs to recognise or create one funding request.
+
 /// The recognition fields are exactly the ones the specification names: destination address,
 /// creator public key, and the exact currencies and amounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,9 +251,10 @@ pub(crate) struct FundingRequest {
     /// Full canonical Hot address - the destination.
     pub(crate) hot_address: String,
     /// The DApp half of the Hot's canonical address.
+
     /// A Vault -> Hot transfer is addressed with this, NOT with the dexdo DApp. The canonical
     /// multisig `submitTransaction`/`sendTransaction` parameter builders in
-    /// `crates/core/src/canonical_multisig.rs` hard-code `dapp_id = ROOT_PN_DAPP_ID`("4"), which is
+    /// `crates/core/src/canonical_multisig.rs` hard-code `dapp_id = ROOT_PN_DAPP_ID` ("4"), which is
     /// right for every caller they have today - all of them address a dexdo contract (RootPN, a
     /// PrivateNote), and dexdo contracts all live in DApp 4. A Hot does not: it is a self-DApp
     /// multisig, so its DApp half equals its own account id. Carrying the Hot's own DApp id on the
@@ -258,6 +273,7 @@ pub(crate) struct FundingRequest {
 }
 
 /// The immutable identity of ONE Vault -> Hot transfer.
+
 /// Every field the specification names, and they are DERIVED from the request rather than chosen
 /// separately: `FundingFingerprint::of(&request)` is what the journal records and it is also what
 /// the provider builds its `submitTransaction` parameters from. One derivation feeding both is the
@@ -265,6 +281,7 @@ pub(crate) struct FundingRequest {
 /// went on the wire cannot disagree - and a fingerprint that does not describe the real transfer
 /// would fail to recognise it in the queue, which reads as absence, which authorizes a second
 /// transfer out of a cold Vault.
+
 /// Frozen for one GENERATION. A later run whose shortfall has moved does not edit these fields; it
 /// keeps looking for THIS transfer until the chain proves what became of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +326,7 @@ impl FundingFingerprint {
 
 impl FundingFingerprint {
     /// The payload to put on the wire for this fingerprint.
+
     /// Checked rather than assumed: the wire payload and the recorded `payload_hash` describe the
     /// same transfer, and a client that sent a body its own record did not describe would create a
     /// request no later run could recognise - which reads as absence, which authorizes a second
@@ -334,6 +352,7 @@ pub(crate) fn payload_hash(payload: &str) -> String {
 }
 
 /// What the chain proved about a request that is no longer in the Vault's queue.
+
 /// Recorded so the conclusion can be audited later: "the client decided this had executed" is not
 /// the same claim as "the chain showed this executed, here is what it showed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +367,7 @@ pub(crate) struct FundingEvidence {
     pub(crate) detail: String,
     /// The INTERNAL message that carried this transfer to the Hot, once the Hot's own finalized
     /// receipt for it has been read.
+
     /// Structural rather than a phrase inside `source`, because a decision is taken from it: it is
     /// the only fact that says the credit which landed on the Hot is THIS generation's delivery and
     /// not an unrelated incoming transfer of the same size. `None` is "not established", which is
@@ -357,6 +377,7 @@ pub(crate) struct FundingEvidence {
 }
 
 /// Whether a funding request matching [`FundingRequest`] is on chain.
+
 /// These are not two answers plus an error. Both `Unknown` and the two disappearance verdicts are
 /// load-bearing: the specification says a chain read failure means "unknown" and forbids a repeat
 /// submit, and it says that a request leaving the live queue proves nothing on its own - only
@@ -404,16 +425,19 @@ pub(crate) trait HotFundingProvider {
     fn provider(&self) -> WalletProvider;
 
     /// Keep the provider's chain probe aligned with the journal the mechanism just read.
+
     /// Normally this is the same record supplied when the production provider is constructed. A
     /// request may also be created while one command is waiting, though, so the provider must see
     /// that newly written queue id before the final balance observation is allowed to retire it.
     fn refresh_recorded_request(&self, _recorded: Option<RecordedRequest>) {}
 
     /// Prove whether a request matching `request` is already on chain.
+
     /// Only called for a provider whose [`WalletProvider::creates_vault_request`] is true.
     /// Returning `Absent` is a claim that the queue was read, that nothing of ours is in it AND
     /// that nothing of ours was ever there; a request that HAS been there and is now gone must come
     /// back as `Executed`, `ExpiredUnexecuted` or `Unknown`, never as `Absent`.
+
     /// What an earlier run recorded - the frozen fingerprint and, once the chain has ever reported
     /// one, the pending transaction id that is the primary key from then on - reaches a provider
     /// through its constructor as a [`RecordedRequest`], not through this call. The production
@@ -427,6 +451,53 @@ pub(crate) trait HotFundingProvider {
     /// What to tell the operator when there is no request to create - the Gosh.ai link, or the
     /// manual shortfall and Hot address.
     fn manual_instruction(&self, request: &FundingRequest) -> String;
+}
+
+/// What the top-up prints a payment code for: the destination, the amount, and the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopUpPaymentCode {
+    pub(crate) address: String,
+    /// Whole SHELL, rounded UP: the link carries a display-unit decimal, and asking for less than
+    /// the shortfall leaves the command waiting on money that will never be enough.
+    pub(crate) whole_shell: u128,
+    /// The chain the request was built for -- NOT `current_network()`. The request already carries
+    /// it, and reading the environment a second time is how the two could come to differ.
+    pub(crate) network: String,
+}
+
+/// Decide what code a top-up prints, or that it prints none.
+
+/// A named decision rather than two nested `if`s inside `resolve_hot_funding`, for the reason
+/// [`crate::cli::wallet_manual::ManualFundingWait`] gives at the same kind of fork: the function
+/// holding it is reachable only from the product, so everything decided inside it is untestable and
+/// therefore unprotected. Measured by review on the first version of: replacing the network
+/// argument at that call site with an empty string left every one of the eleven new tests green,
+/// because they all drove the builder with a label handed in by hand. This is the wiring the issue
+/// is about, and it is now the thing under test.
+
+/// `None` in two cases, and both are correct silence: a provider that tops up somewhere other than
+/// this address (Gosh.ai does it on a web page), and no ECC[2] SHELL shortfall at all. Native
+/// shortfall is deliberately not offered as a code -- see the block comment at the call site.
+pub(crate) fn top_up_payment_code(
+    provider: WalletProvider,
+    request: &FundingRequest,
+) -> Option<TopUpPaymentCode> {
+    if !matches!(provider, WalletProvider::Manual) {
+        return None;
+    }
+    let ecc_shell = request
+        .shortfall
+        .get(&dexdo_core::params::SHELL_CURRENCY_ID)
+        .copied()
+        .filter(|shortfall| *shortfall > 0)?;
+
+    Some(TopUpPaymentCode {
+        address: request.hot_address.clone(),
+        // No `.max(1)`: the filter above already dropped a zero shortfall, so `div_ceil` of a
+        // positive value is at least 1. The clamp used to guard a path that no longer exists.
+        whole_shell: ecc_shell.div_ceil(dexdo_core::params::SHELL_UNIT),
+        network: request.network.clone(),
+    })
 }
 
 /// What an earlier run recorded about the request it may have put on chain.
@@ -451,16 +522,19 @@ pub(crate) struct RecordedRequest {
 // ---------------------------------------------------------------------------------------------
 
 /// The states one funding request moves through.
+
 /// `Prepared` is written and flushed BEFORE any `submitTransaction`, and that ordering is the whole
 /// basis of repeat safety - see [`ensure_hot_funded`]. For a provider that never creates a request
 /// it degenerates to "an open funding need for this Hot", which is a superset of the same meaning
 /// and keeps one state machine instead of two.
+
 /// `Executed` and `Expired` are the two ways a request leaves the Vault's queue, and they are
 /// opposite in money terms: `Executed` means the transfer left the Vault, so only any remaining
 /// shortfall may be requested after that exact generation is retired; `Expired` means it never left,
 /// so the full current shortfall is still needed. Neither is ever concluded from the request's
 /// absence - only from finalized chain evidence, which is retained on the record as
 /// [`FundingEvidence`].
+
 /// `Satisfied` is reached from any of the others and only ever by an observed Hot balance that
 /// meets the requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +553,7 @@ pub(crate) enum FundingState {
 pub(crate) struct FundingJournalRecord {
     pub(crate) version: u32,
     /// Which attempt at funding this Hot the record describes.
+
     /// A generation is the unit over which the shortfall and the fingerprint are frozen. It is
     /// incremented only after finalized evidence proves the previous generation can no longer move
     /// money: it either expired unexecuted, or its recorded queue id executed. It is never
@@ -574,6 +649,7 @@ impl FundingJournalRecord {
     }
 
     /// The generation a finalized execution retires, when the verdict can be bound to it.
+
     /// Only a parseable recorded queue id binds a `TransactionSent` to THIS generation; a
     /// generation-invariant history fallback may forbid a submit, but can never say which
     /// generation executed.
@@ -585,21 +661,25 @@ impl FundingJournalRecord {
     }
 
     /// Whether `observed` was read AFTER this generation's executed transfer reached the Hot.
+
     /// `Executed` is a fact about the VAULT: the message left it. The credit lands on the Hot in a
     /// later transaction, and until it does the Hot's balance is still the balance this generation
     /// was sized against - so a shortfall computed from it is the OLD shortfall, and a request for
     /// it asks the Vault for the same money a second time.
+
     /// Two facts, and both are needed, because they answer two different questions.
+
     /// IDENTITY comes first: the chain must have named the internal message that carried THIS
     /// generation's transfer to the Hot and shown the Hot's own finalized receipt for it. A balance
     /// that grew by the expected amount does not say which transfer grew it - an unrelated incoming
     /// transfer of the same size produces exactly the same reading - and it is identity, not size,
     /// that says the executed generation can be retired. Without it the credit is unproven and the
     /// window is still open.
+
     /// SUFFICIENCY comes second, and it is about the READING rather than the chain: the next
     /// generation is sized from the balance this run already observed, and that observation may
     /// pre-date the credit even when the credit is proven. The record carries both halves needed to
-    /// tell: the balance the shortfall was computed from(`required` minus `shortfall`) and the
+    /// tell: the balance the shortfall was computed from (`required` minus `shortfall`) and the
     /// amount the frozen transfer carries. A reading showing at least their sum is a reading the
     /// credit has reached; anything less is the window.
     fn executed_delivery_is_credited(&self, observed: &HotBalances) -> bool {
@@ -630,6 +710,7 @@ impl FundingJournalRecord {
     }
 
     /// Whether this record still describes a request that may yet move money.
+
     /// `Prepared` and `Submitted` both do - a prepared record is the trace of a submit whose result
     /// was never observed, which is precisely the request that may be sitting in the queue.
     /// `Executed` is retired only while handling that exact finalized verdict; a later contradictory
@@ -653,6 +734,7 @@ impl FundingJournalRecord {
     }
 
     /// The request this record describes, for probing the queue on a later run.
+
     /// A repeat must look for the request the EARLIER run may have created, which is this one - not
     /// for whatever today's shortfall happens to be. That is precisely what the journal is for:
     /// without it the destination, creator key and exact amounts of the earlier request are not
@@ -674,21 +756,27 @@ impl FundingJournalRecord {
 }
 
 /// The final native vmshell floor this money path requires the Hot to hold.
+
 /// The specification fixes that a single `submitTransaction` carries both halves of the shortfall -
 /// the exact native vmshell shortfall in `value`, SHELL in `cc[2]`. The floor is what the money path
 /// can ATTACH out of the Hot before it next reads a balance, and an already-held native balance is
 /// subtracted rather than transferred again.
+
 /// It is built from three canonical facts, and it is the whole of what the two submits take:
+
 /// > [`dexdo_core::params::NOTE_DEPLOY_WALLET_SUBMITS`] submits x ([`dexdo_core::params::NOTE_DEPLOY_SUBMIT_NATIVE_VALUE`] attached +
 /// > [`dexdo_core::params::WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW`] fee)
+
 /// A fresh `note deploy` submits twice - the deposit voucher and the SHELL gas voucher - and EACH of
 /// those submits takes two separate amounts out of the Hot: the value it attaches, which never
-/// returns(`RootPN.generateVoucher` accepts the message and sends no change back), and the fee its
+/// returns (`RootPN.generateVoucher` accepts the message and sends no change back), and the fee its
 /// own transaction charges, which `flag: 1` pays from the wallet's balance rather than out of the
 /// amount being sent. A floor counting either half alone leaves the Hot able to start the deploy and
 /// unable to finish it: it stops after the first voucher with the deposit already spent and a halo2
 /// proof already made.
+
 /// Two deliberate choices, so that neither is quietly optimized back later.
+
 /// **Over-funding is preferred to under-funding.** The fee half is an upper bound rather than the
 /// fee itself, and the floor is sized to the LARGEST of the paths sharing this mechanism rather than
 /// to each separately - the funding step runs before either command reads its recovery file, so it
@@ -696,10 +784,12 @@ impl FundingJournalRecord {
 /// it can know is the most the path can spend. Every raw unit of the difference moves the operator's
 /// own money into the operator's own Hot, which is not a loss; being short stops a money path that
 /// has already paid for its first leg, which is.
+
 /// **It never exceeds the recipe the operator was already told to send.** The figure is exactly the
 /// "sends" half of [`dexdo_core::params::OPERATOR_WALLET_PREDEPLOY_NATIVE_VALUE`]'s own budget - that budget is one
 /// wallet deploy plus these same two submits - so asking a Hot to reach this floor can never ask for
 /// more native than `note wallet` already funds a fresh wallet with.
+
 /// moved the arithmetic itself to [`dexdo_core::params::FUNDING_WALLET_NATIVE_FLOOR_RAW`],
 /// where the same three constants now produce it once. The two were always the same figure for the
 /// same reason -- what a funding wallet's own outgoing messages cost it -- and the other commands
@@ -710,9 +800,10 @@ pub(crate) fn vault_to_hot_native_value() -> u128 {
 }
 
 /// The journal file name for one Hot: `sha256(network, hot_address)` in hex.
+
 /// The specification writes the key as `sha256(network + hot_address)`. The two INPUTS are what it
 /// fixes; a bare concatenation of them is not injective, because a network name may end in hex and
-/// a canonical address begins with it, so two different(network, Hot) pairs could in principle
+/// a canonical address begins with it, so two different (network, Hot) pairs could in principle
 /// share a file. A NUL separator cannot occur in either input and makes the encoding injective,
 /// which is the property the key is relied on for: one file per Hot, and never one file for two.
 pub(crate) fn funding_journal_key(network: &str, hot_address: &str) -> String {
@@ -794,6 +885,7 @@ pub(crate) fn load_funding_journal(
 }
 
 /// Write the record atomically, owner-only.
+
 /// Atomic and flushed, both load-bearing: a `prepared` record that a crash could lose would break
 /// the ordering that repeat safety rests on, and a half-written record would be unreadable exactly
 /// when it is needed most.
@@ -810,15 +902,18 @@ pub(crate) fn store_funding_journal(data_dir: &Path, record: &FundingJournalReco
 // ---------------------------------------------------------------------------------------------
 
 /// Serializes the final balance check and the spend that follows it, per Hot.
+
 /// Without it two commands read the same sufficient balance at the same moment and both go on to
 /// spend it.
+
 /// In PRODUCTION this lock is not taken here. `note deploy` and `note topup` have shared one
 /// funding-wallet lock since, taken before either reads anything, and they reach this module
 /// through [`ensure_hot_funded_with_turn`] with [`HotTurn::AlreadyHeldByCaller`]. A second lock
 /// around the same spend would serialize nothing the first does not and would deadlock the moment
 /// the two keys were ever unified. The acquisition below is what a caller that holds no turn of its
 /// own uses.
-/// Mechanism. An OS advisory lock(`fs2`), the same call `acquire_seller_pool_lock`, the pool write
+
+/// Mechanism. An OS advisory lock (`fs2`), the same call `acquire_seller_pool_lock`, the pool write
 /// lock and the note-deploy prover lock already use. Advisory rather than a `create_new`
 /// sentinel because of the cancel requirement: the kernel releases an advisory lock when the holder
 /// dies however it died, including under SIGKILL where no `Drop` runs, so an interrupted run cannot
@@ -922,11 +1017,13 @@ fn unix_now_secs() -> u64 {
 }
 
 /// Whether a read failed because the chain never answered, as opposed to answering something.
-/// The single shared reader([`dexdo_core::shellnet::retry_transient_read`]) is the thing that
+
+/// The single shared reader ([`dexdo_core::chain::retry_transient_read`]) is the thing that
 /// decides which transport failures are worth repeating; when its own budget for ONE read runs out
 /// it marks the error with [`dexdo_core::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX`]. That marker is the
 /// whole discrimination, and it is deliberately the shared helper's verdict rather than a second
 /// opinion formed here: "no answer yet" is the only failure a longer wait can change.
+
 /// Everything without the marker is an answer and stays final - a parameter encoding fault, an
 /// account that is not Active, a malformed address. Waiting ten minutes to be told the same thing
 /// is the failure mode this predicate exists to avoid.
@@ -935,18 +1032,23 @@ fn read_got_no_answer(error: &anyhow::Error) -> bool {
 }
 
 /// Leave the wait carrying the funding state, so the machine error envelope can name it.
+
 /// Wrapped so the failure keeps BOTH things a failed money command is judged on.
+
 /// The first shape of this rendered the error to a string and rebuilt around it
 /// (`anyhow::Error::new(state).context(format!("{error:#}"))`). That was a defect: `classify_error`
 /// picks the machine code by downcasting the causes - `DexdoError` for `E_GATEWAY_UNREACHABLE` /
 /// `E_GATEWAY_WRONG_ENDPOINT`, `DealHandleSchemaTooNew`, `ChainError` - and flattening threw every
 /// one of them away. Adding a field to the envelope while silently moving `code` is not a fix.
+
 /// The obvious repair, `error.context(state)`, restores the causes but makes the STATE the error's
 /// `Display`, and four accepted tests read the operator's message through `to_string()`. So the
 /// state travels in a wrapper that renders as its own source and keeps that source as a real cause:
 /// `to_string()` is still the operator's message, and every typed cause is still downcastable.
+
 /// Only the stable event travels - no address, no provider response, no local path, no key
 /// material.
+
 /// `notice` is `None` when this run has not arranged anything yet, and then nothing is attached:
 /// an absent `funding_notice` means "no funding request of this run exists", which is an answer in
 /// its own right and must not be confused with `already_funded`.
@@ -962,6 +1064,7 @@ fn carrying_funding_state(error: anyhow::Error, notice: Option<&FundingNotice>) 
 // ---------------------------------------------------------------------------------------------
 
 /// What the mechanism did about the shortfall, for the caller's output.
+
 /// Returned rather than printed so a machine-readable caller can put it in a structured field and
 /// leave stdout alone; the human line this module writes goes to stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -995,9 +1098,34 @@ impl FundingNotice {
             Self::ManualTopUpRequested => MachineFundingNotice::ManualTopUpRequested,
         }
     }
+
+    /// What the wait is on, and whether the OPERATOR is the one who has to act.
+
+    /// The display said "waiting for you to confirm the Vault -> Hot transfer" on every pass of the
+    /// wait, whatever the arrangement had actually done. On the path where finalized history shows
+    /// an executed transfer that no recorded queue id binds to a generation, nothing was submitted
+    /// on purpose -- the conservative branch that stops a double transfer, and it stays. The
+    /// operator who opened the wallet found an empty pending list and waited out the whole budget
+    /// for a confirmation that was never asked for.
+
+    /// The second half of the answer is not cosmetic: `needs_you` is the client saying it is
+    /// stopped ON the operator. Where it is waiting on the chain instead, that is a different fact,
+    /// and someone who walked away has to be able to tell the two apart.
+    fn wait_step(&self) -> (&'static str, bool) {
+        match self {
+            Self::RequestSubmitted | Self::RequestAlreadyPending => (AWAITING_CONFIRMATION, true),
+            Self::ManualTopUpRequested => (AWAITING_MANUAL_TOP_UP, true),
+            Self::RequestExecuted { .. } => (AWAITING_EXECUTED_CREDIT, false),
+            Self::RequestIndeterminate { .. } => (AWAITING_UNRESOLVED_SUBMIT, false),
+            // Never reaches the wait -- a met requirement returns before it. Answered rather than
+            // left to panic: a later caller that does reach it gets a true line.
+            Self::AlreadyFunded => (AWAITING_HOT_BALANCE, false),
+        }
+    }
 }
 
 /// Render the Acki confirmation notice under the already accepted ANSI policy.
+
 /// `stderr_is_terminal` names the stream this line is written to. Passing the two facts in keeps
 /// all three policy outcomes functional-testable without mutating process-wide environment state.
 fn render_ackinacki_funding_notice(
@@ -1005,20 +1133,32 @@ fn render_ackinacki_funding_notice(
     stderr_is_terminal: bool,
     no_color: bool,
 ) -> String {
-    if stderr_is_terminal && !no_color {
-        format!("\x1b[33m{message}\x1b[0m")
-    } else {
-        message.to_string()
-    }
+    // The notice says a request is out and the next move is the operator's -- it is a call to act,
+    // so it is drawn like every other one in the client: amber, and bold. It used to be its own
+    // `\x1b[33m`, a yellow that belonged to no role and matched nothing else on the screen.
+    crate::cli::style::action(
+        crate::cli::style::Palette::resolved(stderr_is_terminal, no_color),
+        message,
+    )
 }
 
-#[cfg(any(feature = "shellnet", test))]
+/// Say that the funding request is out and the next move is the operator's.
+
+/// Where the running command shows a checklist, this IS one of its ticks: the request being sent is
+/// a step passed, and printing it as its own framed paragraph while the line right under it already
+/// says "waiting for you to confirm" states the same fact twice. Where there is no display -- every
+/// other command that funds a Hot -- it stays the framed notice it has always been.
 fn print_ackinacki_funding_notice(message: &str) {
+    if crate::cli::progress::tick(message) {
+        return;
+    }
     eprintln!(
         "{}",
         render_ackinacki_funding_notice(
             message,
-            std::io::stderr().is_terminal(),
+            // The operator's screen as it was, not descriptor 2 as it is: `note deploy` points that
+            // at the prover's fold, and this notice is drawn under it.
+            crate::cli::interaction::screen_is_terminal(),
             crate::cli::no_color_requested(),
         )
     );
@@ -1045,6 +1185,7 @@ impl Default for FundingWaitBounds {
 }
 
 /// Who holds the Hot's turn while this runs.
+
 /// The specification requires the final balance check and the spend that follows it to be
 /// serialized per Hot. It does not require that THIS module be the thing that serializes them, and
 /// in production it is not: both money commands take the funding-wallet lock they have shared since
@@ -1062,6 +1203,7 @@ pub(crate) enum HotTurn {
 }
 
 /// Everything one call to [`ensure_hot_funded`] needs about the caller.
+
 /// The specification writes the entry point as `ensure_hot_funded(binding, requirements,
 /// operation)`; the other three - who is asking on chain, where its durable state lives, and how
 /// long it may wait - are the same for the whole call and travel together rather than as loose
@@ -1072,7 +1214,7 @@ pub(crate) struct HotFundingContext<'a> {
     pub(crate) binding: &'a WalletBinding,
     /// The exact need, per currency, computed by the calling operation.
     pub(crate) requirements: &'a FundingRequirements,
-    /// The operation's name, for the operator-facing messages("note deploy", "note topup").
+    /// The operation's name, for the operator-facing messages ("note deploy", "note topup").
     pub(crate) operation: &'a str,
     /// The public key of the agent that creates a Vault request, recorded in the journal so a later
     /// run can recognise its own request in the queue.
@@ -1083,6 +1225,7 @@ pub(crate) struct HotFundingContext<'a> {
 }
 
 /// A Hot proven to hold enough, with the per-Hot turn still held.
+
 /// When this module took the lock, it is inside on purpose. The specification asks for the final
 /// check AND the spend to be serialized; handing back a value that proves the check while releasing
 /// the lock would serialize only the check, and two commands would still spend the same balance.
@@ -1099,6 +1242,7 @@ pub(crate) struct FundedHot {
 }
 
 /// Ensure the Hot holds `requirements`, taking the Hot's turn here.
+
 /// Production does not use this form - see [`HotLock`] - and reaches
 /// [`ensure_hot_funded_with_turn`] holding the turn it already took.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1115,14 +1259,18 @@ where
 }
 
 /// Ensure the Hot holds `requirements`, arranging a top-up through the binding's provider if not.
+
 /// The eight steps of the specification, in order: the caller has computed its exact need; this
 /// reads the Hot's balances; if they suffice it returns; otherwise it selects the flow by
 /// `binding.provider`, creates a provider-supported request or points the operator at a manual
 /// top-up, waits for the balances to reach the required level, re-checks immediately before the
 /// caller spends, and only then returns.
+
 /// # The invariant a repeat rests on
+
 /// **A funding request is created only from a state that PROVES no earlier request of ours can
 /// still move money.** Three things establish that, and all three are needed:
+
 /// 1. the `prepared` record is written and flushed BEFORE the submit, so a spend that lands while
 /// this client never learns it did always leaves a record at least as advanced as `prepared` -
 /// there is no window in which money moved and the journal is silent;
@@ -1134,14 +1282,18 @@ where
 /// explicit that queue disappearance alone must never authorize another submit, because
 /// "executed" and "expired" look identical from the queue and are opposite in money terms. Only
 /// finalized history separates them, and the verdict it gave is retained on the record.
+
 /// The record is also what makes the probe possible at all: it carries the frozen fingerprint - the
 /// creator key, destination, DApp, value, currencies, flags, bounce and payload hash - of the
 /// request an earlier run may have created, and without those the request in the queue is not
 /// recognisable as ours.
+
 /// The path is pinned too. An open record carries the provider that opened it; if the binding now
 /// names a different one, this refuses rather than resuming down the other provider's flow, because
 /// a request the first provider created may still be pending and this run cannot reason about it.
+
 /// # What closes the journal
+
 /// Only an observed on-chain balance that meets every requirement. Not a timeout, not a `Ctrl-C`,
 /// not a provider's own answer, and not a chain read that failed.
 pub(crate) async fn ensure_hot_funded_with_turn<R, P>(
@@ -1182,6 +1334,19 @@ where
 
     let started = tokio::time::Instant::now();
     let mut arranged = false;
+    // Two questions, and reusing one flag for both is what turned out to be.
+
+    // `arranged` answers "may this pass size a residual from a balance it read?" -- loop control.
+    // `notice_is_this_run_s` answers "did this run arrange anything, so is there an ending to
+    // report?" -- what the operator and a runtime are told.
+
+    // They agree everywhere except the one path this issue is about: a generation the chain proved
+    // EXECUTED whose credit the Hot has not shown yet clears `arranged` deliberately (nothing to
+    // size a residual from) while an arrangement HAS happened. Gating the notice on `arranged`
+    // therefore reported "no funding request of this run exists" for a run that had one, and the
+    // timeout refusal fell to its default arm -- "Confirm the Vault -> Hot transfer" -- which is
+    // the sentence this issue exists against.
+    let mut notice_is_this_run_s = false;
     let mut notice = FundingNotice::AlreadyFunded;
     // the last balance this run actually read. The timeout message names what is still
     // missing, and that figure has to come from a reading that happened - so when the operator's
@@ -1211,6 +1376,7 @@ where
         // retry ran out it produced a transient read error that took the arm below instead of the
         // documented timeout. Two different wrongs from one missing bound: a wait longer than
         // asked for, and the wrong verdict at the end of it.
+
         // The first pass is deliberately unbounded. The budget check further down is placed after a
         // full check-and-arrange pass precisely so that `--funding-timeout 0` still performs one
         // check and an already-funded Hot never fails on a timeout; bounding the first read to a
@@ -1245,7 +1411,7 @@ where
             }
             // Everything else is an answer: an encoding fault, an account that is not Active, a
             // rejected request. It will read the same in ten minutes, so it leaves now.
-            Err(error) => return Err(carrying_funding_state(error, arranged.then_some(&notice))),
+            Err(error) => return Err(carrying_funding_state(error, notice_is_this_run_s.then_some(&notice))),
         };
         last_observed = Some(observed.clone());
         if requirements.met_by(&observed) {
@@ -1312,6 +1478,7 @@ where
             // arrangement this run is allowed. The credit - or this wait's own budget running out -
             // is what ends that window, and only a pass that reads a balance after it may size
             // anything.
+            notice_is_this_run_s = true;
             arranged = !load_funding_journal(data_dir, &network, &hot_address)?
                 .filter(FundingJournalRecord::is_open)
                 .is_some_and(|record| record.awaits_executed_credit(&observed));
@@ -1324,6 +1491,20 @@ where
         if started.elapsed() >= bounds.timeout {
             break;
         }
+        // Reaching here means the balance is short and the request has been arranged: the client is
+        // not working, it is stopped until a human confirms the Vault -> Hot transfer inside the
+        // phone wallet. Said on every pass because this is a loop and the announcement belongs
+        // where the waiting happens; the display ignores a repeat of what it already says, so the
+        // seconds keep counting up rather than resetting each poll. On a command with no status
+        // display this is a no-op, and the printed notice above remains the only word.
+        // Which of the two it is comes from what the arrangement actually did, not from the fact
+        // that a wait is running.
+        let (waiting_on, needs_you) = notice.wait_step();
+        if needs_you {
+            crate::cli::progress::step_needs_you(waiting_on);
+        } else {
+            crate::cli::progress::step(waiting_on);
+        }
         tokio::time::sleep(bounds.poll).await;
     }
 
@@ -1331,6 +1512,7 @@ where
     // a read that was still running when the window closed. One exit means one verdict -- before
     // the second way produced a transient chain error instead, which named the wrong culprit
     // for the same event.
+
     // `last_observed` is `Some` here: the first pass reads unbounded and records its answer, and the
     // bounded arm only breaks once a reading exists. The fallback keeps that reasoning honest
     // rather than resting on it - if it were ever wrong, the message says so instead of panicking.
@@ -1344,7 +1526,7 @@ where
                  journal keeps what is pending.",
                 bounds.timeout.as_secs()
             ),
-            arranged.then_some(&notice),
+            notice_is_this_run_s.then_some(&notice),
         ));
     };
     let shortfall = requirements.shortfall(&observed);
@@ -1352,19 +1534,397 @@ where
     // `arranged` is true on every path that reaches here: a met requirement returns above,
     // and an unmet one arranges before the budget is ever checked. So the timeout always
     // carries the funding state, which is the whole point of naming it here.
+    // Two layers, one error, as everywhere else: the operator's two lines on top, and the timeout's
+    // own words -- the whole address, the raw figures, what was left untouched -- in the chain under
+    // them, where `{error:#}`, the funding state and a later reconstruction all still read them.
     Err(carrying_funding_state(
-        anyhow!(
-            "{operation}: timed out after {}s waiting for Hot {hot_address} to reach the \
-             required balance (still missing {}). Nothing was cancelled: any Vault \
-             transfer you have already confirmed stays on chain, the wallet binding, its \
-             keys and every recovery file are untouched, and the funding journal keeps \
-             what is pending. Top the Hot up and re-run the same command - it re-checks \
-             the balance and continues.",
+        funding_timeout_refusal(
+            operation,
+            &hot_address,
             bounds.timeout.as_secs(),
-            render_native_and_ecc_amounts(native_shortfall, &shortfall)
-        ),
-        arranged.then_some(&notice),
+            native_shortfall,
+            &shortfall,
+            notice_is_this_run_s.then_some(&notice),
+        )
+        .into_error(),
+        notice_is_this_run_s.then_some(&notice),
     ))
+}
+
+/// What the status display says while the wait is on the operator, not on the client.
+
+/// Deliberately in the second person and deliberately naming the application: the operator who has
+/// walked away from a `note deploy` needs to read one line and know the client is not stuck but
+/// waiting for them. Measured before this existed: 147 seconds under the label `preparing`.
+const AWAITING_CONFIRMATION: &str =
+    "waiting for you to confirm the Vault -> Hot transfer in Acki Nacki Wallet";
+
+/// The lines that replace it where nothing was submitted. Each names what the client is
+/// waiting ON, because "waiting" alone is what let the wrong one stand for all of them.
+const AWAITING_EXECUTED_CREDIT: &str =
+    "waiting for the Hot to show a Vault transfer that already executed -- nothing was submitted, \
+     so there is nothing to confirm";
+const AWAITING_UNRESOLVED_SUBMIT: &str =
+    "waiting on the Hot balance -- an earlier submit's result is unresolved, so nothing was \
+     submitted";
+const AWAITING_MANUAL_TOP_UP: &str = "waiting for you to top the Hot up yourself";
+const AWAITING_HOT_BALANCE: &str = "waiting for the Hot balance to reach what this command needs";
+
+/// The wait for a Vault -> Hot transfer, run out.
+
+/// The old text was six lines and 128 hex characters of address, in raw ECC[2], with a paragraph
+/// listing what had NOT been cancelled -- to say "the transfer was never confirmed; confirm it and
+/// run this again".
+
+/// The "nothing was cancelled" thought stays, as one clause. It is there because an operator read a
+/// timeout as a cancellation and sent a second transfer; between wordiness and a double spend, the
+/// choice is wordiness. What it does NOT need is the inventory of which files survived: that is in
+/// the detail, which the log keeps.
+fn funding_timeout_refusal(
+    operation: &str,
+    hot_address: &str,
+    seconds: u64,
+    native_shortfall: u128,
+    shortfall: &BTreeMap<u32, u128>,
+    notice: Option<&FundingNotice>,
+) -> crate::cli::refusal::Refusal {
+    use crate::cli::refusal::{address, how_long, shell, Refusal};
+
+    let ecc_shell = shortfall
+        .get(&dexdo_core::params::SHELL_CURRENCY_ID)
+        .copied()
+        .unwrap_or_default();
+    // Which shortfall to say out loud: a Hot can be short of the token it trades in, of the gas its
+    // own messages need, or of both, and an operator sends different things for each.
+    let missing = match (ecc_shell, native_shortfall) {
+        (0, 0) => "the balance it needs".to_string(),
+        (ecc, 0) => format!("{} SHELL", shell(ecc)),
+        (0, native) => format!("{} vmshell of gas", shell(native)),
+        (ecc, native) => format!(
+            "{} SHELL and {} vmshell of gas",
+            shell(ecc),
+            shell(native)
+        ),
+    };
+    // Why the budget ran out, when the answer is not "the transfer was never confirmed".
+    // The shortfall alone is true and useless: an operator who was never asked for anything reads
+    // it as their own fault and goes looking in a wallet that has nothing in it.
+    let (cause, do_next) = match notice {
+        Some(FundingNotice::RequestExecuted { evidence }) => {
+            let cause = if evidence.delivery_message_id.is_some() {
+                " An earlier Vault transfer had already executed and the Hot has not shown its \
+                 credit yet, so this run submitted nothing."
+            } else {
+                " An earlier Vault transfer had already executed but could not be bound to this \
+                 request, so this run submitted nothing rather than risk a second transfer."
+            };
+            (
+                cause,
+                "There is nothing in the wallet to confirm: nothing was submitted, on purpose. \
+                 Re-run the same command -- it re-reads the balance and carries on. If the Hot is \
+                 still short after that, the Vault has to hold enough to cover it first.",
+            )
+        }
+        Some(FundingNotice::RequestIndeterminate { .. }) => (
+            " An earlier submit's result could not be established, so this run submitted nothing.",
+            "There is nothing in the wallet to confirm: nothing was submitted while that earlier \
+             submit is unresolved. Re-run the same command -- it reconciles that submit first, \
+             then carries on.",
+        ),
+        Some(FundingNotice::ManualTopUpRequested) => (
+            " This provider creates no request; the Hot is topped up by you.",
+            "Top the Hot up yourself, then run the same command again -- it re-reads the balance \
+             and carries on.",
+        ),
+        _ => (
+            "",
+            // Named plainly here. The clickable form lives in the interactive branch;
+            // putting it in this one too would tangle two reviews over one sentence.
+            "Confirm the Vault -> Hot transfer in Acki Nacki Wallet, then run the same command \
+             again -- it re-reads the balance and carries on.",
+        ),
+    };
+    Refusal::new(
+        format!(
+            "Hot {} is still short {missing} after {}, and nothing was cancelled.{cause}",
+            address(hot_address),
+            how_long(seconds)
+        ),
+        do_next.to_string(),
+        format!(
+            "{operation}: timed out after {seconds}s waiting for Hot {hot_address} to reach the \
+             required balance (still missing {}). Any Vault transfer already confirmed stays on \
+             chain; the wallet binding, its keys and every recovery file are untouched, and the \
+             funding journal keeps what is pending.",
+            render_native_and_ecc_amounts(native_shortfall, shortfall)
+        ),
+    )
+}
+
+/// neither the wait nor the refusal may send the operator to a wallet with nothing in it.
+
+/// Measured on the chain on 2026-08-19. Finalized history showed an executed Vault -> Hot transfer
+/// for this Hot that no recorded queue id bound to a generation, so the client deliberately
+/// submitted nothing -- the conservative branch that stops a double transfer, and it stays. What it
+/// TOLD the operator was another matter: the display said "waiting for you to confirm the Vault ->
+/// Hot transfer in Acki Nacki Wallet" on every pass, and the timeout that ended the run said to
+/// confirm it and re-run. Both name an action on a request that does not exist. The operator opened
+/// the wallet, found nothing, and waited out the whole budget.
+#[cfg(test)]
+mod issue_1621_nothing_pending_is_not_waiting_for_you {
+    use super::*;
+
+    /// The shape of the id-less history fallback: execution established, the delivery message that
+    /// would bind it to a generation not.
+    fn unbindable_execution() -> FundingNotice {
+        FundingNotice::RequestExecuted {
+            evidence: FundingEvidence {
+                verdict: "executed".to_string(),
+                source: "finalized history".to_string(),
+                observed_at_unix: Some(1_787_173_349),
+                detail: "the Vault emitted TransactionSent for queue transaction \
+                         3380883781668717591"
+                    .to_string(),
+                delivery_message_id: None,
+            },
+        }
+    }
+
+    /// The boundary is the DEMAND, not the word: a line may well mention that there is nothing to
+    /// confirm -- what it may not do is address the operator as the one holding this up. Pinned as
+    /// "waiting for you" plus `needs_you`, so a re-wording around the demand still holds it, and
+    /// the first draft of this module does not come back: it banned the substring `confirm`
+    /// outright and so failed the honest line "nothing was submitted, so there is nothing to
+    /// confirm".
+    #[test]
+    fn the_wait_does_not_ask_the_operator_for_an_action_that_does_not_exist() {
+        let (label, needs_you) = unbindable_execution().wait_step();
+        assert!(
+            !label.contains("waiting for you"),
+            "the wait addresses the operator about a request that was never created: {label}"
+        );
+        assert!(
+            !needs_you,
+            "the display says the client is stopped on the operator, and it is not: {label}"
+        );
+        assert!(
+            label.contains("nothing was submitted"),
+            "the wait does not say why there is nothing in the wallet: {label}"
+        );
+    }
+
+    /// The path where the operator IS holding it up keeps saying so. Narrowing a claim must not
+    /// switch it off where it was right.
+    #[test]
+    fn a_request_actually_in_the_queue_still_asks_the_operator_to_confirm_it() {
+        for notice in [
+            FundingNotice::RequestSubmitted,
+            FundingNotice::RequestAlreadyPending,
+        ] {
+            let (label, needs_you) = notice.wait_step();
+            assert!(
+                label.contains("confirm"),
+                "a pending request must still be confirmed by the operator: {label}"
+            );
+            assert!(needs_you, "{label}");
+        }
+    }
+
+    /// The verdict the run ends on. It named the shortfall -- true, and not the reason the operator
+    /// had just spent the whole budget waiting.
+    /// The refusal is handed the notice the run ended on, and not a flag about something else.
+
+    /// `funding_timeout_refusal` was already right, and its own test above proves it: given
+    /// `RequestExecuted` it says "nothing was submitted, on purpose". The hole was one line up, in
+    /// the CALLER, and it is why this whole issue survived a passing test suite.
+
+    /// `arranged` answers "may this pass size a residual from a balance it read?" -- loop control.
+    /// It was also used to decide WHAT TO TELL THE OPERATOR, and on the one path this issue is
+    /// about those two answers are opposite: a generation proved EXECUTED whose credit has not
+    /// landed sets `arranged = false`, so `arranged.then_some(&notice)` handed the refusal `None`,
+    /// `None` fell to the `_` arm, and the operator was told to go and confirm a transfer this run
+    /// deliberately never sent. Exactly the sentence exists against.
+
+    /// Read out of the source because the alternative is standing up a chain, a journal and a
+    /// wallet binding to observe one argument. What is pinned is the argument itself: the notice
+    /// goes through, and a flag about residual sizing does not stand between it and the operator.
+    #[test]
+    fn the_timeout_refusal_is_given_the_notice_and_not_the_residual_flag() {
+        let source = include_str!("wallet_funding.rs");
+        let call = source
+            .split_once("Err(carrying_funding_state(")
+            .expect("the wait ends in a carried funding refusal")
+            .1;
+        let refusal_args = call
+            .split_once("        .into_error(),")
+            .expect("the refusal is built before it is carried")
+            .0;
+
+        assert!(
+            !refusal_args.contains("arranged.then_some(&notice)"),
+            "the timeout refusal is gated on `arranged`, which answers a different question -- \
+             residual sizing -- and on the EXECUTED-without-credit path it answers `false`, so the \
+             operator is sent to confirm a transfer this run never submitted:\n{refusal_args}"
+        );
+        assert!(
+            refusal_args.contains("notice_is_this_run_s.then_some(&notice)"),
+            "the refusal is not given the notice this run ended on, so it cannot say which of the \
+             four endings happened:\n{refusal_args}"
+        );
+    }
+
+    #[test]
+    fn the_timeout_names_the_state_it_ended_in_and_an_action_that_exists() {
+        let hot = "f830b3800ef37e69b66ae4efd524506defd5e39491bcbb1287695559fb9f6e20";
+        let mut shortfall = BTreeMap::new();
+        shortfall.insert(
+            dexdo_core::params::SHELL_CURRENCY_ID,
+            350 * dexdo_core::params::SHELL_UNIT,
+        );
+        let refusal = funding_timeout_refusal(
+            "note deploy",
+            hot,
+            600,
+            0,
+            &shortfall,
+            Some(&unbindable_execution()),
+        );
+
+        let action = refusal.do_next();
+        assert!(
+            !action.contains("Confirm the Vault -> Hot transfer"),
+            "the action sends the operator to a wallet with nothing in it: {action}"
+        );
+        assert!(
+            action.contains("nothing was submitted"),
+            "the action does not say why there is nothing to confirm: {action}"
+        );
+
+        let rendered = refusal.render();
+        assert!(
+            rendered.contains("could not be bound"),
+            "the verdict still blames the balance and not the state it ended in: {rendered}"
+        );
+        assert!(
+            rendered.contains("nothing was cancelled"),
+            "the clause that stops a second transfer must survive: {rendered}"
+        );
+    }
+}
+
+/// the funding wait's refusal names what to do, in units the operator holds.
+#[cfg(test)]
+mod funding_refusal_1432_tests {
+    use super::*;
+
+    fn shortfall_of(ecc_shell: u128) -> BTreeMap<u32, u128> {
+        let mut map = BTreeMap::new();
+        if ecc_shell > 0 {
+            map.insert(dexdo_core::params::SHELL_CURRENCY_ID, ecc_shell);
+        }
+        map
+    }
+
+    /// The action is the whole point: an operator who reads a timeout as "it failed" sends a
+    /// second transfer. It has to say confirm-then-rerun, and it has to say nothing was cancelled.
+    #[test]
+    fn the_timeout_says_confirm_and_rerun_and_that_nothing_was_cancelled() {
+        let refusal = funding_timeout_refusal(
+            "note deploy",
+            "f5d7cf2acdb781ec106701e7f02835e6625f15708e819b5822f65364f17acc2b",
+            600,
+            0,
+            &shortfall_of(100 * dexdo_core::params::SHELL_UNIT),
+            None,
+        );
+
+        let action = refusal.do_next();
+        assert!(action.contains("Confirm"), "{action}");
+        assert!(action.contains("run the same command again"), "{action}");
+
+        let rendered = refusal.render_with(crate::cli::style::Palette::None);
+        assert!(
+            rendered.contains("nothing was cancelled"),
+            "the clause that stops a second transfer: {rendered}"
+        );
+    }
+
+    /// Units and lengths the operator can hold: SHELL rather than raw ECC[2], minutes rather than
+    /// seconds, an address they can tell from another rather than 128 hex characters.
+    #[test]
+    fn the_first_line_carries_no_raw_units_and_no_whole_address() {
+        let hot = "f5d7cf2acdb781ec106701e7f02835e6625f15708e819b5822f65364f17acc2b";
+        let refusal = funding_timeout_refusal(
+            "note deploy",
+            hot,
+            600,
+            0,
+            &shortfall_of(100 * dexdo_core::params::SHELL_UNIT),
+            None,
+        );
+        let first = refusal.render_with(crate::cli::style::Palette::None).lines().next().unwrap_or_default().to_string();
+
+        assert!(first.contains("100 SHELL"), "{first}");
+        assert!(!first.contains("100000000000"), "raw ECC[2] reached the operator: {first}");
+        assert!(first.contains("10 minutes"), "{first}");
+        assert!(!first.contains("600s"), "{first}");
+        assert!(!first.contains(hot), "the whole address reached the operator: {first}");
+        assert!(first.contains("\u{2026}7acc2b"), "{first}");
+    }
+
+    /// A Hot short of gas and a Hot short of SHELL are different errands. Both said, and neither
+    /// invented: with nothing missing the sentence does not name an amount at all.
+    #[test]
+    fn each_kind_of_shortfall_is_named_for_what_it_is() {
+        let hot = "f5d7cf2acdb781ec106701e7f02835e6625f15708e819b5822f65364f17acc2b";
+        let unit = dexdo_core::params::SHELL_UNIT;
+
+        let gas_only = funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(0), None);
+        assert!(
+            gas_only
+                .render_with(crate::cli::style::Palette::None)
+                .contains("vmshell of gas"),
+            "{}",
+            gas_only.render_with(crate::cli::style::Palette::None)
+        );
+
+        let both = funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(unit), None);
+        let text = both.render_with(crate::cli::style::Palette::None);
+        assert!(text.contains("SHELL and"), "{text}");
+        assert!(text.contains("vmshell of gas"), "{text}");
+
+        let neither = funding_timeout_refusal("note deploy", hot, 60, 0, &shortfall_of(0), None);
+        assert!(
+            neither.render_with(crate::cli::style::Palette::None).contains("the balance it needs"),
+            "no amount may be invented: {}",
+            neither.render_with(crate::cli::style::Palette::None)
+        );
+    }
+
+    /// The detail keeps every figure the first line dropped, for whoever reconstructs the run.
+    #[test]
+    fn the_detail_still_carries_the_raw_figures() {
+        let hot = "f5d7cf2acdb781ec106701e7f02835e6625f15708e819b5822f65364f17acc2b";
+        // The record keeps every figure; the operator's two lines keep none of them. The amount is
+        // stated in SHELL, as everywhere else this client says a SHELL figure -- the same number,
+        // named in the unit it is spent in.
+        let rendered = funding_timeout_refusal(
+            "note deploy",
+            hot,
+            600,
+            0,
+            &shortfall_of(100 * dexdo_core::params::SHELL_UNIT),
+            None,
+        )
+        .detail()
+        .to_string();
+        assert!(rendered.contains(hot), "the whole address is still recorded");
+        assert!(rendered.contains("600s"), "the exact wait is still recorded");
+        assert!(
+            rendered.contains("100 SHELL"),
+            "the amount is still recorded: {rendered}"
+        );
+    }
 }
 
 /// Close an open record, and only ever with the balances that were actually read.
@@ -1427,7 +1987,7 @@ where
         network: binding.network.clone(),
         vault_address,
         hot_address: hot_address.clone(),
-        // Finding(2): the Hot's own DApp, never the dexdo constant. See `FundingRequest`.
+        // Finding (2): the Hot's own DApp, never the dexdo constant. See `FundingRequest`.
         hot_dapp_id: hot.dapp_id().to_string(),
         creator_pubkey: creator_pubkey.to_string(),
         required: requirements.required.clone(),
@@ -1460,6 +2020,37 @@ where
         let record = open.unwrap_or_else(|| FundingJournalRecord::open(&today, unix_now_secs()));
         store_funding_journal(data_dir, &record)?;
         eprintln!("{}", provider.manual_instruction(&today));
+        // The same code the deploy prints, for the same reason: the address is 130 characters, the
+        // wallet that must send is a phone, and copying it out of a terminal by hand is where a
+        // line break gets swallowed. A top-up used to print the address and nothing else -- so the
+        // one moment the operator had a camera in their hand was the moment we stopped offering it.
+
+        // ONLY for an ECC[2] SHELL shortfall, and for exactly that amount. Two mistakes are being
+        // avoided here, and the first version of this block made both:
+
+        // * `native_shortfall` is a different balance from ECC[2] SHELL. A wallet transfer to an
+        // already-deployed account credits ECC[2]; native vmshell is gas, and on an Active
+        // account it is not what an incoming SHELL transfer touches. Asking for native and
+        // labelling it `token=2` would have the operator send a currency the wait never looks
+        // at, and the command would time out however much they sent. (The deploy case differs
+        // because its code carries `flag=16`, which is what converts the arriving SHELL into
+        // native vmshell -- measured in `ledger.md`: at flag 1 the same ECC[2] arrives as
+        // ECC[2]. Being uninit is not what converts it, and this comment used to say it was.)
+        // * `native_shortfall` is capped by FUNDING_WALLET_NATIVE_FLOOR_RAW, ~0.507 vmshell, so
+        // `div_ceil(SHELL_UNIT).max(1)` is 1 for every possible value. The line above says
+        // "short 100 SHELL" and the code beneath it would open the send screen pre-filled with
+        // 1 -- and the operator, having scanned rather than read, sends 1.
+
+        // Rounded UP to whole SHELL: the link carries a display-unit decimal, and asking for less
+        // than the shortfall leaves the command waiting on money that will never be enough.
+        if let Some(code) = top_up_payment_code(binding.provider, &today) {
+            crate::cli::wallet_manual::write_payment_qr(
+                &mut std::io::stderr(),
+                &code.address,
+                code.whole_shell,
+                &code.network,
+            );
+        }
         return Ok(FundingNotice::ManualTopUpRequested);
     }
 
@@ -1485,10 +2076,10 @@ where
             record.pending_transaction_id = pending_transaction_id.or(record.pending_transaction_id);
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
-            print_ackinacki_funding_notice(
-                "Hot wallet funding request is pending. Confirm the pending Vault -> Hot \
-                 transaction in your wallet application.",
-            );
+            print_ackinacki_funding_notice(&format!(
+                "Vault -> Hot funding request was already pending; confirm it in {}.",
+                crate::cli::link::wallet_app()
+            ));
             Ok(FundingNotice::RequestAlreadyPending)
         }
         RequestPresence::Executed { evidence } => {
@@ -1507,7 +2098,7 @@ where
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
             if requirements.met_by(observed) {
-                eprintln!(
+                tracing::info!(
                     "{operation}: the earlier Vault -> Hot funding request for {hot_address} \
                      EXECUTED ({}), and the Hot balance already reflects enough funding. No second \
                      request was created.",
@@ -1538,7 +2129,10 @@ where
                              chain fact yet, so nothing says the Hot's balance holds THIS transfer \
                              rather than an unrelated one of the same size"
                         };
-                        eprintln!(
+                        // Bookkeeping about a previous run, not this run's result: at `info` it is
+                        // there for a reconstruction without being a paragraph in front of the
+                        // operator.
+                        tracing::info!(
                             "{operation}: the earlier Vault -> Hot funding request for \
                              {hot_address} EXECUTED ({}), but {missing}. Sizing a second request \
                              from it would ask the Vault for the same shortfall twice. Nothing was \
@@ -1547,7 +2141,7 @@ where
                         );
                         return Ok(FundingNotice::RequestExecuted { evidence });
                     }
-                    eprintln!(
+                    tracing::info!(
                         "{operation}: the earlier Vault -> Hot funding request for {hot_address} \
                          EXECUTED ({}), the Hot has been credited with it, and the current \
                          requirement is still unmet. That finalized generation cannot execute \
@@ -1650,6 +2244,7 @@ where
 }
 
 /// Write `prepared` for `generation`, flush it, and only then submit.
+
 /// From the moment the record is on disk, a submit whose result is never observed still leaves a
 /// trace - which is what the next run reconciles against. Nothing about this ordering is negotiable:
 /// it is the only thing standing between "the client crashed mid-submit" and "the client has no idea
@@ -1678,10 +2273,14 @@ where
             record.pending_transaction_id = pending_transaction_id;
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
-            print_ackinacki_funding_notice(
-                "Hot wallet funding request submitted. Confirm the pending Vault -> Hot \
-                 transaction in Acki Nacki Wallet.",
-            );
+            // Past tense where it becomes a tick, because that line stays on the screen as a
+            // record of what happened; the instruction it carries is what the live line under it
+            // then repeats for as long as the wait lasts. The wallet's name is a link where the
+            // terminal can make one.
+            print_ackinacki_funding_notice(&format!(
+                "Vault -> Hot funding request sent; confirm it in {}.",
+                crate::cli::link::wallet_app()
+            ));
             Ok(FundingNotice::RequestSubmitted)
         }
         SubmitOutcome::Indeterminate { reason } => {
@@ -1698,10 +2297,13 @@ where
 }
 
 /// A native vmshell amount and an ECC currency map, rendered with each half named as its own unit.
+
 /// Both halves, always, because they are disjoint balances and every gate that reads them blocks on
-/// BOTH([`FundingRequirements::met_by`]). Native is never folded into an `ECC[N]` label: an
+/// BOTH ([`FundingRequirements::met_by`]). Native is never folded into an `ECC[N]` label: an
 /// invented currency id would be a second way to say the same thing wrongly.
+
 /// # Why there is exactly one of these
+
 /// There were two. This module's wait-loop timeout and the provider instructions in [`providers`]
 /// each rendered the same pair of values through their own implementation, and the copies drifted
 /// until they disagreed about money: a live mainnet `note deploy` printed "Hot wallet... is short
@@ -1710,7 +2312,9 @@ where
 /// . A wallet rich in ECC[2] and low on gas is exactly the state in which that map is empty,
 /// so the operator was told the sum of a missing balance was "nothing" by one renderer and told the
 /// truth by the other, in one incident.
+
 /// # Why it is not named for shortfalls
+
 /// [`providers::describe_recorded_request`] renders a queued transfer's own amount through it,
 /// which is not a shortfall at all. One name covering two meanings is how the last divergence
 /// started.
@@ -1721,7 +2325,7 @@ fn render_native_and_ecc_amounts(native: u128, amounts: &BTreeMap<u32, u128>) ->
     }
     parts.extend(amounts.iter().map(|(currency, amount)| {
         if *currency == dexdo_core::params::SHELL_CURRENCY_ID {
-            format!("{amount} raw ECC[2] SHELL")
+            format!("{} SHELL", dexdo_core::shell_amount(*amount))
         } else {
             format!("{amount} raw ECC[{currency}]")
         }
@@ -1745,13 +2349,12 @@ fn render_native_and_ecc_amounts(native: u128, amounts: &BTreeMap<u32, u128>) ->
 // The real chain reader
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(feature = "shellnet")]
 #[async_trait::async_trait(?Send)]
 impl HotBalanceReader for dexdo_core::ChainClient {
     async fn hot_balances(&self, hot: &CanonicalAddress) -> Result<HotBalances> {
         let address = dexdo_core::Address::parse(&hot.legacy())
             .map_err(|e| anyhow!("Hot {hot} is not a chain address: {e:?}"))?;
-        let account = dexdo_core::shellnet::retry_transient_read(|| self.get_account(&address))
+        let account = dexdo_core::chain::retry_transient_read(|| self.get_account(&address))
             .await
             .map_err(|e| anyhow!("read Hot {hot} balances: {e}"))?
             .ok_or_else(|| anyhow!("Hot {hot} not found on chain"))?;
@@ -1770,19 +2373,22 @@ pub(crate) mod providers;
 // ---------------------------------------------------------------------------------------------
 
 /// Ensure the bound Hot can pay for `operation`, arranging a top-up through its provider if not.
+
 /// This is what `note deploy` and `note topup` call. Three things about its shape are deliberate.
+
 /// **An explicit Hot is manual for this command.** `--multisig-address` wins over the binding and
-/// is used exactly as resolved(`resolve_funding_wallet`). It does not create a durable binding and
+/// is used exactly as resolved (`resolve_funding_wallet`). It does not create a durable binding and
 /// no provider is inferred from its address: the explicit BYO path itself selects the agreed manual
 /// instruction plus bounded on-chain balance wait.
+
 /// **The Hot's turn is already held.** Both callers take the funding-wallet lock they have shared
 /// since before they read anything, so the check and the spend are already serialized under
 /// one key. Taking a second lock here would serialize nothing the first does not.
+
 /// **It does not do the final check.** Step 7 of the specification - re-read the balance immediately
 /// before sending - is the caller's own preflight, which runs next and still refuses on its own
 /// terms. This returns once the balance HAS been observed to meet the requirement; the caller then
 /// proves it again against the figure it is about to spend.
-#[cfg(feature = "shellnet")]
 pub(crate) async fn fund_hot_for_money_command(
     client: &dexdo_core::ChainClient,
     endpoint: &str,

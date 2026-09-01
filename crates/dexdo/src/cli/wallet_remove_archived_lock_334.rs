@@ -1,18 +1,23 @@
 //! (rymkapro, 2026-08-17): `wallet remove-archived` deletes the ONLY local keys to a Hot, so
 //! it must take the funding wallet's turn -- the SAME one `note deploy` and `note topup` take.
+
 //! Without it the command decided from two observations it did not own, and a money command fitted
 //! entirely into the gap between them: it loads the binding and its keys, a parallel rebind archives
 //! that binding, `remove-archived` reads a still-empty journal and a still-zero Hot, the money
 //! command writes `prepared` and sends its Vault -> Hot request, `remove-archived` deletes the keys,
 //! and the confirmed request later credits a Hot nobody can spend from.
+
 //! Two properties make the fix real rather than decorative, and each is proven separately here.
+
 //! **It is the same lock.** A turn taken under a different key is worse than no turn at all -- it
 //! serialises the command against itself while leaving the wallet raced, which is what the lock's
 //! own documentation warns about. The binding records a Hot in whatever spelling it was written
 //! with, and a money command resolves its wallet independently; if the two hashed to different lock
 //! files the fix would be a no-op that reads as a fix.
+
 //! **It covers the whole window.** A lock taken after the journal check would leave step 3 outside
 //! it and close nothing.
+
 //! The command cannot be driven end to end offline: `run_remove_archived` reads its store through
 //! `data_dir::effective()`, whose `EXPLICIT_DATA_DIR` is a process-wide `OnceLock` that no test can
 //! reset, and it reaches the chain for the balance. So the placement is proven the way the sibling
@@ -27,17 +32,14 @@ fn production_source() -> &'static str {
         .unwrap_or(source)
 }
 
-fn body_of(entry: &str) -> &'static str {
-    let production = production_source();
-    let start = production
-        .find(&format!("async fn {entry}"))
-        .unwrap_or_else(|| panic!("{entry} present"));
-    let body = &production[start..];
-    let end = body[1..]
-        .find("\nasync fn ")
-        .map(|offset| offset + 1)
-        .unwrap_or(body.len());
-    &body[..end]
+/// The shared seam, not a hand-rolled slice.
+
+/// This one ended at the next sibling `async fn`, with `unwrap_or(body.len())` behind it, so the
+/// absence of a next sibling was silent and "the body" became the whole rest of `wallet.rs`. It
+/// also kept comments, so a commented-out call read as a call. `code_of` bounds by brace depth and
+
+fn body_of(entry: &str) -> String {
+    crate::cli::source_probe::code_of(production_source(), &format!("async fn {entry}"))
 }
 
 /// The turn is taken, and it is taken before EITHER observation the deletion rests on.
@@ -87,7 +89,6 @@ fn remove_archived_locks_on_the_hot_it_is_about_to_forget_334() {
 
 /// The two spellings of one wallet must land on ONE lock file. This is the property that makes the
 /// turn shared with the spenders instead of private to this command.
-#[cfg(feature = "shellnet")]
 #[test]
 fn the_binding_spelling_and_the_spender_spelling_take_one_turn_334() {
     let account_id = "5".repeat(64);
@@ -96,9 +97,9 @@ fn the_binding_spelling_and_the_spender_spelling_take_one_turn_334() {
     );
     let legacy = format!("0:{account_id}");
 
-    let from_spender = crate::cli::note_cmd::funding_wallet_lock_path("shellnet", &canonical)
+    let from_spender = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &canonical)
         .expect("a spender resolves its wallet's lock path");
-    let from_binding = crate::cli::note_cmd::funding_wallet_lock_path("shellnet", &legacy)
+    let from_binding = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &legacy)
         .expect("the binding's recorded Hot resolves its lock path");
 
     assert_eq!(
@@ -110,12 +111,11 @@ fn the_binding_spelling_and_the_spender_spelling_take_one_turn_334() {
 
 /// A different wallet must NOT share the turn: a lock that collides for everyone serialises the
 /// whole client and would be its own defect.
-#[cfg(feature = "shellnet")]
 #[test]
 fn two_different_wallets_do_not_share_one_turn_334() {
-    let one = crate::cli::note_cmd::funding_wallet_lock_path("shellnet", &format!("0:{}", "5".repeat(64)))
+    let one = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "5".repeat(64)))
         .expect("first wallet");
-    let two = crate::cli::note_cmd::funding_wallet_lock_path("shellnet", &format!("0:{}", "6".repeat(64)))
+    let two = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "6".repeat(64)))
         .expect("second wallet");
     assert_ne!(
         one, two,

@@ -101,15 +101,15 @@ async fn issue_1105_one_below_escrow_plus_limit_price_bond_refuses_before_submit
         .expect_err("one raw unit below escrow plus bond must refuse");
     let message = format!("{error:#}");
     assert!(
-        message.contains(&format!("available={available}")),
+        message.contains(&format!("available={} SHELL", dexdo_core::shell_amount(available))),
         "{message}"
     );
     assert!(
-        message.contains(&format!("required={required}")),
+        message.contains(&format!("required={} SHELL", dexdo_core::shell_amount(required))),
         "{message}"
     );
     assert!(
-        message.contains(&format!("buyer bond {buyer_bond}")),
+        message.contains(&format!("buyer bond {} SHELL", dexdo_core::shell_amount(buyer_bond))),
         "{message}"
     );
     assert!(message.contains("--max-price-per-tick"), "{message}");
@@ -132,11 +132,11 @@ async fn issue_1105_escrow_only_refuses_before_submit() {
         .expect_err("the issue case, a note holding only escrow, must refuse");
     let message = format!("{error:#}");
     assert!(
-        message.contains(&format!("available={escrow}")),
+        message.contains(&format!("available={} SHELL", dexdo_core::shell_amount(escrow))),
         "{message}"
     );
     assert!(
-        message.contains(&format!("required={required}")),
+        message.contains(&format!("required={} SHELL", dexdo_core::shell_amount(required))),
         "{message}"
     );
     assert_issue_1105_no_submit(&chain, &journal_path);

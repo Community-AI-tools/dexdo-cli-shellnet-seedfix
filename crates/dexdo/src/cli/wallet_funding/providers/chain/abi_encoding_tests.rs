@@ -1,4 +1,5 @@
 //! item 1: the Vault -> Hot `submitTransaction` parameters, put through the SDK encoder.
+
 //! Reading the built `Value` back and comparing it to what the builder put there proves only that
 //! the builder is self-consistent. It cannot see the one thing that decides whether the transfer
 //! ever leaves this process: `dapp_id` is declared `uint256` in
@@ -6,6 +7,7 @@
 //! argument as DECIMAL unless it carries the `0x` prefix. A bare 64-hex DApp id is therefore refused
 //! with `can not parse number from string` before any message is built - a refusal a string-to-string
 //! assertion is blind to, because the string it compares is exactly the one the encoder rejects.
+
 //! So this goes through [`encode_external_call`] against the vendored canonical ABI - the same
 //! function, ABI and parameters `RealVaultChain::submit` uses - and then decodes the message the
 //! chain would receive. Encoding is the red/green oracle; the decode makes the assertion about the
@@ -34,7 +36,7 @@ fn vault_to_hot_fingerprint() -> FundingFingerprint {
         dest: format!("{hot_dapp_id}::{}", "b2".repeat(32)),
         dapp_id: hot_dapp_id,
         value: 0,
-        cc: [(2u32, 450_000_000_000u128)].into_iter().collect(),
+        cc: [(2u32, 350_000_000_000u128)].into_iter().collect(),
         send_flags: 1,
         bounce: true,
         payload_hash: payload_hash(VAULT_TO_HOT_PAYLOAD),

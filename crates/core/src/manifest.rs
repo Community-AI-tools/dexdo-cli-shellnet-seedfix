@@ -1,11 +1,13 @@
 //! Market-provisioning output manifest: the addresses a `dexdo provision` run produces.
-//! One JSON file per per-deal market(`InferenceOrderBook` + `RootModel` + the deployed `TokenContract`).
-//! Pure data(no chain, no feature gate); this is the output/parsing contract, covered by a
+//! One JSON file per per-deal market (`InferenceOrderBook` + `RootModel` + the deployed `TokenContract`).
+
+//! Pure data (no chain, no feature gate); this is the output/parsing contract, covered by a
 //! deterministic offline guard.
+
 //! **Note-funded:** `dexdo provision` brings up the OB + per-deal `TokenContract` from the
 //! seller note's own ECC[2] -- no operator multisig. The note pre-funds the TC's uninit deploy address via
 //! `PrivateNote.fundDeployShell` and the external seller-signed deploy activates it, so `token_contract` here
-//! is the **deployed, active** per-deal TC(not a derived placeholder). The `RootModel` is NOT note-funded:
+//! is the **deployed, active** per-deal TC (not a derived placeholder). The `RootModel` is NOT note-funded:
 //! since 4.0.34 `SuperRoot.deployRootModel` deploys it with its own value, and an external deploy of it is
 //! refused outright. Giver is the one-time mint faucet only; zero giver in the operate path.
 
@@ -13,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// `sha256(frame_model)` as `0x<hex>` -- the canonical on-chain modelHash: the seller
-/// (`--model`->`frame_model`) and the buyer(`--frame-model`) derive it from the SAME `frame_model` to
+/// (`--model`->`frame_model`) and the buyer (`--frame-model`) derive it from the SAME `frame_model` to
 /// converge on a single order-book address. Also used to validate a manifest's `model_hash`.
 pub fn model_hash_for(frame_model: &str) -> String {
     let digest = Sha256::digest(frame_model.as_bytes());
@@ -134,6 +136,7 @@ fn parse_model_flag(token: &str) -> Result<(usize, &'static str), String> {
 
 /// Parse and validate the injective canonical-id grammar:
 /// `producer--model--version[--unit][--w<N>k][--<N>p][--tools][--think][--<precision>]`.
+
 /// Flag order is fixed, each slot may occur at most once, and the parser rejects rather than
 /// normalizing. In particular, callers must keep hashing the original raw bytes with
 /// [`model_hash_for`], never reconstruct an id from this parsed value.
@@ -223,8 +226,8 @@ fn normalize_hash(h: &str) -> String {
 /// Resolve a `modelHash` back to a configured model name -- the inverse of [`model_hash_for`].
 /// This is an **integrity/fallback** helper: the 4.0.6 `TokenContract` exposes `getModelName()` directly (the
 /// authoritative display name), so the real reader uses that name and calls this to **cross-check** it against
-/// the operator's configured set(or to recover the name when only the hash -- `getModelHash` -- is on hand). It
-/// matches by hashing each configured name(normalized for the optional `0x`/case). Returns the first match, or
+/// the operator's configured set (or to recover the name when only the hash -- `getModelHash` -- is on hand). It
+/// matches by hashing each configured name (normalized for the optional `0x`/case). Returns the first match, or
 /// `None` if the hash is absent or unknown to the configured set -- then the caller shows the raw hash rather
 /// than guessing. The configured set is the operator's `models.json` / market manifest(s), never an unbounded
 /// preimage search.
@@ -239,6 +242,7 @@ pub fn resolve_model_name(model_hash: Option<&str>, known_models: &[String]) -> 
 /// A provisioned per-deal market. `token_contract` is what `dexdo seller`/`buyer`
 /// take as `--token-contract`; the rest is the surrounding market identity (for transparency and
 /// `dexdo monitor`). No secrets -- public/derivable only.
+
 /// **Addresses:** written as canonical `<dapp_id>::<account_id>`, read in either that or the
 /// legacy `0:<account_id>` form, and held in memory in the workchain form the chain client takes. A
 /// manifest written by an older version keeps loading unchanged; one written now carries the DApp
@@ -246,9 +250,9 @@ pub fn resolve_model_name(model_hash: Option<&str>, known_models: &[String]) -> 
 /// account id as its DApp id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketManifest {
-    /// Network the market is deployed on(e.g. `shellnet`).
+    /// Network the market is deployed on (e.g. the chain build).
     pub network: String,
-    /// Configured frame model id(the model the seller serves; the buyer's `--frame-model`).
+    /// Configured frame model id (the model the seller serves; the buyer's `--frame-model`).
     pub frame_model: String,
     /// `sha256(frame_model)` -- the on-chain `modelHash` keying the order book.
     pub model_hash: String,
@@ -261,24 +265,27 @@ pub struct MarketManifest {
     /// Per-deal `TokenContract` -- the **deployed, active** address.
     #[serde(with = "crate::address::serde_self_dapp")]
     pub token_contract: String,
-    /// The seller's provisioned `PrivateNote`(the market owner's note).
+    /// The seller's provisioned `PrivateNote` (the market owner's note).
     #[serde(with = "crate::address::serde_canonical")]
     pub seller_note: String,
-    /// Deal nonce(disambiguates multiple `TokenContract`s under one `RootModel`).
+    /// Deal nonce (disambiguates multiple `TokenContract`s under one `RootModel`).
     pub nonce: u64,
-    /// Tick price P(SHELL) the `TokenContract` was deployed with.
+    /// Tick price P in whole SHELL, the price the `TokenContract` was deployed with. Raw ECC[2]
+    /// in memory, whole SHELL on disk: the file is read by an operator, and the book quotes prices
+    /// in whole SHELL.
+    #[serde(with = "crate::params::serde_price_shell")]
     pub price_per_tick: u128,
     /// Max ticks the `TokenContract` bounds the deal to.
     pub max_ticks: u128,
 }
 
 impl MarketManifest {
-    /// Serialize to pretty JSON(the on-disk `--output` format).
+    /// Serialize to pretty JSON (the on-disk `--output` format).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 
-    /// Parse from JSON(what `dexdo seller`/`buyer` load to resolve the market).
+    /// Parse from JSON (what `dexdo seller`/`buyer` load to resolve the market).
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
@@ -308,8 +315,8 @@ impl MarketManifest {
 mod tests {
     use super::*;
 
-    /// The on-chain model id must be canonical `producer--model--version`(what the indexer parses): exactly
-    /// three non-empty `--`-parts. An OpenAI slug(`qwen/qwen3-32b`) or a 2/4-part name is rejected fail-loud.
+    /// The on-chain model id must be canonical `producer--model--version` (what the indexer parses): exactly
+    /// three non-empty `--`-parts. An OpenAI slug (`qwen/qwen3-32b`) or a 2/4-part name is rejected fail-loud.
     #[test]
     fn validate_canonical_model_id_requires_three_parts() {
         assert!(validate_canonical_model_id("openai--gpt--4.1").is_ok());
@@ -324,7 +331,7 @@ mod tests {
 
     /// `model_hash_for` is the on-chain model key = `0x` + lowercase hex of `sha256(frame_model)`. On 4.0.6
     /// the IOB/TokenContract ctors require `sha256(modelName) == modelHash`, so this derivation IS the
-    /// model-name invariant fixed inPR -- guard it offline(deterministic, 32-byte, distinct per frame).
+    /// model-name invariant fixed inPR -- guard it offline (deterministic, 32-byte, distinct per frame).
     #[test]
     fn model_hash_for_is_sha256_hex() {
         // Known SHA-256 vector: sha256("abc").
@@ -410,7 +417,7 @@ mod tests {
 
     fn sample() -> MarketManifest {
         MarketManifest {
-            network: "shellnet".to_string(),
+            network: "net-a".to_string(),
             frame_model: "qwen/qwen3-32b".to_string(),
             model_hash: model_hash_for("qwen/qwen3-32b"),
             inference_order_book: addr('1'),
@@ -418,13 +425,46 @@ mod tests {
             token_contract: addr('3'),
             seller_note: addr('4'),
             nonce: 7,
-            price_per_tick: 1000,
+            // A thousand SHELL a tick. The file carries whole SHELL, and a raw 1000 is not a price
+            // the book can hold.
+            price_per_tick: 1000 * crate::params::PRICE_STEP,
             max_ticks: 1024,
         }
     }
 
+    /// A market file written before prices were quoted in whole SHELL is refused, not read as a
+    /// price a billion times its own size.
+
+    /// `dexdo provision` wrote `price_per_tick: 3000000000` for three SHELL a tick while this field
+    /// held raw ECC[2] units. Read as SHELL that is three billion a tick -- above the largest note
+    /// that exists, so no note could pay for one tick at it. The refusal names that, and names the
+    /// command that writes a current file.
+    #[test]
+    fn a_market_file_from_before_the_unit_change_is_refused_by_name() {
+        let mut file = serde_json::to_value(sample()).expect("sample serializes");
+        file["price_per_tick"] = serde_json::json!(3_000_000_000u64);
+
+        let error = MarketManifest::from_json(&file.to_string())
+            .expect_err("a raw-unit price must not be read as SHELL");
+        let text = error.to_string();
+        assert!(
+            text.contains("above the largest note that exists"),
+            "the refusal must say why the figure cannot be a price: {text}"
+        );
+        assert!(
+            text.contains("dexdo provision"),
+            "the refusal must name what writes a current file: {text}"
+        );
+
+        // The largest note that does exist is still a price this reads.
+        let mut top = serde_json::to_value(sample()).expect("sample serializes");
+        top["price_per_tick"] = serde_json::json!(1_000_000u64);
+        let read = MarketManifest::from_json(&top.to_string()).expect("a price at the bound reads");
+        assert_eq!(read.price_per_tick, 1_000_000 * crate::params::PRICE_STEP);
+    }
+
     /// The output/parsing contract: round-trips losslessly and carries the fields the
-    /// `--market` loader feeds to `dexdo seller`/`buyer`(`token_contract`, `frame_model`).
+    /// `--market` loader feeds to `dexdo seller`/`buyer` (`token_contract`, `frame_model`).
     #[test]
     fn manifest_roundtrips_and_exposes_consumable_fields() {
         let m = sample();
@@ -440,6 +480,7 @@ mod tests {
     /// Issue: a manifest is **written** with canonical `<dapp_id>::<account_id>` addresses, and is
     /// **read** from either that or a legacy `0:<account_id>` file written by an older version. Both load
     /// to the same manifest, so an existing market.json keeps driving the same deal.
+
     /// The DApp half is role-specific. A per-deal `TokenContract` is a self-DApp account - its own
     /// `info.dapp_id` IS its account id - so it is written `<account_id>::<account_id>`. The book, the
     /// `RootModel` and the seller's `PrivateNote` are system contracts of the shared dexdo DApp.

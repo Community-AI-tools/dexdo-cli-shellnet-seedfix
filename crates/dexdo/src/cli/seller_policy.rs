@@ -143,12 +143,14 @@ pub(crate) fn is_err_not_open(error: &ChainError) -> bool {
 }
 
 /// Recognise an advance failure that is really the deal's own terminal `ProbeBurned`.
+
 /// A buyer that stops during the probe burns it, and that settlement destroys the TokenContract. Every
 /// getter the seller reconciles against goes with it -- `getState` starts answering nothing -- so the
 /// driver's read fails and the failure arrives here wearing no exit code at all. It is neither
 /// `ERR_NOT_OPEN` nor a dispute, so it used to fall through both classifiers and become the seller's
 /// first fatal error: the process died on an outcome the protocol allows and it had nothing left to do
 /// about.
+
 /// The receipts outlive the account, so the terminal is still provable after the fact. Proving it here
 /// only retires the deal -- the seller submits nothing further against a contract that no longer exists.
 /// Anything short of an exact, unambiguous `ProbeBurned` leaves the existing classification untouched.
@@ -185,10 +187,7 @@ pub(crate) async fn classify_by_fact_advance_failure(
     // deposit) both mean money already moved, so treat either as a fault rather than a harmless terminal.
     if state.opened || state.disputed || state.tokens_final > 0 || state.is_stopped() {
         return Ok(AdvanceFailureDisposition::Fault {
-            reason: format!(
-                "reason=unsafe_lifecycle funded={} opened={} disputed={} tokens_final={} deposit={}",
-                state.funded, state.opened, state.disputed, state.tokens_final, state.deposit
-            ),
+            reason: unsafe_lifecycle_reason(&state),
         });
     }
 
@@ -202,42 +201,69 @@ pub(crate) async fn classify_by_fact_advance_failure(
         || snapshot.burned != 0
     {
         return Ok(AdvanceFailureDisposition::Fault {
-            reason: format!(
-                "reason=money_or_locks_present buyer_locked={} buyer_lead={} seller_locked={} \
-                 finalized_owed={} burned={}",
-                snapshot.buyer_locked,
-                snapshot.buyer_lead,
-                snapshot.seller_locked,
-                snapshot.seller_received,
-                snapshot.burned
-            ),
+            reason: money_or_locks_reason(&snapshot),
         });
     }
 
     Ok(AdvanceFailureDisposition::BenignTerminal {
-        reason: format!(
-            "reason=err_not_open_unopened_no_money funded={} opened={} disputed={} tokens_final={} \
-             buyer_locked={} buyer_lead={} seller_locked={} finalized_owed={} burned={}",
-            state.funded,
-            state.opened,
-            state.disputed,
-            state.tokens_final,
-            snapshot.buyer_locked,
-            snapshot.buyer_lead,
-            snapshot.seller_locked,
-            snapshot.seller_received,
-            snapshot.burned
-        ),
+        reason: unopened_no_money_reason(&state, &snapshot),
     })
 }
 
+/// Why an ERR_NOT_OPEN deal is a fault: it ran. Money in it is stated in SHELL, counts stay counts.
+pub(crate) fn unsafe_lifecycle_reason(state: &dexdo_core::DealChainState) -> String {
+    format!(
+        "reason=unsafe_lifecycle funded={} opened={} disputed={} tokens_final={} deposit={}",
+        state.funded,
+        state.opened,
+        state.disputed,
+        state.tokens_final,
+        dexdo_core::shell_amount(state.deposit)
+    )
+}
+
+/// Why an ERR_NOT_OPEN deal is a fault: money or locks are still in it.
+pub(crate) fn money_or_locks_reason(snapshot: &dexdo_core::StreamSnapshot) -> String {
+    format!(
+        "reason=money_or_locks_present buyer_locked={} buyer_lead={} seller_locked={} \
+         finalized_owed={} burned={}",
+        dexdo_core::shell_amount(snapshot.buyer_locked),
+        dexdo_core::shell_amount(snapshot.buyer_lead),
+        dexdo_core::shell_amount(snapshot.seller_locked),
+        dexdo_core::shell_amount(snapshot.seller_received),
+        dexdo_core::shell_amount(snapshot.burned)
+    )
+}
+
+/// Why an ERR_NOT_OPEN deal is harmless: it never opened and holds nothing.
+pub(crate) fn unopened_no_money_reason(
+    state: &dexdo_core::DealChainState,
+    snapshot: &dexdo_core::StreamSnapshot,
+) -> String {
+    format!(
+        "reason=err_not_open_unopened_no_money funded={} opened={} disputed={} tokens_final={} \
+         buyer_locked={} buyer_lead={} seller_locked={} finalized_owed={} burned={}",
+        state.funded,
+        state.opened,
+        state.disputed,
+        state.tokens_final,
+        dexdo_core::shell_amount(snapshot.buyer_locked),
+        dexdo_core::shell_amount(snapshot.buyer_lead),
+        dexdo_core::shell_amount(snapshot.seller_locked),
+        dexdo_core::shell_amount(snapshot.seller_received),
+        dexdo_core::shell_amount(snapshot.burned)
+    )
+}
+
 /// The two consumption figures a terminal must state separately, and the tail between them.
+
 /// `claimed_tokens` is the cumulative the seller CLAIMED. `finalized_tokens` is the part the contract
 /// PROMOTED, and money is computed from that one alone (`TokenContract._payFinalAndClose` reads
 /// `_tokensFinal`). The two are equal only when every claim served its `CLAIM_PROMOTE_WINDOW` before the
 /// deal ended. A buyer STOP inside that window closes on the promoted figure and refunds the rest
 /// (`TokenContract.stop` -> `_closeClean`), so the difference is delivered, claimed, verified work that
 /// was not paid -- the seller's only chance to recognise it is this line.
+
 /// Both figures are in TOKENS. The key this replaces printed the CLAIMED figure, in tokens, under the
 /// name `finalized_ticks` -- wrong in the quantity AND wrong in the unit, so a deal that paid one tick
 /// against three million claimed tokens reported `finalized_ticks=3000000` and read as success.
@@ -357,6 +383,7 @@ mod terminal_consumption_tests {
     }
 
     /// regression, value half: the terminal must state BOTH figures, each under its own name.
+
     /// Asserting only the promoted value would pass against the defect, because the defect printed a
     /// number that was numerically fine for the quantity it was NOT labelled as. What fails on the old
     /// code is the pair: `finalized_*` must carry the promoted figure and nothing else must be called

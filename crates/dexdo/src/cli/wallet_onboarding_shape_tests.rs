@@ -1,8 +1,10 @@
 /// The agreed Acki Nacki wallet shape, enforced case by case.
-/// The specification is the answer recorded on(2026-08-12): owners are
+
+/// The specification is the answer recorded on (2026-08-12): owners are
 /// `[K0, K1, matching_agent_key]`, Vault/Hot transaction confirms `2`/`1`, data confirms `2` on
 /// both -- restated for the Vault as "the exact form: exactly three pubkey custodians including
 /// the local Vault key, `requiredTxnConfirms=2` and `requiredDataConfirms=2`".
+
 /// Each invariant gets its own case, and each case asserts WHY the wallet was refused, not merely
 /// that some error came back: a count check that happened to fail on membership would pass an
 /// `is_err()` assertion while leaving the count unenforced. The accepting case is here for the same
@@ -144,7 +146,7 @@ mod agreed_wallet_shape_tests {
     fn response() -> AgentWalletsResponse {
         serde_json::from_value(serde_json::json!({
             "version": 1,
-            "network": "shellnet",
+            "network": "net-a",
             "vault": scoped('c'),
             "hot": scoped('d'),
         }))
@@ -351,7 +353,7 @@ mod agreed_wallet_shape_tests {
 
     fn validated() -> ValidatedWalletPair {
         ValidatedWalletPair {
-            network: "shellnet".to_string(),
+            network: "net-a".to_string(),
             vault_scoped_address: format!("{0}::{0}", public('c')),
             hot_scoped_address: format!("{0}::{0}", public('d')),
         }
@@ -363,7 +365,8 @@ mod agreed_wallet_shape_tests {
         let hot_key = Path::new("/agent/keys/hot.key");
         let vault_key = Path::new("/agent/keys/vault.key");
 
-        let separate = binding_of("binding-id", &validated, hot_key, Some(vault_key), None);
+        let separate = binding_of(
+        crate::cli::wallet::test_network_a(),"binding-id", &validated, hot_key, Some(vault_key), None);
         assert_eq!(separate.hot_key_file.as_deref(), Some(hot_key));
         assert_eq!(
             separate.vault_key_file.as_deref(),
@@ -373,7 +376,8 @@ mod agreed_wallet_shape_tests {
 
         // Without --vault-key the Hot key IS the Vault custodian, which is what `run` validates
         // the Vault against, so the binding records that same file rather than nothing.
-        let shared = binding_of("binding-id", &validated, hot_key, None, None);
+        let shared = binding_of(
+        crate::cli::wallet::test_network_a(),"binding-id", &validated, hot_key, None, None);
         assert_eq!(shared.vault_key_file.as_deref(), Some(hot_key));
     }
 
@@ -384,6 +388,7 @@ mod agreed_wallet_shape_tests {
         let wallet_address = format!("0:{}", public('e'));
 
         let binding = binding_of(
+            crate::cli::wallet::test_network_a(),
             "binding-id",
             &validated,
             hot_key,
@@ -399,7 +404,8 @@ mod agreed_wallet_shape_tests {
         // Optional by specification: an onboarding that is otherwise proved is not failed over it,
         // and a blank address is recorded as absent rather than as an empty string.
         for absent in [None, Some(""), Some("   ")] {
-            let binding = binding_of("binding-id", &validated, hot_key, None, absent);
+            let binding = binding_of(
+        crate::cli::wallet::test_network_a(),"binding-id", &validated, hot_key, None, absent);
             assert_eq!(binding.push_profile_address, None, "{absent:?}");
         }
     }

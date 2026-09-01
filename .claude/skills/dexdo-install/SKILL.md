@@ -1,6 +1,6 @@
 ---
 name: dexdo-install
-description: Install and verify the dexdo CLI so an agent (or a fresh machine) is ready to sell or buy model inference on the dexdo market (real Acki Nacki shellnet). Covers the one-line installer (or a source build), putting `dexdo` on PATH, fetching the deployed-contracts manifest, verifying with `dexdo --version` / `dexdo doctor`, creating and funding the supported shellnet multisig wallet, and the remaining prerequisites needed before running the seller or buyer. Load this to get `dexdo` installed and green from scratch; then use the `dexdo-sell-model` skill to sell or `dexdo-buy-model` to buy.
+description: Install and verify the dexdo CLI so an agent (or a fresh machine) is ready to sell or buy model inference on the dexdo market (real Acki Nacki shellnet). Covers the one-line installer (or a source build), putting `dexdo` on PATH, fetching the deployed-contracts manifest, verifying with `dexdo --version` / `dexdo doctor`, creating and funding the supported shellnet multisig wallet, and the remaining prerequisites needed before running the seller or buyer. Load this to get `dexdo` installed and green from scratch; then use `dexdo-sell-model-for-agent` to sell or `dexdo-buy-model-for-agent` to buy with an assistant doing the work, or `dexdo-sell-model-for-human` / `dexdo-buy-model-for-human` to run the commands yourself. Written for both an agent and a person: installing is the same sequence either way, so there is one document and no second copy to drift from it.
 ---
 
 # dexdo -- install and verify the CLI
@@ -44,11 +44,8 @@ Build from source (alternative, needs Rust):
 
 ```sh
 git clone https://github.com/gosh-sh/dexdo-cli && cd dexdo-cli
-cargo build --release -p dexdo --features shellnet   # binary: target/release/dexdo
+cargo build --release -p dexdo   # binary: target/release/dexdo
 ```
-
-The `shellnet` feature is required for any on-chain command; a build without it fails closed with
-`unavailable: build with --features shellnet`. The released binary already includes it.
 
 ## Phase 2. Verify the binary
 
@@ -61,23 +58,34 @@ Both must succeed (exit 0) before continuing.
 
 ## Phase 3. Fetch the deployed-contracts manifest
 
-Every on-chain command needs `contracts/deployed.shellnet.json` in the working directory (it pins the
-deployed contract addresses and the shellnet version). If you installed the binary (did not build from
-source), download it once:
+Every on-chain command needs a manifest, and you tell the client where it is. The manifest pins the
+deployed contract addresses and NAMES ITS NETWORK: the client takes the network, the endpoint and
+the pins from that file. There is no flag and no network option to disagree with it -- which file
+you point at IS which network you work on.
+
+Download it once and say where it lives:
 
 ```sh
-mkdir -p contracts
-curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/contracts/deployed.shellnet.json \
-  -o contracts/deployed.shellnet.json
+curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/manifest/mainnet.manifest.json \
+  -o ~/dexdo/mainnet.manifest.json
+
+export DEXDO_MANIFEST=~/dexdo/mainnet.manifest.json
 ```
 
-A source checkout already ships this file.
+Put the `export` in your shell config so new terminals have it. **Without it every on-chain command
+refuses** -- deliberately: a client that guessed which network you meant is how a mainnet operator
+once spent twelve minutes onboarding against a test chain.
+
+A source checkout already ships the file; point the variable at the copy in the checkout.
 
 ## Phase 4. Health check
 
 ```sh
-dexdo doctor --contracts contracts/deployed.shellnet.json
+dexdo doctor
 ```
+
+Every command reads the manifest `DEXDO_MANIFEST` names. There is no flag for it, and no default: a
+default would be the client choosing a network for you, quietly.
 
 `dexdo doctor` reports the reachable shellnet version and whether your manifest is fresh (matches the
 deployed contracts). A green doctor here means the binary, manifest, and network are ready. The failure
@@ -85,6 +93,34 @@ policy is a separate gate -- you set it up in Phase 5, and `dexdo seller` / `dex
 complete policy when they start (once a policy exists, doctor also flags an incomplete one). If doctor
 flags manifest drift, re-download the manifest (Phase 3). If it flags shellnet unreachable, check
 network access to `shellnet.ackinacki.org`.
+
+## What the client prints, and how to make it say more
+
+The client is quiet by default. Only errors are logged; a long command shows one live status line
+that is rewritten in place -- the step it is on and how long that step has been running -- and the
+line disappears when the command ends. Nothing accumulates on the screen while a proof runs.
+
+Results are separate from progress. A command's result goes to **stdout**; the status line, the
+prover's phase reports and the recovery notes all go to **stderr**. So a pipe or a redirect gets the
+result and nothing else:
+
+```sh
+dexdo note deploy --nominal N100 --data-dir ./.dexdo-shellnet > note.txt
+```
+
+Redirected or captured output is never rewritten in place and carries no colour: one plain line per
+step, in order, safe to keep in a log.
+
+**To see detail**, set `RUST_LOG`. It overrides the quiet default:
+
+```sh
+RUST_LOG=info dexdo note deploy --nominal N100 --data-dir ./.dexdo-shellnet
+RUST_LOG=debug dexdo doctor
+```
+
+Use `RUST_LOG=info` when a command behaves unexpectedly and you want the chain reads and retries it
+is doing; use the default when you just want it to run. `NO_COLOR=1` drops the colour without
+dropping the status line.
 
 ## Phase 5. Prerequisites for real trading (before seller / buyer)
 
@@ -118,7 +154,6 @@ set -eu
 umask 077
 
 TVM_NETWORK=shellnet
-DEXDO_ENDPOINT=shellnet.ackinacki.org
 [ "$TVM_NETWORK" = shellnet ] || {
   printf '%s\n' 'wallet onboarding is shellnet-only' >&2
   exit 1
@@ -137,16 +172,15 @@ chmod 700 "$WALLET_HOME" "$WALLET_HOME/contracts"
 #     attachment and matches only the REMAINDER against ALLOWED_NOMINALS, so the wallet must attach
 #     the nominal plus the gas deposit or the deposit is refused (ERR_BELOW_GAS_DEPOSIT / 408,
 #     ERR_NOT_ALLOWED / 141) after the wallet has already spent.
-#   gas voucher leg = ECC_SHELL_DEPOSIT_RAW
-#     A separate `isFee=true` voucher, deducted nothing, that gives the new note its own SHELL gas.
+#     There is no second leg: `RootPN` credits every note it creates with the whole GAS_DEPOSIT,
+#     which is the note's own SHELL gas. A note that needs more takes it later with `note topup`.
 #
 # `dexdo note deploy` checks the SUM before it submits anything, so an underfunded wallet is
 # refused with `missing=<raw>` and no wallet POST is made.
 NOMINAL=N100
 NOMINAL_RAW=100000000000
 ROOT_PN_GAS_DEPOSIT_RAW=250000000000  # contracts/dex/modifiers/modifiers.sol: GAS_DEPOSIT
-ECC_SHELL_DEPOSIT_RAW=100000000000    # the SHELL gas voucher leg
-WALLET_ECC_MIN=$((NOMINAL_RAW + ROOT_PN_GAS_DEPOSIT_RAW + ECC_SHELL_DEPOSIT_RAW))
+WALLET_ECC_MIN=$((NOMINAL_RAW + ROOT_PN_GAS_DEPOSIT_RAW))
 
 TVM_SDK_REV=88d50d3883c5bef619e29db8534002eb5e65eb4b
 TVM_SDK_DIR="$WALLET_HOME/tvm-sdk"
@@ -437,12 +471,11 @@ jq -er '.secret | select(test("^[0-9a-fA-F]{64}$"))' "$KEYS" > "$WALLET_SECRET"
 chmod 600 "$WALLET_SECRET"
 
 PN_POOL="${DEXDO_PN_POOL:-"$WALLET_HOME/pn_pool.json"}"
-dexdo note deploy --json \
+dexdo note deploy --json --non-interactive \
   --multisig-address "$WALLET_ADDR" \
-  --multisig-key "$WALLET_SECRET" \
+  --multisig-private-key "$WALLET_SECRET" \
   --nominal "$NOMINAL" \
   --token-type shell \
-  --endpoint "$DEXDO_ENDPOINT" \
   --pool "$PN_POOL" > "$WALLET_HOME/note-deploy.json"
 jq -e '.status == "deployed" and .error == null' \
   "$WALLET_HOME/note-deploy.json" >/dev/null
@@ -457,9 +490,7 @@ NOTE_ADDR=$(jq -er '.notes[-1].address' "$PN_POOL")
 # hash from the manifest file here: the CLI checks against the hash it verified against the live
 # chain, and a manifest copy can be older than the chain (`dexdo doctor` prints both).
 dexdo note balance \
-  --note-addr "$NOTE_ADDR" \
-  --contracts contracts/deployed.shellnet.json \
-  --endpoint "$DEXDO_ENDPOINT" > "$WALLET_HOME/note-balance.txt"
+  --note-addr "$NOTE_ADDR" > "$WALLET_HOME/note-balance.txt"
 chmod 600 "$WALLET_HOME/note-balance.txt"
 grep -Fq 'status: Active' "$WALLET_HOME/note-balance.txt"
 
@@ -481,16 +512,19 @@ holds the whole balance.
 
 1. A **model access key** for the seller only (for example `GROQ_API_KEY`), exported in the
    environment (`export GROQ_API_KEY=...`), never written to logs or files that get committed.
-2. A completed **failure policy**. Scaffold and fill it now:
+2. A completed **failure policy**. You do not write it: the first `dexdo seller` or `dexdo buyer`
+   run on a terminal asks for it -- one situation at a time, in words, with the suggested answer
+   marked -- and writes the answers to the policy file. It asks once. Read back what it wrote:
 
    ```sh
-   dexdo policy init --role seller    # or --role buyer
    dexdo policy show
    ```
 
-   The real `dexdo seller`/`dexdo buyer` refuse to start until every field is set (no `UNSET`). For a
-   seller, `seller.max_open_deals` must be exactly `1`. Use the allowed values listed under
-   `_legend.allowed` in the scaffold.
+   The real `dexdo seller`/`dexdo buyer` refuse to start until every field is set. Without a terminal
+   -- a script, a service unit -- or with `--non-interactive`, there is no interview and the run
+   refuses instead, so answer the questions once on a terminal before scripting either role. For a
+   seller, `seller.max_open_deals` must be exactly `1`. `dexdo policy init` still scaffolds a file to
+   fill by hand, with the allowed values listed under `_legend.allowed`.
 3. A **private note** (wallet-funded, no giver). The wallet block above already deploys one; these
    are the rules it obeys. Notes are funded in SHELL only, so `--token-type shell` is the only
    accepted currency, and `--nominal` is required with no default (`N100`, `N1000`, or `N10000` --
@@ -503,74 +537,28 @@ holds the whole balance.
    export DEXDO_PN_POOL="$PWD/pn_pool.json"
    ```
 
-## Phase 6. Run it -- work end to end
-
-After Phase 5 (wallet, key, policy, note), pull the note address and owner secret out of the pool (the
-secret goes to a `0600` file, never the screen):
-
-```sh
-NOTE_ADDR=$(jq -r '.notes[-1].address' "$DEXDO_PN_POOL")
-jq -r '.notes[-1].owner_secret_key_hex' "$DEXDO_PN_POOL" > note.secret.hex
-chmod 600 note.secret.hex
-```
-
-### Sell (seller side)
-
-Needs a `models.json` mapping your model (frame id, upstream base_url, served_model, `api_key_env`).
-Read the current price, provision one per-deal market, then run the gateway:
-
-```sh
-dexdo market qwen--qwen3--32b --note-addr "$NOTE_ADDR" --contracts contracts/deployed.shellnet.json
-dexdo provision --note-addr "$NOTE_ADDR" --note-key note.secret.hex --frame-model qwen--qwen3--32b \
-  --nonce 1 --price-per-tick 1000000000 --max-ticks 1024 --deposit-shells 20 --output market.json \
-  --contracts contracts/deployed.shellnet.json
-export GROQ_API_KEY=<your-key>
-dexdo seller --market market.json --model qwen --models models.json \
-  --note-addr "$NOTE_ADDR" --note-key note.secret.hex --gateway-listen 0.0.0.0:8443 \
-  --gateway-advertise <public-host>:8443 \
-  --contracts contracts/deployed.shellnet.json
-```
-
-`--gateway-advertise` is the address a REMOTE buyer dials; it must be publicly reachable.
-Startup rejects a bind-all/loopback/private/link-local/CGNAT advertise -- and any reserved range
-that is never routed (documentation, benchmarking, `240.0.0.0/4`, `0.0.0.0/8`, multicast) -- with
-`error[E_ADVERTISE_NOT_PUBLIC]` before posting the offer. For same-host or LAN testing only,
-add `--allow-private-advertise`.
-
-Hand the buyer the deal address (`token_contract` in `market.json`) and the frame model
-`qwen--qwen3--32b`. Check revenue: `dexdo status 0:<TC> --contracts contracts/deployed.shellnet.json`
-or `dexdo monitor --market market.json --contracts contracts/deployed.shellnet.json`.
-
-### Buy (buyer side)
-
-Read an executable quote, place the buy, then send OpenAI-style requests to the local listener:
-
-```sh
-dexdo quote --market market.json --ticks 8 --contracts contracts/deployed.shellnet.json
-dexdo buyer --market market.json --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
-  --ticks 8 --max-price-per-tick 1000000000 --local-listen 127.0.0.1:8080 \
-  --contracts contracts/deployed.shellnet.json
-# in another shell, send OpenAI-style requests to the buyer's local endpoint:
-curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"qwen--qwen3--32b","messages":[{"role":"user","content":"hi"}]}'
-```
-
-`--max-price-per-tick` must be `>=` the ask or the order never crosses. Check the deal with
-`dexdo status 0:<TC> --contracts contracts/deployed.shellnet.json`.
-
 ## Next (full flows + recovery)
 
-- To SELL model access: load the `dexdo-sell-model` skill -- models.json, pricing, provision, the
-  gateway, status/monitor accounting, and wrap-up.
-- To BUY model access: load the `dexdo-buy-model` skill -- quote depth, price ceilings, continuity
-  modes, using the model, and recovery/resume.
+Each trade has two documents, and which one is right depends on who is doing the work. This is the
+one page both readers share, so both routes are named here -- a person sent only to the agent-driven
+document lands in a text addressed past them to a machine.
+
+- To SELL model access, **with an assistant running the commands**: load `dexdo-sell-model-for-agent`
+  -- models.json, pricing, provision, the gateway, status/monitor accounting, and wrap-up.
+- To SELL model access **yourself, by hand**: load `dexdo-sell-model-for-human` -- the same commands,
+  plus what each one costs, which one holds your terminal, and what cannot be undone.
+- To BUY model access, **with an assistant running the commands**: load `dexdo-buy-model-for-agent`
+  -- quote depth, price ceilings, continuity modes, using the model, and recovery/resume.
+- To BUY model access **yourself, by hand**: load `dexdo-buy-model-for-human`.
+- To keep several sellers standing on one machine: load `seller-ops-onboarding`.
 
 ## Hard rules
 
 - Never print, log, or commit the wallet seed/key, the note owner secret (`owner_secret_key_hex`), the
   pool file, or any provider API key.
-- Every on-chain command takes the same `contracts/deployed.shellnet.json`; a mismatch between two
-  sides is diagnosed by `dexdo doctor`.
+- Every on-chain command reads the manifest `DEXDO_MANIFEST` names, so both sides of a deal are on
+  the same network exactly when they point at the same manifest; a mismatch is diagnosed by
+  `dexdo doctor`.
 
 ## Common install errors
 
@@ -578,8 +566,6 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
   that is already running keeps its old PATH; `source` the file the installer printed, or open a new
   terminal. If the installer reported an unrecognized shell (or ran with `DEXDO_NO_MODIFY_PATH=1` /
   `--no-modify-path`), add the printed line to your shell config by hand (Linux/macOS: `~/.local/bin`).
-- `unavailable: build with --features shellnet` -- a source build compiled without the feature; rebuild
-  with `--features shellnet` (Phase 1). The released binary already includes it.
-- `dexdo doctor` reports manifest drift -- re-download `contracts/deployed.shellnet.json` (Phase 3).
+- `dexdo doctor` reports manifest drift -- re-download the manifest (Phase 3).
 - On an older Linux the released binary still runs (static musl); if a self-built glibc binary fails
   with `GLIBC_... not found`, use the released musl binary instead of a local glibc build.
