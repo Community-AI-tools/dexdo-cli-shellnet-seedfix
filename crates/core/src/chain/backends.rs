@@ -10529,6 +10529,10 @@ mod codecell_tests {
                 // The report names the chain the run is on; the row is keyed by generation now,
                 // and a generation is not a chain.
                 network: crate::params::current_network().to_string(),
+                endpoint: "https://example.invalid".to_string(),
+                manifest_generation: Some(pins.version.to_string()),
+                chain_generation: Some(pins.version.to_string()),
+                clock_skew_seconds: 0,
                 versions: Vec::new(),
                 checks,
             };

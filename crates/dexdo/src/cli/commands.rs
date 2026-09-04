@@ -32,7 +32,8 @@ pub(crate) use crate::cli::settlement_receipt::run_settlement_receipt;
 use crate::cli::support::*;
 use anyhow::{bail, Context as _, Result};
 use dexdo::registry::{
-    default_model_registry_address, resolve_registered_model_identity, ModelRegistryReader,
+    default_model_registry_address, resolve_registered_model_identity, resolve_registered_model_identity_with,
+    RegistrySuggestions, ModelRegistryReader,
 };
 use dexdo::registry::{
     enforce_model_registry_policy as enforce_model_registry_policy_with_reader,
@@ -348,6 +349,11 @@ pub(crate) fn save_mock_runtime_deal_handle(
 
 pub(crate) fn load_pool_json(path: &std::path::Path) -> Result<Value> {
     let path = crate::cli::note::resolve_private_file_path(path, "DEXDO_PN_POOL")?;
+    // the pool carries `owner_secret_key_hex` for EVERY note in it -- the most secret-dense
+    // file the client has -- and it was read with no permission check at all. put that check
+    // on `--note-key`, `--multisig-private-key` and the rest, and this file, which is worth all of
+    // them together, was not among them.
+    crate::cli::support::refuse_exposed_secret_file(&path, "DEXDO_PN_POOL")?;
     let bytes = std::fs::read(&path)
         .map_err(|e| anyhow::anyhow!("read DEXDO_PN_POOL {}: {e}", path.display()))?;
     let pool = serde_json::from_slice(&bytes)
@@ -357,6 +363,8 @@ pub(crate) fn load_pool_json(path: &std::path::Path) -> Result<Value> {
 }
 
 pub(crate) fn validate_existing_pool_if_present(path: &std::path::Path) -> Result<()> {
+    // Absent is fine here and the next line says so; exposed is not.
+    crate::cli::support::refuse_exposed_secret_file_if_present(path, "--pool")?;
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -857,6 +865,32 @@ pub(crate) fn with_pool_write_lock<T>(
     update(&lock.pool_path)
 }
 
+/// Where this instance's note pool is, for the commands that READ it.
+
+/// **The defect this closes.** The last arm was `None`, and the client therefore wrote a
+/// pool it could not then find. `note deploy` and `note recover` take their target from
+/// `data_dir::automatic_private_file` when `--pool` is absent (`main.rs`), which resolves through
+/// `data_dir::effective()` and lands in the platform data directory. The readers stopped at
+/// `data_dir::explicit()`, which is `Some` only when `--data-dir` was passed. So on a default
+/// install the money was on disk, at the right path, owner-only -- and `dexdo note list` answered
+/// "this instance has deployed no notes yet" about a pool written minutes earlier. That sentence was
+/// not a limitation, it was false, and `recover`, `dispute`, `reclaim` and the note picker were
+/// equally blind.
+
+/// **Why the new arm is LAST rather than a swap.** Replacing `explicit()` with `effective()` was the
+/// obvious repair and it is wrong: `effective()` always resolves, so `DEXDO_PN_POOL` below would
+/// become unreachable. The variable is the READER's pointer by design -- the writer never consults
+/// it, and `note_deploy_same_file_pool_guard` refuses outright when it and `--pool` name the same
+/// existing file, because appending there "can hide note-key confusion". Making the variable
+/// unreachable would be a silent break on a money path, which is worse than the defect being fixed.
+
+/// So nothing that resolves today changes what it resolves to; only the case that resolved to
+/// NOTHING now resolves, and it resolves to the writer's own location by the writer's own call.
+
+/// **The one case still answered as `None`:** a platform data directory that cannot be determined at
+/// all -- no `$HOME`, or an OS `directories` does not know. That is what the code does today too, and
+/// the alternative is changing this function's return type across its nine callers to improve a
+/// message for a case none of them can reach in practice.
 pub(crate) fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     if let Some(path) = explicit {
         return Some(path.to_path_buf());
@@ -864,10 +898,24 @@ pub(crate) fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::
     if let Some(root) = crate::cli::data_dir::explicit() {
         return Some(root.join(DEFAULT_PN_POOL_PATH));
     }
-    match std::env::var_os("DEXDO_PN_POOL") {
-        Some(raw) if !raw.is_empty() => Some(std::path::PathBuf::from(raw)),
-        _ => None,
+    if let Some(raw) = std::env::var_os("DEXDO_PN_POOL") {
+        if !raw.is_empty() {
+            return Some(std::path::PathBuf::from(raw));
+        }
     }
+    // ONLY IF IT IS THERE, and the asymmetry with the arms above is deliberate.
+
+    // An explicit `--pool`, `--data-dir` or `DEXDO_PN_POOL` is returned whether or not the file
+    // exists: the operator named that path, and a typo in it has to be reported against it rather
+    // than swallowed. Nobody named this one. A default that is not on disk means this instance has
+    // not deployed a note, which is exactly what the callers' own refusals say -- and returning the
+    // path anyway made them say something else: `note list` answered "resolve parent directory for
+    // DEXDO_PN_POOL <path>: No such file or directory", naming a variable the operator never set.
+    // Caught by `a_home_with_no_pool_still_says_so`, which is why it is in the suite.
+    let shipped = crate::cli::data_dir::effective()
+        .ok()?
+        .join(DEFAULT_PN_POOL_PATH);
+    shipped.is_file().then_some(shipped)
 }
 
 /// The explicitly supplied recovery identity, normalized once for both the single-target resolver and
@@ -1885,6 +1933,7 @@ pub(crate) async fn resolve_registry_content_identity(
     contracts: &std::path::Path,
     endpoint: Option<&str>,
     requested_model: &str,
+    suggestions_policy: RegistrySuggestions,
 ) -> Result<String> {
     let registry_address = default_model_registry_address(contracts).with_context(|| {
         format!(
@@ -1897,9 +1946,14 @@ pub(crate) async fn resolve_registry_content_identity(
         endpoint,
         &registry_address,
     )?;
-    let identity =
-        resolve_registered_model_identity(&reader, role, &registry_address, requested_model)
-            .await?;
+    let identity = resolve_registered_model_identity_with(
+        &reader,
+        role,
+        &registry_address,
+        requested_model,
+        suggestions_policy,
+    )
+    .await?;
     Ok(identity.registry_model)
 }
 
@@ -2503,7 +2557,7 @@ pub(crate) async fn chain_doctor_preflight_market(
     let chain = dexdo_core::RealChainBackend::connect(contracts)?;
     let report = chain.doctor(market).await?;
     if !report.is_ok() {
-        bail!("{}", render_chain_doctor_report(&report));
+        bail!("{}", render_chain_doctor_preflight_report(&report));
     }
     Ok(())
 }
@@ -2642,6 +2696,7 @@ async fn chain_doctor_report(
     endpoint: Option<&str>,
     contracts: &std::path::Path,
     market: Option<&std::path::Path>,
+    observe: impl FnMut(usize, &dexdo_core::ChainDoctorCheck),
 ) -> Result<dexdo_core::ChainDoctorReport> {
     let contracts_path = contracts;
     let contracts = contracts
@@ -2655,7 +2710,7 @@ async fn chain_doctor_report(
     let market = market.map(load_market).transpose()?;
     let chain = dexdo_core::RealChainBackend::connect_with_endpoint(contracts, Some(endpoint))
         .map_err(|error| doctor_contracts_error(std::path::Path::new(contracts), error))?;
-    chain.doctor(market.as_ref()).await
+    chain.doctor_observing(market.as_ref(), observe).await
 }
 
 fn doctor_contracts_error(path: &std::path::Path, error: anyhow::Error) -> anyhow::Error {
@@ -2675,13 +2730,8 @@ fn doctor_contracts_error(path: &std::path::Path, error: anyhow::Error) -> anyho
     }
 }
 
-fn render_chain_doctor_report(report: &dexdo_core::ChainDoctorReport) -> String {
-    let mut out = String::new();
-    let status = if report.is_ok() { "PASS" } else { "FAIL" };
-    out.push_str(&format!(
-        "dexdo doctor: {status} network={}\n",
-        report.network
-    ));
+fn render_chain_doctor_preflight_report(report: &dexdo_core::ChainDoctorReport) -> String {
+    let mut out = format!("dexdo doctor: FAIL network={}\n", report.network);
     if !report.versions.is_empty() {
         out.push_str("versions:\n");
         for (name, version) in &report.versions {
@@ -2689,20 +2739,274 @@ fn render_chain_doctor_report(report: &dexdo_core::ChainDoctorReport) -> String 
         }
     }
     out.push_str("checks:\n");
-    for c in &report.checks {
-        out.push_str(&format!("  {:<4} {}", c.status.as_str(), c.name));
-        if let Some(addr) = &c.address {
-            out.push_str(&format!(" addr={addr}"));
+    for check in &report.checks {
+        out.push_str(&format!("  {:<4} {}", check.status.as_str(), check.name));
+        if let Some(address) = &check.address {
+            out.push_str(&format!(" addr={address}"));
         }
-        if let Some(expected) = &c.expected {
+        if let Some(expected) = &check.expected {
             out.push_str(&format!(" expected={expected}"));
         }
-        if let Some(actual) = &c.actual {
+        if let Some(actual) = &check.actual {
             out.push_str(&format!(" actual={actual}"));
         }
-        out.push_str(&format!(" - {}\n", c.message));
+        out.push_str(&format!(" - {}\n", check.message));
     }
     out
+}
+
+fn render_chain_doctor_step(
+    index: usize,
+    check: &dexdo_core::ChainDoctorCheck,
+    raw: bool,
+) -> Option<String> {
+    use crate::cli::style::{self, Palette, Role};
+    use dexdo_core::ChainDoctorStatus;
+
+    if check.status == ChainDoctorStatus::Skip {
+        return None;
+    }
+    let palette = Palette::stderr();
+    let (glyph, role, ending) = match check.status {
+        ChainDoctorStatus::Pass => (style::OK, Role::Ok, "checked"),
+        ChainDoctorStatus::Fail => (style::ERR, Role::Err, "failed"),
+        ChainDoctorStatus::Skip => unreachable!("skips are rendered separately"),
+    };
+    let mut out = style::glyph_line(
+        palette,
+        glyph,
+        role,
+        &format!(
+            "[{index}/{}] {} {ending}",
+            dexdo_core::CHAIN_DOCTOR_CHECK_COUNT,
+            check.name
+        ),
+    );
+    if raw {
+        let fields = [
+            check.address.as_deref().map(|value| format!("addr={value}")),
+            check
+                .expected
+                .as_deref()
+                .map(|value| format!("expected={value}")),
+            check.actual.as_deref().map(|value| format!("actual={value}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        for field in fields {
+            out.push('\n');
+            out.push_str(&style::raw_line(palette, &field));
+        }
+    }
+    Some(out)
+}
+
+fn emit_doctor_step(rendered: &str, mut emit: impl FnMut(&str)) {
+    for line in rendered.lines() {
+        emit(line);
+    }
+}
+
+fn doctor_summary(report: &dexdo_core::ChainDoctorReport) -> crate::cli::machine::DoctorSummary {
+    use dexdo_core::ChainDoctorStatus;
+
+    let passed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == ChainDoctorStatus::Pass)
+        .count();
+    let failed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == ChainDoctorStatus::Fail)
+        .count();
+    let skipped = report
+        .checks
+        .iter()
+        .filter(|check| check.status == ChainDoctorStatus::Skip)
+        .count();
+    crate::cli::machine::DoctorSummary {
+        checked: passed + failed,
+        passed,
+        failed,
+        skipped,
+    }
+}
+
+fn render_clock_skew(seconds: i64) -> String {
+    match seconds.cmp(&0) {
+        std::cmp::Ordering::Greater => format!("{seconds}s ahead of chain time"),
+        std::cmp::Ordering::Less => format!("{}s behind chain time", seconds.unsigned_abs()),
+        std::cmp::Ordering::Equal => "in sync with chain time".to_string(),
+    }
+}
+
+fn render_chain_doctor_report(
+    report: &dexdo_core::ChainDoctorReport,
+    policy: &policy::DoctorPolicyAssessment,
+) -> String {
+    use crate::cli::style::{self, Palette, Role};
+    use dexdo_core::ChainDoctorStatus;
+
+    let palette = Palette::stdout();
+    let mut out = String::new();
+    out.push_str("Doctor report\n");
+    out.push_str(&format!(
+        "{}\n",
+        style::field(palette, "network", &report.network, Role::Text)
+    ));
+    out.push_str(&format!(
+        "{}\n",
+        style::field(palette, "endpoint", &report.endpoint, Role::Text)
+    ));
+    out.push_str(&format!(
+        "{}\n",
+        style::field(
+            palette,
+            "generation",
+            &format!(
+                "manifest {}, chain {}",
+                report.manifest_generation.as_deref().unwrap_or("unknown"),
+                report.chain_generation.as_deref().unwrap_or("unknown")
+            ),
+            Role::Text,
+        )
+    ));
+    out.push_str(&format!(
+        "{}\n",
+        style::field(
+            palette,
+            "clock",
+            &render_clock_skew(report.clock_skew_seconds),
+            Role::Text,
+        )
+    ));
+    if !report.versions.is_empty() {
+        out.push_str("  versions\n");
+        for (name, version) in &report.versions {
+            out.push_str(&format!(
+                "{}\n",
+                style::field(palette, name, version, Role::Text)
+            ));
+        }
+    }
+    let skipped = report
+        .checks
+        .iter()
+        .enumerate()
+        .filter(|(_, check)| check.status == ChainDoctorStatus::Skip)
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        out.push_str("\nSkipped\n");
+        for (index, check) in skipped {
+            out.push_str(&format!(
+                "{}\n",
+                style::glyph_line(
+                    palette,
+                    "\u{2610}",
+                    Role::Label,
+                    &format!(
+                        "[{}/{}] SKIP {} - {}",
+                        index + 1,
+                        dexdo_core::CHAIN_DOCTOR_CHECK_COUNT,
+                        check.name,
+                        check.message
+                    )
+                )
+            ));
+        }
+    }
+    let summary = doctor_summary(report);
+    out.push_str(&format!(
+        "{}\n",
+        style::field(
+            palette,
+            "policy",
+            &policy::doctor_policy_line(policy),
+            Role::Text,
+        )
+    ));
+    out.push_str(&format!(
+        "{}\n",
+        style::field(
+            palette,
+            "checked",
+            &format!(
+                "{} ({} passed, {} failed, {} skipped)",
+                summary.checked, summary.passed, summary.failed, summary.skipped
+            ),
+            Role::Text,
+        )
+    ));
+    let verdict = if report.is_ok() { "PASS" } else { "FAIL" };
+    let detail = if report.is_ok() {
+        format!(
+            "{} checks passed, {} skipped",
+            summary.passed, summary.skipped
+        )
+    } else {
+        let failed = report
+            .checks
+            .iter()
+            .filter(|check| check.status == ChainDoctorStatus::Fail)
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} checks failed: {failed}", summary.failed)
+    };
+    out.push_str(&format!("dexdo doctor: {verdict} - {detail}\n"));
+    out
+}
+
+fn doctor_machine_response(
+    report: &dexdo_core::ChainDoctorReport,
+    policy: &policy::DoctorPolicyAssessment,
+) -> crate::cli::machine::DoctorResponse {
+    use crate::cli::machine;
+    use dexdo_core::ChainDoctorStatus;
+
+    let checks = report
+        .checks
+        .iter()
+        .map(|check| machine::DoctorCheck {
+            name: check.name.clone(),
+            verdict: match check.status {
+                ChainDoctorStatus::Pass => "pass",
+                ChainDoctorStatus::Fail => "fail",
+                ChainDoctorStatus::Skip => "skip",
+            },
+            skip_reason: (check.status == ChainDoctorStatus::Skip)
+                .then(|| check.message.clone()),
+            address: check.address.clone(),
+            expected: check.expected.clone(),
+            actual: check.actual.clone(),
+            message: check.message.clone(),
+        })
+        .collect();
+    machine::DoctorResponse {
+        schema: machine::DOCTOR_SCHEMA,
+        network: report.network.clone(),
+        endpoint: report.endpoint.clone(),
+        manifest_generation: report.manifest_generation.clone(),
+        chain_generation: report.chain_generation.clone(),
+        versions: report
+            .versions
+            .iter()
+            .map(|(contract, version)| machine::DoctorVersion {
+                contract: contract.clone(),
+                version: version.clone(),
+            })
+            .collect(),
+        checks,
+        clock_skew_seconds: report.clock_skew_seconds,
+        policy: machine::DoctorPolicy {
+            status: policy.status.as_str(),
+            problems: policy.problems.clone(),
+        },
+        summary: doctor_summary(report),
+        verdict: if report.is_ok() { "pass" } else { "fail" },
+    }
 }
 
 pub(crate) async fn chain_doctor_preflight(
@@ -2725,9 +3029,9 @@ pub(crate) async fn chain_doctor_preflight_with_endpoint(
     // always is here -- but a preflight that reads mainnet while naming the chain build is the same
     // wrong answer the report itself used to print.
     let report =
-        chain_doctor_report(&deployed.network, Some(&endpoint), contracts, market).await?;
+        chain_doctor_report(&deployed.network, Some(&endpoint), contracts, market, |_, _| {}).await?;
     if !report.is_ok() {
-        bail!("{}", render_chain_doctor_report(&report));
+        bail!("{}", render_chain_doctor_preflight_report(&report));
     }
     Ok(())
 }
@@ -2750,14 +3054,181 @@ pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
     let declared = dexdo_core::Deployed::load(&manifest)
         .with_context(|| format!("load the manifest {}", manifest.display()))?
         .network;
-    let report =
-        chain_doctor_report(&declared, None, &crate::cli::commands::manifest_path()?, args.market.as_deref()).await?;
-    print!("{}", render_chain_doctor_report(&report));
-    println!("{}", policy::doctor_policy_line(args.policy.as_deref())?);
+    let status = (!args.json).then(|| {
+        crate::cli::progress::Status::new("checking the network and deployed contracts")
+    });
+    let raw = crate::cli::style::raw_requested();
+    let report = chain_doctor_report(
+        &declared,
+        None,
+        &manifest,
+        args.market.as_deref(),
+        |index, check| {
+            if let (Some(status), Some(line)) = (
+                status.as_ref(),
+                render_chain_doctor_step(index, check, raw),
+            ) {
+                emit_doctor_step(&line, |line| status.keep_exact(line));
+            }
+        },
+    )
+    .await;
+    let report = match report {
+        Ok(report) => report,
+        Err(error) if args.json => {
+            let code = crate::cli::machine::classify_error(
+                crate::cli::machine::OP_DOCTOR,
+                &error,
+            );
+            crate::cli::machine::print_short_error(crate::cli::machine::OP_DOCTOR, code)?;
+            return Err(crate::cli::machine::printed_error());
+        }
+        Err(error) => return Err(error),
+    };
+    let policy = policy::doctor_policy_assessment(args.policy.as_deref())?;
+    drop(status);
+    if args.json {
+        crate::cli::machine::print_json(&doctor_machine_response(&report, &policy))?;
+    } else {
+        print!("{}", render_chain_doctor_report(&report, &policy));
+    }
     if !report.is_ok() {
-        bail!("doctor failed: {}", report.fail_summary());
+        return Err(crate::cli::machine::printed_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod doctor_output_1860_tests {
+    use super::*;
+    use dexdo_core::{ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus};
+
+    fn report() -> ChainDoctorReport {
+        ChainDoctorReport {
+            network: "net-a".to_string(),
+            endpoint: "https://net-a.example/graphql".to_string(),
+            manifest_generation: Some("4.0.36".to_string()),
+            chain_generation: Some("4.0.36".to_string()),
+            clock_skew_seconds: -2,
+            versions: vec![("SuperRoot".to_string(), "4.0.36 SuperRoot".to_string())],
+            checks: vec![
+                ChainDoctorCheck {
+                    name: "SuperRoot code hash".to_string(),
+                    status: ChainDoctorStatus::Pass,
+                    address: Some("0:abcd".to_string()),
+                    expected: Some("expected-hash".to_string()),
+                    actual: Some("actual-hash".to_string()),
+                    message: "binary pin matches the live chain".to_string(),
+                },
+                ChainDoctorCheck {
+                    name: "RootModel code hash".to_string(),
+                    status: ChainDoctorStatus::Skip,
+                    address: None,
+                    expected: None,
+                    actual: None,
+                    message: "pass --market <manifest> to check it".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn missing_policy() -> policy::DoctorPolicyAssessment {
+        policy::DoctorPolicyAssessment {
+            status: policy::DoctorPolicyStatus::Missing,
+            problems: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn doctor_json_is_one_complete_path_free_document() {
+        let value = serde_json::to_value(doctor_machine_response(&report(), &missing_policy()))
+            .expect("serialize doctor response");
+        assert_eq!(value["schema"], "dexdo.doctor.v1");
+        assert_eq!(value["network"], "net-a");
+        assert_eq!(value["endpoint"], "https://net-a.example/graphql");
+        assert_eq!(value["manifest_generation"], "4.0.36");
+        assert_eq!(value["chain_generation"], "4.0.36");
+        assert_eq!(value["clock_skew_seconds"], -2);
+        assert_eq!(value["policy"]["status"], "missing");
+        assert_eq!(value["verdict"], "pass");
+        assert_eq!(value["summary"]["checked"], 1);
+        assert_eq!(value["summary"]["skipped"], 1);
+        assert_eq!(value["checks"][0]["expected"], "expected-hash");
+        assert_eq!(value["checks"][0]["actual"], "actual-hash");
+        assert_eq!(value["checks"][1]["verdict"], "skip");
+        assert_eq!(
+            value["checks"][1]["skip_reason"],
+            "pass --market <manifest> to check it"
+        );
+        assert!(
+            !value.to_string().contains("/Users/") && !value.to_string().contains("policy.json"),
+            "machine output must not carry a local policy path: {value}"
+        );
+    }
+
+    #[test]
+    fn human_checks_hide_raw_fields_unless_raw_was_requested() {
+        let check = &report().checks[0];
+        let ordinary = render_chain_doctor_step(1, check, false).expect("performed check");
+        assert!(ordinary.contains("\u{2714} [1/14] SuperRoot code hash checked"));
+        for raw in ["addr=", "expected=", "actual="] {
+            assert!(!ordinary.contains(raw), "ordinary step leaked {raw}: {ordinary}");
+        }
+
+        let raw = render_chain_doctor_step(1, check, true).expect("performed check");
+        for field in ["addr=0:abcd", "expected=expected-hash", "actual=actual-hash"] {
+            assert!(raw.contains(field), "raw step omitted {field}: {raw}");
+        }
+        assert!(
+            render_chain_doctor_step(2, &report().checks[1], false).is_none(),
+            "a skipped check must not look like a performed step"
+        );
+    }
+
+    #[test]
+    fn raw_doctor_progress_emits_every_physical_line_to_the_writer() {
+        let check = &report().checks[0];
+        let rendered = render_chain_doctor_step(1, check, true).expect("performed check");
+        let mut emitted = Vec::new();
+        emit_doctor_step(&rendered, |line| emitted.push(line.to_string()));
+
+        assert_eq!(emitted.len(), 4, "one step and three raw fields: {emitted:#?}");
+        for field in ["addr=0:abcd", "expected=expected-hash", "actual=actual-hash"] {
+            assert!(
+                emitted.iter().any(|line| line.contains(field)),
+                "progress writer lost {field}: {emitted:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_report_separates_skips_and_ends_with_the_verdict() {
+        let rendered = render_chain_doctor_report(&report(), &missing_policy());
+        assert!(rendered.contains("\nSkipped\n"), "{rendered}");
+        assert!(rendered.contains("SKIP RootModel code hash"), "{rendered}");
+        assert!(
+            rendered.contains("policy") && rendered.contains("not configured (optional for doctor)"),
+            "{rendered}"
+        );
+        for raw in ["addr=", "expected=", "actual="] {
+            assert!(!rendered.contains(raw), "human report leaked {raw}: {rendered}");
+        }
+        assert_eq!(
+            rendered.lines().last(),
+            Some("dexdo doctor: PASS - 1 checks passed, 1 skipped")
+        );
+    }
+
+    #[test]
+    fn a_failed_human_report_names_the_failed_check_in_its_final_line() {
+        let mut report = report();
+        report.checks[0].status = ChainDoctorStatus::Fail;
+        let rendered = render_chain_doctor_report(&report, &missing_policy());
+        assert_eq!(
+            rendered.lines().last(),
+            Some("dexdo doctor: FAIL - 1 checks failed: SuperRoot code hash")
+        );
+    }
 }
 
 
@@ -2770,20 +3241,40 @@ pub(crate) struct BookTarget {
     pub(crate) note_addr: Option<String>,
 }
 
-pub(crate) fn model_target_from_config(
-    models: &std::path::Path,
-    model: &str,
-    note_addr: Option<String>,
-) -> Result<BookTarget> {
-    let cfg = dexdo::seller::ModelsConfig::load(models)?;
-    let frame_model = cfg.get(model)?.frame_model.clone();
-    Ok(BookTarget {
+/// The per-model book target for a name that is already resolved. Address arithmetic only: it reads
+/// no file, asks no chain, and decides nothing.
+
+/// **What stood here, and why it is gone.** `model_target_from_config` began
+/// `ModelsConfig::load(models)?` with no guard, so a `models.json` was MANDATORY to ask what a
+/// model's book was -- and it was the DEFAULT arm. Every caller read
+/// `if registry_policy.is_some() { registry_requested_model(..) } else { model_target_from_config(..) }`,
+/// so the on-chain catalog was consulted only when the operator passed
+/// `--model-registry-validation`. That is an authority standing behind an optional config file,
+
+/// `market`, `market-data`, `quote` and `orders` among the read paths the registry serves.
+
+/// The cost was borne by the user who has no catalog: they could not ask what any market was, not
+/// even one the registry names, and the refusal pointed at a file they never had.
+
+/// **The fork is deleted rather than wrapped.** The name is resolved by `registry_requested_model`
+/// at the call site, inside that command's own `ReadBudget`, and this function only turns the
+/// answer into a target. Keeping the resolution AT the call site is deliberate: the read-budget
+/// guards in `market_views.rs` and `buyer.rs` pin `.read(registry_requested_model(` there, and a
+/// guard edited by the same change it guards is no longer independent of it.
+
+/// The policy `registry_requested_model` carries, unchanged and relied on here: no config, or a
+/// config that does not know the name, means the name is the model and the chain is not read at
+/// all; a config that maps it elsewhere is decided by the registry, with the losing
+/// entry named; and **a name the registry does not carry but the config does still resolves** -- an
+/// operator serving their own model does not lose these commands.
+pub(crate) fn book_target_for(frame_model: String, note_addr: Option<String>) -> BookTarget {
+    BookTarget {
         model_hash: model_hash_for(&frame_model),
         frame_model,
         order_book: None,
         root_model: None,
         note_addr,
-    })
+    }
 }
 
 /// Which model the operator named, when there is NO market manifest to ask: the model itself, or
@@ -2852,9 +3343,17 @@ pub(crate) async fn registry_requested_model(
     }
     // The config knows it and points somewhere else. Now the registry's answer decides.
     let registered =
-        resolve_registry_content_identity(RegistryRole::Buyer, contracts, endpoint, model)
-            .await
-            .is_ok();
+        // Skip: this call keeps only `.is_ok()`. The message is never rendered by anyone, so a
+        // registry walk to build one is work with no reader at all -- the plainest case of it.
+        resolve_registry_content_identity(
+            RegistryRole::Buyer,
+            contracts,
+            endpoint,
+            model,
+            RegistrySuggestions::Skip,
+        )
+        .await
+        .is_ok();
     // `configured` is passed in, not re-read. Reading again would parse the file a second and third
     // time for one resolution, and the entry named in the operator-facing note would come from a
     // LATER read than the one that drove the decision -- a file edited in between would make the
@@ -3968,6 +4467,9 @@ pub(crate) fn note_deploy_fold_state_into_pool_locked(
     use crate::cli::note::{pn_state_to_pool_note, pool_with_note_added};
 
     let note = pn_state_to_pool_note(state)?;
+    // this reads the existing pool -- every note's owner secret -- before folding a new note
+    // in. A pool that does not exist yet is the first-note case and stays fine.
+    crate::cli::support::refuse_exposed_secret_file_if_present(pool_path, "--pool")?;
     let existing = match std::fs::read(pool_path) {
         Ok(b) => Some(serde_json::from_slice(&b).map_err(|e| {
             anyhow::anyhow!("--pool {} is not valid JSON: {e}", pool_path.display())
@@ -3999,7 +4501,7 @@ mod actionable_error_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("manifest/deployed.manifest.json");
 
-        let error = chain_doctor_report("net-a", None, &missing, None)
+        let error = chain_doctor_report("net-a", None, &missing, None, |_, _| {})
             .await
             .unwrap_err()
             .to_string();

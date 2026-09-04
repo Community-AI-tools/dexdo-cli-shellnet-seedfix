@@ -12,19 +12,21 @@ streaming, so neither side has to trust the other to be paid or served fairly.
 **Linux / macOS**
 
 ```sh
-curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh | sh
+curl -fsSL https://get.dex.do/install.sh | sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.ps1 | iex
+irm https://get.dex.do/install.ps1 | iex
 ```
 
 The installer detects your operating system and CPU architecture, downloads the
 matching release archive, verifies its checksum, and installs `dexdo` into
 `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\dexdo\bin` (Windows). Override
-the directory with `DEXDO_BIN_DIR`.
+the binary directory with `DEXDO_BIN_DIR`. It also installs the archived mainnet
+manifest as `<home>/.dexdo/manifest.json`; reinstalling replaces that release
+artifact with a warning.
 
 ### PATH setup
 
@@ -47,16 +49,17 @@ shell keeps its old PATH, so `source` the file or open a new terminal.
 To skip PATH setup entirely and just get the instruction:
 
 ```sh
-curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh | DEXDO_NO_MODIFY_PATH=1 sh
+curl -fsSL https://get.dex.do/install.sh | DEXDO_NO_MODIFY_PATH=1 sh
 # or, with an argument:
-curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh | sh -s -- --no-modify-path
+curl -fsSL https://get.dex.do/install.sh | sh -s -- --no-modify-path
 ```
 
 ### Manual download
 
 Download the archive for your platform from the
 [latest release](https://github.com/gosh-sh/dexdo-cli/releases/latest), verify it
-against `SHA256SUMS`, extract it, and move `dexdo` onto your PATH.
+against `SHA256SUMS`, extract it, move `dexdo` onto your PATH, and copy the
+archived `manifest/mainnet.manifest.json` to `<home>/.dexdo/manifest.json`.
 
 | Platform | Archive |
 |----------|---------|
@@ -117,14 +120,33 @@ Run `dexdo <command> --help` for the flags of any command.
 
 ## Configuration
 
-`dexdo` reads its model configuration from `models.json` in the working
-directory, and the deployed contract pins from the manifest that
-`DEXDO_MANIFEST` names.
+`dexdo` reads the deployed contract pins from a manifest: the one the
+installer put at `<home>/.dexdo/manifest.json`, or the one `DEXDO_MANIFEST`
+names.
+
+A **seller** also needs a model catalogue: `models.json` in the working
+directory, describing the upstream it proxies. You write that file --
+`models.example.json` beside this README is a filled-in shape to copy and
+edit, and nothing loads it under that name. Put your provider key in the
+environment variable its `api_key_env` names, never in the file itself.
+
+A **buyer** needs one only to add per-model verification data, or to use a
+short local nickname instead of the market's full name. `market`,
+`executable-book`, `quote`, `orders` and `subscription` resolve a model name
+against the on-chain ModelRegistry and need no catalogue at all.
 
 The manifest names the network it pins, and the client takes the network from
 it, endpoint and all: which file you point at is which network you work on.
-There is no flag and no default -- with the variable unset, every on-chain
-command refuses instead of choosing a network for you.
+With the variable unset the client reads `$HOME/.dexdo/manifest.json` on
+Linux/macOS or `%USERPROFILE%\.dexdo\manifest.json` on Windows, which the
+installer puts there -- so a fresh install already works, on mainnet, with
+nothing for you to configure. This is the only default: the working directory,
+binary directory and platform configuration directories are never searched.
+
+Set `DEXDO_MANIFEST` to use a manifest kept anywhere else -- another network,
+or a copy you maintain yourself. It wins wherever it is set, and a path it
+names that does not exist is refused against that path rather than falling
+back to the installed default.
 
 ```sh
 export DEXDO_MANIFEST=~/dexdo/mainnet.manifest.json

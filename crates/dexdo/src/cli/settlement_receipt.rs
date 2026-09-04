@@ -29,6 +29,13 @@ mod settlement_receipt_unverified_conservation_1417;
 #[path = "settlement_receipt_exit_code_1785.rs"]
 mod settlement_receipt_exit_code_1785;
 
+// Also the home of the ABI-keyed `getState` payload builder the fixtures below use, so the
+// names this file's tests feed the parser come from `contracts/compiled/airegistry/
+// TokenContract.abi.json` and cannot be a contract generation out of date on their own.
+#[cfg(test)]
+#[path = "settlement_receipt_getstate_shape_1560.rs"]
+mod settlement_receipt_getstate_shape_1560;
+
 const RECEIPT_SCHEMA: &str = "dexdo.settlement-receipt.v1";
 const PROOF_LEVEL: &str = "chain_event_observed";
 const REWARDS_SCHEMA: &str = "dexdo.note-rewards.v1";
@@ -125,6 +132,17 @@ struct CurrentReceipt {
     seller: CurrentSellerReceipt,
 }
 
+/// The deal's own `getState()`, in the order the compiled ABI declares it.
+
+/// The four fields this block used to carry -- `prepaid`, `frozen`, `prepaidTime`, `lastAdvance`
+/// -- are the pre-4.0.31 prepaid/frozen buffer, which no longer exists: "There is no prepaid/frozen
+/// buffer beyond the probe: a claim earns money by outliving its own window, not by being paid in
+/// advance" (`contracts/airegistry/TokenContract.sol`, the contract header). What survived of that
+/// buffer is the probe -- `_frozen` at `open()` became `_probeTick`, and `_prepaidTime` became
+/// `_probeTime` -- while `_lastAdvance`, the anchor of the last seller-side step, became
+/// `_lastClaimTime`. `prepaid` itself has NO successor: the delivered-not-yet-finalized quantity is
+/// now a cumulative TOKEN count (`tokensFinal`/`tokensPending`), not a SHELL earmark, so it is
+/// reported as what it is rather than restated under a money field's name.
 #[derive(Debug, Clone, Serialize)]
 struct CurrentStateReceipt {
     funded: bool,
@@ -132,11 +150,15 @@ struct CurrentStateReceipt {
     probe_accepted: bool,
     disputed: bool,
     deposit: String,
-    prepaid: String,
-    frozen: String,
+    /// SHELL held as the unaccepted probe. Owed to nobody until `acceptProbe`.
+    probe_tick: String,
     finalized_owed: String,
-    prepaid_time: u64,
-    last_advance: u64,
+    /// Promoted cumulative consumption in TOKENS -- the only figure money is computed from.
+    tokens_final: String,
+    /// The one claimed cumulative consumption still inside its contest window, in TOKENS.
+    tokens_pending: String,
+    probe_time: u64,
+    last_claim_time: u64,
     dispute_time: u64,
     funded_time: u64,
 }
@@ -416,20 +438,33 @@ fn optional_nonzero_address(value: &Value, field: &str) -> Option<Option<String>
     Some((!bare.chars().all(|character| character == '0')).then_some(address))
 }
 
-fn parse_current(current: &TokenContractCurrentFacts) -> Option<ParsedCurrent> {
+/// `getState` is read through the workspace's one strict decoder rather than a second
+/// hand-written field list, so `facts` arrives already decoded from `current.state` -- the output of
+/// exactly the call that decoder is written for (`ChainClient::token_contract_state`), with its
+/// names pinned against the compiled `TokenContract.abi.json` by
+/// `the_deal_state_decoder_matches_the_compiled_getstate`. This receipt therefore cannot go a
+/// contract generation out of date on its own again, which is how it came to declare every live
+/// deal `inconsistent`.
+fn parse_current(
+    current: &TokenContractCurrentFacts,
+    facts: dexdo_core::DealChainState,
+) -> Option<ParsedCurrent> {
     let state = CurrentStateReceipt {
-        funded: boolean(&current.state, "funded")?,
-        opened: boolean(&current.state, "opened")?,
-        probe_accepted: boolean(&current.state, "probeAccepted")?,
-        disputed: boolean(&current.state, "disputed")?,
-        deposit: decimal_u128(&current.state, "deposit")?,
-        prepaid: decimal_u128(&current.state, "prepaid")?,
-        frozen: decimal_u128(&current.state, "frozen")?,
-        finalized_owed: decimal_u128(&current.state, "finalizedOwed")?,
-        prepaid_time: integer_u64(&current.state, "prepaidTime")?,
-        last_advance: integer_u64(&current.state, "lastAdvance")?,
-        dispute_time: integer_u64(&current.state, "disputeTime")?,
-        funded_time: integer_u64(&current.state, "fundedTime")?,
+        funded: facts.funded,
+        opened: facts.opened,
+        probe_accepted: facts.probe_accepted,
+        disputed: facts.disputed,
+        deposit: facts.deposit.to_string(),
+        probe_tick: facts.probe_tick.to_string(),
+        finalized_owed: facts.finalized_owed.to_string(),
+        tokens_final: facts.tokens_final.to_string(),
+        tokens_pending: facts.tokens_pending.to_string(),
+        probe_time: facts.probe_time,
+        last_claim_time: facts.last_claim_time,
+        dispute_time: facts.dispute_time,
+        // The decoder reports "never funded" as `None`; the getter reports it as `0` and this
+        // receipt keeps the getter's own reading.
+        funded_time: facts.funded_time.unwrap_or_default(),
     };
     let fees = CurrentFeesReceipt {
         fee_accrued: decimal_u128(&current.fees, "feeAccrued")?,
@@ -1016,13 +1051,32 @@ fn build_receipt(
     }
 
     let parsed_current = match (&chain.current, chain.account_active) {
-        (Some(current), true) => match parse_current(current) {
-            Some(parsed) => Some(parsed),
-            None => {
-                issues.push("current_getter_shape_invalid".to_string());
-                None
+        (Some(current), true) => {
+            // second half. The strict decoder already SAYS which field is wrong -- "missing
+            // fields: probeTick" -- and `.ok()?` threw that sentence away, so the receipt could only
+            // ever report `current_getter_shape_invalid` and naming the four dead fields cost a
+            // manual comparison against the compiled ABI. The code is kept unchanged for the
+            // machine and the sentence is added BESIDE it for the reader; the two sort adjacently,
+            // the code first, because it is a prefix of the detail line.
+
+            // Decoded here rather than inside `parse_current` so it happens exactly once: this is
+            // the only scope that owns `issues`, and a second decode call to recover the reason
+            // would be a copy that can drift from the one whose result is used.
+            let decoded = match dexdo_core::DealChainState::decode_getter(&current.state) {
+                Ok(state) => Some(state),
+                Err(reason) => {
+                    issues.push(format!("current_getter_shape_invalid: {reason}"));
+                    None
+                }
+            };
+            match decoded.and_then(|state| parse_current(current, state)) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    issues.push("current_getter_shape_invalid".to_string());
+                    None
+                }
             }
-        },
+        }
         (None, true) => {
             issues.push("active_token_contract_getters_missing".to_string());
             None
@@ -1126,12 +1180,13 @@ fn build_receipt(
 
     if let (Some(terminal), Some(current)) = (terminal_events.first(), &parsed_current) {
         let state = &current.receipt.state;
-        if state.opened
-            || state.disputed
-            || state.deposit != "0"
-            || state.prepaid != "0"
-            || state.frozen != "0"
-        {
+        // The money still earmarked inside the deal, and nothing else. `deposit` and `probeTick`
+        // are the two escrow earmarks every terminal path zeroes -- the same pair
+        // `DealChainState::is_stopped` reads to tell a settled close from a funded-never-opened
+        // deal. `tokensFinal`/`tokensPending` are deliberately absent: they are the cumulative
+        // DELIVERY record, which a terminal path preserves rather than clears, so requiring them to
+        // be zero would report every correctly settled deal as a mismatch.
+        if state.opened || state.disputed || state.deposit != "0" || state.probe_tick != "0" {
             issues.push("terminal_event_current_state_mismatch".to_string());
         }
         match terminal.event {
@@ -1650,20 +1705,36 @@ mod tests {
         finalized_owed: u128,
     ) -> TokenContractCurrentFacts {
         TokenContractCurrentFacts {
-            state: json!({
-                "funded": buyer.is_some(),
-                "opened": opened,
-                "probeAccepted": probe_accepted,
-                "disputed": disputed,
-                "deposit": if opened { "25" } else { "0" },
-                "prepaid": if opened { "10" } else { "0" },
-                "frozen": if opened { "10" } else { "0" },
-                "finalizedOwed": finalized_owed.to_string(),
-                "prepaidTime": "100",
-                "lastAdvance": "101",
-                "disputeTime": "0",
-                "fundedTime": "90",
-            }),
+            // the KEYS come from `contracts/compiled/airegistry/TokenContract.abi.json`, not
+            // from literals here. This fixture used to name the pre-4.0.31 prepaid/frozen buffer --
+            // `prepaid`, `frozen`, `prepaidTime`, `lastAdvance` -- none of which the contract has
+            // declared for five generations, so it confirmed the parser against itself while every
+            // live deal read `inconsistent`. Meaning is unchanged: an open deal still holds an
+            // escrow and a tick's worth of money, at the same timestamps. `frozen` is now
+            // `probeTick` and `lastAdvance` is now `lastClaimTime`; `prepaid` -- the delivered but
+            // not yet finalized tick -- is a cumulative TOKEN count now, so it is stated as one.
+            state: super::settlement_receipt_getstate_shape_1560::getstate_payload(&[
+                ("funded", json!(buyer.is_some())),
+                ("opened", json!(opened)),
+                ("probeAccepted", json!(probe_accepted)),
+                ("disputed", json!(disputed)),
+                ("deposit", json!(if opened { "25" } else { "0" })),
+                ("probeTick", json!(if opened { "10" } else { "0" })),
+                ("finalizedOwed", json!(finalized_owed.to_string())),
+                ("tokensFinal", json!("0")),
+                (
+                    "tokensPending",
+                    json!(if opened {
+                        u128::from(dexdo_core::DobParams::canonical().tick_size).to_string()
+                    } else {
+                        "0".to_string()
+                    }),
+                ),
+                ("probeTime", json!("100")),
+                ("lastClaimTime", json!("101")),
+                ("disputeTime", json!("0")),
+                ("fundedTime", json!("90")),
+            ]),
             fees: json!({
                 "feeAccrued": "0",
                 "ticksFinalized": if probe_accepted { "3" } else { "0" },

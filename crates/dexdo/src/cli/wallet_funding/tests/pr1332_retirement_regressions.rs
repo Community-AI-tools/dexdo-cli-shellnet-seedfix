@@ -72,6 +72,7 @@ async fn a_timeout_then_present_without_evidence_refuses_retirement() {
     let (dir, provider) = accepted_request_then_refusal(RequestPresence::Present {
         transaction_hash: None,
         pending_transaction_id: Some("pending".to_string()),
+        chain_created_at_unix: None,
     })
     .await;
 

@@ -8,9 +8,9 @@
 //! # Why the Vault provider is built around a seam
 
 //! [`VaultChain`] is the whole of what the Acki Nacki flow needs from the chain: the live queue, the
-//! finalized queue history, the wallet's own expiry window, the chain clock, and the submit. It is a
-//! trait for the reason every money path in this client uses one - the decisions taken from those
-//! five facts are the part that costs money to get wrong, and they have to be provable offline,
+//! finalized queue history, and the submit. It is a trait for the reason every money path in this
+//! client uses one - the decisions taken from those three facts are the part that
+//! costs money to get wrong, and they have to be provable offline,
 //! against scripted answers, rather than only against a testnet that happens to be in the right
 //! state.
 
@@ -19,10 +19,10 @@ use std::{cell::RefCell, collections::BTreeMap};
 use anyhow::{bail, Result};
 
 use super::{
-    payload_hash, render_native_and_ecc_amounts, vault_to_hot_native_value, FundingEvidence,
-    FundingFingerprint, FundingRequest, HotFundingProvider, RecordedRequest, RequestPresence,
-    SubmitOutcome, WalletProvider, VAULT_TO_HOT_BOUNCE, VAULT_TO_HOT_PAYLOAD,
-    VAULT_TO_HOT_SEND_FLAGS,
+    funding_request_deadline, payload_hash, render_native_and_ecc_amounts,
+    vault_to_hot_native_value, FundingEvidence, FundingFingerprint, FundingRequest,
+    HotFundingProvider, RecordedRequest, RequestPresence, SubmitOutcome, WalletProvider,
+    VAULT_TO_HOT_BOUNCE, VAULT_TO_HOT_PAYLOAD, VAULT_TO_HOT_SEND_FLAGS,
 };
 
 /// The base64 of an empty BOC cell, which is how a multisig queue reports the empty payload every
@@ -180,12 +180,6 @@ pub(crate) trait VaultChain {
         destination_dapp_id: &str,
     ) -> Result<Option<String>>;
 
-    /// `getParameters.expirationTime` - how long a queued request stays confirmable.
-    async fn expiration_window_secs(&self) -> Result<u64>;
-
-    /// The chain's own clock, in unix seconds.
-    async fn chain_time_secs(&self) -> Result<u64>;
-
     /// Put the transfer `fingerprint` describes into the Vault's queue.
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome>;
 }
@@ -207,16 +201,16 @@ pub(crate) trait VaultChain {
 /// `Absent` for a request that has been in the queue. It answers from finalized history:
 
 /// - a `TransactionSent` for the request's id is a POSITIVE proof of execution;
-/// - `TransactionSubmitted` gives the id and the CHAIN time the request was queued at, so the
-/// expiry deadline is `that + getParameters.expirationTime`, read off the wallet itself;
-/// - a chain clock past that deadline with no `TransactionSent` is a positive proof of expiry
-/// without execution;
-/// - anything else - an unreadable queue, an unreadable history, a deadline not yet reached - is
-/// `Unknown`, and `Unknown` never authorizes a submit.
+/// - `TransactionSubmitted` gives the id and the CHAIN time the request was queued at; that time is
+/// mandatory when adopting a queue request for which this process has no local record;
+/// - request lifetime and expiry use the journal timestamp and the one canonical client lifetime;
+/// - anything else - an unreadable queue, an unreadable history, or no finalized verdict - is
+/// `Unknown`.
 pub(crate) struct AckinackiVaultProvider<C: VaultChain> {
     chain: C,
     /// What an earlier run recorded, read from the journal under the same held turn this runs
-    /// under. `None` means no open record: nothing of ours can be on chain.
+    /// under. `None` means no local open record; an exact request from another checkout can still be
+    /// present and is adopted only after its finalized admission time is found.
     recorded: RefCell<Option<RecordedRequest>>,
 }
 
@@ -250,24 +244,14 @@ impl<C: VaultChain> AckinackiVaultProvider<C> {
     }
 }
 
-/// The request in the terms an operator can look it up by in the wallet application.
-
-/// A refusal that says only "something could not be established" leaves the operator with nothing to
-/// do. This names the transfer the client was looking for, so they can go and see for themselves
-/// whether it is sitting in the Vault's pending list - which is the one observation that settles it.
-pub(crate) fn describe_recorded_request(
-    expected: &FundingFingerprint,
-    recorded: &RecordedRequest,
-) -> String {
-    let queue_id = match recorded.pending_transaction_id.as_deref() {
-        Some(id) => format!("queue transaction {id}"),
-        None => "no queue id was ever observed for it".to_string(),
-    };
+fn describe_recorded_request(expected: &FundingFingerprint, recorded: &RecordedRequest) -> String {
+    let queue_id = recorded.pending_transaction_id.as_deref().map_or_else(
+        || "without a known queue id".to_string(),
+        |id| format!("queue transaction {id}"),
+    );
     format!(
-        "generation {} - {} to {} in DApp {}, created by custodian key {} ({queue_id})",
+        "generation {} ({queue_id}), {} to {} in DApp {}, created by custodian key {}",
         recorded.generation,
-        // The fingerprint's own native `value` is the native half of THIS transfer, so the
-        // description names the whole of what was queued rather than only its currency map.
         render_native_and_ecc_amounts(expected.value, &expected.cc),
         expected.dest,
         expected.dapp_id,
@@ -380,13 +364,47 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                     ),
                 });
             }
-            return Ok(RequestPresence::Present {
-                transaction_hash: self
-                    .recorded
-                    .borrow()
+            let recorded = self.recorded.borrow().clone();
+            let chain_created_at_unix = if known_id.is_some()
+                || recorded
                     .as_ref()
-                    .and_then(|recorded| recorded.transaction_hash.clone()),
+                    .is_some_and(|recorded| recorded.submit_attempted)
+            {
+                None
+            } else {
+                let history = match self.chain.history().await {
+                    Ok(history) => history,
+                    Err(error) => {
+                        return Ok(RequestPresence::Unknown {
+                            reason: format!(
+                                "the Vault queue holds exact transaction {}, but its finalized \
+                                 history could not be read to date that request: {error}",
+                                found.id
+                            ),
+                        })
+                    }
+                };
+                let Some(submitted) = history.iter().rev().find(|event| {
+                    event.kind == VaultQueueEventKind::Submitted
+                        && event.transaction_id == found.id
+                        && addresses_equal(&event.dest, &expected.dest)
+                        && dapp_ids_equal(&event.dapp_id, &expected.dapp_id)
+                        && event.value == expected.value
+                }) else {
+                    return Ok(RequestPresence::Unknown {
+                        reason: format!(
+                            "the Vault queue holds exact transaction {}, but finalized history has \
+                             no matching TransactionSubmitted message whose chain time can date it",
+                            found.id
+                        ),
+                    });
+                };
+                Some(submitted.created_at)
+            };
+            return Ok(RequestPresence::Present {
+                transaction_hash: recorded.and_then(|recorded| recorded.transaction_hash),
                 pending_transaction_id: Some(found.id.to_string()),
+                chain_created_at_unix,
             });
         }
 
@@ -476,108 +494,15 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             }
         }
 
-        // Not executed, and not in the queue. The remaining question is whether it can still be
-        // confirmed. That deadline is a chain fact: the time the wallet recorded it queued at, plus
-        // the wallet's own expiration window.
-        let window = match self.chain.expiration_window_secs().await {
-            Ok(window) => window,
-            Err(error) => {
-                return Ok(RequestPresence::Unknown {
-                    reason: format!("the Vault's expiration window could not be read: {error}"),
-                })
-            }
-        };
-        let now = match self.chain.chain_time_secs().await {
-            Ok(now) => now,
-            Err(error) => {
-                return Ok(RequestPresence::Unknown {
-                    reason: format!("the chain clock could not be read: {error}"),
-                })
-            }
-        };
-        // ONLY the wallet's own record of the queue admission may date this deadline.
-
-        // A local clock may never conclude expiry. The asymmetry is what decides it: concluding
-        // "expired" for a request that in fact EXECUTED authorizes a second transfer out of a cold
-        // Vault, and that is unrecoverable; concluding "I cannot tell" costs the operator one more
-        // run of the same command. So when the finalized history carries no `TransactionSubmitted`
-        // for this fingerprint there is no chain time to measure from, and that is absence of
-        // evidence - not evidence of expiry. It refuses.
-
-        // The local deadline is still REPORTED, because an operator wants to know it. Reported and
-        // acted upon are kept apart deliberately, here and in the message: nothing below the report
-        // reads it, and no branch returns a verdict from it.
-        // The fallback above is deliberately conservative for execution: recovering a wrong id and
-        // finding its `TransactionSent` can only forbid a submit. Expiry is the opposite verdict -
-        // it authorizes a fresh signed transfer - so only the journal's recorded queue id may select
-        // the `TransactionSubmitted` that dates that deadline.
-        let submitted_for_expiry = match known_id {
-            Some(_) => submitted,
-            None => None,
-        };
-        let Some(submitted) = submitted_for_expiry else {
-            let local_deadline = recorded.created_at_unix.saturating_add(window);
-            let missing_chain_date = if submitted.is_some() {
-                format!(
-                    "the Vault's finalized history has a matching TransactionSubmitted, but that \
-                     event carries neither this generation's queue id nor its creator key or \
-                     currency map, so nothing proves it belongs to generation {}",
-                    recorded.generation
-                )
-            } else {
-                format!(
-                    "the Vault's finalized history carries no TransactionSubmitted for {}",
-                    describe_recorded_request(&expected, &recorded)
-                )
-            };
-            return Ok(RequestPresence::Unknown {
-                reason: format!(
-                    "{missing_chain_date}, so there is no chain time that can safely date this \
-                     generation's expiry deadline; neither execution nor expiry can be established \
-                     from chain fact and no second transfer will be created. Look for {} in Acki \
-                     Nacki Wallet: if it is pending, confirm it and re-run this command; if it never \
-                     reached the Vault, nothing was transferred. Reported for information and \
-                     authorizing nothing: this client opened the record at local time {}, the \
-                     wallet's expiration window is {window}s, so by the local clock it would have \
-                     elapsed at {local_deadline}, and the chain clock now reads {now}.",
-                    describe_recorded_request(&expected, &recorded),
-                    recorded.created_at_unix,
-                ),
-            });
-        };
-
-        // Chain-dated, so a verdict is available. Everything from here is a chain fact: the time
-        // the wallet recorded the queue admission, the wallet's own expiration window, and the
-        // chain clock.
-        let queued_at = submitted.created_at;
-        let deadline = queued_at.saturating_add(window);
-        if now > deadline {
-            return Ok(RequestPresence::ExpiredUnexecuted {
-                evidence: FundingEvidence {
-                    verdict: "expired".to_string(),
-                    source: format!(
-                        "the Vault's finalized message {} and its own expiration window",
-                        submitted.message_id
-                    ),
-                    observed_at_unix: Some(now),
-                    detail: format!(
-                        "no TransactionSent was ever emitted for generation {}; the Vault queued it \
-                         at chain time {queued_at}, the wallet's expiration window is {window}s, \
-                         and the chain clock is {now}, past the {deadline} after which it can no \
-                         longer be confirmed",
-                        recorded.generation
-                    ),
-                    // Nothing was delivered, so there is no delivery to name.
-                    delivery_message_id: None,
-                },
-            });
-        }
-
+        // Selection reaches the provider only for a journal record that is still live by its local
+        // UTC deadline. With neither a queue entry nor finalized execution, there is no additional
+        // chain verdict to make here.
         Ok(RequestPresence::Unknown {
             reason: format!(
-                "the request is not in the Vault queue and finalized history shows no \
-                 TransactionSent for it, but the chain clock is {now} and it stays confirmable \
-                 until {deadline}; neither execution nor expiry is proven yet"
+                "{} is not in the Vault queue and finalized history shows no TransactionSent for \
+                 it; it remains live in the local funding journal until {}",
+                describe_recorded_request(&expected, &recorded),
+                funding_request_deadline(recorded.created_at_unix)
             ),
         })
     }

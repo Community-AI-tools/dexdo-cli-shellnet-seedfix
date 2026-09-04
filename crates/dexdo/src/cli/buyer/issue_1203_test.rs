@@ -237,9 +237,9 @@ mod issue_1203 {
         );
         let current = format!("0:{}", "1".repeat(64));
         let pool_path = dir.join("pool.json");
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": note_addr,
@@ -247,8 +247,7 @@ mod issue_1203 {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let money_lock = super::super::BuyerMoneyLock::open(&note_addr).unwrap();
         let artifacts = BuyerMoneyArtifacts(vec![
             money_lock.path.clone(),

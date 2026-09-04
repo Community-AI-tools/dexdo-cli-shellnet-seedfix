@@ -1264,6 +1264,14 @@ pub(crate) fn resume_onboarding(
     if !files::is_resumable_draft(&draft, &network, binding_id) {
         return Ok(None);
     }
+    // this reads the stored RECOVERY PHRASE back on resume. `--multisig-seed-file` gets the
+    // permission check on its way in (`support.rs`, pinned there); the same secret, written by this
+    // client and read by this client, did not. Checked before the read, so a refusal has not already
+    // loaded what it refuses.
+    crate::cli::support::refuse_exposed_secret_file(
+        &draft.hot_seed_file,
+        "the stored Gosh.ai recovery phrase",
+    )?;
     let phrase = Zeroizing::new(
         std::fs::read_to_string(&draft.hot_seed_file)
             // The path is named, the contents never are.

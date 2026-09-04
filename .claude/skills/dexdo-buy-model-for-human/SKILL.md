@@ -147,9 +147,15 @@ If a seller gives you a specific deal instead, ask for the `market.json` file, o
 `token_contract` string **and the canonical frame model**. The bare string alone is not enough: you
 need the model as `--frame-model` alongside `--token-contract`.
 
-Before any `market` or `buyer` command, put a `models.json` in the working directory. The buyer
-defaults to that path and uses the entry to verify the model's identity -- that check is what stops
-a seller substituting a cheaper model for the one you paid for.
+The reading commands below need no catalogue: they resolve a model name against the on-chain
+ModelRegistry, and `dexdo markets address --model '<name>'` names a market's book without any local
+file.
+
+Before the `buyer` command itself, put a `models.json` in the working directory. The buyer defaults
+to that path and uses the entry to verify the model's identity -- that check is what stops a seller
+substituting a cheaper model for the one you paid for, so without the file the buyer fails closed on
+every model. The release archive ships no catalogue, only `models.example.json` to copy and edit;
+nothing loads it under that name.
 
 ---
 

@@ -34,7 +34,6 @@ use super::*;
 
 const SHELL: u32 = 2;
 const REQUIRED: u128 = 1_000;
-const WINDOW: u64 = 3_600;
 const QUEUED_AT: u64 = 1_000_000;
 
 fn hex64(byte: u8) -> String {
@@ -132,14 +131,6 @@ impl VaultChain for &FakeVault {
         _destination_dapp_id: &str,
     ) -> Result<Option<String>> {
         Ok(Some(format!("delivery-of-{sent_event_message_id}")))
-    }
-
-    async fn expiration_window_secs(&self) -> Result<u64> {
-        Ok(WINDOW)
-    }
-
-    async fn chain_time_secs(&self) -> Result<u64> {
-        Ok(self.now.get())
     }
 
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
@@ -282,7 +273,7 @@ async fn an_executed_transfer_the_hot_has_not_shown_yet_opens_no_second_generati
          sized against the balance it has not reached yet: generation 2 would ask the Vault for \
          the same 1000 a second time, and the Hot would end up holding both"
     );
-    let inside_window = record_of(dir.path()).expect("the executed generation stays recorded");
+    let mut inside_window = record_of(dir.path()).expect("the executed generation stays recorded");
     assert_eq!(
         inside_window.generation, 1,
         "no generation may be opened from a reading that predates the delivery"
@@ -291,6 +282,23 @@ async fn an_executed_transfer_the_hot_has_not_shown_yet_opens_no_second_generati
     assert!(
         inside_window.evidence.is_some(),
         "the execution verdict is kept on the record so the next run reconciles against it"
+    );
+
+    // Put the old queue deadline in the past. Once execution is finalized that deadline cannot
+    // make the already-sent transfer disappear or make the same amount safe to submit again.
+    inside_window.created_at_unix = 0;
+    inside_window.expires_at_unix = dexdo_core::params::VAULT_FUNDING_REQUEST_LIFETIME.as_secs();
+    store_funding_journal(dir.path(), &inside_window).expect("age the executed record");
+
+    // Run 3: the same pre-delivery balance is still visible after that queue deadline. Persisting
+    // `Executed` must keep the generation in duplicate selection until the Hot receives it.
+    let hot = FakeHot::holding(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "a later invocation in the same Executed -> Hot-credit window must keep reconciling the \
+         original generation instead of submitting the same shortfall again"
     );
 
     // The delivery is credited. It was sized for exactly this requirement, so the credit alone
@@ -308,7 +316,7 @@ async fn an_executed_transfer_the_hot_has_not_shown_yet_opens_no_second_generati
     assert_eq!(
         record_of(dir.path()).expect("record").state,
         FundingState::Satisfied,
-        "only an observed balance that meets the requirement closes the record"
+        "the credited generation is retained as completed history"
     );
 }
 

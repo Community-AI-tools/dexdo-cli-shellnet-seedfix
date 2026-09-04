@@ -28,9 +28,9 @@ fn pool_with_no_recorded_deal(name: &str) -> (std::path::PathBuf, std::path::Pat
     ));
     std::fs::create_dir_all(&dir).expect("create the fixture directory");
     let pool_path = dir.join("pn_pool.json");
-    std::fs::write(
+    crate::cli::support::write_owner_only_key_fixture(
         &pool_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
+        &serde_json::to_string_pretty(&serde_json::json!({
             "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
             "notes": [
                 { "address": format!("0:{}", "1".repeat(64)), "owner_secret_key_hex": "2a".repeat(32) },
@@ -38,8 +38,7 @@ fn pool_with_no_recorded_deal(name: &str) -> (std::path::PathBuf, std::path::Pat
             ],
         }))
         .expect("serialise the fixture pool"),
-    )
-    .expect("write the fixture pool");
+    );
     (dir, pool_path)
 }
 

@@ -39,6 +39,25 @@ try {
   Copy-Item (Join-Path $tmp "dexdo-$vern-x86_64-windows\dexdo.exe") (Join-Path $binDir 'dexdo.exe') -Force
   Write-Host "dexdo: installed $ver to $binDir\dexdo.exe"
 
+  # The deployment manifest, at the client's sole per-user default. With no
+  # DEXDO_MANIFEST set this is the ONLY place dexdo looks -- not the working
+  # directory, binary directory, or platform config directories. It is a release
+  # artifact, so every install replaces it together with the binary.
+  $manifestDir = Join-Path $env:USERPROFILE '.dexdo'
+  New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+  $manifestDest = Join-Path $manifestDir 'manifest.json'
+  if (Test-Path $manifestDest -PathType Container) {
+    throw "dexdo: install failed: $manifestDest is a directory; expected a file"
+  }
+  if (Test-Path $manifestDest) {
+    Write-Warning "dexdo: replacing existing $manifestDest"
+  }
+  Copy-Item (Join-Path $tmp "dexdo-$vern-x86_64-windows\manifest\mainnet.manifest.json") $manifestDest -Force
+  if (-not (Test-Path $manifestDest -PathType Leaf) -or (Get-Item $manifestDest).Length -eq 0) {
+    throw "dexdo: install failed: $manifestDest was not written"
+  }
+  Write-Host "dexdo: installed the mainnet manifest to $manifestDest"
+
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if ($userPath -notlike "*$binDir*") {
     [Environment]::SetEnvironmentVariable('Path', "$userPath;$binDir", 'User')

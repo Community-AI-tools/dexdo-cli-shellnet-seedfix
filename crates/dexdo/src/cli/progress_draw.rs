@@ -88,6 +88,10 @@ const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 const CLEAR_LINE: &str = "\r\x1b[2K";
 
+fn plain_clear_line(columns: usize) -> String {
+    format!("\r{}\r", " ".repeat(columns.saturating_sub(1)))
+}
+
 /// How far a measurable wait has come, when the running code can say: `(done, total)` in whatever
 /// unit it counts -- blocks, bytes, deals. Rendered as a bar beside the live line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,7 +201,14 @@ impl Shared {
             .filter(|measure| measure.total > 0)
             .map(|measure| format!(" {}", measure.bar(BAR_WIDTH)))
             .unwrap_or_default();
-        let room = self.columns.saturating_sub(
+        // A plain terminal clears by overwriting the row, so it leaves the last column unused:
+        // filling it can trigger an automatic wrap before the next carriage return arrives.
+        let columns = if self.colour {
+            self.columns
+        } else {
+            self.columns.saturating_sub(1)
+        };
+        let room = columns.saturating_sub(
             spinner.chars().count() + seconds.chars().count() + bar.chars().count() + 2,
         );
         let label = format!("{}{bar}", clip(&label, room));
@@ -213,7 +224,9 @@ impl Shared {
             };
             format!("{CLEAR_LINE}{mark}{spinner}{RESET} {body} {DIM}{seconds}{RESET}")
         } else {
-            format!("{CLEAR_LINE}{spinner} {label} {seconds}")
+            let text = format!("{spinner} {label} {seconds}");
+            let padding = columns.saturating_sub(visible_width(&text));
+            format!("\r{text}{}", " ".repeat(padding))
         };
         self.write(&text);
     }
@@ -221,7 +234,11 @@ impl Shared {
     /// Remove the live line, leaving the cursor where it was.
     pub(super) fn erase(&mut self) {
         if self.live {
-            self.write(CLEAR_LINE);
+            if self.colour {
+                self.write(CLEAR_LINE);
+            } else {
+                self.write(&plain_clear_line(self.columns));
+            }
         }
     }
 
@@ -368,6 +385,13 @@ mod tests {
         let shared = Shared::new("first".into(), Plan::default());
         assert!(!shared.live);
         assert!(!shared.colour);
+    }
+
+    #[test]
+    fn a_plain_terminal_clears_without_escape_sequences() {
+        let clear = plain_clear_line(5);
+        assert_eq!(clear, "\r    \r");
+        assert!(!clear.contains(ESCAPE));
     }
 
     /// The live line must never wrap: `\r` returns to the start of the LAST screen line, so a

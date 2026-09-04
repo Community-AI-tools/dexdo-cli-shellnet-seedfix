@@ -110,7 +110,7 @@ impl From<&WalletProviderCommand> for WalletProvider {
 
 /// A Hot bound on one network must still never be spent on another, and that guarantee does not
 /// come from the type being closed: it comes from the binding being keyed by this label and from
-/// the label having exactly one source, the manifest `DEXDO_MANIFEST` names.
+/// the label having exactly one source, the selected manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct WalletNetwork(String);
@@ -390,25 +390,14 @@ async fn hot_balance_for(
 ) -> std::result::Result<crate::cli::wallet_funding::HotBalances, String> {
     use crate::cli::wallet_funding::HotBalanceReader;
 
-    // The unset variable is named in ONE line here, not with the full refusal `params` writes.
-    // That text is four sentences and an `export` example, and it is right for a command that
-    // stops -- it is the whole output, and it teaches. Here it is a footnote to an answer already
-    // delivered: the operator asked which wallet, got it, and one field of it is missing. Pasted
-    // in whole it buries the binding it was annotating under a paragraph about something else.
-    if crate::cli::commands::manifest_path().is_err() {
-        return Err(format!(
-            "{} is not set, so no network was named",
-            dexdo_core::params::MANIFEST_PATH_VAR
-        ));
-    }
     let manifest = crate::cli::commands::manifest_path().map_err(|error| format!("{error}"))?;
     let declared = dexdo_core::Deployed::load(&manifest)
         .map_err(|error| format!("{} cannot be read: {error}", manifest.display()))?
         .network;
     if declared != network.as_str() {
         return Err(format!(
-            "{} names {declared}, and this binding is on {network}",
-            dexdo_core::params::MANIFEST_PATH_VAR
+            "the manifest {} names {declared}, and this binding is on {network}",
+            manifest.display()
         ));
     }
     let endpoint = wallet_read_endpoint(Some(manifest.as_path()), network.clone())
@@ -543,8 +532,8 @@ async fn run_show(args: crate::cli::args::WalletShowArgs) -> Result<()> {
 
         // No `--network` on it. The flag is gone, so a line carrying it is one the operator
         // pastes and the binary refuses -- which is worse than no suggestion at all. Which chain the
-        // binding lands on is `DEXDO_MANIFEST`'s answer, the same as for the command printing this,
-        // so the line needs to say nothing about it.
+        // binding lands on is the selected manifest's answer, the same as for the command printing
+        // this, so the line needs to say nothing about it.
         print!(
             "{}\n{}\n",
             style::paint(palette, Role::Bold, "No wallet bound"),
@@ -801,23 +790,20 @@ where
 /// to the account the money is on its way to, and confirming the request afterwards pays into an
 /// account nobody can spend from - which is the whole loss this command exists to prevent.
 
-/// Nothing new is recorded for this. The durable funding journal is already keyed by the same
-/// (network, Hot) pair the funding mechanism writes it under, and
+/// Nothing new is recorded for this. Every generation in the durable funding journal is read under
+/// the same (network, Hot) key the funding mechanism writes it under, and
 /// [`crate::cli::wallet_funding::FundingJournalRecord::generation_may_still_execute`] is the
-/// predicate that mechanism itself uses for "this generation may still move money". A generation
-/// carrying a finalized verdict - `expired` (it never left the Vault) or `satisfied` (closed
-/// against an observed balance, reachable only once every recorded queue id has a verdict) - is not
-/// one of those, so the removal goes through. This refuses the window it has to refuse and nothing
-/// wider: a Hot with no journal record has nothing pending and is removable as before.
+/// predicate that mechanism itself uses for "this generation may still move money". A locally
+/// expired generation cannot be confirmed any longer and does not block removal; at the exact UTC
+/// deadline it is still live and blocks. A generation carrying a finalized verdict - `expired` (it
+/// never left the Vault) or `satisfied` (closed against an observed balance, reachable only once
+/// every recorded queue id has a verdict) - is not blocking either. This refuses the window it has
+/// to refuse and nothing wider: a Hot with no live journal record is removable as before.
 
 /// An unreadable or unknown-version journal is an error rather than a pass. That record may be the
-/// only local trace of a request that is already on chain, and `load_funding_journal` says so in
-/// its own words.
+/// only local trace of a request that is already on chain, and the journal reader says so in its
+/// own words.
 fn refuse_removal_while_funding_may_still_arrive(binding: &WalletBinding) -> Result<()> {
-    use crate::cli::wallet_funding::{
-        funding_journal_path, load_funding_journal, FundingJournalRecord,
-    };
-
     let hot = dexdo_core::CanonicalAddress::parse(&binding.hot_address).map_err(|error| {
         anyhow::anyhow!(
             "archived binding {} records unusable Hot address {:?}: {error}; nothing was removed",
@@ -831,8 +817,29 @@ fn refuse_removal_while_funding_may_still_arrive(binding: &WalletBinding) -> Res
     let hot_address = hot.to_string();
     let network = binding.network.as_str();
     let data_dir = crate::cli::data_dir::effective()?;
-    let Some(record) = load_funding_journal(&data_dir, network, &hot_address)?
-        .filter(FundingJournalRecord::generation_may_still_execute)
+    refuse_removal_while_funding_may_still_arrive_at(
+        binding,
+        &data_dir,
+        &hot_address,
+        crate::cli::wallet_funding::unix_now_secs(),
+    )
+}
+
+fn refuse_removal_while_funding_may_still_arrive_at(
+    binding: &WalletBinding,
+    data_dir: &std::path::Path,
+    hot_address: &str,
+    now: u64,
+) -> Result<()> {
+    use crate::cli::wallet_funding::{funding_journal_path, load_funding_journal_records};
+
+    let network = binding.network.as_str();
+    let Some(record) = load_funding_journal_records(data_dir, network, hot_address)?
+        .unwrap_or_default()
+        .into_iter()
+        .find(|record| {
+            record.generation_may_still_execute() && !record.is_expired_at(now)
+        })
     else {
         return Ok(());
     };
@@ -840,16 +847,17 @@ fn refuse_removal_while_funding_may_still_arrive(binding: &WalletBinding) -> Res
         "archived binding {} cannot be removed: its funding journal {} records generation {} in \
          state {:?} for Hot {hot_address}, so that request may still move money into a Hot whose \
          only local key this removal would destroy. {} Settle it from the Vault pending list, or \
-         let it expire, then re-run the money command that created it so the journal records the \
-         finalized verdict - after that this removal is allowed. Nothing was removed.",
+         wait until its local UTC deadline {} has passed; after that this removal is allowed. \
+         Nothing was removed.",
         binding.id,
-        funding_journal_path(&data_dir, network, &hot_address).display(),
+        funding_journal_path(data_dir, network, hot_address).display(),
         record.generation,
         record.state,
         record.pending_transaction_id.as_deref().map_or_else(
             || "No Vault queue transaction id was ever observed for it.".to_string(),
             |pending| format!("Its Vault queue transaction is {pending}."),
         ),
+        record.expires_at_unix,
     );
 }
 

@@ -3,9 +3,8 @@
 use crate::cli::args::OrdersArgs;
 use crate::cli::args::OrdersCommand;
 use crate::cli::commands::{
-    fold_snapshot_from_orders, model_target_from_config,
-    read_book_target, resolve_order_book_target, retry_executable_read, target_from_market,
-    BookTarget,
+    book_target_for, fold_snapshot_from_orders, read_book_target, registry_requested_model,
+    resolve_order_book_target, retry_executable_read, target_from_market, BookTarget,
 };
 use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
@@ -691,16 +690,27 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
         }
         target_from_market(market)?
     } else {
-        model_target_from_config(
-            &args.models,
-            args.model.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "orders without --market requires --model, or --model-hash when the name is \
-                     not known -- `dexdo note outstanding` prints the hash of every resting order"
-                )
-            })?,
-            Some(note_addr.to_string()),
-        )?
+        // `orders` had NO registry path at all -- not even behind
+        // `--model-registry-validation`, which the other three read views did honour. So it was the
+        // strictest of them: a `models.json` was required to name a book the registry could have
+
+        // paths the registry serves, so it asks the same question the same way, through this
+        // command's own budget.
+        let model = args.model.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "orders without --market requires --model, or --model-hash when the name is \
+                 not known -- `dexdo note outstanding` prints the hash of every resting order"
+            )
+        })?;
+        let requested_model = budget
+            .read(registry_requested_model(
+                &manifest_path,
+                None,
+                &args.models,
+                model,
+            ))
+            .await?;
+        book_target_for(requested_model, Some(note_addr.to_string()))
     };
     // this is the one `orders` subcommand that is NOT about resting rows, so it returns
     // before the fold. A matched order is gone from the book; the evidence it left is the fill

@@ -368,7 +368,7 @@ fn a_replaced_binding_is_archived_with_its_provider_intact() {
 fn rebinding_never_touches_the_previous_bindings_secrets() {
     let (_temp, store) = store();
     let old = store.open_draft().expect("first draft");
-    std::fs::write(old.dir().join("hot.key"), b"old-secret").expect("write old secret");
+    crate::cli::support::write_owner_only_key_fixture(&old.dir().join("hot.key"), "old-secret");
     store
         .commit_active(&binding(
             old.id(),
@@ -380,7 +380,7 @@ fn rebinding_never_touches_the_previous_bindings_secrets() {
     let new = store.open_draft().expect("second draft");
     assert_ne!(new.id(), old.id(), "each binding gets its own id");
     assert_ne!(new.dir(), old.dir(), "and its own secrets directory");
-    std::fs::write(new.dir().join("hot.key"), b"new-secret").expect("write new secret");
+    crate::cli::support::write_owner_only_key_fixture(&new.dir().join("hot.key"), "new-secret");
     store
         .commit_active(&binding(new.id(), WalletProvider::GoshAi, "4::hot-two"))
         .expect("commit second");

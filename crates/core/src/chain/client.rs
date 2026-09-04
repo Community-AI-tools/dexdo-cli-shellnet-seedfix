@@ -70,6 +70,10 @@ mod client_issue_1834_tests;
 #[path = "client_issue_1599_tests.rs"]
 mod client_issue_1599_tests;
 
+#[cfg(test)]
+#[path = "client_issue_1861_tests.rs"]
+mod client_issue_1861_tests;
+
 // the fall-through step of `resolve_endpoint`. Declared beside the pair because it
 // pins the other half of the same rule -- refuses a label the endpoint contradicts, this one
 // refuses to invent an endpoint the label does not imply.
@@ -432,6 +436,11 @@ pub struct ChainDoctorCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainDoctorReport {
     pub network: String,
+    pub endpoint: String,
+    pub manifest_generation: Option<String>,
+    pub chain_generation: Option<String>,
+    /// Positive means the local clock is ahead of the chain; negative means it is behind.
+    pub clock_skew_seconds: i64,
     pub versions: Vec<(String, String)>,
     pub checks: Vec<ChainDoctorCheck>,
 }
@@ -451,6 +460,33 @@ impl ChainDoctorReport {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+pub const CHAIN_DOCTOR_CHECK_COUNT: usize = 14;
+
+fn record_doctor_check(
+    checks: &mut Vec<ChainDoctorCheck>,
+    observe: &mut impl FnMut(usize, &ChainDoctorCheck),
+    check: ChainDoctorCheck,
+) {
+    observe(checks.len() + 1, &check);
+    checks.push(check);
+}
+
+fn signed_clock_skew_seconds(local_unix: u64, chain_unix: u64) -> i64 {
+    let difference = i128::from(local_unix) - i128::from(chain_unix);
+    difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn doctor_report_endpoint(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return "<invalid-endpoint>".to_string();
+    };
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn getter_u128(v: &Value, key: &str) -> Option<u128> {
@@ -2177,8 +2213,9 @@ impl Deployed {
     /// Read the manifest at the path the caller was given. Exactly that path, always.
 
 
-    /// comes from `DEXDO_MANIFEST` (`params::manifest_path`), and everything this function can do
-    /// when the file is not there is say WHICH file, because that is the operator's next move.
+    /// `params::manifest_path`: `DEXDO_MANIFEST` when set, otherwise the sole per-user default.
+    /// Everything this function can do when the file is not there is say WHICH file, because that
+    /// is the operator's next move.
 
     /// What used to be here, and why it is gone: a missing default path fell back to
     /// scanning `manifest/` for a single `deployed.*.json`, and before that to a copy of the
@@ -2194,6 +2231,12 @@ impl Deployed {
     /// no fix in it.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
+        if path.is_dir() {
+            anyhow::bail!(
+                "the deployment manifest path must name a FILE, but {} is a directory",
+                path.display()
+            );
+        }
         let bytes = std::fs::read(path).map_err(|error| {
             let missing = error.kind() == std::io::ErrorKind::NotFound;
             let refusal = anyhow::Error::new(error).context(format!(
@@ -3961,6 +4004,29 @@ where
     send(prepared).await.map(Some)
 }
 
+/// The exact-hash destination receipt read, retried the way every other chain read is.
+
+/// both money-path observers reached the request below directly -- the note-deploy wallet and
+/// RootPN polls through [`poll_finalized_destination_receipt`], and the multisig delivery proof in
+/// [`prove_multisig_delivery_message`]. So a single `502` from the edge ended `dexdo note deploy`
+/// AFTER the wallet spend had been submitted, leaving the run to be reconciled by hand. The same
+/// client already calls a `502` on a read repeatable -- [`read_failure_is_transient`] accepts any
+/// `is_server_error()` -- and repeats it at sixteen other production reads in this file, plus two
+/// in `dexdo`. This read was simply outside the wrapper.
+
+/// Retrying it is safe for the reason written above [`retry_transient_read`], and it holds here
+/// literally: [`EXACT_MESSAGE_RECEIPT_QUERY`] is a GraphQL **query** over `blockchain.message` and
+/// `blockchain.account`. Nothing is submitted, so nothing can be submitted twice.
+
+/// The retry sits on the read rather than on either caller because the poll loop around it repeats
+/// for a DIFFERENT reason -- the receipt is not finalized yet -- and a request that came back
+/// without an answer is not an unfinalized receipt.
+
+/// The request stays INSIDE this function rather than moving to a `..._once` helper of its own. A
+/// helper would take `http: &reqwest::Client`, and `ci/check-client-bypass-ratchet.sh` counts that
+/// signature as one more unmetered read surface (its DIRECT ceiling is an equality, measured 28 vs
+/// 27). One more reader is exactly what this change does NOT add: it is the same single request,
+/// repeated when it comes back with nothing.
 async fn query_exact_destination_receipt(
     http: &reqwest::Client,
     endpoint: &str,
@@ -3969,23 +4035,26 @@ async fn query_exact_destination_receipt(
     expected_message_hash: &str,
 ) -> Result<Value> {
     let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-    let response = http
-        .post(&gql)
-        .json(&json!({
-            "query": EXACT_MESSAGE_RECEIPT_QUERY,
-            "variables": {
-                "hash": bare_hex(expected_message_hash),
-                "accountId": bare_hex(account_id),
-                "dappId": bare_hex(dapp_id),
-            },
-        }))
-        .send()
-        .await?;
-    let response: Value = chain_response_for_status(response)
-        .await?
-        .json()
-        .await?;
-    Ok(response)
+    retry_transient_read(|| async {
+        let response = http
+            .post(&gql)
+            .json(&json!({
+                "query": EXACT_MESSAGE_RECEIPT_QUERY,
+                "variables": {
+                    "hash": bare_hex(expected_message_hash),
+                    "accountId": bare_hex(account_id),
+                    "dappId": bare_hex(dapp_id),
+                },
+            }))
+            .send()
+            .await?;
+        let response: Value = chain_response_for_status(response)
+            .await?
+            .json()
+            .await?;
+        Ok(response)
+    })
+    .await
 }
 
 fn parse_exact_destination_receipt(
@@ -5597,6 +5666,25 @@ pub async fn prove_multisig_delivery_message(
     Ok(Some(delivery))
 }
 
+/// One exact-hash message read, retried the way every other chain read is.
+
+/// second half. `prove_multisig_delivery_message` reaches its receipt read through TWO of
+/// these -- the anchor (`:5552`) and one per sibling (`:5572`) -- and both posted directly. Putting
+/// the retry only on the receipt read would have made the release note half true: the same money
+/// path would still die on a `502`, one step earlier.
+
+/// Pure, on the same terms as [`query_exact_destination_receipt`]: `query` is `&'static str` and its
+/// only two arguments are [`SOURCE_TRANSACTION_OUT_MESSAGES_QUERY`] and
+/// [`MESSAGE_DESTINATION_QUERY`], both GraphQL **queries** over `blockchain.message`. Nothing is
+/// submitted, so nothing can be submitted twice.
+
+/// The `errors` check below stays OUTSIDE the retry, deliberately. A GraphQL failure carried in a
+/// 200 body is not typed here, so `is_transient_read_failure` cannot recognise it either way, and
+/// this change is not the place to alter that -- it is a separate defect of a different shape.
+
+/// The request stays inside this function rather than moving to a `..._once` helper: that helper
+/// would take `http: &reqwest::Client` and `ci/check-client-bypass-ratchet.sh` counts the signature
+/// against a ceiling that is an equality. Same reason as the receipt read above.
 async fn post_message_query(
     http: &reqwest::Client,
     gql: &str,
@@ -5604,18 +5692,22 @@ async fn post_message_query(
     message_id: &str,
     what: &str,
 ) -> Result<Value> {
-    let response = http
-        .post(gql)
-        .json(&json!({
-            "query": query,
-            "variables": { "hash": bare_hex(message_id) },
-        }))
-        .send()
-        .await?;
-    let response: Value = chain_response_for_status(response)
-        .await?
-        .json()
-        .await?;
+    let response: Value = retry_transient_read(|| async {
+        let response = http
+            .post(gql)
+            .json(&json!({
+                "query": query,
+                "variables": { "hash": bare_hex(message_id) },
+            }))
+            .send()
+            .await?;
+        let response: Value = chain_response_for_status(response)
+            .await?
+            .json()
+            .await?;
+        Ok(response)
+    })
+    .await?;
     if let Some(errors) = response.get("errors") {
         return Err(anyhow!("{what} GraphQL errors for {message_id}: {errors}"));
     }
@@ -7085,44 +7177,72 @@ impl RealChainBackend {
     /// Read-only chain readiness report: compare this binary's embedded/pinned contract images against
     /// a live chain and, when supplied, verify that a market manifest still points at active IOB/TC accounts.
     pub async fn doctor(&self, market: Option<&MarketManifest>) -> Result<ChainDoctorReport> {
+        self.doctor_observing(market, |_, _| {}).await
+    }
+
+    /// The same report with a notification after each check completes.
+    pub async fn doctor_observing(
+        &self,
+        market: Option<&MarketManifest>,
+        mut observe: impl FnMut(usize, &ChainDoctorCheck),
+    ) -> Result<ChainDoctorReport> {
         let mut checks = Vec::new();
         self.liveness().await?;
-        checks.push(self.endpoint_reachable_check());
-        checks.push(clock_skew_check(
-            local_unix_secs()?,
+        record_doctor_check(
+            &mut checks,
+            &mut observe,
+            self.endpoint_reachable_check(),
+        );
+        let local_unix = local_unix_secs()?;
+        let chain_unix =
             retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
-                .await?,
-        ));
+                .await?;
+        let clock_skew_seconds = signed_clock_skew_seconds(local_unix, chain_unix);
+        record_doctor_check(
+            &mut checks,
+            &mut observe,
+            clock_skew_check(local_unix, chain_unix),
+        );
 
         let pins = self.generation_pins_for_this_network()?;
         let superroot = self.superroot.clone();
-        checks.push(
+        record_doctor_check(
+            &mut checks,
+            &mut observe,
             self.generation_check(&superroot, pins.superroot, superroot_generation_check)
                 .await?,
         );
 
         if self.deployed.dapp_config.trim().is_empty() {
-            checks.push(skipped_check(
-                "DappConfig account",
-                "fixed-superroot redeploy has no legacy DappConfig manifest account",
-            ));
+            record_doctor_check(
+                &mut checks,
+                &mut observe,
+                skipped_check(
+                    "DappConfig account",
+                    "fixed-superroot redeploy has no legacy DappConfig manifest account",
+                ),
+            );
         } else {
             let dapp_config = Address::parse(&self.deployed.dapp_config)?;
             let (dapp_active, _) = self.account_active_code_hash(&dapp_config).await?;
-            checks.push(active_check(
-                "DappConfig account",
-                &dapp_config,
-                dapp_active,
-            ));
+            record_doctor_check(
+                &mut checks,
+                &mut observe,
+                active_check("DappConfig account", &dapp_config, dapp_active),
+            );
         }
 
         let rootpn = Address::parse(ROOTPN_ADDR)?;
-        checks.push(
+        record_doctor_check(
+            &mut checks,
+            &mut observe,
             self.generation_check(&rootpn, pins.rootpn, rootpn_generation_check)
                 .await?,
         );
         let rootoracle = Address::parse(ROOTORACLE_ADDR)?;
-        checks.push(
+        record_doctor_check(
+            &mut checks,
+            &mut observe,
             self.generation_check(&rootoracle, pins.rootoracle, rootoracle_generation_check)
                 .await?,
         );
@@ -7143,7 +7263,11 @@ impl RealChainBackend {
             .run_getter_retrying(&rootpn, ROOTPN_ABI, "getDetails", json!({}))
             .await
         {
-            Ok(Some(details)) => checks.push(private_note_pin_check(pins.private_note, &details)),
+            Ok(Some(details)) => record_doctor_check(
+                &mut checks,
+                &mut observe,
+                private_note_pin_check(pins.private_note, &details),
+            ),
             other => {
                 let reason = match other {
                     Ok(None) => "the account is not active".to_string(),
@@ -7152,18 +7276,22 @@ impl RealChainBackend {
                     }
                     Ok(Some(_)) => unreachable!("the matching arm above takes this case"),
                 };
-                checks.push(ChainDoctorCheck {
-                    name: "PrivateNote code hash (RootPN pin)".to_string(),
-                    status: ChainDoctorStatus::Fail,
-                    address: Some(display_dexdo_address(&rootpn)),
-                    expected: Some(pins.private_note.to_string()),
-                    actual: None,
-                    message: format!(
-                        "the PrivateNote code RootPN {} mints could not be read, so nothing holds \
-                         the notes this chain issues: {reason}",
-                        display_dexdo_address(&rootpn)
-                    ),
-                });
+                record_doctor_check(
+                    &mut checks,
+                    &mut observe,
+                    ChainDoctorCheck {
+                        name: "PrivateNote code hash (RootPN pin)".to_string(),
+                        status: ChainDoctorStatus::Fail,
+                        address: Some(display_dexdo_address(&rootpn)),
+                        expected: Some(pins.private_note.to_string()),
+                        actual: None,
+                        message: format!(
+                            "the PrivateNote code RootPN {} mints could not be read, so nothing holds \
+                             the notes this chain issues: {reason}",
+                            display_dexdo_address(&rootpn)
+                        ),
+                    },
+                );
             }
         }
 
@@ -7178,7 +7306,7 @@ impl RealChainBackend {
         // RootPN exposes no getter for it (`getDetails` returns the PMP and PrivateNote hashes and
         // nothing else), so this reads the storage field off the account and hashes the cell. That is
         // the whole reason the check is here rather than one line beside the others.
-        checks.push(match pins.token_contract_code {
+        let deal_code_check = match pins.token_contract_code {
             Some(expected) => self.root_pn_deal_code_check(&rootpn, expected).await?,
             // A generation whose RootPN has no such field: 4.0.35 and earlier deployed the deal
             // off-chain, so there was never anything to install.
@@ -7186,11 +7314,14 @@ impl RealChainBackend {
                 "RootPN TokenContract code (setTokenContractCode)",
                 "this generation's RootPN does not carry the deal code; the deal was deployed off-chain",
             ),
-        });
+        };
+        record_doctor_check(&mut checks, &mut observe, deal_code_check);
 
         if let Some(market) = market {
             let rm = Address::parse(&market.root_model)?;
-            checks.push(
+            record_doctor_check(
+                &mut checks,
+                &mut observe,
                 self.code_hash_account_check(
                     "RootModel code hash",
                     &rm,
@@ -7199,7 +7330,7 @@ impl RealChainBackend {
                 .await?,
             );
             let ob = Address::parse(&market.inference_order_book)?;
-            checks.push(match pins.inference_orderbook {
+            let order_book_check = match pins.inference_orderbook {
                 Some(expected) => {
                     self.generation_check(&ob, expected, inference_orderbook_generation_check)
                         .await?
@@ -7211,9 +7342,12 @@ impl RealChainBackend {
                     "InferenceOrderBook code hash",
                     "no book of this generation has been read on this network yet",
                 ),
-            });
+            };
+            record_doctor_check(&mut checks, &mut observe, order_book_check);
             let tc = Address::parse(&market.token_contract)?;
-            checks.push(
+            record_doctor_check(
+                &mut checks,
+                &mut observe,
                 self.self_dapp_code_hash_account_check(
                     "TokenContract code hash",
                     &tc,
@@ -7227,30 +7361,35 @@ impl RealChainBackend {
                 self.token_contract_state(&tc).await?.is_some(),
             );
             token_contract_state.address = Some(display_token_contract(&tc));
-            checks.push(token_contract_state);
+            record_doctor_check(&mut checks, &mut observe, token_contract_state);
             let seller_note = Address::parse(&market.seller_note)?;
-            checks.push(self.seller_note_withdrawn_check(&seller_note).await?);
+            let seller_note_check = self.seller_note_withdrawn_check(&seller_note).await?;
+            record_doctor_check(&mut checks, &mut observe, seller_note_check);
         } else {
-            checks.push(skipped_check(
-                "RootModel code hash",
-                "pass --market <manifest> to check the seller's deployed RootModel",
-            ));
-            checks.push(skipped_check(
-                "InferenceOrderBook code hash",
-                "pass --market <manifest> to check a deployed order book",
-            ));
-            checks.push(skipped_check(
-                "TokenContract code hash",
-                "pass --market <manifest> to check a deployed TokenContract",
-            ));
-            checks.push(skipped_check(
-                "market TokenContract state",
-                "pass --market <manifest> to check manifest freshness",
-            ));
-            checks.push(skipped_check(
-                "seller PrivateNote withdrawn state",
-                "pass --market <manifest> to check the seller note's hasWithdrawn flag",
-            ));
+            for check in [
+                skipped_check(
+                    "RootModel code hash",
+                    "pass --market <manifest> to check the seller's deployed RootModel",
+                ),
+                skipped_check(
+                    "InferenceOrderBook code hash",
+                    "pass --market <manifest> to check a deployed order book",
+                ),
+                skipped_check(
+                    "TokenContract code hash",
+                    "pass --market <manifest> to check a deployed TokenContract",
+                ),
+                skipped_check(
+                    "market TokenContract state",
+                    "pass --market <manifest> to check manifest freshness",
+                ),
+                skipped_check(
+                    "seller PrivateNote withdrawn state",
+                    "pass --market <manifest> to check the seller note's hasWithdrawn flag",
+                ),
+            ] {
+                record_doctor_check(&mut checks, &mut observe, check);
+            }
         }
 
         // THE VERSION BANNER IS NOT WORTH THE REPORT. These three reads decorate the header; a
@@ -7268,9 +7407,29 @@ impl RealChainBackend {
                 versions.push((label.to_string(), v));
             }
         }
-        checks.extend(self.deployed.validate(&versions));
+        for check in self.deployed.validate(&versions) {
+            record_doctor_check(&mut checks, &mut observe, check);
+        }
+        debug_assert_eq!(checks.len(), CHAIN_DOCTOR_CHECK_COUNT);
+        let chain_generations = versions
+            .iter()
+            .filter_map(|(_, version)| version.split_whitespace().next())
+            .filter(|generation| !generation.is_empty())
+            .collect::<BTreeSet<_>>();
+        let chain_generation = (chain_generations.len() == 1)
+            .then(|| (*chain_generations.first().expect("one generation")).to_string());
         Ok(ChainDoctorReport {
             network: self.deployed.network.clone(),
+            endpoint: doctor_report_endpoint(self.client.endpoint()),
+            manifest_generation: self
+                .deployed
+                .version
+                .as_deref()
+                .map(str::trim)
+                .filter(|generation| !generation.is_empty())
+                .map(str::to_string),
+            chain_generation,
+            clock_skew_seconds,
             versions,
             checks,
         })
@@ -14197,6 +14356,17 @@ mod tests {
     }
 
     #[test]
+    fn doctor_report_endpoint_omits_url_credentials_query_and_fragment() {
+        let endpoint = doctor_report_endpoint(
+            "https://operator:secret@example.invalid:8443/rpc/graphql?access_token=private#trace",
+        );
+        assert_eq!(endpoint, "https://example.invalid:8443/rpc/graphql");
+        for secret in ["operator", "secret", "access_token", "private", "trace"] {
+            assert!(!endpoint.contains(secret), "doctor endpoint leaked {secret}: {endpoint}");
+        }
+    }
+
+    #[test]
     fn clock_skew_real_boundaries_fail_closed_with_actionable_message() {
         for behind in [41, 60] {
             let check = clock_skew_check(1_000_000 - behind, 1_000_000);
@@ -14214,6 +14384,10 @@ mod tests {
 
         let report = ChainDoctorReport {
             network: "net-a".to_string(),
+            endpoint: "https://net-a.example".to_string(),
+            manifest_generation: Some("1.0.0".to_string()),
+            chain_generation: Some("1.0.0".to_string()),
+            clock_skew_seconds: i64::try_from(MAX_CLOCK_AHEAD_SECS + 1).unwrap(),
             versions: Vec::new(),
             checks: vec![check],
         };

@@ -164,6 +164,7 @@ fn issue_1056_seller_args(
         price_per_tick: dexdo_core::PRICE_STEP as u64,
         mock_token_count: 98,
         model: None,
+        allow_unverified_model: false,
         models: root.join("unused-models.json"),
         policy: None,
     }
@@ -181,8 +182,7 @@ async fn issue_1056_restart_child() {
     let residual_ticks = 98 - matched_ticks;
     let root = tempfile::tempdir().expect(" restart directory");
     let seller_seed = [0x56; 32];
-    std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed))
-        .expect(" seller key");
+    crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
     let seller_owner = issue_1056_seller_owner(seller_seed);
     let parent_token_contract = issue_1056_parent_token_contract();
     let successor_token_contract = issue_1056_successor_token_contract(&seller_owner);

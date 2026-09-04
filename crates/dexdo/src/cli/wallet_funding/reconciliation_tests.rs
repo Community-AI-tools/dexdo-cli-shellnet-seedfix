@@ -1,9 +1,8 @@
 //! item 2: how a funding request leaves the Vault's queue, and what may follow each way.
 
-//! A request vanishing from the queue means either that it EXECUTED or that it EXPIRED, and the two
-//! are opposite in money terms: after the first, another submit transfers a second time out of a
-//! cold Vault; after the second, another submit is the only way the Hot is ever funded. The rule the
-//! specification fixes is that queue disappearance ALONE must never authorize another submit.
+//! A request vanishing from the queue does not prove whether it executed. A second submit before
+//! the canonical local UTC deadline could transfer twice out of a cold Vault, so queue disappearance
+//! alone must never authorize it. Expiry is handled by journal selection before reconciliation.
 
 //! Every test here drives the real entry point [`ensure_hot_funded_with_turn`] through the real
 //! production provider [`AckinackiVaultProvider`], composed exactly as a money command composes it -
@@ -20,7 +19,6 @@ use super::*;
 
 const SHELL: u32 = 2;
 const REQUIRED: u128 = 1_000;
-const WINDOW: u64 = 3_600;
 const QUEUED_AT: u64 = 1_000_000;
 
 fn hex64(byte: u8) -> String {
@@ -114,8 +112,6 @@ fn sent_event(id: u64, native: u128, at: u64) -> VaultQueueEvent {
 struct FakeVault {
     queue: RefCell<Vec<QueuedTransfer>>,
     history: RefCell<Vec<VaultQueueEvent>>,
-    window: u64,
-    now: Cell<u64>,
     queue_error: RefCell<Option<String>>,
     history_error: RefCell<Option<String>>,
     submits: Cell<usize>,
@@ -132,8 +128,6 @@ impl FakeVault {
         Self {
             queue: RefCell::new(Vec::new()),
             history: RefCell::new(Vec::new()),
-            window: WINDOW,
-            now: Cell::new(QUEUED_AT),
             queue_error: RefCell::new(None),
             history_error: RefCell::new(None),
             submits: Cell::new(0),
@@ -173,14 +167,6 @@ impl VaultChain for &FakeVault {
         Ok(Some(format!("delivery-of-{sent_event_message_id}")))
     }
 
-    async fn expiration_window_secs(&self) -> Result<u64> {
-        Ok(self.window)
-    }
-
-    async fn chain_time_secs(&self) -> Result<u64> {
-        Ok(self.now.get())
-    }
-
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
         self.submits.set(self.submits.get() + 1);
         self.submitted.borrow_mut().push(fingerprint.clone());
@@ -198,7 +184,7 @@ impl VaultChain for &FakeVault {
             .push(queued(id, fingerprint.value, shortfall));
         self.history
             .borrow_mut()
-            .push(submitted_event(id, fingerprint.value, self.now.get()));
+            .push(submitted_event(id, fingerprint.value, QUEUED_AT));
         Ok(SubmitOutcome::Accepted {
             transaction_hash: Some(format!("tx-{id}")),
             pending_transaction_id: Some(
@@ -265,6 +251,12 @@ fn record_of(dir: &Path) -> Option<FundingJournalRecord> {
     load_funding_journal(dir, "net-a", &hot_address()).expect("read journal")
 }
 
+fn records_of(dir: &Path) -> Vec<FundingJournalRecord> {
+    load_funding_journal_records(dir, "net-a", &hot_address())
+        .expect("read journal")
+        .unwrap_or_default()
+}
+
 /// One run of a money command's funding step, composed exactly as production composes it: read the
 /// journal under the held turn, hand what it recorded to the provider, then run the mechanism.
 async fn money_command_run(dir: &Path, vault: &FakeVault, hot: &FakeHot) -> Result<FundedHot> {
@@ -310,6 +302,101 @@ async fn money_command_run_with_requirements(
 
 fn temp() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp data dir")
+}
+
+/// another checkout can create the exact transfer before this data directory has a journal.
+/// The first local run must adopt that queue entry rather than submit an indistinguishable second
+/// transfer.
+#[tokio::test]
+async fn an_external_exact_request_with_two_minutes_left_keeps_its_real_deadline() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let now = unix_now_secs();
+    let lifetime = dexdo_core::params::VAULT_FUNDING_REQUEST_LIFETIME.as_secs();
+    let queued_at = now.saturating_sub(lifetime.saturating_sub(2 * 60));
+    vault.queue.borrow_mut().push(queued(41, 0, REQUIRED));
+    vault
+        .history
+        .borrow_mut()
+        .push(submitted_event(41, 0, queued_at));
+    let hot = FakeHot::always(0);
+
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(
+        vault.submits.get(),
+        0,
+        "the existing exact queue entry is the request; no local submit is allowed"
+    );
+    let record = record_of(dir.path()).expect("the external request is recorded locally");
+    assert_eq!(record.state, FundingState::Submitted);
+    assert_eq!(record.pending_transaction_id.as_deref(), Some("41"));
+    assert_eq!(
+        record.created_at_unix, queued_at,
+        "the adopted request keeps the finalized queue-admission time"
+    );
+    assert_eq!(record.expires_at_unix, funding_request_deadline(queued_at));
+    assert!(
+        !record.is_expired_at(record.expires_at_unix),
+        "the adopted request remains live at its actual deadline"
+    );
+    assert!(
+        record.is_expired_at(record.expires_at_unix.saturating_add(1)),
+        "it expires one second after that deadline, not one hour after this process adopted it"
+    );
+}
+
+/// A matching queue entry alone does not reveal when it was created. Without its finalized
+/// `TransactionSubmitted` envelope there is no safe timestamp to adopt, so neither adoption nor a
+/// second submit is allowed.
+#[tokio::test]
+async fn an_external_exact_request_without_a_chain_date_fails_closed() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    vault.queue.borrow_mut().push(queued(41, 0, REQUIRED));
+    let hot = FakeHot::always(0);
+
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(vault.submits.get(), 0, "an undated request never authorizes a submit");
+    let record = record_of(dir.path()).expect("Prepared is durable before the failed adoption");
+    assert_eq!(record.state, FundingState::Prepared);
+    assert!(record.pending_transaction_id.is_none());
+    assert!(
+        !record.submit_attempted,
+        "observing an undated external request is not a local submit attempt"
+    );
+
+    let lifetime = dexdo_core::params::VAULT_FUNDING_REQUEST_LIFETIME.as_secs();
+    let queued_at = unix_now_secs().saturating_sub(lifetime.saturating_sub(2 * 60));
+    vault
+        .history
+        .borrow_mut()
+        .push(submitted_event(41, 0, queued_at));
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    let adopted = record_of(dir.path()).expect("the retry adopted the dated queue request");
+    assert_eq!(adopted.state, FundingState::Submitted);
+    assert!(!adopted.submit_attempted);
+    assert_eq!(adopted.created_at_unix, queued_at);
+    assert_eq!(adopted.expires_at_unix, funding_request_deadline(queued_at));
+    assert_eq!(vault.submits.get(), 0, "neither pass submits a duplicate");
+}
+
+/// a queue read that did not answer cannot prove that a first exact request is absent.
+#[tokio::test]
+async fn an_unreadable_queue_before_the_first_local_submit_fails_closed() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    *vault.queue_error.borrow_mut() = Some("queue temporarily unavailable".to_string());
+    let hot = FakeHot::always(0);
+
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+
+    assert_eq!(vault.submits.get(), 0, "unknown never authorizes a submit");
+    let record = record_of(dir.path()).expect("Prepared is durable before the failed probe");
+    assert_eq!(record.state, FundingState::Prepared);
+    assert!(record.pending_transaction_id.is_none());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -385,45 +472,6 @@ async fn an_executed_underfill_opens_a_new_generation_for_the_exact_remaining_sh
     assert_eq!(after_second.pending_transaction_id.as_deref(), Some("8"));
 }
 
-/// The opposite reading of the SAME observable. The request was never confirmed and the wallet's own
-/// expiration window has passed, so it can no longer execute: no money left the Vault, and a fresh
-/// request is now the only way the Hot is ever funded.
-#[tokio::test]
-async fn a_request_the_chain_shows_expired_unexecuted_is_submitted_again_as_a_new_generation() {
-    let dir = temp();
-    let vault = FakeVault::empty();
-
-    let hot = FakeHot::always(0);
-    let _ = money_command_run(dir.path(), &vault, &hot).await;
-    assert_eq!(vault.submits.get(), 1);
-    assert_eq!(record_of(dir.path()).expect("record").generation, 1);
-
-    // Nobody confirmed it. It ages out of the queue, and the wallet emits no execution event.
-    vault.queue.borrow_mut().clear();
-    vault.now.set(QUEUED_AT + WINDOW + 1);
-
-    let hot = FakeHot::always(0);
-    let _ = money_command_run(dir.path(), &vault, &hot).await;
-
-    assert_eq!(
-        vault.submits.get(),
-        2,
-        "a request proven to have EXPIRED without executing must be replaced: refusing to would \
-         leave the Hot permanently unfundable"
-    );
-    let after = record_of(dir.path()).expect("record");
-    assert_eq!(
-        after.generation, 2,
-        "the replacement is a NEW generation, so the retired one can never be matched again"
-    );
-    assert_eq!(after.state, FundingState::Submitted);
-    assert_eq!(
-        after.pending_transaction_id.as_deref(),
-        Some("8"),
-        "the new generation carries its own queue id"
-    );
-}
-
 /// The state between the two: gone from the live queue, no execution event, and still inside the
 /// window in which the human can confirm it. Neither verdict is proven, so nothing is submitted.
 #[tokio::test]
@@ -438,7 +486,6 @@ async fn a_disappearance_that_proves_neither_verdict_submits_nothing() {
     // It is not in the live queue this instant - a stale read, a reorganised view, anything - but
     // the deadline has not passed and no execution event exists.
     vault.queue.borrow_mut().clear();
-    vault.now.set(QUEUED_AT + WINDOW - 1);
 
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
@@ -457,8 +504,9 @@ async fn a_disappearance_that_proves_neither_verdict_submits_nothing() {
     assert!(after.evidence.is_none(), "there was no evidence to record");
 }
 
-/// An unreadable history is not an expired request. This is the same rule as the unreadable queue,
-/// one layer down, and it is the one a flaky gateway exercises in production.
+/// Unreadable history does not authorize another submit for a still-live request. This is the same
+/// rule as an unreadable queue, one layer down, and it is what a flaky gateway exercises in
+/// production.
 #[tokio::test]
 async fn an_unreadable_history_never_authorizes_another_submit() {
     let dir = temp();
@@ -469,7 +517,6 @@ async fn an_unreadable_history_never_authorizes_another_submit() {
     assert_eq!(vault.submits.get(), 1);
 
     vault.queue.borrow_mut().clear();
-    vault.now.set(QUEUED_AT + WINDOW + 1);
     *vault.history_error.borrow_mut() = Some("502 Bad Gateway".to_string());
 
     let hot = FakeHot::always(0);
@@ -527,24 +574,12 @@ async fn an_unobserved_submit_is_recovered_from_the_wallets_own_submitted_event(
     assert_eq!(after.state, FundingState::Executed);
 }
 
-/// The verdict a LOCAL clock is never allowed to reach.
-
-/// The submit's result was never observed, so no queue id was recorded, and the wallet's finalized
-/// history carries no `TransactionSubmitted` for it either. There is therefore no chain time to date
-/// an expiry deadline from. Dating it from the journal's own creation time instead would let a
-/// client whose clock had drifted - or whose history read came back silently short - resubmit a
-/// request that had in fact executed, and that is the double transfer out of a cold Vault. The
-/// asymmetry settles it: a wrong "expired" is unrecoverable, a wrong "I cannot tell" costs one more
-/// run. Absence of evidence is refused rather than read as evidence of expiry.
+/// A still-live exact request remains the one being reconciled even if history has no admission.
 #[tokio::test]
 async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_retried() {
     let dir = temp();
     let vault = FakeVault::empty();
     vault.indeterminate.set(true);
-    // A chain clock far past anything the LOCAL record could date a deadline to: measured from
-    // `created_at_unix`, the wallet's window would have elapsed many times over by now.
-    vault.now.set(unix_now_secs() + WINDOW * 10);
-
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
     assert_eq!(vault.submits.get(), 1, "the first run creates the request");
@@ -566,8 +601,7 @@ async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_ret
     assert_eq!(
         vault.submits.get(),
         1,
-        "with no TransactionSubmitted there is no chain time to measure an expiry from, and a \
-         local clock may never conclude one: refusing costs a re-run, retrying can transfer twice"
+        "a still-live exact request is reused even when chain history has no admission event"
     );
     let after = record_of(dir.path()).expect("run 2 kept the record");
     assert_eq!(
@@ -575,27 +609,16 @@ async fn a_request_the_history_never_recorded_queuing_is_refused_rather_than_ret
         FundingState::Prepared,
         "a state the chain did not prove advances nothing"
     );
-    assert_eq!(
-        after.generation, 1,
-        "a generation is retired only by finalized expiry or execution of its recorded queue id, \
-         and nothing here proved either"
-    );
+    assert_eq!(after.generation, 1, "the local lifetime has not elapsed");
     assert!(after.evidence.is_none(), "there was no evidence to record");
 }
 
-/// The refusal has to be actionable, and it has to keep reporting apart from deciding.
-
-/// An operator told only that something "could not be established" has nothing to do. They are told
-/// which transfer to look for, so they can settle it by looking at the Vault's pending list - the
-/// one observation that actually resolves this. The local deadline is reported alongside, because it
-/// is useful, and marked as authorizing nothing, because it is not what decided.
+/// The refusal names the exact request and the UTC journal deadline an operator can inspect.
 #[tokio::test]
 async fn the_refusal_names_the_request_and_reports_the_local_deadline_without_acting_on_it() {
     let dir = temp();
     let vault = FakeVault::empty();
     vault.indeterminate.set(true);
-    vault.now.set(unix_now_secs() + WINDOW * 10);
-
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
@@ -608,22 +631,21 @@ async fn the_refusal_names_the_request_and_reports_the_local_deadline_without_ac
 
     let FundingNotice::RequestIndeterminate { reason } = funded.notice else {
         panic!(
-            "a request that cannot be dated from chain fact must stay indeterminate, never become \
-             a verdict: {:?}",
+            "a live request with no chain verdict must stay indeterminate: {:?}",
             funded.notice
         );
     };
     assert!(
-        reason.contains("no TransactionSubmitted"),
-        "the refusal must say exactly what is missing: {reason}"
+        reason.contains("no TransactionSent"),
+        "the refusal must name the missing finalized verdict: {reason}"
     );
     assert!(
         reason.contains(&hot_address()) && reason.contains(&creator()),
         "the refusal must name the transfer the operator should go and look for: {reason}"
     );
     assert!(
-        reason.contains("authorizing nothing"),
-        "the local deadline is reported, never the thing that decided: {reason}"
+        reason.contains("local funding journal until"),
+        "the canonical journal deadline must be reported: {reason}"
     );
     assert_eq!(
         vault.submits.get(),
@@ -755,10 +777,9 @@ async fn the_record_freezes_the_full_fingerprint_the_submit_used() {
     );
 }
 
-/// The frozen fingerprint is the generation's, not today's. A later run whose shortfall has moved
-/// must still be looking for the transfer the earlier run created, or it cannot recognise it.
+/// Regression for: a live request for A must not block a changed shortfall B.
 #[tokio::test]
-async fn a_moved_shortfall_does_not_move_the_frozen_fingerprint() {
+async fn a_moved_shortfall_creates_a_second_request_without_mutating_the_first() {
     let dir = temp();
     let vault = FakeVault::empty();
     let hot = FakeHot::always(0);
@@ -770,13 +791,74 @@ async fn a_moved_shortfall_does_not_move_the_frozen_fingerprint() {
     let hot = FakeHot::always(400);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
-    let after = record_of(dir.path()).expect("record");
+    let after = records_of(dir.path());
     assert_eq!(
-        after.fingerprint, first,
-        "the fingerprint is frozen for the generation; recomputing it would make the request in \
-         the queue unrecognisable, and an unrecognisable request reads as absence"
+        after.len(),
+        2,
+        "both different live amounts stay in the journal"
     );
-    assert_eq!(vault.submits.get(), 1, "the queued request was still recognised");
+    assert_eq!(
+        after[0].fingerprint, first,
+        "creating B must not mutate A's frozen fingerprint"
+    );
+    assert_eq!(after[1].fingerprint.cc.get(&SHELL), Some(&600));
+    assert_eq!(vault.submits.get(), 2, "B is a separate Vault request");
+}
+
+/// Regression for's live acceptance: once request A funds the Hot, rerunning the command
+/// that created A must reconcile A rather than the newest live request B for a different amount.
+#[tokio::test]
+async fn an_already_funded_command_reconciles_its_own_amount_not_the_newest_other_amount() {
+    let dir = temp();
+    let vault = FakeVault::empty();
+    let empty_hot = FakeHot::always(0);
+    let first_requirements = requirements();
+    let second_requirements = FundingRequirements::new([(SHELL, REQUIRED + 250)]);
+
+    let _ = money_command_run_with_requirements(
+        dir.path(),
+        &vault,
+        &empty_hot,
+        &first_requirements,
+        bounds(),
+    )
+    .await;
+    let _ = money_command_run_with_requirements(
+        dir.path(),
+        &vault,
+        &empty_hot,
+        &second_requirements,
+        bounds(),
+    )
+    .await;
+    assert_eq!(vault.submits.get(), 2, "both distinct amounts were queued");
+
+    // The operator approves only A. B remains confirmable in the Vault while A's exact credit is
+    // already visible on the Hot, matching the live N100/N1000 acceptance sequence.
+    vault.queue.borrow_mut().retain(|request| request.id != 7);
+    vault
+        .history
+        .borrow_mut()
+        .push(sent_event(7, 0, QUEUED_AT + 1));
+    let funded_hot = FakeHot::always(REQUIRED);
+    money_command_run_with_requirements(
+        dir.path(),
+        &vault,
+        &funded_hot,
+        &first_requirements,
+        bounds(),
+    )
+    .await
+    .expect("A is funded and must not be blocked by pending B");
+
+    let after = records_of(dir.path());
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].generation, 1);
+    assert_eq!(after[0].state, FundingState::Satisfied);
+    assert_eq!(after[1].generation, 2);
+    assert_eq!(after[1].state, FundingState::Submitted);
+    assert_eq!(after[1].pending_transaction_id.as_deref(), Some("8"));
+    assert_eq!(vault.submits.get(), 2, "the rerun submits nothing");
 }
 
 /// A version-1 record is refused rather than guessed at. It has no fingerprint and no generation,

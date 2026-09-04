@@ -22,7 +22,7 @@ use crate::cli::commands::{
     chain_doctor_preflight, unix_now_secs, BookRow, BookTarget, RuntimeDealHandleInput,
 };
 use crate::cli::commands::{
-    load_pool_json, model_target_from_config, note_pool_path, preload_default_model_registry,
+    load_pool_json, book_target_for, note_pool_path, preload_default_model_registry,
     preload_model_registry_policy, registry_requested_model, resolve_order_book_target,
     target_from_market, try_acquire_pool_write_lock, with_pool_write_lock, write_pool_private,
     PoolWriteLock,
@@ -64,7 +64,7 @@ fn buy_order_deadline() -> Result<u64> {
     })
 }
 use dexdo::registry::{
-    default_model_registry_address, resolve_registered_model_identity, ChainModelRegistryReader,
+    default_model_registry_address, resolve_registered_model_identity_with, RegistrySuggestions, ChainModelRegistryReader,
 };
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::{
@@ -4643,6 +4643,7 @@ fn reject_buyer_raw_token_contract_without_registry_book_proof(
 async fn resolve_content_identity_model(
     contracts: &std::path::Path,
     frame_model: &str,
+    suggestions_policy: RegistrySuggestions,
 ) -> Result<String> {
     let registry_address = default_model_registry_address(contracts).map_err(|e| {
         anyhow!(
@@ -4651,11 +4652,12 @@ async fn resolve_content_identity_model(
         )
     })?;
     let reader = ChainModelRegistryReader::from_manifest(contracts, &registry_address)?;
-    let identity = resolve_registered_model_identity(
+    let identity = resolve_registered_model_identity_with(
         &reader,
         RegistryRole::Buyer,
         &registry_address,
         frame_model,
+        suggestions_policy,
     )
     .await?;
     Ok(identity.registry_model)
@@ -4762,7 +4764,19 @@ async fn resolve_buyer_content_identity_model(
         frame_model,
         allow_unverified_model,
         resuming,
-        resolve_content_identity_model(contracts, frame_model).await,
+        resolve_content_identity_model(
+            contracts,
+            frame_model,
+            // Same reasoning as the seller's gate: with the opt-out set,
+            // `buyer_content_identity_resolution_result` turns this Err into a warning, so the
+            // list would be computed for a refusal that does not happen.
+            if allow_unverified_model {
+                RegistrySuggestions::Skip
+            } else {
+                RegistrySuggestions::Compute
+            },
+        )
+        .await,
     )
 }
 
@@ -7734,28 +7748,6 @@ async fn subscription_note_spendable_balance(
     chain.private_note_shell_balance(note).await
 }
 
-fn subscription_target(args: &SubscriptionArgs) -> Result<BookTarget> {
-    if let Some(market) = args.market.as_deref() {
-        if args.model.is_some() {
-            bail!("--market and --model are mutually exclusive for subscription");
-        }
-        target_from_market(market)
-    } else {
-        let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "subscription without --market requires --note-addr to derive the order-book address"
-            )
-        })?;
-        model_target_from_config(
-            &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("subscription without --market requires --model"))?,
-            Some(note_addr),
-        )
-    }
-}
-
 fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<dexdo_core::Address> {
     let note_addr = args
         .identity
@@ -8994,7 +8986,15 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
 
     let registry_policy =
         load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &manifest_path)?;
-    let initial_target = if registry_policy.is_some() && args.market.is_none() {
+    // the fork on `registry_policy.is_some()` is gone. It made the catalog the default
+
+    // what is left is the one question this command actually has -- a market manifest, or a name.
+    let initial_target = if let Some(market) = args.market.as_deref() {
+        if args.model.is_some() {
+            bail!("--market and --model are mutually exclusive for subscription");
+        }
+        target_from_market(market)?
+    } else {
         let requested_model = budget
             .read(registry_requested_model(
                 &manifest_path,
@@ -9005,15 +9005,7 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                 })?,
             ))
             .await?;
-        BookTarget {
-            model_hash: model_hash_for(&requested_model),
-            frame_model: requested_model,
-            order_book: None,
-            root_model: None,
-            note_addr: Some(note_addr.clone()),
-        }
-    } else {
-        subscription_target(&args)?
+        book_target_for(requested_model, Some(note_addr.clone()))
     };
     let requested_model = initial_target.frame_model.clone();
     // THE NAME IS RESOLVED HERE TOO, because this is a separate entry.
@@ -9024,21 +9016,37 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
     // section 8 lists `subscription place` among the paths that require a resolved name, and
     // section 3 requires the rule to be the same wherever money is placed.
 
-    // No opt-out is threaded in because `SubscriptionArgs` carries none: `--allow-unverified-model`
-    // is a `buyer`/`seller` flag. So an unreadable registry stops a subscription rather than
-    // downgrading it, which is the fail-closed side and the same default the buyer has.
+    // THE OPT-OUT IS THE SAME ONE, because the rule is the same one.
+
+    // This used to read "no opt-out is threaded in because `SubscriptionArgs` carries none", and
+    // that stated the CAUSE as if it were the REASON: the flag was absent because nobody had added
+    // it, and the comment then justified the absence after the fact. `subscription place` is the
+    // fifth path that spends against a registry name -- `buyer`, `seller`, `provision` and
+    // `deploy-market` are the other four -- and it was the only one where the operator could not
+    // override the same refusal. Section 3 asks for one rule applied identically on both sides; one
+    // rule with four escape hatches and a fifth path without is the "one identity rule, two
+    // defaults" defect named, wearing a different number.
+
+    // It sits on `place`, not on `SubscriptionArgs`, because `place` is the subcommand that spends.
+    // `status` and the other read-only subcommands never reach this line, and a global flag would
+    // have advertised an override for a refusal they cannot produce.
+
+    // What the flag does NOT do is unchanged, and it is the whole of its safety: it reaches only
+    // the arm where the registry could not answer. A name the registry answered about and spells
+    // differently is refused with or without it -- `buyer_content_identity_resolution_result`
+    // decides that above the opt-out, on purpose.
 
     // Inside `budget.read`, like the reads either side of it. `ReadBudget` puts a
     // `tokio::time::timeout` on what is left of `--read-timeout` and charges what was spent; outside
     // it, an unresponsive registry hangs `subscription place` instead of producing its own "chain
     // read timed out" refusal, and the next read then gets a fuller budget than the operator asked
     // for.
-    if !args.mock.mock_chain && matches!(&args.command, SubscriptionCommand::Place(_)) {
+    if let (false, SubscriptionCommand::Place(place)) = (args.mock.mock_chain, &args.command) {
         budget
             .read(resolve_buyer_content_identity_model(
                 &manifest_path,
                 &requested_model,
-                false,
+                place.allow_unverified_model,
                 false,
             ))
             .await?;
@@ -15312,7 +15320,13 @@ mod tests {
         // expectation at `Qwen/Qwen3-32B`, which no run can satisfy --
         // `registry_identity_candidates("Qwen3-32B")` yields only `["Qwen3-32B", "qwen3-32b"]`,
         // so no producer-prefixed candidate is ever generated.
-        let identity = super::resolve_content_identity_model(&contracts, "qwen--qwen3--32b")
+        let identity = super::resolve_content_identity_model(
+            &contracts,
+            "qwen--qwen3--32b",
+            // Unreachable on this path: the name resolves, and the policy only governs the walk a
+            // FAILED resolution makes. `Compute` is the literal pre-change behaviour.
+            RegistrySuggestions::Compute,
+        )
             .await
             .expect("resolve qwen content identity from embedded ModelRegistry ABI");
         assert_eq!(identity, "Qwen/Qwen3-32B");
@@ -15604,7 +15618,7 @@ mod tests {
             &wallet,
         )
         .unwrap();
-        std::fs::write(&pool_path, serde_json::to_vec(&initial_pool).unwrap()).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&pool_path, &serde_json::to_string(&initial_pool).unwrap());
         let first_alias = dir.join("first-pool.json");
         let second_alias = dir.join("second-pool.json");
         std::os::unix::fs::symlink(&pool_path, &first_alias).unwrap();
@@ -15703,7 +15717,7 @@ mod tests {
         assert!(err.contains("regular file"), "{err}");
 
         let pool = dir.join("pn_pool.json");
-        std::fs::write(&pool, br#"{"notes":[]}"#).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&pool, r#"{"notes":[]}"#);
         let lock = dir.join("pn_pool.json.lock");
         std::os::unix::fs::symlink(&pool, &lock).unwrap();
         let err = super::with_pool_write_lock(&pool, |_| Ok(()))
@@ -15729,7 +15743,7 @@ mod tests {
         let _cleanup = TempDirCleanup(dir.clone());
         let pool = dir.join("pn_pool.json");
         let other = dir.join("other_pool.json");
-        std::fs::write(&pool, br#"{"notes":[]}"#).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&pool, r#"{"notes":[]}"#);
         std::fs::write(&other, br#"{"notes":[]}"#).unwrap();
 
         let err = super::note_deploy_same_file_pool_guard(Some(pool.as_os_str()), &pool)
@@ -15766,9 +15780,9 @@ mod tests {
         let pool = dir.join("pn_pool.json");
         let stale_note = format!("0:{}", "1".repeat(64));
         let buyer_note = format!("0:{}", "2".repeat(64));
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": stale_note,
@@ -15776,8 +15790,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
         let chain = RecordingRecoveryChain::default();
         let buyer =
@@ -15845,7 +15858,7 @@ mod tests {
             ),
         ] {
             let pool_path = dir.join(format!("{case}.pool.json"));
-            std::fs::write(&pool_path, serde_json::to_vec_pretty(&pool).unwrap()).unwrap();
+            crate::cli::support::write_owner_only_key_fixture(&pool_path, &serde_json::to_string_pretty(&pool).unwrap());
             let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
             let recording = std::sync::Arc::new(QuotePreflightChain::default());
             let backend: std::sync::Arc<dyn dexdo_core::ChainBackend> = recording.clone();
@@ -16024,9 +16037,9 @@ mod tests {
         let note_addr = format!("0:{}", "1".repeat(64));
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": note_addr,
@@ -16037,8 +16050,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         // `pool_record` exists only on the path that persists it, so this is `recover`'s resolver.
         let resolved = super::resolve_persistable_pool_recovery_inputs(
@@ -16097,8 +16109,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        std::fs::write(&original_pool, &pool_bytes).unwrap();
-        std::fs::write(&retargeted_pool, &pool_bytes).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&original_pool, std::str::from_utf8(&pool_bytes).unwrap());
+        crate::cli::support::write_owner_only_key_fixture(&retargeted_pool, std::str::from_utf8(&pool_bytes).unwrap());
         std::os::unix::fs::symlink(&original_pool, &pool_alias).unwrap();
 
         let resolved = super::resolve_persistable_pool_recovery_inputs(
@@ -16156,7 +16168,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        std::fs::write(&pool_path, &bytes).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&pool_path, std::str::from_utf8(&bytes).unwrap());
 
         let err = super::persist_pool_recovery_record(&super::PoolRecoveryRecord {
             pool_path: pool_path.clone(),
@@ -16200,9 +16212,19 @@ mod tests {
             if let Some(role) = buyer_role {
                 buyer_note["token_contract_role"] = serde_json::json!(role);
             }
-            std::fs::write(
+            // REMOVED, NOT OVERWRITTEN, and the removal is the point rather than a workaround.
+
+            // This loop writes the same path once per case. `write_owner_only_key_fixture` opens
+            // with `create_new`, so the second pass would fail -- and the fix is NOT to let the
+            // writer overwrite. That `create_new` is the guarantee that makes the writer worth
+            // using: a fixture can never inherit the mode of a file some earlier write left
+            // behind, which is the exact defect this whole change exists to remove. Relaxing it
+            // for one convenient case would trade a property needed everywhere for a line needed
+            // here.
+            std::fs::remove_file(&pool_path).ok();
+            crate::cli::support::write_owner_only_key_fixture(
                 &pool_path,
-                serde_json::to_vec_pretty(&serde_json::json!({
+                &serde_json::to_string_pretty(&serde_json::json!({
                     "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                     "notes": [
                         {
@@ -16215,8 +16237,7 @@ mod tests {
                     ]
                 }))
                 .unwrap(),
-            )
-            .unwrap();
+            );
 
             let resolved = super::resolve_pool_recovery_inputs(
                 &RecoveryIdentityArgs {
@@ -16267,15 +16288,14 @@ mod tests {
             "token_contract_role": "buyer",
             "token_contract_updated_at_unix": 99
         });
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [row, row]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         // `recover`'s resolver: the one that also has to persist the record it resolved.
         let resolved = super::resolve_persistable_pool_recovery_inputs(
@@ -16336,9 +16356,9 @@ mod tests {
         let pool_path = dir.join("pn_pool.json");
         let first_tc = format!("0:{}", "2".repeat(64));
         let second_tc = format!("0:{}", "4".repeat(64));
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [
                     {
@@ -16358,8 +16378,7 @@ mod tests {
                 ]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         let identity = || RecoveryIdentityArgs {
             note_key: None,
@@ -16431,9 +16450,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let _cleanup = TempDirCleanup(dir.clone());
         let pool_path = dir.join("pn_pool.json");
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [
                     {
@@ -16449,8 +16468,7 @@ mod tests {
                 ]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         // Not `unwrap_err`: resolved inputs carry a note secret and nothing may render them.
         let err = match super::resolve_pool_recovery_inputs(
@@ -19166,9 +19184,9 @@ mod tests {
         let _cleanup = TempDirCleanup(dir.clone());
         let pool = dir.join("pn_pool.json");
         let buyer_note = format!("0:{}", "3".repeat(64));
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": buyer_note,
@@ -19176,8 +19194,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
         let pool_note_addr = Some(buyer_note.as_str());
 
@@ -19242,9 +19259,9 @@ mod tests {
         let _cleanup = TempDirCleanup(dir.clone());
         let pool = dir.join("pn_pool.json");
         let buyer_note = format!("0:{}", "7".repeat(64));
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": buyer_note,
@@ -19252,8 +19269,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
         let journal_path = super::BuyerMoneyLock::open(&buyer_note)
             .unwrap()
@@ -20532,6 +20548,7 @@ mod tests {
             note_key: None,
             max_price_per_tick: dexdo_core::PRICE_STEP,
             ticks: u128::from(dexdo_core::SUBSCRIPTION_WEEKS),
+            allow_unverified_model: false,
         };
         let plan = super::subscription_place_plan(&place_args).unwrap();
         assert!(backend
@@ -20680,6 +20697,7 @@ mod tests {
             note_key: None,
             max_price_per_tick: dexdo_core::PRICE_STEP,
             ticks,
+            allow_unverified_model: false,
         };
         let plan = super::subscription_place_plan(&place_args).unwrap();
         let place = crate::cli::args::SubscriptionCommand::Place(place_args);
@@ -21011,6 +21029,7 @@ mod tests {
                 note_key: None,
                 max_price_per_tick: price,
                 ticks,
+                allow_unverified_model: false,
             };
             let plan = super::subscription_place_plan(&args).expect("valid subscription");
             let expected = subscription_test_reserve(ticks, price);
@@ -21026,6 +21045,7 @@ mod tests {
                 note_key: None,
                 max_price_per_tick: price,
                 ticks,
+                allow_unverified_model: false,
             };
             assert!(
                 super::subscription_place_plan(&args).is_err(),
@@ -21037,6 +21057,7 @@ mod tests {
                 note_key: None,
                 max_price_per_tick: invalid_price,
                 ticks: 4,
+                allow_unverified_model: false,
             };
             assert!(
                 super::subscription_place_plan(&args).is_err(),
@@ -21048,6 +21069,7 @@ mod tests {
             note_key: None,
             max_price_per_tick: largest_step,
             ticks: 4,
+            allow_unverified_model: false,
         };
         assert!(super::subscription_place_plan(&overflow)
             .expect_err("fee multiplication overflow")
@@ -23473,9 +23495,9 @@ mod tests {
             total_with_fee: 0,
             complete: false,
         };
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": journal.note_addr,
@@ -23483,8 +23505,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
 
         let assigned_order_id = 41;
@@ -24035,15 +24056,14 @@ mod tests {
         let token_contract = format!("0:{}", "8".repeat(64));
         let frame_model = "Qwen3-32B";
         let pool_path = dir.join("pool.json");
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{ "address": note_addr, "owner_secret_key_hex": "00" }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
 
         // The wording of each refusal belongs to the chain side and is pinned there
@@ -25905,9 +25925,9 @@ mod tests {
         let mut fixture = buyer_submit_test_journal();
         fixture.intent = super::BuyerSubmitIntent::on_demand();
         fixture.expected_token_contract = None;
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -25915,8 +25935,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
         let _ = std::fs::remove_file(&money_lock.journal_path);
@@ -26140,9 +26159,9 @@ mod tests {
         );
         fixture.intent = super::BuyerSubmitIntent::on_demand();
         fixture.expected_token_contract = None;
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -26150,8 +26169,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
         let _ = std::fs::remove_file(&money_lock.journal_path);
@@ -26533,9 +26551,9 @@ mod tests {
         journal.escrow = reserve.total_escrow;
         let mut placement = subscription_test_placement(order_id, deadline);
         placement.ticks = journal.ticks;
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": journal.note_addr,
@@ -26543,8 +26561,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&journal.note_addr).unwrap();
         let _ = std::fs::remove_file(&money_lock.journal_path);
@@ -27585,15 +27602,14 @@ mod tests {
 
     fn write_spot_resume_pool(dir: &std::path::Path, note_addr: &str) -> std::path::PathBuf {
         let pool_path = dir.join("pool.json");
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{ "address": note_addr, "owner_secret_key_hex": "00" }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         pool_path
     }
 
@@ -28154,9 +28170,9 @@ mod tests {
         let journal_path = dir.join("journal.json");
         let pool_path = dir.join("pool.json");
         let journal = buyer_submit_test_journal();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": journal.note_addr,
@@ -28164,8 +28180,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         super::write_buyer_submit_journal(&journal_path, &journal).unwrap();
         let quoted_order = journal
@@ -28432,9 +28447,9 @@ mod tests {
         let journal_path = dir.join("journal.json");
         let pool_path = dir.join("pool.json");
         let fixture = buyer_submit_test_journal();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -28442,8 +28457,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let fill = dexdo_core::MatchedFill {
             order_id: buyer_submit_test_quoted(&fixture).order_id,
@@ -28871,9 +28885,9 @@ mod tests {
         );
         fixture.intent = super::BuyerSubmitIntent::on_demand();
         fixture.expected_token_contract = None;
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -28881,8 +28895,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
         // The unresolved submit the crashed process was waiting on, written the ordinary way.
@@ -29104,9 +29117,9 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-entry-raise");
         let pool_path = dir.join("pool.json");
         let fixture = buyer_submit_test_journal();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -29114,8 +29127,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
         let _ = std::fs::remove_file(&money_lock.journal_path);
@@ -29309,9 +29321,9 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-entry-modes");
         let pool_path = dir.join("pool.json");
         let base = buyer_submit_test_journal();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": base.note_addr,
@@ -29319,8 +29331,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&base.note_addr).unwrap();
         let buyer = dexdo::buyer::Buyer::generate();
@@ -29426,9 +29437,9 @@ mod tests {
         let pool_path = dir.join("pool.json");
         let mut fixture = buyer_submit_test_journal();
         fixture.intent = super::BuyerSubmitIntent::on_demand();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -29436,8 +29447,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
         let _ = std::fs::remove_file(&money_lock.journal_path);
@@ -29564,9 +29574,9 @@ mod tests {
         let journal_path = dir.join("journal.json");
         let pool_path = dir.join("pool.json");
         let fixture = buyer_submit_test_journal();
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": fixture.note_addr,
@@ -29574,8 +29584,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let fill = dexdo_core::MatchedFill {
             order_id: buyer_submit_test_quoted(&fixture).order_id,

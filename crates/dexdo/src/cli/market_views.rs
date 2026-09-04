@@ -3,7 +3,7 @@
 use crate::cli::args::*;
 use crate::cli::commands::{
     enforce_model_registry_policy, fold_snapshot_from_orders,
-    load_enabled_model_registry_policy, model_target_from_config, preload_model_registry_policy,
+    load_enabled_model_registry_policy, book_target_for, preload_model_registry_policy,
     print_book_table, read_book_target, read_executable_book_target, registry_requested_model,
     resolve_model_registry_target, resolve_order_book_target, retry_executable_read,
     snapshot_with_executable_orders, target_from_market, target_from_market_for_model, BookRow,
@@ -121,6 +121,12 @@ fn indexer_market_address_query(order_book: &str) -> MarketsQuery<'_> {
 #[cfg(test)]
 #[path = "market_views_1659_tests.rs"]
 mod market_views_1659_tests;
+
+/// the undeployed-book line these views did not have. Its own file so nothing existing here
+/// is edited to make it pass.
+#[cfg(test)]
+#[path = "market_views_1871_tests.rs"]
+mod market_views_1871_tests;
 
 async fn read_executable_market_view_with<FI, FFI, FF, FFF, FB, FBFut>(
     mut indexer_read: FI,
@@ -451,7 +457,12 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
             )?;
             (requested, target)
         }
-    } else if registry_policy.is_some() {
+    } else {
+        // ONE ARM, NOT TWO. This forked on `registry_policy.is_some()`: the registry when a
+        // config file switched it on, a MANDATORY `models.json` otherwise. So the catalog decided
+        // the default and the chain decided only on request -- an authority behind an optional
+
+        // no catalog could not ask what a registered market was.
         let requested_model = budget
             .read(registry_requested_model(
                 &manifest_path,
@@ -460,22 +471,8 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
                 &args.model,
             ))
             .await?;
-        (
-            requested_model.clone(),
-            BookTarget {
-                model_hash: model_hash_for(&requested_model),
-                frame_model: requested_model,
-                order_book: None,
-                root_model: None,
-                note_addr: args.note_addr.clone(),
-            },
-        )
-    } else {
-        let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
-            .map_err(|e| {
-                anyhow::anyhow!("{e}\n(pass --note-addr <dapp_id>::<account_id> so the per-model book can be derived)")
-            })?;
-        (target.frame_model.clone(), target)
+        let target = book_target_for(requested_model.clone(), args.note_addr.clone());
+        (requested_model, target)
     };
     let view = budget
         .read(async {
@@ -511,6 +508,9 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
         })
         .await?;
     let snapshot = &view.snapshot;
+    if !view.active {
+        eprint_book_not_deployed(&snapshot.frame_model, &snapshot.order_book);
+    }
     let rows = executable_market_rows(snapshot)?;
     println!(
         "{}",
@@ -580,6 +580,38 @@ fn render_executable_book_line(
 /// every empty result carries: an empty book prints `empty_model_book=true`, a short head prints
 /// `insufficient_head_ask=true`, an all-lapsed book prints `expired_counterparty_ask=true`, and only
 /// "rows exist, none of them usable" keeps `no_executable_ask=true`.
+/// The book this name derives is not on chain, said out loud.
+
+/// **Why it exists.** `run_executable_book` already says this: an empty result there carries an
+/// `empty_reason` and renders `none=true <class>=true reason=...`. `run_market` and `run_quote` had no
+/// such mechanism -- they read `active` only to feed the policy-gated enforcement, and on an
+/// undeployed book printed the context line and an empty table. An empty table is a statement that
+/// the market is empty, and that is a different fact from the market not existing.
+
+/// **Why it lands with this change rather than after it.** Until now an unknown name was stopped
+/// earlier by the mandatory catalog (`model "x" not found in the config`), so the silent branch was
+/// reachable only for a catalogued name whose book was undeployed. Removing that requirement lets
+/// any unresolvable name reach it, so the same change that widens the path has to close it.
+
+/// **STDERR, not stdout.** `run_quote --json` writes a machine document to stdout and
+/// `machine_contract_covers_readers_1641` reads it; a human line there would corrupt it. This is the
+/// same split `run_markets_address` uses -- the answer on stdout, what it means on stderr.
+/// Rendered rather than printed, so the sentence is asserted without a chain or a terminal -- the
+/// shape `render_no_executable_book_line` beside it already uses.
+pub(crate) fn render_book_not_deployed(frame_model: &str, order_book: &str) -> String {
+    format!(
+        "book_not_deployed=true model={frame_model} order_book={} -- nothing has been listed under \
+         this name, so there is no market here rather than an empty one. Check the spelling with \
+         `dexdo markets address --model {frame_model}`, which names the book the ModelRegistry \
+         derives for it",
+        addr::display(order_book)
+    )
+}
+
+fn eprint_book_not_deployed(frame_model: &str, order_book: &str) {
+    eprintln!("{}", render_book_not_deployed(frame_model, order_book));
+}
+
 fn render_no_executable_book_line(
     snapshot: &OrderBookSnapshot,
     ticks: u128,
@@ -652,7 +684,8 @@ pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> 
             )?;
             (requested, target)
         }
-    } else if registry_policy.is_some() {
+    } else {
+        // One arm, not two -- see `run_market` above for why the fork was wrong.
         let requested_model = budget
             .read(registry_requested_model(
                 &manifest_path,
@@ -661,22 +694,8 @@ pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> 
                 &args.model,
             ))
             .await?;
-        (
-            requested_model.clone(),
-            BookTarget {
-                model_hash: model_hash_for(&requested_model),
-                frame_model: requested_model,
-                order_book: None,
-                root_model: None,
-                note_addr: args.note_addr.clone(),
-            },
-        )
-    } else {
-        let target = model_target_from_config(&args.models, &args.model, args.note_addr.clone())
-            .map_err(|e| {
-                anyhow::anyhow!("{e}\n(pass --note-addr <dapp_id>::<account_id> so the per-model book can be derived)")
-            })?;
-        (target.frame_model.clone(), target)
+        let target = book_target_for(requested_model.clone(), args.note_addr.clone());
+        (requested_model, target)
     };
     let (snapshot, orders, empty_reason) = budget
         .read(async {
@@ -759,7 +778,8 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         }
         let target = target_from_market(market)?;
         (target.frame_model.clone(), target)
-    } else if registry_policy.is_some() {
+    } else {
+        // One arm, not two -- see `run_market` above for why the fork was wrong.
         let model = args
             .model
             .as_deref()
@@ -772,25 +792,8 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
                 model,
             ))
             .await?;
-        (
-            requested_model.clone(),
-            BookTarget {
-                model_hash: model_hash_for(&requested_model),
-                frame_model: requested_model,
-                order_book: None,
-                root_model: None,
-                note_addr: args.note_addr.clone(),
-            },
-        )
-    } else {
-        let target = model_target_from_config(
-            &args.models,
-            args.model
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("quote without --market requires --model"))?,
-            args.note_addr.clone(),
-        )?;
-        (target.frame_model.clone(), target)
+        let target = book_target_for(requested_model.clone(), args.note_addr.clone());
+        (requested_model, target)
     };
     let (view, q) = budget
         .read(async {
@@ -828,6 +831,9 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         })
         .await?;
     let snapshot = &view.snapshot;
+    if !view.active {
+        eprint_book_not_deployed(&snapshot.frame_model, &snapshot.order_book);
+    }
     if args.json {
         let response = quote_response_from_quote(
             chain.network(),

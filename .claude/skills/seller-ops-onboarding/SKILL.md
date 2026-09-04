@@ -380,9 +380,12 @@ to `models.json` in the current working directory, `--policy` and the note pool 
 state directory turns out to be. Under a service manager the working directory is not what it was in
 the shell, and that is where money goes to the wrong wallet. Write out `--data-dir`, `--models`,
 `--policy`, `--market` on every invocation. The manifest is the exception, and it is not a flag at
-all: `DEXDO_MANIFEST` holds the full path to the manifest file, the manifest names the network and
-the endpoint, and there is no default -- unset, the client refuses rather than guessing a network.
-Export it once for the unit; there is nothing left to pin per invocation.
+all: `DEXDO_MANIFEST` holds the full path to the manifest file, and the manifest names the network
+and the endpoint. Unset, the client reads the manifest installed beside the `dexdo` binary -- that
+directory and no other -- so on a host where the binary was installed some other way, or replaced,
+the network can move without the unit file changing. Export it once for the unit and that stops
+being possible: the variable wins wherever it is set, and a path it names that does not exist is
+refused against that path rather than falling back to the installed manifest.
 
 **Say `--non-interactive`, and answer what it then refuses.** A script has nobody to answer a
 question, and the client already treats a run whose input or whose screen is not a terminal exactly

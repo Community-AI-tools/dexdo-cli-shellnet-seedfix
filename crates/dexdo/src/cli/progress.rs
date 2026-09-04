@@ -315,6 +315,11 @@ impl Status {
         guard.line(&text);
     }
 
+    /// Keep a caller-rendered line above the live status line without adding another glyph.
+    pub(crate) fn keep_exact(&self, line: impl AsRef<str>) {
+        lock(&self.shared).line(line.as_ref());
+    }
+
     /// The state this display shares with [`super::progress_capture`], which needs to write through
     /// the same descriptor and to replace the label from a reader thread.
     pub(super) fn shared(&self) -> Arc<Mutex<Shared>> {

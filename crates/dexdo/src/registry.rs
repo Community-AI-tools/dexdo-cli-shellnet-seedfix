@@ -343,11 +343,53 @@ pub fn registry_answered(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<RegistryAnswered>().is_some())
 }
 
+/// Does the refusal this resolution may produce have a READER?
+
+/// The suggestion list exists for one person: an operator who has been STOPPED and needs to see the
+/// registered spelling so they can fix a typo. In a refusal it arrives exactly on time -- nothing
+/// has moved, and the list is what they need next.
+
+/// In the warn-and-continue arm there is no such person. The operator passed
+/// `--allow-unverified-model`, which says "I know this name is unconfirmed, go on"; they are not
+/// stopped, the escrow moves either way, and "did you mean" arrives after the decision was made.
+/// Information with no reader is not care, it is cost -- and it is charged on the hot path:
+/// enumerating the registered names and re-verifying five finalists against chain measured 7.62s
+/// against 1.82s for a name that resolves (`dexdo markets address`, shellnet, 2026-09-03; a second
+/// unresolvable name gave 7.51s).
+
+/// `Skip` does not make the client quiet. The refusal still says the registry did not confirm the
+/// name and still lists every candidate tried; what it stops doing is computing a list nobody
+/// reads, and it names the command that produces one on demand instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrySuggestions {
+    /// The message will be shown to someone who has been stopped. Walk the registry.
+    Compute,
+    /// The caller has already decided to continue past this answer. Do not walk.
+    Skip,
+}
+
 pub async fn resolve_registered_model_identity(
     reader: &(dyn ModelRegistryReader + Send + Sync),
     role: RegistryRole,
     registry_address: &str,
     claimed_model: &str,
+) -> Result<ResolvedModelIdentity> {
+    resolve_registered_model_identity_with(
+        reader,
+        role,
+        registry_address,
+        claimed_model,
+        RegistrySuggestions::Compute,
+    )
+    .await
+}
+
+pub async fn resolve_registered_model_identity_with(
+    reader: &(dyn ModelRegistryReader + Send + Sync),
+    role: RegistryRole,
+    registry_address: &str,
+    claimed_model: &str,
+    suggestions_policy: RegistrySuggestions,
 ) -> Result<ResolvedModelIdentity> {
     let registry_display = dexdo_core::address::display(registry_address);
     let candidates = registry_identity_candidates(claimed_model);
@@ -389,10 +431,32 @@ pub async fn resolve_registered_model_identity(
             _ => misses.push(candidate.clone()),
         }
     }
-    let suggestions = registered_model_suggestions(reader, claimed_model)
-        .await
-        .unwrap_or_default();
-    // Both of these are VERDICTS: every candidate was looked up and none is registered.
+    // THE WALK IS HERE OR IT IS NOWHERE, and the `if` above it is the whole change.
+
+    // It used to run unconditionally, before this function had any idea whether its answer would
+    // be shown. The caller decided that afterwards -- `model_resolution_result` and
+    // `buyer_content_identity_resolution_result` both look at `--allow-unverified-model` on the way
+    // out -- so on the warn path the registry was enumerated and five finalists re-verified to
+    // build a list that was then swallowed. That is not a rendering detail: it is the difference
+    // between 1.82s and 7.62s of a seller preflight that has 18s to reach a resting offer.
+    let suggestions = match suggestions_policy {
+        RegistrySuggestions::Compute => registered_model_suggestions(reader, claimed_model)
+            .await
+            .unwrap_or_default(),
+        RegistrySuggestions::Skip => Vec::new(),
+    };
+    // A VERDICT either way: every candidate was looked up and none is registered. `Skip` changes
+    // what the message can offer, never what it reports.
+    if matches!(suggestions_policy, RegistrySuggestions::Skip) {
+        return Err(RegistryAnswered::error(format!(
+            "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}; run `dexdo markets address --model {}` for the registered spellings closest to it",
+            role.as_str(),
+            claimed_model,
+            registry_display,
+            misses,
+            claimed_model
+        )));
+    }
     if !suggestions.is_empty() {
         return Err(RegistryAnswered::error(format!(
             "{} content identity registry check failed: claimed model {} does not resolve to a registered ModelRegistry {} identity; tried {:?}; registered canonical suggestions: {:?}",

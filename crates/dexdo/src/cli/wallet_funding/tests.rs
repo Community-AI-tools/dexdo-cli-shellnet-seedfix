@@ -407,6 +407,7 @@ async fn a_repeat_after_an_unobserved_successful_spend_does_not_spend_twice() {
     let provider2 = FakeProvider::ackinacki(RequestPresence::Present {
         transaction_hash: Some("tx-from-run-1".to_string()),
         pending_transaction_id: Some("pending-7".to_string()),
+        chain_created_at_unix: None,
     });
     let second = run(dir.path(), &binding, &chain2, &provider2, tight_bounds()).await;
     assert!(second.is_err(), "still unfunded, so the wait still fails");
@@ -424,7 +425,7 @@ async fn a_repeat_after_an_unobserved_successful_spend_does_not_spend_twice() {
 }
 
 #[tokio::test]
-async fn the_repeat_probes_for_the_request_the_first_run_recorded() {
+async fn an_exact_repeat_probes_the_request_the_first_run_recorded() {
     let dir = temp();
     let binding = binding(WalletProvider::AckinackiWallet);
 
@@ -438,12 +439,13 @@ async fn the_repeat_probes_for_the_request_the_first_run_recorded() {
     let recorded_shortfall = record(dir.path()).expect("record").shortfall.clone();
     assert_eq!(recorded_shortfall.get(&SHELL), Some(&900));
 
-    // The Hot moved: today's shortfall is different. The repeat must still look for the request the
-    // earlier run may have created, which is the recorded one - otherwise it cannot recognise it.
-    let chain2 = FakeChain::always(400);
+    // The exact same shortfall must look for the request the earlier run may have created rather
+    // than prepare another generation.
+    let chain2 = FakeChain::always(100);
     let provider2 = FakeProvider::ackinacki(RequestPresence::Present {
         transaction_hash: None,
         pending_transaction_id: None,
+        chain_created_at_unix: None,
     });
     let _ = run(dir.path(), &binding, &chain2, &provider2, tight_bounds()).await;
 
@@ -452,7 +454,7 @@ async fn the_repeat_probes_for_the_request_the_first_run_recorded() {
     assert_eq!(
         probed.shortfall.get(&SHELL),
         Some(&900),
-        "the probe must describe the RECORDED request, not today's shortfall"
+        "the probe must describe the recorded exact request"
     );
     assert_eq!(probed.creator_pubkey, "creator-pubkey");
     assert_eq!(probed.hot_address, self_dapp_hot());

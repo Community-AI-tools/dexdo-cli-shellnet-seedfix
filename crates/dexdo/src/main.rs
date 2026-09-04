@@ -25,6 +25,7 @@ use cli::policy;
 #[command(
     name = "dexdo",
     version,
+    long_version = env!("DEXDO_LONG_VERSION"),
     about = "dexdo -- private inference market: seller and buyer clients"
 )]
 struct Cli {
@@ -373,6 +374,7 @@ enum Command {
 impl Command {
     fn machine_operation(&self) -> Option<&'static str> {
         match self {
+            Command::Doctor(args) if args.json => Some(machine::OP_DOCTOR),
             Command::ModelRegistry(args) if args.json => Some(machine::OP_MODEL_REGISTRY),
             // the address subcommand asks a narrower question but is the same command,
             // so its JSON failures report under the same operation. `raw_machine_operation`
@@ -516,6 +518,7 @@ fn raw_machine_operation(args: &[std::ffi::OsString]) -> Option<&'static str> {
     };
     for (idx, arg) in args.iter().enumerate().skip(1) {
         let op = match arg.to_str()? {
+            "doctor" | "health" => machine::OP_DOCTOR,
             "model-registry" => machine::OP_MODEL_REGISTRY,
             "markets" => machine::OP_MARKETS,
             "quote" => machine::OP_QUOTE,
@@ -1355,7 +1358,7 @@ mod note_cli_tests {
 
 #[cfg(test)]
 mod doctor_cli_tests {
-    use super::{Cli, Command};
+    use super::{machine, raw_machine_operation, Cli, Command};
     use clap::Parser;
 
     /// `dexdo doctor` is the read-only chain health guard; `health` is kept as an alias.
@@ -1363,9 +1366,36 @@ mod doctor_cli_tests {
     fn doctor_subcommand_parses() {
         let c = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor parses");
         assert!(matches!(c.command, Command::Doctor(_)));
+        assert_eq!(c.command.machine_operation(), None);
+        let c = Cli::try_parse_from(["dexdo", "doctor", "--json"])
+            .expect("doctor machine mode parses");
+        let Command::Doctor(ref args) = c.command else {
+            panic!("expected doctor command");
+        };
+        assert!(args.json);
+        assert_eq!(c.command.machine_operation(), Some(machine::OP_DOCTOR));
         let c = Cli::try_parse_from(["dexdo", "health", "--market", "m.json"])
             .expect("health alias parses");
         assert!(matches!(c.command, Command::Doctor(_)));
+    }
+
+    #[test]
+    fn invalid_doctor_json_arguments_are_attributed_before_clap_parses() {
+        let raw = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for command in ["doctor", "health"] {
+            assert_eq!(
+                raw_machine_operation(&raw(&["dexdo", command, "--json", "--bad-argument"])),
+                Some(machine::OP_DOCTOR)
+            );
+            assert_eq!(
+                raw_machine_operation(&raw(&["dexdo", command, "--bad-argument"])),
+                None
+            );
+        }
     }
 
     /// `--network` is refused, and a URL through it most of all.
@@ -3251,7 +3281,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let endpoints = dir.join("endpoints.json");
         let note_key = dir.join("buyer.key");
-        std::fs::write(&note_key, "11".repeat(32)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&note_key, &"11".repeat(32));
         let endpoints_arg = endpoints.to_str().unwrap();
         let note_key_arg = note_key.to_str().unwrap();
         // One SHELL a tick -- what the argument now takes, and what the book's step is.

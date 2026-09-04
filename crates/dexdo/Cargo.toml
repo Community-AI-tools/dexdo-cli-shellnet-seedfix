@@ -65,6 +65,29 @@ pbkdf2.workspace = true
 tiny-bip39.workspace = true
 zeroize.workspace = true
 tvm_client = { workspace = true }
+# The operating system's own secret store, where the operating system has one. Declared with no
+# backend here on purpose: with no backend selected the crate resolves to its in-process mock, whose
+# persistence is `EntryOnly`, and `secret_store` accepts a store only when it reports `UntilDelete`.
+# So the base dependency buys one thing -- the same code compiles and is type-checked on every
+# platform, including the Linux host that is the only one continuous integration builds -- while the
+# per-target tables below are what actually turn a store on. Measured cost of the base dependency:
+# one crate; its only dependency, `log`, is already in this graph.
+keyring = { version = "3" }
+
+# Keychain Services. `security-framework` is already in the macOS graph through
+# reqwest -> rustls-platform-verifier, so `-framework Security` is already linked on this target and
+# the backend adds no system library of its own.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+# Credential Manager. Its `windows-sys` is NOT the one declared below for the owner-only DACL: that
+# one is `0.59`, keyring asks for `^0.60`, and pre-1.0 minors are semver-incompatible, so these
+# are two separate copies that move independently -- raising ours does not carry keyring with it.
+# The cost is still zero, for a different reason: `windows-sys 0.60.2` was already in the Windows
+# graph through `tvm_client` -> `tvm_executor` -> `wasmtime v36.0.11` before keyring was added.
+[target.'cfg(target_os = "windows")'.dependencies.keyring]
+version = "3"
+features = ["windows-native"]
 
 # the POSIX existence probe (`kill(pid, 0)`) that corroborates an unlocked sentinel. Already
 # in this build graph -- this only makes it callable from here.

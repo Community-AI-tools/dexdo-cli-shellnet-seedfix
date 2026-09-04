@@ -48,6 +48,7 @@ fn refusal_seller_args(
         price_per_tick: dexdo_core::PRICE_STEP as u64,
         mock_token_count: 4,
         model: None,
+        allow_unverified_model: false,
         models: root.join("unused-models.json"),
         policy: Some(policy),
     }
@@ -68,7 +69,7 @@ enum RefusedStartupOutcome {
 async fn a_startup_refused_at_max_open_deals_funds_no_replacement_token_contract() {
     let root = tempfile::tempdir().expect(" regression directory");
     let seller_seed = [0x14; 32];
-    std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+    crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
     let seller_note = Arc::new(
         dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
             .unwrap()
@@ -104,9 +105,9 @@ async fn a_startup_refused_at_max_open_deals_funds_no_replacement_token_contract
 
     // The canonical single-deal seller policy, the one the mainnet run used.
     let policy_path = root.path().join("seller-policy.json");
-    std::fs::write(
+    crate::cli::support::write_owner_only_key_fixture(
         &policy_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
+        &serde_json::to_string_pretty(&serde_json::json!({
             "version": 1,
             "seller": {
                 "on": {
@@ -118,8 +119,7 @@ async fn a_startup_refused_at_max_open_deals_funds_no_replacement_token_contract
             }
         }))
         .unwrap(),
-    )
-    .unwrap();
+    );
 
     // The settled deal as an earlier run left it: a handle in the deals directory and an
     // authoritative owner-fill lineage with unmatched capacity and no successor linked yet.

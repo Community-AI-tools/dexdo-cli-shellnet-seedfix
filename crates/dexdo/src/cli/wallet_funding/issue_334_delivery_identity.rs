@@ -20,6 +20,7 @@
 //! is what the chain reports.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use super::providers::{
     AckinackiVaultProvider, QueuedTransfer, VaultChain, VaultQueueEvent, VaultQueueEventKind,
@@ -30,9 +31,9 @@ const SHELL: u32 = 2;
 /// What the first command needs, and therefore what generation 1 carries.
 const FIRST_REQUIREMENT: u128 = 400;
 /// What the next command needs. Larger, so the requirement stays unmet and the executed generation
-/// has to be reconciled rather than simply closed.
-const SECOND_REQUIREMENT: u128 = 1_000;
-const WINDOW: u64 = 3_600;
+/// has to be reconciled rather than simply closed. Its remainder deliberately equals the first
+/// transfer: once that transfer is provably credited and closed, the same amount is valid again.
+const SECOND_REQUIREMENT: u128 = 800;
 const QUEUED_AT: u64 = 1_000_000;
 
 fn hex64(byte: u8) -> String {
@@ -99,10 +100,13 @@ struct FakeVault {
     queue: RefCell<Vec<QueuedTransfer>>,
     history: RefCell<Vec<VaultQueueEvent>>,
     delivery: Cell<Delivery>,
+    delivery_after_first_probe: Cell<Option<Delivery>>,
+    delivery_probes: Cell<usize>,
     now: Cell<u64>,
     submits: Cell<usize>,
     submitted: RefCell<Vec<FundingFingerprint>>,
     next_id: Cell<u64>,
+    credit_on_delivery: RefCell<Option<(Rc<Cell<u128>>, u128)>>,
 }
 
 impl FakeVault {
@@ -111,11 +115,22 @@ impl FakeVault {
             queue: RefCell::new(Vec::new()),
             history: RefCell::new(Vec::new()),
             delivery: Cell::new(delivery),
+            delivery_after_first_probe: Cell::new(None),
+            delivery_probes: Cell::new(0),
             now: Cell::new(QUEUED_AT),
             submits: Cell::new(0),
             submitted: RefCell::new(Vec::new()),
             next_id: Cell::new(7),
+            credit_on_delivery: RefCell::new(None),
         }
+    }
+
+    fn credit_hot_when_delivery_is_resolved(&self, hot: &FakeHot, amount: u128) {
+        *self.credit_on_delivery.borrow_mut() = Some((hot.shell.clone(), amount));
+    }
+
+    fn resolve_delivery_after_first_probe(&self) {
+        self.delivery_after_first_probe.set(Some(Delivery::Proven));
     }
 }
 
@@ -141,19 +156,24 @@ impl VaultChain for &FakeVault {
             "a delivery may only ever be proven at the destination the generation froze"
         );
         assert_eq!(destination_dapp_id, hex64(0xa1));
-        match self.delivery.get() {
-            Delivery::Proven => Ok(Some(format!("delivery-of-{sent_event_message_id}"))),
+        let delivery = self.delivery.get();
+        let probe = self.delivery_probes.get();
+        self.delivery_probes.set(probe + 1);
+        if probe == 0 {
+            if let Some(next) = self.delivery_after_first_probe.take() {
+                self.delivery.set(next);
+            }
+        }
+        match delivery {
+            Delivery::Proven => {
+                if let Some((shell, amount)) = self.credit_on_delivery.borrow_mut().take() {
+                    shell.set(shell.get() + amount);
+                }
+                Ok(Some(format!("delivery-of-{sent_event_message_id}")))
+            }
             Delivery::Unproven => Ok(None),
             Delivery::Unreadable => bail!("the delivery message could not be read"),
         }
-    }
-
-    async fn expiration_window_secs(&self) -> Result<u64> {
-        Ok(WINDOW)
-    }
-
-    async fn chain_time_secs(&self) -> Result<u64> {
-        Ok(self.now.get())
     }
 
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
@@ -191,23 +211,54 @@ impl VaultChain for &FakeVault {
 
 /// A Hot whose balances are whatever the chain would report at that moment.
 struct FakeHot {
-    shell: u128,
+    shell: Rc<Cell<u128>>,
+    reads: Cell<usize>,
+    never_answer_on_read: Cell<Option<usize>>,
+    no_answer_then_hold: Cell<Option<(usize, u128)>>,
 }
 
 impl FakeHot {
     /// A Hot with every native unit this money path can attach, holding `shell` ECC[2]. The native
     /// leg is deliberately never the refusal here: what is under test is the SHELL identity.
     fn holding(shell: u128) -> Self {
-        Self { shell }
+        Self {
+            shell: Rc::new(Cell::new(shell)),
+            reads: Cell::new(0),
+            never_answer_on_read: Cell::new(None),
+            no_answer_then_hold: Cell::new(None),
+        }
+    }
+
+    fn never_answer_on_read(&self, read: usize) {
+        self.never_answer_on_read.set(Some(read));
+    }
+
+    fn no_answer_then_hold(&self, read: usize, shell: u128) {
+        self.no_answer_then_hold.set(Some((read, shell)));
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl HotBalanceReader for FakeHot {
     async fn hot_balances(&self, _hot: &CanonicalAddress) -> Result<HotBalances> {
+        let read = self.reads.get() + 1;
+        self.reads.set(read);
+        if self.never_answer_on_read.get() == Some(read) {
+            std::future::pending::<()>().await;
+        }
+        if let Some((failed_read, next_shell)) = self.no_answer_then_hold.get() {
+            if failed_read == read {
+                self.no_answer_then_hold.set(None);
+                self.shell.set(next_shell);
+                bail!(
+                    "{}5 attempt(s) in 45s",
+                    dexdo_core::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX
+                );
+            }
+        }
         Ok(HotBalances::new(
             vault_to_hot_native_value(),
-            [(SHELL, self.shell)],
+            [(SHELL, self.shell.get())],
         ))
     }
 }
@@ -228,6 +279,16 @@ async fn money_command_run(
     hot: &FakeHot,
     required: u128,
 ) -> Result<FundedHot> {
+    money_command_run_with_bounds(dir, vault, hot, required, one_pass_bounds()).await
+}
+
+async fn money_command_run_with_bounds(
+    dir: &Path,
+    vault: &FakeVault,
+    hot: &FakeHot,
+    required: u128,
+    bounds: FundingWaitBounds,
+) -> Result<FundedHot> {
     let recorded = record_of(dir)
         .filter(FundingJournalRecord::is_open)
         .map(|record| record.recorded_request());
@@ -240,7 +301,7 @@ async fn money_command_run(
             operation: "note deploy",
             creator_pubkey: &creator(),
             data_dir: dir,
-            bounds: one_pass_bounds(),
+            bounds,
         },
         HotTurn::AcquireOwn,
         hot,
@@ -276,33 +337,21 @@ fn the_vault_transfer_executes(vault: &FakeVault) {
 // The defect: a balance that grew by the right amount, for the wrong reason
 // ---------------------------------------------------------------------------------------------
 
-/// Someone else's transfer arrives while ours is still in flight.
-
-/// The Hot now reads exactly what it would read had our delivery landed: the balance generation 1
-/// was sized against, plus the amount generation 1 carries. Sizing generation 2 from that reading
-/// asks the Vault for the remaining shortfall while the Vault still owes the first one - and once
-/// the original delivery lands, the Hot has been credited twice out of a cold Vault.
-
-/// Only the delivery's own identity separates the two readings, and here the chain cannot yet name
-/// it. So nothing is submitted.
+/// An unproven delivery does not duplicate the same exact live amount.
 #[tokio::test]
-async fn an_unrelated_credit_of_the_expected_size_opens_no_second_generation() {
+async fn an_unproven_delivery_does_not_duplicate_the_same_exact_amount() {
     let dir = temp();
     let vault = FakeVault::with_delivery(Delivery::Unproven);
     generation_one(dir.path(), &vault).await;
     the_vault_transfer_executes(&vault);
 
-    // The balance the OLD aggregate test accepts as proof of delivery: pre-delivery balance (0)
-    // plus exactly what generation 1 carries (400). It came from somewhere else.
-    let hot = FakeHot::holding(FIRST_REQUIREMENT);
-    let _ = money_command_run(dir.path(), &vault, &hot, SECOND_REQUIREMENT).await;
+    let hot = FakeHot::holding(0);
+    let _ = money_command_run(dir.path(), &vault, &hot, FIRST_REQUIREMENT).await;
 
     assert_eq!(
         vault.submits.get(),
         1,
-        "an aggregated balance that grew by the carried amount does not identify WHICH transfer \
-         grew it; while the delivery cannot be named, a replacement generation would ask the Vault \
-         for a shortfall it is already sending"
+        "an exact live amount remains de-duplicated while its delivery cannot be proven"
     );
     let after = record_of(dir.path()).expect("the executed generation stays recorded");
     assert_eq!(
@@ -345,12 +394,204 @@ async fn a_delivery_the_chain_can_name_opens_the_next_generation_for_the_exact_r
     assert_eq!(
         after.fingerprint.cc.get(&SHELL),
         Some(&(SECOND_REQUIREMENT - FIRST_REQUIREMENT)),
-        "the replacement carries the exact remaining shortfall, not the original amount"
+        "the replacement carries the exact remaining shortfall even when it equals the completed \
+         generation's amount"
     );
     assert_eq!(
         vault.submitted.borrow().len(),
         2,
         "exactly two transfers were ever put on the wire"
+    );
+}
+
+/// The balance used to size a replacement must be read after the destination receipt is known.
+/// Here the first 400 are unrelated funds. The executed generation's own 400 land exactly while
+/// the provider resolves its delivery message, so the pre-receipt read says "short 400" while the
+/// required post-receipt read says "funded".
+#[tokio::test]
+async fn a_pre_receipt_balance_cannot_open_a_duplicate_remainder() {
+    let dir = temp();
+    let vault = FakeVault::with_delivery(Delivery::Proven);
+    generation_one(dir.path(), &vault).await;
+    the_vault_transfer_executes(&vault);
+
+    let hot = FakeHot::holding(FIRST_REQUIREMENT);
+    vault.credit_hot_when_delivery_is_resolved(&hot, FIRST_REQUIREMENT);
+    let funded = money_command_run(dir.path(), &vault, &hot, SECOND_REQUIREMENT).await;
+
+    assert_eq!(
+        hot.reads.get(),
+        2,
+        "the Hot must be read again after the finalized delivery receipt is resolved"
+    );
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "the stale pre-receipt shortfall must not create a second Vault transfer"
+    );
+    assert_eq!(
+        funded.expect("the post-receipt balance is sufficient").observed.get(SHELL),
+        SECOND_REQUIREMENT,
+    );
+    let record = record_of(dir.path()).expect("record");
+    assert_eq!(
+        record.state,
+        FundingState::Satisfied,
+        "generation 1 closes only against the post-receipt balance"
+    );
+    assert_eq!(
+        record
+            .satisfied_balances
+            .as_ref()
+            .and_then(|balances| balances.get(&SHELL)),
+        Some(&SECOND_REQUIREMENT),
+        "the journal must persist the post-receipt balance, not the stale first read"
+    );
+}
+
+/// A receipt that appears on a later poll still shares the command's original wait deadline. The
+/// mandatory read is allowed to consume what remains of that window, but it cannot silently start a
+/// new unbounded chain-read budget.
+#[tokio::test]
+async fn a_late_post_receipt_read_cannot_outlive_the_funding_wait() {
+    let dir = temp();
+    let vault = FakeVault::with_delivery(Delivery::Unproven);
+    generation_one(dir.path(), &vault).await;
+    the_vault_transfer_executes(&vault);
+    vault.resolve_delivery_after_first_probe();
+
+    let hot = FakeHot::holding(FIRST_REQUIREMENT);
+    hot.never_answer_on_read(3);
+    let started = tokio::time::Instant::now();
+    let result = money_command_run_with_bounds(
+        dir.path(),
+        &vault,
+        &hot,
+        SECOND_REQUIREMENT,
+        FundingWaitBounds {
+            timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+            lock_timeout: Duration::from_millis(200),
+            lock_poll: Duration::from_millis(1),
+        },
+    )
+    .await;
+
+    let refusal = result.expect_err("the post-receipt read must share the funding deadline");
+    let refusal_chain = format!("{refusal:#}");
+    assert!(
+        refusal_chain.contains("timed out after 0s"),
+        "the operator must get the ordinary funding-timeout verdict: {refusal_chain}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the post-receipt read escaped the funding deadline"
+    );
+    assert_eq!(hot.reads.get(), 3, "the third read is the post-receipt read");
+    assert_eq!(vault.submits.get(), 1, "a timed-out read submits nothing");
+    let record = record_of(dir.path()).expect("record");
+    assert_eq!(record.state, FundingState::Executed);
+    assert!(
+        record
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.delivery_message_id.is_some()),
+        "the finalized receipt remains durable for the next command"
+    );
+}
+
+/// Exhausting one shared-reader attempt after the receipt is not a balance verdict. The finalized
+/// delivery evidence is already durable at this point, so the same funding wait must poll again
+/// rather than fail the command or submit another transfer.
+#[tokio::test]
+async fn a_post_receipt_no_answer_is_retried_within_the_funding_wait() {
+    let dir = temp();
+    let vault = FakeVault::with_delivery(Delivery::Proven);
+    generation_one(dir.path(), &vault).await;
+    the_vault_transfer_executes(&vault);
+
+    let hot = FakeHot::holding(FIRST_REQUIREMENT);
+    hot.no_answer_then_hold(2, SECOND_REQUIREMENT);
+    let funded = money_command_run_with_bounds(
+        dir.path(),
+        &vault,
+        &hot,
+        SECOND_REQUIREMENT,
+        FundingWaitBounds {
+            timeout: Duration::from_secs(30),
+            poll: Duration::from_millis(1),
+            lock_timeout: Duration::from_millis(200),
+            lock_poll: Duration::from_millis(1),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        funded
+            .expect("the next Hot read within the funding window is sufficient")
+            .observed
+            .get(SHELL),
+        SECOND_REQUIREMENT,
+    );
+    assert_eq!(
+        hot.reads.get(),
+        3,
+        "the ordinary polling path must retry the failed post-receipt read"
+    );
+    assert_eq!(
+        vault.submits.get(),
+        1,
+        "a transient read failure must not submit a second transfer"
+    );
+    let record = record_of(dir.path()).expect("record");
+    assert_eq!(record.state, FundingState::Satisfied);
+    assert!(
+        record
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.delivery_message_id.is_some()),
+        "the finalized delivery evidence remains durable across the failed read"
+    );
+}
+
+/// The same transient failure can occur while an already sufficient Hot is reconciling its exact
+/// recorded generation. That caller must rejoin the funding wait too, rather than turn a temporary
+/// read failure into a queue-settlement refusal.
+#[tokio::test]
+async fn an_already_funded_reconciliation_retries_a_post_receipt_no_answer() {
+    let dir = temp();
+    let vault = FakeVault::with_delivery(Delivery::Proven);
+    generation_one(dir.path(), &vault).await;
+    the_vault_transfer_executes(&vault);
+
+    let hot = FakeHot::holding(FIRST_REQUIREMENT);
+    hot.no_answer_then_hold(2, FIRST_REQUIREMENT);
+    let funded = money_command_run_with_bounds(
+        dir.path(),
+        &vault,
+        &hot,
+        FIRST_REQUIREMENT,
+        FundingWaitBounds {
+            timeout: Duration::from_secs(30),
+            poll: Duration::from_millis(1),
+            lock_timeout: Duration::from_millis(200),
+            lock_poll: Duration::from_millis(1),
+        },
+    )
+    .await
+    .expect("the already-funded reconciliation must retry the Hot read");
+
+    assert_eq!(funded.observed.get(SHELL), FIRST_REQUIREMENT);
+    assert_eq!(hot.reads.get(), 3, "the failed read must be retried");
+    assert_eq!(vault.submits.get(), 1, "reconciliation submits nothing");
+    let record = record_of(dir.path()).expect("record");
+    assert_eq!(record.state, FundingState::Satisfied);
+    assert!(
+        record
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.delivery_message_id.is_some()),
+        "the finalized delivery evidence remains durable across the failed read"
     );
 }
 
@@ -388,10 +629,7 @@ async fn the_proven_delivery_is_recorded_as_its_own_journal_field() {
 // A read that failed is not an answer about money
 // ---------------------------------------------------------------------------------------------
 
-/// The queue proves execution and the delivery read fails. Two different facts are now missing at
-/// once, and neither may be guessed: the verdict falls back to `Unknown`, which submits nothing and
-/// retires nothing. Reading a failed read as "no delivery" would be the same double transfer by a
-/// different route.
+/// A delivery read failure cannot authorize a duplicate of the same exact live amount.
 #[tokio::test]
 async fn a_delivery_read_that_failed_leaves_the_verdict_unknown_and_submits_nothing() {
     let dir = temp();
@@ -399,8 +637,8 @@ async fn a_delivery_read_that_failed_leaves_the_verdict_unknown_and_submits_noth
     generation_one(dir.path(), &vault).await;
     the_vault_transfer_executes(&vault);
 
-    let hot = FakeHot::holding(FIRST_REQUIREMENT);
-    let _ = money_command_run(dir.path(), &vault, &hot, SECOND_REQUIREMENT).await;
+    let hot = FakeHot::holding(0);
+    let _ = money_command_run(dir.path(), &vault, &hot, FIRST_REQUIREMENT).await;
 
     assert_eq!(
         vault.submits.get(),

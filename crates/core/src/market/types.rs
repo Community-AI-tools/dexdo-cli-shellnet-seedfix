@@ -2715,6 +2715,17 @@ mod tests {
             ),
             ("CLI args", include_str!("../../../dexdo/src/cli/args.rs")),
             ("CLI main help", include_str!("../../../dexdo/src/main.rs")),
+            // This guard was green and right about every file it listed -- and the ONE file
+            // in the tree that still read `prepaid`/`frozen`/`prepaidTime`/`lastAdvance` was not on
+            // the list, so the settlement receipt declared every live deal `inconsistent` for five
+            // contract generations with a check for exactly that defect passing beside it. Verified
+            // by execution rather than by reading: with this entry added and the parser at its
+            // pre-fix revision this test FAILS -- "CLI settlement receipt:135 still reads/renders a
+            // deleted field or reclaim path: prepaid: String," -- and passes on the fixed one.
+            (
+                "CLI settlement receipt",
+                include_str!("../../../dexdo/src/cli/settlement_receipt.rs"),
+            ),
         ];
         for (source_name, source) in sources {
             for (line_index, line) in source.lines().enumerate() {

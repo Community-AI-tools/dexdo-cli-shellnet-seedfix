@@ -16,7 +16,7 @@ use crate::cli::support::{
     require_provision_nonce, resolve_market_fields, validate_price_step, SHELL_UNIT,
 };
 use anyhow::Result;
-use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole, RegistrySuggestions};
 use dexdo_core::params::{
     MARKET_DEPLOY_ACTIVATION_MAX_READS, MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL,
 };
@@ -40,18 +40,34 @@ use dexdo_core::params::{
 /// `command` names the command the operator actually ran. `deploy-market` asks this same
 /// question now, and a refusal hard-coded to say "provision" would tell them a command they did not
 /// run had refused -- the class of defect this branch exists to remove.
-async fn ensure_model_resolves(
+pub(crate) async fn ensure_model_resolves(
     caller: ModelResolutionCaller,
     contracts: &std::path::Path,
     endpoint: Option<&str>,
     requested_model: &str,
     allow_unverified_model: bool,
 ) -> Result<()> {
+    // The FLAG axis, judged before the registry is read.
+
+    // A name that claims capability flags is claiming a grammar, and a claimed grammar can be wrong
+    // on its own terms -- `--toolz`, `--fp9`, `--tools--w8k` out of order -- without the chain
+    // having any part in the answer. That verdict needs no network, so it is reached without one,
+    // and the refusal names the offending token instead of the generic "does not resolve" the
+    // registry read would otherwise have produced for the same name.
+    ensure_model_flags_are_canonical(caller, requested_model, allow_unverified_model)?;
     let resolved = resolve_registry_content_identity(
         RegistryRole::Seller,
         contracts,
         endpoint,
         requested_model,
+        // The operator already said "go on". `model_resolution_result` below
+        // turns this Err into a warning when the flag is set, so a suggestion list computed here
+        // is built for a refusal that will not happen. The warning still reports the fact.
+        if allow_unverified_model {
+            RegistrySuggestions::Skip
+        } else {
+            RegistrySuggestions::Compute
+        },
     )
     .await;
     // `.map(drop)` and that is now correct rather than merely convenient. reported the
@@ -60,6 +76,63 @@ async fn ensure_model_resolves(
     // below, a successful resolution returns a name equal to the one that was asked about, so
     // there is nothing left to carry.
     model_resolution_result(caller, requested_model, allow_unverified_model, resolved).map(drop)
+}
+
+/// Does a name that CLAIMS capability flags spell them the one canonical way?
+
+/// **The source, and there is one.** The flag grammar is defined exactly once in this tree, by
+/// `dexdo_core::parse_canonical_model_id` (`crates/core/src/manifest.rs`), whose own doc states it:
+/// `producer--model--version[--unit][--w<N>k][--<N>p][--tools][--think][--<precision>]`, each slot at
+/// most once, the order fixed, and rejecting rather than normalizing.
+
+/// CALLS that definition rather than restating it: a second statement of a grammar is a second
+/// grammar, and two of them on one name is the defect was about.
+
+/// **This is not the shape gate removed, and the bound is what makes that true.**
+/// `validate_canonical_model_id` used to stand on the operate commands and require three `--` parts
+/// of EVERY name, so `Qwen3-32B` -- which the 4.0.36 catalog actually holds -- was refused before the
+/// catalog was asked. This runs only when the name ALREADY has more than three parts, which is to say
+/// only when it claims a flag tail. No name the registry can hold reaches it: the catalog carries no
+/// `--` at all (`grep -c -- "--" contracts/canonical-model-ids.md` is 0 over its 11257 lines, and the
+/// control -- the same pattern over a copy with one flagged name prepended -- reports 1), so a name
+/// with a flag tail is never a registered spelling. `.nth(3)` is the same base arity the dropped-flag
+/// scan below counts with `.skip(3)`.
+
+/// **`--allow-unverified-model` bypasses this, and that is the directive's own scoping rather than a
+/// softening.** Section 5 lists exactly one thing the flag does not cover -- a name the registry
+/// confirmed under a different spelling, a confirmed model plus an operator typo -- and that arm
+/// stays un-bypassable where it already is, below. Everything else the flag covers, and its stated
+/// business purpose is trading a model the catalog does not confirm: a NEW one, or the operator's
+/// OWN. An own name is precisely a name this grammar has no authority over, and
+/// `acme--vision--v1--internal` is indistinguishable in code from a canonical name carrying one bad
+/// flag. Refusing it under the flag would be the shape gate returning at a new address -- a
+/// name refused for its shape.
+
+/// So on the default path the gate bites, and under the flag the operator has already said the
+/// catalog is not the authority on this name. Measured before choosing: of the 14 names with a flag
+/// tail anywhere in this tree, the 5 that fail this grammar are all deliberate negative fixtures
+/// (`crates/core/tests/canonical_model_id_1225.rs`, `crates/core/src/manifest.rs`, and the alias case
+/// in `registry.rs`); no operator-facing name in the tree is affected either way.
+pub(crate) fn ensure_model_flags_are_canonical(
+    caller: ModelResolutionCaller,
+    requested_model: &str,
+    allow_unverified_model: bool,
+) -> Result<()> {
+    if allow_unverified_model || requested_model.split("--").nth(3).is_none() {
+        return Ok(());
+    }
+    let command = caller.command();
+    let paid_for = caller.paid_for();
+    dexdo_core::parse_canonical_model_id(requested_model).map_err(|reason| {
+        anyhow::anyhow!(
+            "{command} refuses before deploying anything: `{requested_model}` carries capability \
+             flags and {reason}. The canonical flag grammar is \
+             `producer--model--version[--<unit>][--w<N>k][--<N>p][--tools][--think][--<precision>]` \
+             -- every flag is one of those tokens, each slot appears at most once, and the slots keep \
+             that order. Nothing was sent, and {paid_for} had this gone through"
+        )
+    })?;
+    Ok(())
 }
 
 /// Did the registry ANSWER "no", or could it not be asked?
@@ -99,6 +172,16 @@ pub(crate) enum ModelResolutionCaller {
     Provision,
     /// Deploys the order book, and nothing else.
     DeployMarket,
+    /// Lists the model: posts the sell offer, and deploys the order book first when it is absent.
+
+    /// The book deploy is not hypothetical and it is why this variant exists. The seller's
+    /// own `post_offer` reads `inference_orderbook_stats` and, on `None`, calls
+    /// `deploy_inference_orderbook` out of the note before it writes the ask
+    /// (`crates/core/src/chain/backends.rs`, "An operate exception:... deploy it
+    /// (model listing)"). So `dexdo seller` is a command that CREATES a market under whatever name
+    /// it was handed, which is exactly the spend `provision` and `deploy-market` already ask the
+    /// registry about first.
+    Seller,
 }
 
 impl ModelResolutionCaller {
@@ -107,6 +190,7 @@ impl ModelResolutionCaller {
         match self {
             Self::Provision => "provision",
             Self::DeployMarket => "deploy-market",
+            Self::Seller => "seller",
         }
     }
 
@@ -117,6 +201,10 @@ impl ModelResolutionCaller {
                 "the order book, RootModel and TokenContract would be paid for and never trade"
             }
             Self::DeployMarket => "the order book would be paid for and never trade",
+            Self::Seller => {
+                "the order book this listing deploys when it is absent would be paid for and never \
+                 trade"
+            }
         }
     }
 }
@@ -489,6 +577,12 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     println!("{json}");
     Ok(())
 }
+
+/// the seller lists only a confirmed name, and only flags the grammar can spell. Its own
+/// file so nothing here is edited to make it pass.
+#[cfg(test)]
+#[path = "admin_1855_registry_gate_tests.rs"]
+mod admin_1855_registry_gate_tests;
 
 #[cfg(test)]
 mod tests {

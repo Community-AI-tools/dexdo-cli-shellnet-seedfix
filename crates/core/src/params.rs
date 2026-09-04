@@ -920,27 +920,57 @@ pub const DEFAULT_MODELS_PATH: &str = "models.json";
 /// Default per-instance private-note pool filename.
 pub const DEFAULT_PN_POOL_PATH: &str = "pn_pool.json";
 
-/// The environment variable that says where the deployment manifest is. There is no other way.
+/// The environment variable that says which secret store this process uses.
 
-/// Not a default path, and deliberately not one: a default is a second source of the one fact this
-/// client is not allowed to have two answers for. `manifest/...`, `contracts/...`, "beside the binary"
-/// -- each of those is a network chosen without being asked for, and exists because one of
-/// them silently sent a mainnet-bound operator to the test network.
+/// Three values and nothing else: `system` demands the operating system's own store and refuses to
+/// run without a usable one, `file` demands the store the client raises for itself, and leaving the
+/// variable unset lets the client take the system store where there is one.
+
+/// **The variable exists so that the file branch can be reached deliberately.** On a workstation
+/// with a working keychain the system branch answers every time, and a branch that only ever runs
+/// where nobody is looking is a branch nobody has tested. A seller on a headless server takes the
+/// file branch by default, and this is how the same path is exercised on the machine that has a
+/// keychain.
+pub const SECRET_STORE_VAR: &str = "DEXDO_SECRET_STORE";
+
+/// The service name under which the operating system's store holds this client's secrets.
+
+/// The same reverse-DNS triple the platform data directory is derived from, spelled once: an
+/// operator looking at Keychain Access or Credential Manager sees one owner for every entry, and
+/// entries left by an older version are found by the newer one.
+pub const SECRET_STORE_SERVICE: &str = "ai.gosh.dexdo";
+
+/// The environment variable that says where the deployment manifest is. It overrides the default
+/// below and is never overridden by it.
 
 /// The value is the PATH TO THE FILE, not a directory and not a network name. Where the file lives
 /// is the operator's business; which network it describes is the file's own `network` field.
 
 /// Why a variable rather than the working directory: the network then does not depend on where the
-/// command was called from. A script run from somewhere else sees the same variable or refuses --
-/// it cannot quietly end up on another chain.
+/// command was called from. A script run from somewhere else sees the same variable, or the same
+/// per-user default -- never a `manifest/` that happens to sit in the directory it was called from.
 pub const MANIFEST_PATH_VAR: &str = "DEXDO_MANIFEST";
 
-/// The manifest path this process was given, or the refusal that says how to give it one.
+/// The one default manifest path, relative to the current user's home directory.
 
-/// This is the FIRST of the two refusals the manifest directive requires, and it is about the
-/// variable. The second -- the file named by it not being readable -- belongs to whoever opens the
-/// file, and names the PATH instead: the operator's next move differs, so the two must not collapse
-/// into one sentence.
+/// **This slot used to say there must be no default at all**, and the reversal is the owner's, 2
+/// September 2026: by default the client is configured for MAINNET. A user does not know about the
+/// test network, should not have to, and sets nothing to begin working; a developer who wants the
+/// test network exports the variable themselves.
+
+/// **Why that is not coming back.**'s default was the manifest's CONTENT compiled into the
+/// binary, and it sent an operator working in a mainnet directory to another chain's pins -- silently,
+/// because there was nowhere to look at the copy. This is a PATH to the file the release installs:
+/// it is on disk, it is visible, it can be replaced, and it states its own network in its own
+/// `network` field. The bundle also carries exactly one manifest now, and it is mainnet's
+/// (`release/build-public-tree.sh`), so the default is what the user wants rather than a detour.
+
+/// **This value is the sole allowed hardcoded manifest location and MUST NOT BE CHANGED.** It is
+/// anchored below `$HOME` on Unix and `%USERPROFILE%` on Windows: one absolute per-user location,
+/// independent of the working directory and binary directory. Neither those directories nor XDG
+/// directories are searched, and there is no scan or fallback to a second path.
+pub const DEFAULT_MANIFEST_PATH: &str = ".dexdo/manifest.json";
+
 /// The manifest this tree's own tests run against, chosen by DATA rather than by a name in source.
 
 /// Tests need a well-formed manifest to hand the client, and until each of them reached for
@@ -972,18 +1002,71 @@ pub(crate) fn committed_manifest_for_tests() -> std::path::PathBuf {
     dir.join(named)
 }
 
-pub fn manifest_path() -> Result<std::path::PathBuf, String> {
-    match std::env::var(MANIFEST_PATH_VAR) {
-        Ok(value) if !value.trim().is_empty() => Ok(std::path::PathBuf::from(value.trim())),
-        _ => Err(format!(
-            "{MANIFEST_PATH_VAR} is not set, and it is the only thing that says which network this \
-             client talks to. It holds the PATH TO THE MANIFEST FILE -- the document that names the \
-             network, the contracts and the endpoint. Nothing is assumed in its place.\n\n    \
-             export {MANIFEST_PATH_VAR}=<path to your manifest>\n\n\
-             The manifest ships beside the client. Which one you point at is which network you \
-             work on; the file says so itself, in its `network` field."
-        )),
+/// The current user's home directory, from the platform variable named by the installation
+/// contract. A relative value is refused: otherwise the default would once again depend on cwd.
+fn manifest_home_directory() -> Result<std::path::PathBuf, String> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+
+    let home = home
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            "the user home directory is unavailable, so the default manifest path cannot be resolved"
+                .to_string()
+        })?;
+    if !home.is_absolute() {
+        return Err(format!(
+            "the user home directory is not absolute: {}",
+            home.display()
+        ));
     }
+    Ok(home)
+}
+
+/// Which manifest this process runs against: the variable, else the one the release installed in the
+/// user's home directory, else a refusal.
+
+/// **The variable wins, and a path it names is used exactly as given.** If that file is missing the
+/// answer is a refusal naming THAT path -- never a quiet fall back to the default. A typo in the
+/// variable must not be a change of network, which is the whole reason the variable carries a full
+/// path.
+pub fn manifest_path() -> Result<std::path::PathBuf, String> {
+    if let Some(value) = std::env::var_os(MANIFEST_PATH_VAR) {
+        if !value.is_empty() {
+            return Ok(std::path::PathBuf::from(value));
+        }
+    }
+    let looked_in = manifest_home_directory()
+        .map(|home| home.join(DEFAULT_MANIFEST_PATH))
+        .map_err(|reason| {
+            format!(
+                "no deployment manifest, so nothing says which network this client talks to, and \
+                 nothing is assumed in its place.\n\n\
+                 The release installs one at <home>/{DEFAULT_MANIFEST_PATH}, but {reason}.\n\n\
+                 Re-running the installer puts it back. To point at a manifest yourself -- a \
+                 different network, or a copy kept elsewhere -- name the FILE:\n\n    \
+                 export {MANIFEST_PATH_VAR}=<path to your manifest>"
+            )
+        })?;
+    if looked_in.is_file() {
+        return Ok(looked_in);
+    }
+    Err(format!(
+        "no deployment manifest, so nothing says which network this client talks to, and nothing \
+         is assumed in its place.\n\n\
+         The release installs one in your home directory and this run did not find it:\n    \
+         {}\n\n\
+         Re-running the installer puts it back. To point at a manifest yourself -- a different \
+         network, or a copy kept elsewhere -- name the FILE:\n\n    \
+         export {MANIFEST_PATH_VAR}=<path to your manifest>\n\n\
+         Which file you point at is which network you work on; the file says so itself, in its \
+         `network` field. Only this one home-directory location is used by default; the working \
+         directory, executable directory and XDG directories are never searched.",
+        looked_in.display(),
+    ))
 }
 
 /// The network this process is working on, as the manifest names it.
@@ -1022,12 +1105,6 @@ pub fn current_network_endpoint() -> Option<String> {
         .and_then(|path| crate::Deployed::load(&path).ok())
         .and_then(|deployed| deployed.endpoint)
 }
-
-/// No constant here names a network, a manifest file or a directory, and that is the rule rather
-
-/// A name spelled once in the client is still the client having an opinion about which chain
-/// exists, and the whole point of is that it has none -- the operator points
-/// `DEXDO_MANIFEST` at a file, and the file says what it is.
 
 /// Default one-shot buyer receive cap, in tokens.
 pub const DEFAULT_BUYER_MAX_TOKENS: u64 = 8;
@@ -1153,6 +1230,13 @@ pub const HOT_FUNDING_TIMEOUT: Duration = Duration::from_secs(600);
 /// How often the Hot-funding wait re-reads the Hot's on-chain balances, matching the five-second
 /// cadence the wallet specification already fixes for waiting on a Hot to come up.
 pub const HOT_FUNDING_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long one Vault -> Hot funding request remains live in the local journal.
+
+/// UTC Unix seconds are used at both ends of the interval. At exactly `created_at + lifetime` the
+/// request is still live; it expires one second later. Journal output, cleanup and duplicate
+/// detection all read this one value.
+pub const VAULT_FUNDING_REQUEST_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// Maximum local wait for another process holding the same Hot, in seconds.
 

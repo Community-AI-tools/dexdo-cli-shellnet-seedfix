@@ -11,9 +11,10 @@ use crate::cli::commands::{
     resolve_model_registry_target, resolve_registry_content_identity, target_from_market, BookTarget,
 };
 use crate::cli::machine;
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use dexdo::registry::{BuyerMissingBookPolicy, RegistryBookAction, RegistryRole};
+use dexdo::registry::{BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistrySuggestions};
 use dexdo_core::address as addr;
 use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{model_hash_for, ChainBackend, DobParams, MockChainBackend};
@@ -135,6 +136,29 @@ pub(crate) async fn run_markets(mut args: MarketsArgs) -> Result<()> {
                 "markets without --market requires --note-addr to derive order-book addresses"
             )
         })?;
+        // THE CATALOG IS THE RIGHT SOURCE HERE, and it is the only one of these read paths where
+        // that is true. The other views are given a NAME and can ask the registry what it
+        // means; this form is given nothing and answers "the markets of the models I serve", which
+        // is a question only a local catalog can answer -- the registry holds ten thousand names
+        // and none of them is "mine".
+
+        // So the file stays required, and what changes is the refusal. `ModelsConfig::load` says
+        // `read models config models.json: No such file or directory`: true, and useless to someone
+        // who never had that file and did not know this command wanted one. It names neither what
+        // the command was trying to do nor any way forward.
+        if !args.models.exists() {
+            bail!(
+                "`markets` without --market lists the books of the models in your catalog, and \
+                 there is no catalog at {}. Nothing was read.\n\n    \
+                 * one model, no catalog needed:  dexdo markets address --model '<name>'\n    \
+                 * a market you provisioned:      dexdo markets --market '<market.json>'\n    \
+                 * your own catalog:              write {} with the models you serve\n\n\
+                 The names the chain carries are the ModelRegistry's; `markets address` resolves \
+                 one without any local file.",
+                args.models.display(),
+                args.models.display()
+            );
+        }
         let cfg = dexdo::seller::ModelsConfig::load(&args.models)?;
         cfg.models
             .values()
@@ -276,8 +300,17 @@ pub(crate) async fn run_markets_address(args: MarketsAddressArgs) -> Result<()> 
         .network;
     // step 6: a direct chain read ends inside the configured bound, never hangs.
     let registry_model = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-        resolve_registry_content_identity(RegistryRole::Buyer, &manifest, None, &args.model)
-            .await
+        // Compute: this command's whole output is the answer, so its refusal is read by someone
+        // who has been stopped -- and the warning paths now name THIS command as where the list
+        // comes from, which would be a lie if it did not produce one.
+        resolve_registry_content_identity(
+            RegistryRole::Buyer,
+            &manifest,
+            None,
+            &args.model,
+            RegistrySuggestions::Compute,
+        )
+        .await
     })
     .await?;
 

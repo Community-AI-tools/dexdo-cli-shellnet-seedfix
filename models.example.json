@@ -1,0 +1,24 @@
+{
+  "models": {
+    "my-model": {
+      "frame_model": "REPLACE-WITH-A-NAME-THE-MODELREGISTRY-CARRIES",
+      "base_url": "https://api.example.invalid/v1",
+      "served_model": "example-provider/example-model",
+      "api_key_env": "MY_MODEL_API_KEY",
+      "tokenizer_family": "REPLACE-WITH-YOUR-TOKENIZER-FAMILY",
+      "price_per_tick": 1,
+      "identity_aliases": [
+        "Example-Provider/Example-Model"
+      ],
+      "fingerprints": [
+        {
+          "probe_prompt": "REPLACE-WITH-A-SHORT-DETERMINISTIC-PROMPT",
+          "expected_contains": "REPLACE-WITH-A-MARKER-THIS-MODEL-EMITS"
+        }
+      ],
+      "capabilities": {
+        "max_output_tokens": 4096
+      }
+    }
+  }
+}

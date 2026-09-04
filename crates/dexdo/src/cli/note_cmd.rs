@@ -7176,7 +7176,7 @@ mod tests {
         for (case, pool) in invalid_existing_pool_cases() {
             let pool_path = temp.path().join(format!("{case}.pool.json"));
             let original = serde_json::to_vec_pretty(&pool).unwrap();
-            std::fs::write(&pool_path, &original).unwrap();
+            crate::cli::support::write_owner_only_key_fixture(&pool_path, std::str::from_utf8(&original).unwrap());
             let recovery_path = temp.path().join(format!("{case}.recovery.json"));
             let args = super::NoteDeployArgs {
                 json: false,
@@ -7250,7 +7250,7 @@ mod tests {
         for (case, pool) in invalid_existing_pool_cases() {
             let pool_path = temp.path().join(format!("{case}.recover.pool.json"));
             let original_pool = serde_json::to_vec_pretty(&pool).unwrap();
-            std::fs::write(&pool_path, &original_pool).unwrap();
+            crate::cli::support::write_owner_only_key_fixture(&pool_path, std::str::from_utf8(&original_pool).unwrap());
 
             let error = tokio::time::timeout(
                 std::time::Duration::from_secs(1),

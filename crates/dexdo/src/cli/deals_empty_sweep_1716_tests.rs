@@ -28,7 +28,7 @@ fn an_empty_deals_directory_is_an_empty_list_and_not_a_refusal() {
 fn a_directory_of_unrelated_files_is_an_empty_list_and_not_a_refusal() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("notes.txt"), b"not a deal handle").expect("write");
-    std::fs::write(temp.path().join("pn_pool.json"), b"{}").expect("write");
+    crate::cli::support::write_owner_only_key_fixture(&temp.path().join("pn_pool.json"), "{}");
 
     let listed = list_deal_handles(temp.path())
         .expect("files that are not deal handles are not skipped handles");

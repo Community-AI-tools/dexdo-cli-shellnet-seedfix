@@ -1,6 +1,10 @@
 use super::*;
-use crate::cli::wallet_funding::{HotBalanceReader, HotBalances};
+use crate::cli::wallet_funding::{
+    store_funding_journal, FundingJournalRecord, FundingRequest, FundingState, HotBalanceReader,
+    HotBalances,
+};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const OLD_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -88,6 +92,34 @@ fn seed_secret_dir(store: &WalletStore, id: &str, bytes: &[u8]) -> PathBuf {
     let secret = dir.join("secret.fixture");
     std::fs::write(&secret, bytes).expect("write binding secret fixture");
     secret
+}
+
+fn funding_record(
+    binding: &WalletBinding,
+    generation: u32,
+    created_at: u64,
+    amount: u128,
+    state: FundingState,
+) -> FundingJournalRecord {
+    let hot = dexdo_core::CanonicalAddress::parse(&binding.hot_address).expect("canonical Hot");
+    let shortfall = [(dexdo_core::params::SHELL_CURRENCY_ID, amount)]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let request = FundingRequest {
+        provider: WalletProvider::AckinackiWallet,
+        network: binding.network.as_str().to_string(),
+        vault_address: Some(format!("{}::{}", "55".repeat(32), "55".repeat(32))),
+        hot_address: hot.to_string(),
+        hot_dapp_id: hot.dapp_id().to_string(),
+        creator_pubkey: "66".repeat(32),
+        required: shortfall.clone(),
+        required_native: 0,
+        shortfall,
+        native_shortfall: 0,
+    };
+    let mut record = FundingJournalRecord::open_generation(&request, created_at, generation);
+    record.state = state;
+    record
 }
 
 enum ReadOutcome {
@@ -284,6 +316,62 @@ async fn duplicate_archive_records_are_ambiguous_and_change_nothing() {
     assert_eq!(reader.reads.get(), 0);
     fixture.assert_refusal_unchanged(&before);
     assert_eq!(std::fs::read(&duplicate).unwrap(), duplicate_before);
+}
+
+#[test]
+fn an_older_live_request_blocks_removal_even_when_the_newest_generation_is_satisfied() {
+    let fixture = Fixture::new();
+    let now = 1_800_000_000;
+    let mut live = funding_record(&fixture.old, 1, now, 100, FundingState::Submitted);
+    live.pending_transaction_id = Some("7".to_string());
+    store_funding_journal(fixture._temp.path(), &live).expect("store older live request");
+    let satisfied = funding_record(&fixture.old, 2, now, 200, FundingState::Satisfied);
+    store_funding_journal(fixture._temp.path(), &satisfied)
+        .expect("store newer satisfied request");
+
+    let error = refuse_removal_while_funding_may_still_arrive_at(
+        &fixture.old,
+        fixture._temp.path(),
+        &live.hot_address,
+        now,
+    )
+    .expect_err("the older live generation still targets the archived Hot");
+
+    assert!(error.to_string().contains("generation 1"), "{error:#}");
+    assert!(error.to_string().contains("transaction is 7"), "{error:#}");
+}
+
+#[test]
+fn a_submitted_request_blocks_through_its_deadline_and_not_one_second_later() {
+    let fixture = Fixture::new();
+    let created_at = 1_800_000_000;
+    let submitted = funding_record(
+        &fixture.old,
+        1,
+        created_at,
+        100,
+        FundingState::Submitted,
+    );
+    store_funding_journal(fixture._temp.path(), &submitted).expect("store submitted request");
+
+    let at_deadline = refuse_removal_while_funding_may_still_arrive_at(
+        &fixture.old,
+        fixture._temp.path(),
+        &submitted.hot_address,
+        submitted.expires_at_unix,
+    );
+    assert!(
+        at_deadline.is_err(),
+        "the request remains live at the canonical deadline"
+    );
+
+    refuse_removal_while_funding_may_still_arrive_at(
+        &fixture.old,
+        fixture._temp.path(),
+        &submitted.hot_address,
+        submitted.expires_at_unix.saturating_add(1),
+    )
+    .expect("a locally expired request no longer blocks removal");
 }
 
 #[test]

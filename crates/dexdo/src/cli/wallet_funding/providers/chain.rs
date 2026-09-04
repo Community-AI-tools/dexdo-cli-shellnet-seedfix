@@ -278,16 +278,6 @@ impl VaultChain for RealVaultChain<'_> {
         })
     }
 
-    async fn expiration_window_secs(&self) -> Result<u64> {
-        let output = self.getter("getParameters").await?;
-        as_u64(&output["expirationTime"], "expirationTime")
-    }
-
-    async fn chain_time_secs(&self) -> Result<u64> {
-        let http = dexdo_core::chain_http_client()?;
-        dexdo_core::chain::chain_time_secs(&http, &self.endpoint).await
-    }
-
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
         use dexdo_core::airegistry::{calls::encode_external_call, deploy::local_context};
 

@@ -114,10 +114,14 @@ git clone https://github.com/gosh-sh/dexdo-cli && cd dexdo-cli
 cargo build --release -p dexdo   # binary: target/release/dexdo
 ```
 
-Verify with `dexdo --help`. Every on-chain command reads a deployed-contracts manifest, and
-`DEXDO_MANIFEST` says where it is. The manifest NAMES ITS NETWORK, and the client takes the network,
-the endpoint and the pins from it -- so which file you point at IS which network you work on. There
-is no flag and no default: unset, every on-chain command refuses rather than guessing.
+Verify with `dexdo --help`. Every on-chain command reads a deployed-contracts manifest. The manifest
+NAMES ITS NETWORK, and the client takes the network, the endpoint and the pins from it -- so which
+file you point at IS which network you work on. With `DEXDO_MANIFEST` unset the client reads the
+manifest the release installer puts beside the `dexdo` binary, which pins mainnet, and it looks in
+that one directory only -- never the working directory, `$HOME`, or the platform configuration
+directories. **The build above leaves no manifest beside `target/release/dexdo`**, so set the
+variable explicitly here. It wins wherever it is set, and a path it names that does not exist is
+refused against that path rather than falling back.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/manifest/mainnet.manifest.json \

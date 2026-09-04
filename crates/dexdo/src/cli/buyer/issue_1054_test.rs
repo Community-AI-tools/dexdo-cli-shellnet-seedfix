@@ -155,15 +155,14 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
     let note_addr = format!("0:{}", "a".repeat(64));
     let frame_model = "Qwen3-32B";
     let pool_path = dir.path().join("pool.json");
-    std::fs::write(
+    crate::cli::support::write_owner_only_key_fixture(
         &pool_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
+        &serde_json::to_string_pretty(&serde_json::json!({
             "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
             "notes": [{"address": note_addr, "owner_secret_key_hex": "00"}]
         }))
         .expect("serialize note pool"),
-    )
-    .expect("write note pool");
+    );
     let _pool = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
 
     let policy = dir.path().join("policy.json");

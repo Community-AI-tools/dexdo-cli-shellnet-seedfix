@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3f105a747f2472206754127e55f080a4d4fc1ee626b4d86af829b5fd57f5ea3b # shrinks to specs = [(Reclaimable, 0, false, false), (Reclaimable, 0, false, false)], rotation = 0

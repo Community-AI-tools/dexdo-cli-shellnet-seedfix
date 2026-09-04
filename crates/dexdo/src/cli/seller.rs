@@ -623,43 +623,38 @@ fn seller_pool_dir(
         .join(deals::make_token_contract_id(&seller_note)))
 }
 
+/// The gateway's long-lived TLS identity, through the client's secret store.
+
+/// The private key of the seller's gateway is a key like any other, and this is the first thing in
+/// the client to go through `secret_store`: on a machine with a system store the bundle is held
+/// there, and on a headless server -- which is where a seller actually runs -- it is an owner-only
+/// file at exactly the path it has always been. An identity written by an earlier client keeps being
+/// found either way, so a restart still presents the certificate a buyer already pinned.
+
+/// Two things changed with the move, and both are the house rule arriving here rather than a new
+/// decision. The permission check now runs BEFORE the read instead of after it -- the previous shape
+/// had the whole bundle in memory before it decided whether it was allowed to look. And the check is
+/// the one the rest of this repository uses, which admits any owner-only mode rather than `0600`
+/// alone: `0400` on a key is stricter than what was demanded, and refusing it was refusing the
+/// operator who was more careful than required.
 fn load_or_create_gateway_tls(
     pool_dir: &std::path::Path,
 ) -> Result<dexdo::seller::tls::GatewayTls> {
-    let path = pool_dir.join("gateway.pem");
-    match std::fs::read_to_string(&path) {
-        Ok(bundle) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
-                if mode != 0o600 {
-                    bail!(
-                        "seller gateway TLS identity {} must have mode 0600, got {mode:04o}",
-                        path.display()
-                    );
-                }
-            }
-            dexdo::seller::tls::GatewayTls::from_pem_bundle(bundle).map_err(|error| {
-                anyhow::anyhow!("load seller gateway TLS {}: {error}", path.display())
-            })
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(pool_dir).map_err(|error| {
+    let store = crate::cli::secret_store::SecretStore::open()?;
+    let name = crate::cli::secret_store::SecretName::at(pool_dir.join("gateway.pem"));
+    if let Some(bundle) = store.read(&name)? {
+        return dexdo::seller::tls::GatewayTls::from_pem_bundle(bundle.to_string()).map_err(
+            |error| {
                 anyhow::anyhow!(
-                    "create seller pool directory {}: {error}",
-                    pool_dir.display()
+                    "load seller gateway TLS {}: {error}",
+                    name.file().display()
                 )
-            })?;
-            let tls = dexdo::seller::tls::GatewayTls::generate()?;
-            crate::cli::note::write_private_atomic(&path, tls.pem_bundle().as_bytes())?;
-            Ok(tls)
-        }
-        Err(error) => Err(anyhow::anyhow!(
-            "read seller gateway TLS {}: {error}",
-            path.display()
-        )),
+            },
+        );
     }
+    let tls = dexdo::seller::tls::GatewayTls::generate()?;
+    store.write(&name, &tls.pem_bundle())?;
+    Ok(tls)
 }
 
 struct SellerPoolLock {
@@ -4067,6 +4062,61 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                         .flatten(),
                 )
                 .await?;
+                // ASK THE REGISTRY BEFORE THE LISTING IS PAID FOR, ON THE DEFAULT PATH.
+
+                // `dexdo seller` creates a market. Its `post_offer` reads the book's stats and, when
+                // the book is absent, deploys it out of the note before it writes the ask
+                // (`crates/core/src/chain/backends.rs`, "An operate exception...
+                // deploy it (model listing)"). That is the same spend `provision` and
+                // `deploy-market` already refuse to make on a name no buyer can resolve, and this
+                // command was the one of the three still making it.
+
+                // What stood here alone is the block below, and it is behind `if let Some(policy)`:
+                // `RegistryValidationPolicy::disabled()` sets `seller_check_model_registry: false`,
+                // so without an explicit `--model-registry-validation <config.json>` the policy is
+                // `None` and NOTHING asked the catalog anything. `require_model_name` is the only
+                // other name gate on this path and it refuses an empty or space-padded name, which
+
+                // switch as the mechanism a wrong spelling reached mainnet through, and rules that
+                // the check is not configurable: the one opt-out is the flag.
+
+                // The SAME resolver and the SAME refusal rule as the other two commands, by calling
+                // the same function -- one identity rule with two defaults on two sides is the
+                // defect reports, and a seller-local copy of it would be a third.
+
+                // Placed inside this preflight, and not at the command boundary, because the models
+                // file is deliberately read late: has a restarting seller adopt its resting ask
+                // and cancel it before it dies of a missing credential, and reading `models.json`
+                // earlier would leave that ask resting with nobody behind it. Nothing above this
+                // line writes to the chain -- the first write is the offer post, far below.
+                {
+                    let name = args
+                        .model
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                format!("real {}: set --model <name from config> (needed for model registry validation)", dexdo_core::params::current_network())
+                            )
+                        })?;
+                    let listed_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
+                        .get(name)?
+                        .frame_model
+                        .clone();
+                    let listed_frame_model = crate::cli::support::require_model_name(
+                        &listed_frame_model,
+                        "the `frame_model` field of this model's entry in models.json",
+                        "Fix that field in the models config.",
+                    )?;
+                    crate::cli::admin::ensure_model_resolves(
+                        crate::cli::admin::ModelResolutionCaller::Seller,
+                        &crate::cli::commands::manifest_path()?,
+                        None,
+                        &listed_frame_model,
+                        args.allow_unverified_model,
+                    )
+                    .await?;
+                }
                 if let Some(policy) = registry_policy.as_ref() {
                     let name = args
                         .model
@@ -4610,6 +4660,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 8,
             model: Some("unused".to_string()),
+            allow_unverified_model: false,
             models: root.path().join("missing-models.json"),
             policy: Some(policy_path),
         })
@@ -5612,7 +5663,7 @@ mod tests {
         let (chain, config, identity, root) =
             existing_resting_offer(case, note.clone(), "127.0.0.1:0".to_string()).await;
         let root = root.path();
-        std::fs::write(root.join("note.key"), hex::encode(RESTART_NOTE_SEED)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&root.join("note.key"), &hex::encode(RESTART_NOTE_SEED));
         std::fs::write(
             root.join("models.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -5668,6 +5719,7 @@ mod tests {
             price_per_tick: config.price_per_tick,
             mock_token_count: config.mock_token_count,
             model: Some("restart-model".to_string()),
+            allow_unverified_model: false,
             models: root.join("models.json"),
             policy: None,
         })
@@ -8084,7 +8136,7 @@ mod tests {
     async fn inherited_ephemeral_advertise_reaches_the_buyer_as_the_bound_port() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x63; 32];
-        std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
         let token_contract = format!("0:{}", "7".repeat(64));
         let chain = MockChainBackend::new(
             root.path().join("endpoints.json"),
@@ -8118,6 +8170,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 4,
             model: None,
+            allow_unverified_model: false,
             models: root.path().join("unused-models.json"),
             policy: None,
         };
@@ -8213,7 +8266,7 @@ mod tests {
     async fn a_spent_deal_handle_whose_token_contract_is_gone_does_not_stop_the_seller() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x64; 32];
-        std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
         let seller_note = dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
             .unwrap()
             .node(0)
@@ -8312,6 +8365,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 4,
             model: None,
+            allow_unverified_model: false,
             models: root.path().join("unused-models.json"),
             policy: None,
         };
@@ -8670,6 +8724,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             mock_token_count: 4,
             model: None,
+            allow_unverified_model: false,
             models: root.join("unused-models.json"),
             policy: None,
         }
@@ -8679,7 +8734,7 @@ mod tests {
     async fn run_seller_raw_mock_partial_fill_relists_and_serves_two_buyers() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x61; 32];
-        std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
         let seller_note = Arc::new(
             dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
                 .unwrap()
@@ -8807,7 +8862,7 @@ mod tests {
     async fn run_seller_terminal_raw_ancestor_resumes_linked_descendant() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x62; 32];
-        std::fs::write(root.path().join("seller.key"), hex::encode(seller_seed)).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
         let seller_note = Arc::new(
             dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
                 .unwrap()

@@ -27,8 +27,9 @@ curl -fsSL https://get.dex.do/install.sh | sh
 
 The installer downloads the latest release, verifies its SHA256 against the published `SHA256SUMS`,
 unpacks it, and installs `dexdo` into `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\dexdo\bin`
-(Windows). The Linux binaries are static musl and run on any distro (Ubuntu 20.04+, Debian, RHEL,
-Alpine) with no glibc version requirement.
+(Windows). It installs the archived mainnet manifest as `<home>/.dexdo/manifest.json`, replacing an
+older installed manifest with a warning. The Linux binaries are static musl and run on any distro
+(Ubuntu 20.04+, Debian, RHEL, Alpine) with no glibc version requirement.
 
 It then puts that directory on PATH by default. On Linux/macOS it appends one line, marked
 `# added by dexdo installer`, to the config of the shell named in `$SHELL` -- `~/.zshrc` (zsh),
@@ -56,14 +57,21 @@ dexdo --help      # lists the commands: note, provision, market, seller, buyer, 
 
 Both must succeed (exit 0) before continuing.
 
-## Phase 3. Fetch the deployed-contracts manifest
+## Phase 3. Locate the deployed-contracts manifest
 
-Every on-chain command needs a manifest, and you tell the client where it is. The manifest pins the
-deployed contract addresses and NAMES ITS NETWORK: the client takes the network, the endpoint and
-the pins from that file. There is no flag and no network option to disagree with it -- which file
-you point at IS which network you work on.
+Every on-chain command needs a manifest. It pins the deployed contract addresses and NAMES ITS
+NETWORK: the client takes the network, the endpoint and the pins from that file. There is no flag
+and no network option to disagree with it -- which file you point at IS which network you work on.
 
-Download it once and say where it lives:
+**If you installed with the one-liner in Phase 1, this phase is already done.** The installer writes
+`$HOME/.dexdo/manifest.json` on Linux/macOS or `%USERPROFILE%\.dexdo\manifest.json` on Windows, and
+with `DEXDO_MANIFEST` unset that is exactly what the client reads: mainnet, configured by nobody.
+That is the only default; the working directory, binary directory and platform configuration
+directories are not searched.
+
+**If you built from source and have not run the installer, put the release manifest at that default
+path or name one yourself.** Do the same to work on another network, or to keep the file somewhere
+you control:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/manifest/mainnet.manifest.json \
@@ -72,9 +80,10 @@ curl -fsSL https://raw.githubusercontent.com/gosh-sh/dexdo-cli/main/manifest/mai
 export DEXDO_MANIFEST=~/dexdo/mainnet.manifest.json
 ```
 
-Put the `export` in your shell config so new terminals have it. **Without it every on-chain command
-refuses** -- deliberately: a client that guessed which network you meant is how a mainnet operator
-once spent twelve minutes onboarding against a test chain.
+Put the `export` in your shell config so new terminals have it. The variable wins wherever it is
+set, and a path it names that does not exist is refused against that path -- the client never falls
+back to the installed manifest behind your back, because a client that quietly changed network is
+how a mainnet operator once spent twelve minutes onboarding against a test chain.
 
 A source checkout already ships the file; point the variable at the copy in the checkout.
 
@@ -84,15 +93,16 @@ A source checkout already ships the file; point the variable at the copy in the 
 dexdo doctor
 ```
 
-Every command reads the manifest `DEXDO_MANIFEST` names. There is no flag for it, and no default: a
-default would be the client choosing a network for you, quietly.
+Every on-chain command reads a manifest: the one `DEXDO_MANIFEST` names, or -- with the variable
+unset -- `<home>/.dexdo/manifest.json`, which the installer sets to mainnet. There is no flag for it,
+and the client looks nowhere else.
 
-`dexdo doctor` reports the reachable shellnet version and whether your manifest is fresh (matches the
-deployed contracts). A green doctor here means the binary, manifest, and network are ready. The failure
-policy is a separate gate -- you set it up in Phase 5, and `dexdo seller` / `dexdo buyer` enforce a
-complete policy when they start (once a policy exists, doctor also flags an incomplete one). If doctor
-flags manifest drift, re-download the manifest (Phase 3). If it flags shellnet unreachable, check
-network access to `shellnet.ackinacki.org`.
+`dexdo doctor` reports the network named by the selected manifest, the reachable deployment version,
+and whether the manifest is fresh (matches the deployed contracts). A green doctor here means the
+binary, manifest, and network are ready. The failure policy is a separate gate -- you set it up in
+Phase 5, and `dexdo seller` / `dexdo buyer` enforce a complete policy when they start (once a policy
+exists, doctor also flags an incomplete one). If doctor flags manifest drift, re-download the manifest
+(Phase 3). If it flags the endpoint unreachable, check access to the `endpoint` named in that manifest.
 
 ## What the client prints, and how to make it say more
 
@@ -556,9 +566,9 @@ document lands in a text addressed past them to a machine.
 
 - Never print, log, or commit the wallet seed/key, the note owner secret (`owner_secret_key_hex`), the
   pool file, or any provider API key.
-- Every on-chain command reads the manifest `DEXDO_MANIFEST` names, so both sides of a deal are on
-  the same network exactly when they point at the same manifest; a mismatch is diagnosed by
-  `dexdo doctor`.
+- Every on-chain command reads the selected manifest: the file `DEXDO_MANIFEST` names, or the sole
+  per-user default when it is unset. Both sides of a deal must select the same network; a mismatch
+  is diagnosed by `dexdo doctor`.
 
 ## Common install errors
 

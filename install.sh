@@ -89,6 +89,31 @@ install -m 0755 "${tmp}/dexdo-${vern}-${archname}-${osname}/dexdo" "${BINDIR}/de
 echo "dexdo: installed ${ver} to ${BINDIR}/dexdo"
 
 # ---------------------------------------------------------------------------
+# The deployment manifest, at the client's sole per-user default. Without the
+# variable set, this is the ONLY place dexdo looks for one -- not the working
+# directory, the binary directory, or XDG. It is a release artifact, not user
+# data, so every install replaces it together with the binary.
+#
+# Verified rather than assumed: an `install` that silently did nothing leaves
+# exactly the broken install this is here to prevent.
+# ---------------------------------------------------------------------------
+manifest_path="${HOME}/.dexdo/manifest.json"
+mkdir -p "$(dirname "$manifest_path")"
+[ ! -d "$manifest_path" ] || {
+  echo "dexdo: install failed: ${manifest_path} is a directory; expected a file" >&2
+  exit 1
+}
+[ ! -e "$manifest_path" ] || echo "dexdo: warning: replacing existing ${manifest_path}" >&2
+install -m 0644 \
+  "${tmp}/dexdo-${vern}-${archname}-${osname}/manifest/mainnet.manifest.json" \
+  "$manifest_path"
+[ -s "$manifest_path" ] || {
+  echo "dexdo: install failed: ${manifest_path} was not written" >&2
+  exit 1
+}
+echo "dexdo: installed the mainnet manifest to ${manifest_path}"
+
+# ---------------------------------------------------------------------------
 # PATH setup. A binary the shell cannot find is a failed install, so this runs
 # by default. The shell is taken from $SHELL (the user's login shell) and NOT
 # from the interpreter running this script: `curl | sh` always runs under sh

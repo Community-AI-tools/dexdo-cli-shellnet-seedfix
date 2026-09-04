@@ -273,6 +273,7 @@ fn pending() -> RequestPresence {
     RequestPresence::Present {
         transaction_hash: Some("tx".to_string()),
         pending_transaction_id: Some("7".to_string()),
+        chain_created_at_unix: None,
     }
 }
 
@@ -307,8 +308,8 @@ async fn a_read_that_got_no_answer_keeps_waiting_inside_the_funding_window() {
     );
     // Absent, so the request is created; then the finalized verdict that retires it once the
     // balance has arrived, which is the reconciliation a real successful funding goes through.
-    let provider =
-        ScriptedProvider::new(RequestPresence::Absent).with_probes(vec![RequestPresence::Absent, executed()]);
+    let provider = ScriptedProvider::new(RequestPresence::Absent)
+        .with_probes(vec![RequestPresence::Absent, executed()]);
 
     let funded = run(dir.path(), &chain, &provider, patient_bounds())
         .await
@@ -422,6 +423,12 @@ async fn a_failed_wait_names_the_funding_state_it_left_behind() {
 
     // A read that answered no, with a request an EARLIER run created still in the queue.
     let dir = temp();
+    let seed_chain = ScriptedChain::new(vec![], ScriptedChain::shell(0));
+    let seed_provider = ScriptedProvider::new(RequestPresence::Absent);
+    let _ = run(dir.path(), &seed_chain, &seed_provider, spent_bounds())
+        .await
+        .expect_err("the seed run leaves its request pending");
+    assert_eq!(seed_provider.submits.get(), 1);
     let chain = ScriptedChain::new(
         vec![ScriptedChain::shell(0)],
         Err(FINAL_ERROR.to_string()),

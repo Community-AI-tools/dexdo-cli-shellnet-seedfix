@@ -110,14 +110,6 @@ impl VaultChain for SilentVault {
         bail!("rendering a funding instruction must not read a Vault delivery")
     }
 
-    async fn expiration_window_secs(&self) -> Result<u64> {
-        bail!("rendering a funding instruction must not read the Vault expiration window")
-    }
-
-    async fn chain_time_secs(&self) -> Result<u64> {
-        bail!("rendering a funding instruction must not read the chain clock")
-    }
-
     async fn submit(&self, _fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
         bail!("rendering a funding instruction must not submit anything")
     }

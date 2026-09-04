@@ -1323,6 +1323,10 @@ pub(crate) fn resolve_private_file_path(path: &Path, label: &str) -> Result<Path
 
 pub(crate) fn load_note_deploy_recovery(path: &Path) -> Result<Option<NoteDeployRecoveryState>> {
     let path = resolve_private_file_path(path, "note deploy recovery")?;
+    // the recovery file holds the note's `owner_secret_key_hex` -- it is written at 0600 by
+    // `write_private_atomic` and was read back with no check that it still is. A recovery that has
+    // not been written yet is the ordinary case and stays fine.
+    crate::cli::support::refuse_exposed_secret_file_if_present(&path, "note deploy recovery")?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1399,6 +1403,8 @@ pub(crate) const NOTE_DEPLOY_RECOVERY_PRESERVE_INSTRUCTION: &str =
 fn load_existing_note_deploy_recovery_for_write(
     path: &Path,
 ) -> Result<Option<NoteDeployRecoveryState>> {
+    // same file, same secret, read on the write path to decide whether to overwrite.
+    crate::cli::support::refuse_exposed_secret_file_if_present(path, "note deploy recovery")?;
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2946,7 +2952,7 @@ mod note_deploy_tests {
         );
         let recovery_path = temp.path().join("pn_pool.json.recovery.json");
 
-        std::fs::write(&recovery_path, b"{}").expect("a file to retire");
+        crate::cli::support::write_owner_only_key_fixture(&recovery_path, "{}");
 
         let verdict = retire_a_finished_deploy(&recovery_path, &recovery, &pool)
             .expect("a recorded deploy whose key the pool holds is retirable");
@@ -3057,7 +3063,7 @@ mod note_deploy_tests {
             std::fs::create_dir_all(&dir).expect("case dir");
             let pool_path = pool_file_with(&dir, &[&recorded], &funding);
             let recovery_path = dir.join("r.json");
-            std::fs::write(&recovery_path, b"{}").expect("a file to retire");
+            crate::cli::support::write_owner_only_key_fixture(&recovery_path, "{}");
 
             // The same question asked of both: is the note in this recovery file already in this
             // pool. One answers by retiring the spent file, the other by refusing a duplicate.
@@ -3822,11 +3828,10 @@ mod note_deploy_tests {
             "shell_funded": true,
             "sanity_checked": true
         });
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &recovery_path,
-            serde_json::to_vec_pretty(&written_by_the_old_binary).expect("serialize"),
-        )
-        .expect("write the old binary's recovery file");
+            &serde_json::to_string_pretty(&written_by_the_old_binary).expect("serialize"),
+        );
 
         let recovery = load_note_deploy_recovery(&recovery_path)
             .expect("a record with the dropped field still loads")
@@ -3873,11 +3878,10 @@ mod note_deploy_tests {
             "shell_funded": true,
             "sanity_checked": true
         });
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &recovery_path,
-            serde_json::to_vec_pretty(&legacy_recovery).expect("serialize hand-built recovery"),
-        )
-        .expect("write hand-built recovery");
+            &serde_json::to_string_pretty(&legacy_recovery).expect("serialize hand-built recovery"),
+        );
 
         let recovery = load_note_deploy_recovery(&recovery_path)
             .expect("load legacy recovery")
@@ -3911,11 +3915,10 @@ mod note_deploy_tests {
                 "native_funded": true
             }]
         });
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&legacy_pool).expect("serialize hand-built pool"),
-        )
-        .expect("write hand-built pool");
+            &serde_json::to_string_pretty(&legacy_pool).expect("serialize hand-built pool"),
+        );
         let existing_pool: Value = serde_json::from_slice(
             &std::fs::read(&pool_path).expect("load hand-built legacy pool file"),
         )

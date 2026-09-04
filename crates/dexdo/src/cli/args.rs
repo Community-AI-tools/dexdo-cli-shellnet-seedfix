@@ -268,6 +268,14 @@ pub(crate) struct SellerArgs {
     /// `--mock-chain --mock-model` demo.
     #[arg(long)]
     pub(crate) model: Option<String>,
+    /// List a model the on-chain `ModelRegistry` does not confirm, and go on when the registry cannot
+    /// be read. Without it a real-chain seller refuses before it posts anything, the way
+    /// `provision` and `deploy-market` already do -- this is the SAME flag those two carry, not a
+    /// second one. It does not cover a spelling the registry holds differently: that is a confirmed
+    /// model and a typo, and it is refused with the registered spelling named
+    /// . No indexer lists a market raised under it.
+    #[arg(long)]
+    pub(crate) allow_unverified_model: bool,
     /// Path to the models config. Defaults to `<data-dir>/models.json` when
     /// selected, otherwise to `models.json` in the working directory.
     #[arg(long, default_value = DEFAULT_MODELS_PATH)]
@@ -513,6 +521,9 @@ pub(crate) struct MonitorArgs {
 /// Doctor / health check: read-only chain version and manifest freshness guard.
 #[derive(Args)]
 pub(crate) struct DoctorArgs {
+    /// Emit one machine-readable health report instead of human output.
+    #[arg(long)]
+    pub(crate) json: bool,
     /// Optional `dexdo provision` market manifest. When supplied, doctor also verifies the market IOB/TC are
     /// active and carry the expected code hash.
     #[arg(long)]
@@ -933,9 +944,9 @@ pub(crate) struct MarketArgs {
     pub(crate) read_timeout: ChainReadTimeoutArgs,
     /// Model id whose book to render. The client applies no grammar of its own to it.
 
-    /// With `--model-registry-validation`: the exact name the on-chain ModelRegistry carries,
-    /// which `dexdo markets` lists. Without it -- the default -- the name is looked up in
-    /// `--models`, so a name copied out of `dexdo markets` is refused until that config knows it.
+    /// Resolved against the on-chain ModelRegistry, with no local file required. A
+    /// `models.json` is consulted only as a source of your own nicknames: a name it does not know
+    /// is the model itself, and where it maps a name elsewhere the registry decides.
     pub(crate) model: String,
     /// Any active inference PrivateNote address used to derive the per-model order-book address.
     #[arg(long, value_parser = dexdo_core::address::arg_to_chain_param)]
@@ -957,9 +968,9 @@ pub(crate) struct ExecutableBookArgs {
     pub(crate) read_timeout: ChainReadTimeoutArgs,
     /// Model id whose book to inspect. The client applies no grammar of its own to it.
 
-    /// With `--model-registry-validation`: the exact name the on-chain ModelRegistry carries,
-    /// which `dexdo markets` lists. Without it -- the default -- the name is looked up in
-    /// `--models`, so a name copied out of `dexdo markets` is refused until that config knows it.
+    /// Resolved against the on-chain ModelRegistry, with no local file required. A
+    /// `models.json` is consulted only as a source of your own nicknames: a name it does not know
+    /// is the model itself, and where it maps a name elsewhere the registry decides.
     pub(crate) model: String,
     /// Any active inference PrivateNote address used to derive the per-model order-book address.
     #[arg(long, value_parser = dexdo_core::address::arg_to_chain_param)]
@@ -1207,6 +1218,15 @@ pub(crate) struct SubscriptionPlaceArgs {
     /// Whole 28-day volume. Must be within the protocol bound and divisible by four weeks.
     #[arg(long)]
     pub(crate) ticks: u128,
+    /// Place against a model the on-chain `ModelRegistry` does not confirm, and go on when the
+    /// registry cannot be read. Without it `place` refuses before any escrow moves, the way
+    /// `buyer`, `seller`, `provision` and `deploy-market` already do -- this is the SAME flag those
+    /// four carry, not a fifth one, and `place` was the one spending path that had no way to
+    /// override the identical refusal. It does not cover a spelling the registry holds differently:
+    /// that is a confirmed model and a typo, and it is refused with the registered spelling named
+    /// .
+    #[arg(long)]
+    pub(crate) allow_unverified_model: bool,
 }
 
 /// Role override for raw token-contract status/close when no local deal handle exists.

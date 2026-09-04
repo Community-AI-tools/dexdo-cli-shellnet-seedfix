@@ -55,6 +55,7 @@ pub use client::{
     NoteHistoryCoverage, OutstandingDealLeadRefusal, PrivateNoteOutstandingReport, RealChainBackend,
     RecoveredRestingOrder,
     ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus, TokenContractCurrentFacts,
+    CHAIN_DOCTOR_CHECK_COUNT,
     TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
     TokenContractSettlementReceipts,
 };

@@ -75,6 +75,7 @@ pub use chain::{
     NoteTransferRefusal, RealBuyerBackend, RealChainBackend, RealDealBackend, RealNote,
     RealSellerBackend,
     ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus, TokenContractCurrentFacts,
+    CHAIN_DOCTOR_CHECK_COUNT,
     NoteDealCreditReceipt,
     TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
     TokenContractSettlementReceipts,

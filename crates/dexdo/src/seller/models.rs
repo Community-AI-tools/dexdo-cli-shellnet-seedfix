@@ -255,8 +255,13 @@ mod tests {
         // seller refuses to serve it BEFORE the provider is contacted. A shipped config entry without the cap is
         // therefore a model that cannot deliver a single token -- guard the repo's own deployment artifact so a
         // release can never ship one, the way the live fixtures shipped one.
-        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models.json"));
-        let cfg = ModelsConfig::load(path).expect("the repo's models.json loads");
+
+        // re-pointed this at `models.example.json`, and the subject is unchanged: the shipped
+        // artifact. `models.json` stopped being one -- it is our own working config now, and what the
+        // user's archive carries is the example. An example teaching a config with no output cap
+        // teaches a seller a model that never serves a token, which is exactly what this guards.
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models.example.json"));
+        let cfg = ModelsConfig::load(path).expect("the repo's models.example.json loads");
         for (name, model) in &cfg.models {
             assert!(
                 model

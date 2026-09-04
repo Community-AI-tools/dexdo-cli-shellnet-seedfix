@@ -15,7 +15,7 @@
 //! - the preflight read of the Hot's on-chain balances and the per-currency shortfall;
 //! - the bounded wait for those balances to reach the required level;
 //! - the re-check immediately before the caller spends, serialized per Hot;
-//! - the durable journal that stops a repeat of the command from creating a second Vault request.
+//! - the durable journal that keeps distinct live request amounts and de-duplicates exact repeats.
 
 //! What this module does NOT own: how any particular provider gets money into the Hot. That is
 //! [`HotFundingProvider`], one implementation per provider, in [`providers`]. The specification is
@@ -35,7 +35,7 @@ use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dexdo_core::CanonicalAddress;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,13 +46,15 @@ pub(crate) use crate::cli::wallet::WalletProvider;
 
 /// Journal schema version. Bumped only when an older file can no longer be read safely.
 
-/// Version 2 adds the request generation, the immutable transfer fingerprint and the `executed` /
-/// `expired` states. A version-1 record cannot be upgraded in place by guessing those fields: its
+/// Version 3 stores multiple requests and an explicit UTC deadline for each one. Version 2 already
+/// carries every fact needed to migrate its single record: the deadline is its `created_at_unix`
+/// plus the canonical lifetime. A version-1 record cannot be upgraded in place by guessing the
+/// immutable fingerprint and generation: its
 /// fingerprint is exactly what a repeat needs in order to recognise a request already on chain, and
 /// inventing one would make an unrecognisable request look absent - the single state that authorizes
 /// a second transfer out of a cold Vault. A version-1 file is therefore REFUSED, loudly, rather than
 /// migrated.
-const FUNDING_JOURNAL_VERSION: u32 = 2;
+const FUNDING_JOURNAL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------------------------
 // The shape of a Vault -> Hot transfer
@@ -282,8 +284,8 @@ pub(crate) struct FundingRequest {
 /// would fail to recognise it in the queue, which reads as absence, which authorizes a second
 /// transfer out of a cold Vault.
 
-/// Frozen for one GENERATION. A later run whose shortfall has moved does not edit these fields; it
-/// keeps looking for THIS transfer until the chain proves what became of it.
+/// Frozen for one GENERATION. A later run with the same amount keeps looking for this transfer; a
+/// different native value or ECC map gets a separate generation without editing this one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FundingFingerprint {
     /// `creator.owner_pubkey` as the Vault's queue reports it.
@@ -378,25 +380,24 @@ pub(crate) struct FundingEvidence {
 
 /// Whether a funding request matching [`FundingRequest`] is on chain.
 
-/// These are not two answers plus an error. Both `Unknown` and the two disappearance verdicts are
-/// load-bearing: the specification says a chain read failure means "unknown" and forbids a repeat
-/// submit, and it says that a request leaving the live queue proves nothing on its own - only
-/// finalized history can say whether it executed or expired, and those two are opposite in money
-/// terms.
+/// These are not two answers plus an error. `Unknown` is load-bearing: the specification says a
+/// chain read failure means "unknown" and forbids a repeat submit, and it says that a request leaving
+/// the live queue proves nothing on its own. Finalized history can prove execution and dates an
+/// external queue entry before it is adopted; expiry then follows from the one canonical lifetime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestPresence {
-    /// Proven present in the Vault's queue. Carries whatever identifiers the queue exposed.
+    /// Proven present in the Vault's queue. `chain_created_at_unix` is present when the request was
+    /// found by fingerprint without an already recorded queue id, so adoption can replace a
+    /// provisional local timestamp with the finalized `TransactionSubmitted` message's chain time.
     Present {
         transaction_hash: Option<String>,
         pending_transaction_id: Option<String>,
+        chain_created_at_unix: Option<u64>,
     },
     /// Gone from the queue, and finalized history proves it EXECUTED. The money left the Vault.
     /// A verdict bound to this generation's parseable queue id retires that generation; an
     /// id-less history fallback remains conservative and never permits another submit.
     Executed { evidence: FundingEvidence },
-    /// Gone from the queue, and finalized history proves it expired WITHOUT executing. The money
-    /// never left the Vault, so a fresh request is the only way the Hot is ever funded.
-    ExpiredUnexecuted { evidence: FundingEvidence },
     /// Proven absent, with nothing of ours ever having been in the queue. This permits an initial
     /// submit; it never overrides a journal record that says a generation may still execute.
     Absent,
@@ -436,7 +437,7 @@ pub(crate) trait HotFundingProvider {
     /// Only called for a provider whose [`WalletProvider::creates_vault_request`] is true.
     /// Returning `Absent` is a claim that the queue was read, that nothing of ours is in it AND
     /// that nothing of ours was ever there; a request that HAS been there and is now gone must come
-    /// back as `Executed`, `ExpiredUnexecuted` or `Unknown`, never as `Absent`.
+    /// back as `Executed` or `Unknown`, never as `Absent`.
 
     /// What an earlier run recorded - the frozen fingerprint and, once the chain has ever reported
     /// one, the pending transaction id that is the primary key from then on - reaches a provider
@@ -512,8 +513,10 @@ pub(crate) struct RecordedRequest {
     pub(crate) pending_transaction_id: Option<String>,
     /// The transaction hash of our own submit, when its receipt was seen.
     pub(crate) transaction_hash: Option<String>,
-    /// When the record was opened, in local unix seconds. Diagnostic only: no decision is taken
-    /// from it, because a local clock is not chain evidence.
+    /// Whether this journal durably recorded that its own submit call was about to begin.
+    pub(crate) submit_attempted: bool,
+    /// The canonical UTC age anchor: local creation time for this process's durable `Prepared`
+    /// record, or finalized chain admission time after adopting an external queue request.
     pub(crate) created_at_unix: u64,
 }
 
@@ -528,12 +531,10 @@ pub(crate) struct RecordedRequest {
 /// it degenerates to "an open funding need for this Hot", which is a superset of the same meaning
 /// and keeps one state machine instead of two.
 
-/// `Executed` and `Expired` are the two ways a request leaves the Vault's queue, and they are
-/// opposite in money terms: `Executed` means the transfer left the Vault, so only any remaining
-/// shortfall may be requested after that exact generation is retired; `Expired` means it never left,
-/// so the full current shortfall is still needed. Neither is ever concluded from the request's
-/// absence - only from finalized chain evidence, which is retained on the record as
-/// [`FundingEvidence`].
+/// `Executed` means the transfer left the Vault. `Expired` remains readable for version-2 journal
+/// compatibility; version 3 removes unexecuted entries whose canonical local deadline has passed
+/// instead of writing that state. Execution is never concluded from the request's absence, only
+/// from finalized chain evidence retained on the record as [`FundingEvidence`].
 
 /// `Satisfied` is reached from any of the others and only ever by an observed Hot balance that
 /// meets the requirement.
@@ -547,19 +548,16 @@ pub(crate) enum FundingState {
     Satisfied,
 }
 
-/// One Hot's funding record. Non-secret by construction: addresses, a public key, amounts, states
-/// and timestamps. No key material and no seed phrase ever reaches this file.
+/// One request in a Hot's funding journal. Non-secret by construction: addresses, a public key,
+/// amounts, states and timestamps. No key material and no seed phrase ever reaches this file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FundingJournalRecord {
-    pub(crate) version: u32,
     /// Which attempt at funding this Hot the record describes.
 
-    /// A generation is the unit over which the shortfall and the fingerprint are frozen. It is
-    /// incremented only after finalized evidence proves the previous generation can no longer move
-    /// money: it either expired unexecuted, or its recorded queue id executed. It is never
-    /// incremented because the shortfall was merely recomputed, because a wait timed out, or because
-    /// the request is no longer visible - each of those would let a recomputed amount create a
-    /// second live request while the first is still confirmable.
+    /// A generation is the unit over which one exact native value and ECC map are frozen. A new
+    /// generation is created when no live record has that exact amount; other live generations stay
+    /// independently confirmable. A timeout or queue disappearance alone never replaces an exact
+    /// live generation.
     pub(crate) generation: u32,
     pub(crate) provider: WalletProvider,
     pub(crate) network: String,
@@ -577,10 +575,16 @@ pub(crate) struct FundingJournalRecord {
     pub(crate) state: FundingState,
     pub(crate) transaction_hash: Option<String>,
     pub(crate) pending_transaction_id: Option<String>,
+    /// Written before the submit call begins. It distinguishes an unresolved local submit from a
+    /// merely observed external queue entry, whose age must come from finalized chain history.
+    #[serde(default)]
+    pub(crate) submit_attempted: bool,
     /// What the chain showed about this request leaving the queue, when it has left it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) evidence: Option<FundingEvidence>,
     pub(crate) created_at_unix: u64,
+    /// UTC Unix deadline. The request is live at this second and expires one second later.
+    pub(crate) expires_at_unix: u64,
     /// When the Hot's balances were last read against this record. A local timeout does not move
     /// it: it records reconciliation with the chain, not the passage of time.
     pub(crate) last_checked_at_unix: Option<u64>,
@@ -596,9 +600,8 @@ impl FundingJournalRecord {
         Self::open_generation(request, now, 1)
     }
 
-    fn open_generation(request: &FundingRequest, now: u64, generation: u32) -> Self {
+    pub(crate) fn open_generation(request: &FundingRequest, now: u64, generation: u32) -> Self {
         Self {
-            version: FUNDING_JOURNAL_VERSION,
             generation,
             provider: request.provider,
             network: request.network.clone(),
@@ -613,8 +616,10 @@ impl FundingJournalRecord {
             state: FundingState::Prepared,
             transaction_hash: None,
             pending_transaction_id: None,
+            submit_attempted: false,
             evidence: None,
             created_at_unix: now,
+            expires_at_unix: funding_request_deadline(now),
             last_checked_at_unix: None,
             satisfied_balances: None,
             satisfied_native_balance: None,
@@ -622,7 +627,30 @@ impl FundingJournalRecord {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        !matches!(self.state, FundingState::Satisfied)
+        matches!(
+            self.state,
+            FundingState::Prepared | FundingState::Submitted | FundingState::Executed
+        )
+    }
+
+    pub(crate) fn is_expired_at(&self, now: u64) -> bool {
+        now > self.expires_at_unix
+    }
+
+    fn blocks_duplicate_at(&self, now: u64) -> bool {
+        match self.state {
+            FundingState::Prepared | FundingState::Submitted => !self.is_expired_at(now),
+            // Finalized execution says the request left the Vault, not that its internal delivery
+            // has reached the Hot. Keep selecting this exact amount until a Hot reading proves the
+            // credit and the record is closed. The queue deadline cannot expire a transfer that
+            // already executed.
+            FundingState::Executed => true,
+            FundingState::Expired | FundingState::Satisfied => false,
+        }
+    }
+
+    fn carries_same_amount(&self, fingerprint: &FundingFingerprint) -> bool {
+        self.fingerprint.value == fingerprint.value && self.fingerprint.cc == fingerprint.cc
     }
 
     /// A Vault-created generation may be retired only after finalized history proves how it left
@@ -729,6 +757,7 @@ impl FundingJournalRecord {
             fingerprint: self.fingerprint.clone(),
             pending_transaction_id: self.pending_transaction_id.clone(),
             transaction_hash: self.transaction_hash.clone(),
+            submit_attempted: self.submit_attempted,
             created_at_unix: self.created_at_unix,
         }
     }
@@ -753,6 +782,23 @@ impl FundingJournalRecord {
             native_shortfall: self.native_shortfall,
         }
     }
+}
+
+/// Versioned on-disk container for all requests associated with one `(network, Hot)` pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FundingJournal {
+    version: u32,
+    requests: Vec<FundingJournalRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FundingJournalSelection {
+    Existing(FundingJournalRecord),
+    Prepared(FundingJournalRecord),
+}
+
+fn funding_request_deadline(created_at_unix: u64) -> u64 {
+    created_at_unix.saturating_add(dexdo_core::params::VAULT_FUNDING_REQUEST_LIFETIME.as_secs())
 }
 
 /// The final native vmshell floor this money path requires the Hot to hold.
@@ -844,12 +890,12 @@ pub(crate) fn ensure_funding_requests_dir(data_dir: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Read the record for one Hot, if any.
-pub(crate) fn load_funding_journal(
+/// Read every record for one Hot, migrating the version-2 single-record shape in memory.
+pub(crate) fn load_funding_journal_records(
     data_dir: &Path,
     network: &str,
     hot_address: &str,
-) -> Result<Option<FundingJournalRecord>> {
+) -> Result<Option<Vec<FundingJournalRecord>>> {
     let path = funding_journal_path(data_dir, network, hot_address);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -860,10 +906,49 @@ pub(crate) fn load_funding_journal(
     // client will not have this client's shape, so deserializing first turns "a version I do not
     // understand" into "corrupt JSON" - and a record that looks corrupt invites deleting it, which
     // is precisely the record that may be the only trace of a Vault request already on chain.
-    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
+    let mut value = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+        anyhow!(
+            "funding journal {} is not valid JSON: {e}. Do not delete or rewrite it: it may be the \
+             only local trace of a funding request that is already on chain.",
+            path.display()
+        )
+    })?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
     match version {
+        Some(2) => {
+            let created_at_unix = value
+                .get("created_at_unix")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "funding journal {} version 2 has no readable created_at_unix; refusing to \
+                         migrate it. Do not delete it: it may be the only local trace of a funding \
+                         request that is already on chain.",
+                        path.display()
+                    )
+                })?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                anyhow!(
+                    "funding journal {} version 2 is not a JSON object; refusing to migrate it. Do \
+                     not delete it: it may be the only local trace of a funding request that is \
+                     already on chain.",
+                    path.display()
+                )
+            })?;
+            object.remove("version");
+            object.insert(
+                "expires_at_unix".to_string(),
+                serde_json::Value::from(funding_request_deadline(created_at_unix)),
+            );
+            let record: FundingJournalRecord = serde_json::from_value(value).map_err(|e| {
+                anyhow!(
+                    "funding journal {} version 2 cannot be migrated safely: {e}. Do not delete it: \
+                     it may be the only local trace of a funding request that is already on chain.",
+                    path.display()
+                )
+            })?;
+            return Ok(Some(vec![record]));
+        }
         Some(version) if version == u64::from(FUNDING_JOURNAL_VERSION) => {}
         Some(version) => bail!(
             "funding journal {} has version {version} but this client understands {}; refusing to \
@@ -879,22 +964,126 @@ pub(crate) fn load_funding_journal(
             path.display()
         ),
     }
-    let record: FundingJournalRecord = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow!("funding journal {} is not valid JSON: {e}", path.display()))?;
-    Ok(Some(record))
+    let journal: FundingJournal = serde_json::from_value(value).map_err(|e| {
+        anyhow!(
+            "funding journal {} is not valid version-3 JSON: {e}",
+            path.display()
+        )
+    })?;
+    for record in &journal.requests {
+        let expected = funding_request_deadline(record.created_at_unix);
+        if record.expires_at_unix != expected {
+            bail!(
+                "funding journal {} records expires_at_unix={} for generation {} but the canonical \
+                 deadline is {expected}; refusing to act on an inconsistent request",
+                path.display(),
+                record.expires_at_unix,
+                record.generation
+            );
+        }
+    }
+    Ok(Some(journal.requests))
 }
 
-/// Write the record atomically, owner-only.
+/// Compatibility view used by single-request reconciliation tests and call sites.
+
+/// Production selection reads the complete array through [`load_funding_journal_records`].
+pub(crate) fn load_funding_journal(
+    data_dir: &Path,
+    network: &str,
+    hot_address: &str,
+) -> Result<Option<FundingJournalRecord>> {
+    Ok(
+        load_funding_journal_records(data_dir, network, hot_address)?
+            .and_then(|records| records.into_iter().max_by_key(|record| record.generation)),
+    )
+}
+
+fn write_funding_journal(
+    data_dir: &Path,
+    network: &str,
+    hot_address: &str,
+    requests: Vec<FundingJournalRecord>,
+) -> Result<()> {
+    ensure_funding_requests_dir(data_dir)?;
+    let path = funding_journal_path(data_dir, network, hot_address);
+    let bytes = serde_json::to_vec_pretty(&FundingJournal {
+        version: FUNDING_JOURNAL_VERSION,
+        requests,
+    })
+    .map_err(|e| anyhow!("serialize funding journal: {e}"))?;
+    crate::cli::note::write_private_atomic(&path, &bytes)
+}
+
+/// Insert or replace one generation atomically, owner-only.
 
 /// Atomic and flushed, both load-bearing: a `prepared` record that a crash could lose would break
 /// the ordering that repeat safety rests on, and a half-written record would be unreadable exactly
 /// when it is needed most.
 pub(crate) fn store_funding_journal(data_dir: &Path, record: &FundingJournalRecord) -> Result<()> {
-    ensure_funding_requests_dir(data_dir)?;
-    let path = funding_journal_path(data_dir, &record.network, &record.hot_address);
-    let bytes = serde_json::to_vec_pretty(record)
-        .map_err(|e| anyhow!("serialize funding journal record: {e}"))?;
-    crate::cli::note::write_private_atomic(&path, &bytes)
+    let mut requests =
+        load_funding_journal_records(data_dir, &record.network, &record.hot_address)?
+            .unwrap_or_default();
+    requests.retain(|existing| existing.generation != record.generation);
+    requests.push(record.clone());
+    requests.sort_by_key(|request| request.generation);
+    write_funding_journal(data_dir, &record.network, &record.hot_address, requests)
+}
+
+/// Select a live request with exactly the same native and ECC amounts, or atomically prepare a new
+/// generation after removing locally expired records that never executed.
+fn select_or_prepare_funding_request(
+    data_dir: &Path,
+    request: &FundingRequest,
+    now: u64,
+) -> Result<FundingJournalSelection> {
+    let fingerprint = FundingFingerprint::of(request, vault_to_hot_native_value());
+    let mut records =
+        load_funding_journal_records(data_dir, &request.network, &request.hot_address)?
+            .unwrap_or_default();
+    ensure_no_duplicate_live_amounts(&records, now)?;
+    if let Some(existing) = records
+        .iter()
+        .find(|record| record.blocks_duplicate_at(now) && record.carries_same_amount(&fingerprint))
+    {
+        return Ok(FundingJournalSelection::Existing(existing.clone()));
+    }
+
+    let generation = records
+        .iter()
+        .map(|record| record.generation)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("funding journal generation overflow"))?;
+    records.retain(|record| {
+        matches!(record.state, FundingState::Executed) || !record.is_expired_at(now)
+    });
+    let prepared = FundingJournalRecord::open_generation(request, now, generation);
+    records.push(prepared.clone());
+    records.sort_by_key(|record| record.generation);
+    ensure_no_duplicate_live_amounts(&records, now)?;
+    write_funding_journal(data_dir, &request.network, &request.hot_address, records)?;
+    Ok(FundingJournalSelection::Prepared(prepared))
+}
+
+fn ensure_no_duplicate_live_amounts(records: &[FundingJournalRecord], now: u64) -> Result<()> {
+    for (index, left) in records.iter().enumerate() {
+        if !left.blocks_duplicate_at(now) {
+            continue;
+        }
+        if let Some(right) = records[index + 1..].iter().find(|right| {
+            right.blocks_duplicate_at(now) && right.carries_same_amount(&left.fingerprint)
+        }) {
+            bail!(
+                "funding journal contains two live requests with exactly the same amount \
+                 (generations {} and {}); refusing to create or select another request",
+                left.generation,
+                right.generation
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1009,7 +1198,7 @@ pub(crate) fn acquire_hot_lock(
     }
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1184,6 +1373,34 @@ impl Default for FundingWaitBounds {
     }
 }
 
+/// The operator's funding window ended while a post-receipt Hot read was still in flight.
+#[derive(Debug)]
+struct FundingBalanceReadTimedOut {
+    evidence: FundingEvidence,
+}
+
+impl std::fmt::Display for FundingBalanceReadTimedOut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the funding wait ended during the post-receipt Hot balance read")
+    }
+}
+
+impl std::error::Error for FundingBalanceReadTimedOut {}
+
+/// A post-receipt Hot read got no chain answer while the funding window remains open.
+#[derive(Debug)]
+struct FundingBalanceReadNeedsRetry {
+    evidence: FundingEvidence,
+}
+
+impl std::fmt::Display for FundingBalanceReadNeedsRetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the post-receipt Hot balance read got no chain answer")
+    }
+}
+
+impl std::error::Error for FundingBalanceReadNeedsRetry {}
+
 /// Who holds the Hot's turn while this runs.
 
 /// The specification requires the final balance check and the spend that follows it to be
@@ -1268,20 +1485,14 @@ where
 
 /// # The invariant a repeat rests on
 
-/// **A funding request is created only from a state that PROVES no earlier request of ours can
-/// still move money.** Three things establish that, and all three are needed:
+/// **For one `(network, Hot)` pair, two live requests with exactly the same native value and ECC
+/// map never coexist.** Different exact amounts are independent and may be live together.
 
-/// 1. the `prepared` record is written and flushed BEFORE the submit, so a spend that lands while
-/// this client never learns it did always leaves a record at least as advanced as `prepared` -
-/// there is no window in which money moved and the journal is silent;
-/// 2. from any open record, a submit needs [`RequestPresence::Absent`],
-/// [`RequestPresence::ExpiredUnexecuted`], or finalized execution tied to that generation's
-/// parseable recorded queue id. Each is a positive chain fact that the old generation cannot
-/// move money again. `Unknown` - any read failure - is not, and forbids the submit;
-/// 3. a request that has LEFT the Vault's queue is never read as absence. The specification is
-/// explicit that queue disappearance alone must never authorize another submit, because
-/// "executed" and "expired" look identical from the queue and are opposite in money terms. Only
-/// finalized history separates them, and the verdict it gave is retained on the record.
+/// The per-Hot lock serializes selection and persistence. A matching request is live through its
+/// exact UTC deadline and is reused. If no live exact match exists, expired records are removed and
+/// a new `prepared` record is written and flushed BEFORE the submit, so a spend that lands while
+/// this client never learns it did still leaves a durable trace. Queue or history failures never
+/// authorize a duplicate of that same live amount.
 
 /// The record is also what makes the probe possible at all: it carries the frozen fingerprint - the
 /// creator key, destination, DApp, value, currencies, flags, bounce and payload hash - of the
@@ -1333,7 +1544,11 @@ where
         .or_else(|| binding.vault_address.clone());
 
     let started = tokio::time::Instant::now();
+    let funding_deadline = started + bounds.timeout;
     let mut arranged = false;
+    // The request this invocation selected or created. Other amounts may be live for the same Hot,
+    // but they belong to other commands and must neither block nor be retired by this one.
+    let mut active_generation: Option<u32> = None;
     // Two questions, and reusing one flag for both is what turned out to be.
 
     // `arranged` answers "may this pass size a residual from a balance it read?" -- loop control.
@@ -1381,8 +1596,10 @@ where
         // full check-and-arrange pass precisely so that `--funding-timeout 0` still performs one
         // check and an already-funded Hot never fails on a timeout; bounding the first read to a
         // zero remainder would take that away.
+        let first_pass = last_observed.is_none();
+        let balance_read_deadline = (!first_pass).then_some(funding_deadline);
         let remaining = bounds.timeout.saturating_sub(started.elapsed());
-        let read = if last_observed.is_none() {
+        let read = if first_pass {
             reader.hot_balances(&hot).await
         } else {
             match tokio::time::timeout(remaining, reader.hot_balances(&hot)).await {
@@ -1396,7 +1613,7 @@ where
                 }
             }
         };
-        let observed = match read {
+        let mut observed = match read {
             Ok(observed) => observed,
             // A read that never got an answer is not a verdict about the balance, and the operator
             // asked to wait for that balance for `bounds.timeout`. The shared per-read retry has
@@ -1411,48 +1628,159 @@ where
             }
             // Everything else is an answer: an encoding fault, an account that is not Active, a
             // rejected request. It will read the same in ten minutes, so it leaves now.
-            Err(error) => return Err(carrying_funding_state(error, notice_is_this_run_s.then_some(&notice))),
+            Err(error) => {
+                return Err(carrying_funding_state(
+                    error,
+                    notice_is_this_run_s.then_some(&notice),
+                ))
+            }
         };
         last_observed = Some(observed.clone());
+        let mut reconciled_this_pass = false;
         if requirements.met_by(&observed) {
+            if active_generation.is_none() {
+                active_generation = load_funding_journal_records(data_dir, &network, &hot_address)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|record| record.blocks_duplicate_at(unix_now_secs()))
+                    .filter(|record| {
+                        record.required_native == requirements.required_native
+                            && record.required == requirements.required
+                    })
+                    .max_by_key(|record| record.generation)
+                    .map(|record| record.generation);
+            }
             // A sufficient balance proves the command can spend; it says nothing about a Vault
             // request that is still confirmable. Probe a recorded queue id before retiring it. If
-            // finalized history proves execution or expiry, `arrange_funding` records that evidence
-            // and this closes immediately. Present/unknown stays evidence-free and the close below
-            // refuses, naming the request the operator must settle from the Vault's pending list.
-            if let Some(record) = load_funding_journal(data_dir, &network, &hot_address)?
-                .filter(FundingJournalRecord::is_open)
-                .filter(FundingJournalRecord::needs_reconciliation_before_close)
+            // finalized history proves execution, `arrange_funding` records that evidence and this
+            // closes immediately. Present/unknown stays evidence-free and the close below refuses,
+            // naming the request the operator must settle from the Vault's pending list.
+            let active_record = match active_generation {
+                Some(generation) => load_funding_journal_records(data_dir, &network, &hot_address)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|record| record.generation == generation),
+                None => None,
+            };
+            if let Some(record) =
+                active_record.filter(FundingJournalRecord::needs_reconciliation_before_close)
             {
-                if let Err(error) = arrange_funding(
+                let reconciliation = arrange_funding(
                     binding,
                     requirements,
-                    &observed,
+                    &mut observed,
                     operation,
                     creator_pubkey,
                     &hot,
                     vault_address.clone(),
                     data_dir,
+                    &mut active_generation,
+                    balance_read_deadline,
+                    funding_deadline,
+                    reader,
                     provider,
                 )
-                .await
-                {
-                    let pending = record
-                        .pending_transaction_id
-                        .as_deref()
-                        .unwrap_or("unknown");
-                    bail!(
-                        "{operation}: could not reconcile Vault -> Hot queue transaction {pending} \
-                         for generation {} before retiring it ({error}). Refusing to continue while \
-                         that transfer may still be confirmable. Settle it from the Vault pending \
-                         list, then re-run the same command.",
-                        record.generation
-                    );
+                .await;
+                match reconciliation {
+                    Ok(reconciled_notice) => {
+                        reconciled_this_pass = true;
+                        last_observed = Some(observed.clone());
+                        // The first observation was sufficient, so this probe was bookkeeping for
+                        // an earlier run and its notice stays out of this run's result. If the
+                        // mandatory post-receipt read is no longer sufficient, however, it is the
+                        // current money state and the wait must carry it.
+                        if !requirements.met_by(&observed) {
+                            notice = reconciled_notice;
+                            notice_is_this_run_s = true;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(timed_out) = error.downcast_ref::<FundingBalanceReadTimedOut>()
+                        {
+                            notice = FundingNotice::RequestExecuted {
+                                evidence: timed_out.evidence.clone(),
+                            };
+                            notice_is_this_run_s = true;
+                            drop(lock);
+                            break;
+                        }
+                        if let Some(retry) = error.downcast_ref::<FundingBalanceReadNeedsRetry>() {
+                            notice = FundingNotice::RequestExecuted {
+                                evidence: retry.evidence.clone(),
+                            };
+                            notice_is_this_run_s = true;
+                            drop(lock);
+                            tokio::time::sleep(bounds.poll).await;
+                            continue;
+                        }
+                        let pending = record
+                            .pending_transaction_id
+                            .as_deref()
+                            .unwrap_or("unknown");
+                        bail!(
+                            "{operation}: could not reconcile Vault -> Hot queue transaction \
+                             {pending} for generation {} before retiring it ({error}). Refusing to \
+                             continue while that transfer may still be confirmable. Settle it from \
+                             the Vault pending list, then re-run the same command.",
+                            record.generation
+                        );
+                    }
                 }
             }
-            // The only thing that ever closes a record: a read that proves the target was reached,
-            // after every recorded live queue id has a finalized verdict.
-            close_journal_if_open(data_dir, &network, &hot_address, &observed)?;
+        }
+
+        if !requirements.met_by(&observed) && !arranged && !reconciled_this_pass {
+            match arrange_funding(
+                binding,
+                requirements,
+                &mut observed,
+                operation,
+                creator_pubkey,
+                &hot,
+                vault_address.clone(),
+                data_dir,
+                &mut active_generation,
+                balance_read_deadline,
+                funding_deadline,
+                reader,
+                provider,
+            )
+            .await
+            {
+                Ok(arranged_notice) => notice = arranged_notice,
+                Err(error) => {
+                    if let Some(timed_out) = error.downcast_ref::<FundingBalanceReadTimedOut>() {
+                        notice = FundingNotice::RequestExecuted {
+                            evidence: timed_out.evidence.clone(),
+                        };
+                        notice_is_this_run_s = true;
+                        drop(lock);
+                        break;
+                    }
+                    if let Some(retry) = error.downcast_ref::<FundingBalanceReadNeedsRetry>() {
+                        notice = FundingNotice::RequestExecuted {
+                            evidence: retry.evidence.clone(),
+                        };
+                        notice_is_this_run_s = true;
+                        drop(lock);
+                        tokio::time::sleep(bounds.poll).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            reconciled_this_pass = true;
+            last_observed = Some(observed.clone());
+            notice_is_this_run_s = true;
+        }
+
+        if requirements.met_by(&observed) {
+            // Close only the generation this invocation selected. Other amounts belong to other
+            // commands and remain independently confirmable. `observed` may be the mandatory read
+            // taken after a finalized destination receipt; no pre-receipt balance reaches here.
+            if let Some(generation) = active_generation {
+                close_journal_if_open(data_dir, &network, &hot_address, generation, &observed)?;
+            }
             return Ok(FundedHot {
                 _lock: lock,
                 observed,
@@ -1460,27 +1788,17 @@ where
             });
         }
 
-        if !arranged {
-            notice = arrange_funding(
-                binding,
-                requirements,
-                &observed,
-                operation,
-                creator_pubkey,
-                &hot,
-                vault_address.clone(),
-                data_dir,
-                provider,
-            )
-            .await?;
+        if reconciled_this_pass {
             // A generation the chain proved EXECUTED whose credit the Hot has not shown yet leaves
             // this pass with no balance it could size a residual from, so it is not the one
             // arrangement this run is allowed. The credit - or this wait's own budget running out -
             // is what ends that window, and only a pass that reads a balance after it may size
             // anything.
             notice_is_this_run_s = true;
-            arranged = !load_funding_journal(data_dir, &network, &hot_address)?
-                .filter(FundingJournalRecord::is_open)
+            arranged = !load_funding_journal_records(data_dir, &network, &hot_address)?
+                .unwrap_or_default()
+                .into_iter()
+                .find(|record| Some(record.generation) == active_generation)
                 .is_some_and(|record| record.awaits_executed_credit(&observed));
         }
 
@@ -1932,9 +2250,14 @@ fn close_journal_if_open(
     data_dir: &Path,
     network: &str,
     hot_address: &str,
+    generation: u32,
     observed: &HotBalances,
 ) -> Result<()> {
-    let Some(mut record) = load_funding_journal(data_dir, network, hot_address)? else {
+    let Some(mut record) = load_funding_journal_records(data_dir, network, hot_address)?
+        .unwrap_or_default()
+        .into_iter()
+        .find(|record| record.generation == generation)
+    else {
         return Ok(());
     };
     if !record.is_open() {
@@ -1945,8 +2268,8 @@ fn close_journal_if_open(
             bail!(
                 "refusing to retire funding generation {} while Vault queue transaction {pending} \
                  may still execute: the Hot balance now meets the requirement, but finalized \
-                 history has not proved whether that pending transfer executed or expired. Settle \
-                 it from the Vault pending list, then re-run the same command",
+                 history has not proved that the pending transfer executed. Settle it from the \
+                 Vault pending list, then re-run the same command",
                 record.generation
             );
         }
@@ -1965,24 +2288,29 @@ fn close_journal_if_open(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn arrange_funding<P>(
+async fn arrange_funding<R, P>(
     binding: &WalletBinding,
     requirements: &FundingRequirements,
-    observed: &HotBalances,
+    observed: &mut HotBalances,
     operation: &str,
     creator_pubkey: &str,
     hot: &CanonicalAddress,
     vault_address: Option<String>,
     data_dir: &Path,
+    active_generation: &mut Option<u32>,
+    balance_read_deadline: Option<tokio::time::Instant>,
+    funding_deadline: tokio::time::Instant,
+    reader: &R,
     provider: &P,
 ) -> Result<FundingNotice>
 where
+    R: HotBalanceReader,
     P: HotFundingProvider,
 {
     let hot_address = hot.to_string();
     let shortfall = requirements.shortfall(observed);
     let native_shortfall = requirements.native_shortfall(observed);
-    let today = FundingRequest {
+    let mut today = FundingRequest {
         provider: binding.provider,
         network: binding.network.clone(),
         vault_address,
@@ -1996,29 +2324,36 @@ where
         native_shortfall,
     };
 
-    let existing = load_funding_journal(data_dir, &binding.network, &hot_address)?;
-    let open = existing.filter(FundingJournalRecord::is_open);
-    provider.refresh_recorded_request(open.as_ref().map(FundingJournalRecord::recorded_request));
-
-    if let Some(open) = &open {
-        if open.provider != binding.provider {
-            bail!(
-                "{operation}: the funding journal for Hot {hot_address} has an open {} request but \
+    let now = unix_now_secs();
+    let records =
+        load_funding_journal_records(data_dir, &binding.network, &hot_address)?.unwrap_or_default();
+    if let Some(open) = records
+        .iter()
+        .find(|record| record.blocks_duplicate_at(now) && record.provider != binding.provider)
+    {
+        bail!(
+            "{operation}: the funding journal for Hot {hot_address} has an open {} request but \
                  the wallet binding now names {}. A request created by the first provider may still \
                  be pending; refusing to continue down a different provider's flow. Resolve the \
                  pending request, or re-bind after it is settled.",
-                open.provider.as_str(),
-                binding.provider.as_str()
-            );
-        }
+            open.provider.as_str(),
+            binding.provider.as_str()
+        );
     }
 
     if !binding.provider.creates_vault_request() {
+        let open = records
+            .into_iter()
+            .filter(FundingJournalRecord::is_open)
+            .max_by_key(|record| record.generation);
+        provider
+            .refresh_recorded_request(open.as_ref().map(FundingJournalRecord::recorded_request));
         // Nothing on chain to duplicate. Record the open need so the wait and a later run share the
         // same shortfall and the same reconciliation timestamp, then point the operator at the
         // provider's own top-up.
         let record = open.unwrap_or_else(|| FundingJournalRecord::open(&today, unix_now_secs()));
         store_funding_journal(data_dir, &record)?;
+        *active_generation = Some(record.generation);
         eprintln!("{}", provider.manual_instruction(&today));
         // The same code the deploy prints, for the same reason: the address is 130 characters, the
         // wallet that must send is a phone, and copying it out of a terminal by hand is where a
@@ -2054,26 +2389,60 @@ where
         return Ok(FundingNotice::ManualTopUpRequested);
     }
 
-    // A provider that CAN create a request. Whatever an earlier run may have put on chain is
-    // described by the open record, so that is what gets probed - not today's shortfall.
-    let probe_for = open
-        .as_ref()
-        .map(|record| record.recorded_funding_request(hot.dapp_id().to_string()))
-        .unwrap_or_else(|| today.clone());
+    let selected = if requirements.met_by(observed) {
+        records
+            .into_iter()
+            .find(|record| Some(record.generation) == *active_generation)
+            .map(FundingJournalSelection::Existing)
+    } else {
+        Some(select_or_prepare_funding_request(data_dir, &today, now)?)
+    };
+    let Some(selected) = selected else {
+        return Ok(FundingNotice::AlreadyFunded);
+    };
+    *active_generation = Some(match &selected {
+        FundingJournalSelection::Existing(record) | FundingJournalSelection::Prepared(record) => {
+            record.generation
+        }
+    });
+    let open = match selected {
+        FundingJournalSelection::Prepared(record) => {
+            return submit_prepared_request(
+                data_dir,
+                &today,
+                operation,
+                &hot_address,
+                record,
+                provider,
+            )
+            .await;
+        }
+        FundingJournalSelection::Existing(record) => record,
+    };
+    provider.refresh_recorded_request(Some(open.recorded_request()));
+
+    // Reconcile only the live request whose native value and complete ECC map exactly match today's
+    // shortfall. Other live amounts remain independently confirmable in the Vault.
+    let probe_for = open.recorded_funding_request(hot.dapp_id().to_string());
     match provider.probe_existing_request(&probe_for).await? {
         RequestPresence::Present {
             transaction_hash,
             pending_transaction_id,
+            chain_created_at_unix,
         } => {
-            let mut record =
-                open.unwrap_or_else(|| FundingJournalRecord::open(&probe_for, unix_now_secs()));
+            let mut record = open;
             record.state = FundingState::Submitted;
             // `Present` is the live-queue verdict. Discard any conservative no-id `Executed`
             // fallback from an earlier read; it was allowed to forbid a submit, never to describe
             // this now-identified queue entry as finalized.
             record.evidence = None;
             record.transaction_hash = transaction_hash.or(record.transaction_hash);
-            record.pending_transaction_id = pending_transaction_id.or(record.pending_transaction_id);
+            record.pending_transaction_id =
+                pending_transaction_id.or(record.pending_transaction_id);
+            if let Some(created_at_unix) = chain_created_at_unix {
+                record.created_at_unix = created_at_unix;
+                record.expires_at_unix = funding_request_deadline(created_at_unix);
+            }
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
             print_ackinacki_funding_notice(&format!(
@@ -2088,15 +2457,55 @@ where
             // retire it before opening the next generation for today's exact shortfall. An id-less
             // or malformed-id history fallback remains conservative: it may forbid a submit, but
             // cannot prove which generation executed.
-            let retired_generation = open
-                .as_ref()
-                .and_then(FundingJournalRecord::retirable_generation);
-            let mut record =
-                open.unwrap_or_else(|| FundingJournalRecord::open(&probe_for, unix_now_secs()));
+            let retired_generation = open.retirable_generation();
+            let mut record = open;
             record.state = FundingState::Executed;
             record.evidence = Some(evidence.clone());
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
+            if retired_generation.is_some() && evidence.delivery_message_id.is_some() {
+                // The finalized destination receipt may become visible after this turn's first Hot
+                // read. Re-read under the same held Hot turn before deciding that the old
+                // generation is credited, closing it, or sizing a replacement from the balance.
+                // Otherwise the replacement can repeat the whole old shortfall even though its
+                // transfer landed between the first read and this receipt lookup.
+                let refreshed = match balance_read_deadline {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline, reader.hot_balances(hot)).await {
+                            Ok(answer) => answer,
+                            Err(_elapsed) => {
+                                return Err(FundingBalanceReadTimedOut {
+                                    evidence: evidence.clone(),
+                                }
+                                .into())
+                            }
+                        }
+                    }
+                    None => reader.hot_balances(hot).await,
+                };
+                *observed = match refreshed {
+                    Ok(observed) => observed,
+                    Err(error)
+                        if read_got_no_answer(&error)
+                            && tokio::time::Instant::now() < funding_deadline =>
+                    {
+                        return Err(FundingBalanceReadNeedsRetry {
+                            evidence: evidence.clone(),
+                        }
+                        .into())
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "{operation}: read Hot {hot_address} after finalized Vault -> Hot \
+                                 delivery"
+                            )
+                        })
+                    }
+                };
+                today.shortfall = requirements.shortfall(observed);
+                today.native_shortfall = requirements.native_shortfall(observed);
+            }
             if requirements.met_by(observed) {
                 tracing::info!(
                     "{operation}: the earlier Vault -> Hot funding request for {hot_address} \
@@ -2105,7 +2514,7 @@ where
                     evidence.detail
                 );
             } else {
-                if let Some(retired) = retired_generation {
+                if retired_generation.is_some() {
                     // Execution proves the message left the VAULT, not that the Hot has been
                     // credited. Between the two the Hot still holds what this generation was sized
                     // against, so a residual computed here would be the whole old shortfall over
@@ -2148,12 +2557,19 @@ where
                          again, so a fresh request is being created.",
                         evidence.detail
                     );
+                    close_journal_if_open(
+                        data_dir,
+                        &binding.network,
+                        &hot_address,
+                        record.generation,
+                        observed,
+                    )?;
                     return submit_new_request(
                         data_dir,
                         &today,
                         operation,
                         &hot_address,
-                        retired + 1,
+                        active_generation,
                         provider,
                     )
                     .await;
@@ -2166,38 +2582,6 @@ where
                 );
             }
             Ok(FundingNotice::RequestExecuted { evidence })
-        }
-        RequestPresence::ExpiredUnexecuted { evidence } => {
-            // Proven to have left the queue WITHOUT moving money. Like finalized execution of the
-            // recorded id, this retires the previous generation: it can no longer execute, so a
-            // fresh request cannot be a second live transfer. The retired generation's verdict is
-            // kept on the way past, then the new generation is written `prepared` and flushed
-            // before the submit, exactly as the first one was.
-            let retired = open.as_ref().map_or(1, |record| record.generation);
-            if let Some(record) = &open {
-                let mut closing = record.clone();
-                closing.state = FundingState::Expired;
-                closing.evidence = Some(evidence.clone());
-                closing.last_checked_at_unix = Some(unix_now_secs());
-                store_funding_journal(data_dir, &closing)?;
-            }
-            if requirements.met_by(observed) {
-                eprintln!(
-                    "{operation}: the earlier Vault -> Hot funding request for {hot_address} \
-                     expired without executing ({}), but the Hot balance already meets this \
-                     command's requirement. No fresh request was created.",
-                    evidence.detail
-                );
-                return Ok(FundingNotice::AlreadyFunded);
-            }
-            eprintln!(
-                "{operation}: the earlier Vault -> Hot funding request for {hot_address} expired \
-                 without executing ({}). No money left the Vault, so a fresh request is being \
-                 created.",
-                evidence.detail
-            );
-            submit_new_request(data_dir, &today, operation, &hot_address, retired + 1, provider)
-                .await
         }
         RequestPresence::Unknown { reason } => {
             // Not proven absent, so not submittable. The record keeps whatever state the chain last
@@ -2214,31 +2598,35 @@ where
             // execute must never be overwritten from here: `Absent` for a record already carrying a
             // request would be the provider contradicting itself, and the safe reading of a
             // contradiction is "unknown".
-            if let Some(record) = &open {
-                if record.generation_may_still_execute() && record.pending_transaction_id.is_some() {
-                    let reason = format!(
-                        "the queue reports no request while the journal holds pending transaction \
+            if open.generation_may_still_execute() && open.pending_transaction_id.is_some() {
+                let reason = format!(
+                    "the queue reports no request while the journal holds pending transaction \
                          {} for generation {}",
-                        record
-                            .pending_transaction_id
-                            .as_deref()
-                            .unwrap_or("<unknown>"),
-                        record.generation
-                    );
-                    eprintln!(
-                        "{operation}: refusing to create a second Vault -> Hot funding request for \
-                         {hot_address}: {reason}. A request that has been in the queue and is no \
-                         longer there must be proven executed or expired from finalized history, \
-                         never read as absence. Re-run the same command to reconcile."
-                    );
-                    return Ok(FundingNotice::RequestIndeterminate { reason });
-                }
+                    open.pending_transaction_id
+                        .as_deref()
+                        .unwrap_or("<unknown>"),
+                    open.generation
+                );
+                eprintln!(
+                    "{operation}: refusing to create a second Vault -> Hot funding request for \
+                         {hot_address}: {reason}. A live request that has been in the queue and is \
+                         no longer there must be proven executed, never read as absence. Re-run the \
+                         same command to reconcile."
+                );
+                return Ok(FundingNotice::RequestIndeterminate { reason });
             }
             if requirements.met_by(observed) {
                 return Ok(FundingNotice::AlreadyFunded);
             }
-            let generation = open.as_ref().map_or(1, |record| record.generation);
-            submit_new_request(data_dir, &today, operation, &hot_address, generation, provider).await
+            submit_new_request(
+                data_dir,
+                &today,
+                operation,
+                &hot_address,
+                active_generation,
+                provider,
+            )
+            .await
         }
     }
 }
@@ -2254,20 +2642,107 @@ async fn submit_new_request<P>(
     request: &FundingRequest,
     operation: &str,
     hot_address: &str,
-    generation: u32,
+    active_generation: &mut Option<u32>,
     provider: &P,
 ) -> Result<FundingNotice>
 where
     P: HotFundingProvider,
 {
-    let record = FundingJournalRecord::open_generation(request, unix_now_secs(), generation);
+    match select_or_prepare_funding_request(data_dir, request, unix_now_secs())? {
+        FundingJournalSelection::Prepared(record) => {
+            *active_generation = Some(record.generation);
+            submit_prepared_request(data_dir, request, operation, hot_address, record, provider)
+                .await
+        }
+        FundingJournalSelection::Existing(record) => {
+            *active_generation = Some(record.generation);
+            print_ackinacki_funding_notice(&format!(
+                "Vault -> Hot funding request was already pending; confirm it in {}.",
+                crate::cli::link::wallet_app()
+            ));
+            Ok(FundingNotice::RequestAlreadyPending)
+        }
+    }
+}
+
+async fn submit_prepared_request<P>(
+    data_dir: &Path,
+    request: &FundingRequest,
+    operation: &str,
+    hot_address: &str,
+    record: FundingJournalRecord,
+    provider: &P,
+) -> Result<FundingNotice>
+where
+    P: HotFundingProvider,
+{
+    // This generation is durably Prepared, but this process has not submitted it. Clear any older
+    // generation the provider was constructed with, then inspect the exact transfer in the live
+    // queue. Another host or a lost local journal may already have created it with the same
+    // custodian key; only a proven absence authorizes this process to submit.
+    provider.refresh_recorded_request(None);
+    match provider.probe_existing_request(request).await? {
+        RequestPresence::Present {
+            transaction_hash,
+            pending_transaction_id,
+            chain_created_at_unix,
+        } => {
+            let Some(created_at_unix) = chain_created_at_unix else {
+                let reason = "the provider found the exact request in the Vault queue but supplied \
+                              no finalized chain admission time for this unbound local generation"
+                    .to_string();
+                eprintln!(
+                    "{operation}: cannot safely adopt the Vault -> Hot funding request for \
+                     {hot_address} ({reason}). Not submitting another one. It remains recorded as \
+                     prepared; re-run the same command to reconcile once finalized history is \
+                     readable."
+                );
+                return Ok(FundingNotice::RequestIndeterminate { reason });
+            };
+            let mut record = record;
+            record.state = FundingState::Submitted;
+            record.transaction_hash = transaction_hash;
+            record.pending_transaction_id = pending_transaction_id;
+            record.created_at_unix = created_at_unix;
+            record.expires_at_unix = funding_request_deadline(created_at_unix);
+            record.last_checked_at_unix = Some(unix_now_secs());
+            store_funding_journal(data_dir, &record)?;
+            print_ackinacki_funding_notice(&format!(
+                "Vault -> Hot funding request was already pending; confirm it in {}.",
+                crate::cli::link::wallet_app()
+            ));
+            return Ok(FundingNotice::RequestAlreadyPending);
+        }
+        RequestPresence::Executed { evidence } => {
+            let mut record = record;
+            record.state = FundingState::Executed;
+            record.evidence = Some(evidence.clone());
+            record.last_checked_at_unix = Some(unix_now_secs());
+            store_funding_journal(data_dir, &record)?;
+            return Ok(FundingNotice::RequestExecuted { evidence });
+        }
+        RequestPresence::Unknown { reason } => {
+            eprintln!(
+                "{operation}: cannot establish whether a Vault -> Hot funding request for \
+                 {hot_address} already exists ({reason}). Not submitting one. It remains recorded \
+                 as prepared; re-run the same command to reconcile once the chain is readable."
+            );
+            return Ok(FundingNotice::RequestIndeterminate { reason });
+        }
+        RequestPresence::Absent => {}
+    }
+
+    let mut record = record;
+    // Persist the boundary before entering the network call. If the process dies anywhere after
+    // this write, the next run must treat the submit as possibly having reached the Vault.
+    record.submit_attempted = true;
     store_funding_journal(data_dir, &record)?;
+
     match provider.create_request(request).await? {
         SubmitOutcome::Accepted {
             transaction_hash,
             pending_transaction_id,
         } => {
-            let mut record = record;
             record.state = FundingState::Submitted;
             record.transaction_hash = transaction_hash;
             record.pending_transaction_id = pending_transaction_id;
@@ -2521,3 +2996,7 @@ mod issue_334_reaudit_regressions;
 /// aggregated balance cannot carry.
 #[cfg(test)]
 mod issue_334_delivery_identity;
+
+/// multiple live amounts, exact de-duplication, local UTC expiry and journal migration.
+#[cfg(test)]
+mod issue_1904_multiple_requests;

@@ -156,7 +156,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/dexdo" "stage/${NAME}/"
           mkdir -p "stage/${NAME}/manifest"
           cp manifest/mainnet.manifest.json "stage/${NAME}/manifest/"
-          cp models.json README.md LICENSE "stage/${NAME}/"
+          cp models.example.json README.md LICENSE "stage/${NAME}/"
           tar -C stage -czf "${NAME}.tar.gz" "${NAME}"
           hash="$(shasum -a 256 "${NAME}.tar.gz" | awk '{print $1}')"
           sh ci/write-sha256-line.sh "$hash" "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
@@ -170,7 +170,7 @@ jobs:
           mkdir -p "stage/${NAME}/manifest"
           cp "target/${{ matrix.target }}/release/dexdo.exe" "stage/${NAME}/"
           cp manifest/mainnet.manifest.json "stage/${NAME}/manifest/"
-          cp models.json README.md LICENSE "stage/${NAME}/"
+          cp models.example.json README.md LICENSE "stage/${NAME}/"
           (cd stage && 7z a -tzip "../${NAME}.zip" "${NAME}" >/dev/null)
           hash="$(certutil -hashfile "${NAME}.zip" SHA256 | sed -n 2p | tr -d '[:space:]')"
           sh ci/write-sha256-line.sh "$hash" "${NAME}.zip" > "${NAME}.zip.sha256"
@@ -230,17 +230,16 @@ jobs:
   # Runs only for real tag builds (a published release exists) and after the
   # `release` job. Scope: a guard step first asserts the API `latest` == the tag
   # this run published, then it installs via the published scripts, so it always
-  # tests THIS release. macOS is not re-tested here because the per-build binary
-  # smoke test already runs the two macOS binaries natively on their runners;
-  # this job covers the two scripted installers (sh + PowerShell) on clean
-  # linux and windows runners.
+  # tests THIS release. All three supported operating systems run the documented
+  # one-line installer and `doctor`; binary-only smoke coverage is not enough to
+  # prove the per-user manifest was installed.
   install-smoke:
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Prove this job smoke-tests THIS release, not a stale or newer one: the
@@ -257,14 +256,14 @@ jobs:
             echo "latest not yet ${GITHUB_REF_NAME}, retrying ($n) ..."; sleep 10
           done
           echo "latest == ${GITHUB_REF_NAME}; proceeding"
-      - name: Install from the published script and run (linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install from the published script and run (linux / macOS)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           # The documented user command, wrapped in a short retry to absorb
           # release/asset propagation delay before failing closed.
           install_once() {
-            curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh -o install.sh \
+            curl -fsSL https://get.dex.do/install.sh -o install.sh \
               && sh install.sh
           }
           n=0
@@ -277,6 +276,8 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           command -v dexdo
           dexdo --help
+          test -s "$HOME/.dexdo/manifest.json"
+          dexdo doctor
 
       - name: Install from the published script and run (windows)
         if: matrix.os == 'windows-latest'
@@ -287,7 +288,7 @@ jobs:
           $ok = $false
           for ($n = 1; $n -le 12; $n++) {
             try {
-              $script = Invoke-RestMethod 'https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.ps1'
+              $script = Invoke-RestMethod 'https://get.dex.do/install.ps1'
               Invoke-Expression $script
               $ok = $true
               break
@@ -307,3 +308,7 @@ jobs:
           if (-not (Get-Command dexdo -ErrorAction SilentlyContinue)) { throw 'dexdo not found on PATH' }
           dexdo --help
           if ($LASTEXITCODE -ne 0) { throw 'dexdo --help failed' }
+          $manifest = Join-Path $env:USERPROFILE '.dexdo\manifest.json'
+          if (-not (Test-Path $manifest -PathType Leaf)) { throw "installed manifest not found at $manifest" }
+          dexdo doctor
+          if ($LASTEXITCODE -ne 0) { throw 'dexdo doctor failed' }

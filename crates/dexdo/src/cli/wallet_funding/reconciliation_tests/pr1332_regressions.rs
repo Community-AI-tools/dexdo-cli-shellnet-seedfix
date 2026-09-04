@@ -1,8 +1,7 @@
 use super::*;
 
 /// A balance observation says nothing about a request that is still confirmable in the Vault.
-/// Retiring that request loses its queue id; a later, different shortfall then looks like a first
-/// request and creates a second signed transfer.
+/// A later, different shortfall gets its own request without retiring the earlier queue id.
 #[tokio::test]
 async fn a_sufficient_balance_does_not_retire_a_still_pending_vault_request() {
     let dir = temp();
@@ -36,25 +35,27 @@ async fn a_sufficient_balance_does_not_retire_a_still_pending_vault_request() {
     assert_eq!(vault.submits.get(), 1, "the failed probe submits nothing");
 
     // Later the Hot has spent part of that direct top-up. Its new shortfall no longer matches the
-    // frozen transfer, but queue id 7 still does; retaining the record is what prevents request 8.
+    // frozen transfer, so it gets request 8 while queue id 7 remains independently confirmable.
     *vault.queue_error.borrow_mut() = None;
     let hot = FakeHot::always(400);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
     assert_eq!(
         vault.submits.get(),
-        1,
-        "a sufficient balance must not erase the only identity of a still-confirmable transfer"
+        2,
+        "a different amount must create a second request"
     );
-    let after = record_of(dir.path()).expect("the pending generation remains recorded");
-    assert_eq!(after.state, FundingState::Submitted);
-    assert_eq!(after.generation, 1);
-    assert_eq!(after.pending_transaction_id.as_deref(), Some("7"));
+    let after = records_of(dir.path());
+    assert_eq!(after.len(), 2, "both live amounts remain recorded");
+    assert_eq!(after[0].state, FundingState::Submitted);
+    assert_eq!(after[0].generation, 1);
+    assert_eq!(after[0].pending_transaction_id.as_deref(), Some("7"));
+    assert_eq!(after[1].state, FundingState::Submitted);
+    assert_eq!(after[1].generation, 2);
+    assert_eq!(after[1].pending_transaction_id.as_deref(), Some("8"));
 }
 
-/// Destination, DApp id and native value are identical across generations. An old
-/// `TransactionSubmitted` may recover an id for the conservative execution check, but it cannot
-/// date the expiry of an indeterminate generation and thereby authorize another submit.
+/// An unrelated old `TransactionSubmitted` does not duplicate a still-live exact journal request.
 #[tokio::test]
 async fn an_older_submitted_event_cannot_date_an_indeterminate_generation() {
     let dir = temp();
@@ -72,15 +73,18 @@ async fn an_older_submitted_event_cannot_date_an_indeterminate_generation() {
     assert_eq!(first.state, FundingState::Prepared);
     assert_eq!(first.generation, 1);
     assert!(first.pending_transaction_id.is_none());
+    assert!(
+        first.submit_attempted,
+        "the crash-safe boundary is durable before an unresolved submit returns"
+    );
 
-    vault.now.set(QUEUED_AT + WINDOW + 1);
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
     assert_eq!(
         vault.submits.get(),
         1,
-        "an event with no generation discriminator cannot authorize a second signed transfer"
+        "an unrelated event cannot authorize a duplicate of the same live amount"
     );
     let after = record_of(dir.path()).expect("the unresolved generation remains recorded");
     assert_eq!(after.state, FundingState::Prepared);
@@ -98,16 +102,15 @@ async fn an_older_submitted_event_cannot_date_an_indeterminate_generation() {
         );
     };
     assert!(
-        reason.contains("matching TransactionSubmitted")
-            && reason.contains("nothing proves it belongs to generation 1"),
-        "the refusal must distinguish an unrelated match from no event at all: {reason}"
+        reason.contains("generation 1") && reason.contains("local funding journal until"),
+        "the refusal must name the live generation and its deadline: {reason}"
     );
     assert_eq!(vault.submits.get(), 1);
 }
 
 /// A receipt-less submit can have reached the Vault even though this client learned no queue id.
 /// An independently arriving balance may let the money command continue, but it must not erase the
-/// unresolved generation: a later shortfall must reconcile it instead of signing another transfer.
+/// unresolved generation; a later, different shortfall gets a separate request without erasing it.
 #[tokio::test]
 async fn a_sufficient_balance_keeps_an_indeterminate_no_id_generation_visible() {
     let dir = temp();
@@ -140,13 +143,15 @@ async fn a_sufficient_balance_keeps_an_indeterminate_no_id_generation_visible() 
     let _ = money_command_run(dir.path(), &vault, &hot).await;
     assert_eq!(
         vault.submits.get(),
-        1,
-        "a later shortfall must reconcile the unresolved generation, never sign transfer two"
+        2,
+        "a later, different shortfall must get its own transfer"
     );
-    assert_eq!(
-        record_of(dir.path()).expect("the unresolved generation remains").state,
-        FundingState::Prepared
-    );
+    let records = records_of(dir.path());
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].state, FundingState::Prepared);
+    assert_eq!(records[0].generation, 1);
+    assert_eq!(records[1].state, FundingState::Prepared);
+    assert_eq!(records[1].generation, 2);
 }
 
 /// A no-id history fallback is intentionally allowed to find `Sent`, because even a false match
@@ -187,30 +192,28 @@ async fn a_fallback_sent_event_never_retires_an_indeterminate_generation() {
     let _ = money_command_run(dir.path(), &vault, &hot).await;
     assert_eq!(
         vault.submits.get(),
-        1,
-        "fallback execution evidence may forbid, but never authorize, a second transfer"
+        2,
+        "fallback evidence for one amount must not block a distinct amount"
     );
+    let after_second = records_of(dir.path());
+    assert_eq!(after_second.len(), 2);
+    assert_eq!(after_second[0].state, FundingState::Executed);
+    assert_eq!(after_second[0].generation, 1);
+    assert_eq!(after_second[1].state, FundingState::Prepared);
+    assert_eq!(after_second[1].generation, 2);
 
     // The current generation becomes visible after the fallback read. `Present` is authoritative
     // about its liveness and must erase the unrelated execution evidence before close is attempted.
     vault.queue.borrow_mut().push(queued(7, 0, REQUIRED));
-    let hot = FakeHot::always(REQUIRED);
-    let error = money_command_run(dir.path(), &vault, &hot)
-        .await
-        .expect_err("the now-visible request is pending, not safely retired");
-    let message = error.to_string();
-    assert!(
-        message.contains(
-            "refusing to retire funding generation 1 while Vault queue transaction 7 may still \
-             execute"
-        ),
-        "the refusal must name the live request: {message}"
-    );
-    let pending = record_of(dir.path()).expect("the live request remains recorded");
-    assert_eq!(pending.state, FundingState::Submitted);
-    assert_eq!(pending.pending_transaction_id.as_deref(), Some("7"));
-    assert!(pending.evidence.is_none());
-    assert_eq!(vault.submits.get(), 1);
+    let hot = FakeHot::always(0);
+    let _ = money_command_run(dir.path(), &vault, &hot).await;
+    let pending = records_of(dir.path());
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].state, FundingState::Submitted);
+    assert_eq!(pending[0].pending_transaction_id.as_deref(), Some("7"));
+    assert!(pending[0].evidence.is_none());
+    assert_eq!(pending[1].state, FundingState::Prepared);
+    assert_eq!(vault.submits.get(), 2);
 }
 
 /// A persisted queue id that cannot be parsed as the Vault's `uint64` id is not a known id. A

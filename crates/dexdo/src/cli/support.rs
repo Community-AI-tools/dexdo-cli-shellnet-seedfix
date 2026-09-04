@@ -237,6 +237,12 @@ mod printed_follow_up_tests {
     }
 }
 
+/// the permission guard now stands in front of every secret read. Its own file so nothing
+/// existing here is edited to make it pass.
+#[cfg(all(test, unix))]
+#[path = "secret_read_guard_1877_tests.rs"]
+mod secret_read_guard_1877_tests;
+
 #[cfg(test)]
 mod one_note_per_command_tests {
     /// Files allowed to call the identity-based entry point, and why.
@@ -1436,6 +1442,11 @@ mod shell_split_host_aware_tests;
 pub(crate) fn load_note_tree(note_key: Option<&std::path::Path>) -> Result<NoteTree> {
     match note_key {
         Some(path) => {
+            // `--note-key` is guarded wherever it moves money (`read_secret_hex`), and this
+            // seam -- reached from the mock paths -- read the same file unguarded. No money moves
+            // through here, but it is the operator's real key file and the mode is a fact about it,
+            // not about the command.
+            refuse_exposed_secret_file(path, "--note-key")?;
             let hex = std::fs::read_to_string(path)
                 .map_err(|e| anyhow::anyhow!("read --note-key {}: {e}", path.display()))?;
             NoteTree::from_secret_hex(&hex)
@@ -1525,6 +1536,30 @@ pub(crate) fn refuse_exposed_secret_file(path: &std::path::Path, what: &str) -> 
 #[cfg(not(unix))]
 pub(crate) fn refuse_exposed_secret_file(_path: &std::path::Path, _what: &str) -> Result<()> {
     Ok(())
+}
+
+/// The same refusal, for the readers whose callers treat an ABSENT file as a valid state.
+
+/// Several secret readers return `Ok(None)`/`Ok(())` when the file is not there -- a pool that has
+/// not been created yet, a recovery file from a run that never happened. `refuse_exposed_secret_file`
+/// reports a missing file as an error, because at ITS call sites the file is about to be read and
+/// its absence is a failure. Feeding those two shapes through one function would either turn "no
+/// pool yet" into a refusal or teach the strict callers to swallow a missing key.
+
+/// So: absent is Ok here and nothing else is. Present-and-exposed still refuses, with the same
+/// sentence, because it is the same guard.
+
+/// **Use the strict one unless the caller genuinely accepts absence**, and the way to tell is
+/// whether the very next line maps `NotFound` to a success. If it does not, this is the wrong
+/// function.
+pub(crate) fn refuse_exposed_secret_file_if_present(
+    path: &std::path::Path,
+    what: &str,
+) -> Result<()> {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => refuse_exposed_secret_file(path, what),
+    }
 }
 
 /// Write a key fixture the way an operator is required to hold one: owner-only.

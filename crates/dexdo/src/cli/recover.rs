@@ -1827,9 +1827,9 @@ mod tests {
         let token_contract = format!("0:{}", "2".repeat(64));
         let seller_tc = format!("0:{}", "3".repeat(64));
         let secret = "2a".repeat(32);
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [
                     {
@@ -1847,8 +1847,7 @@ mod tests {
                 ]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         let keys = dexdo_core::KeyPair::from_secret_hex(&secret).unwrap();
         let chain = PoolRecoverChain {
@@ -1923,9 +1922,9 @@ mod tests {
         let note_addr = format!("0:{}", "1b".repeat(32));
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": note_addr,
@@ -1934,8 +1933,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         let keys = dexdo_core::KeyPair::from_secret_hex(&secret).unwrap();
         let chain = PoolRecoverChain {
             buyer_note: dexdo_core::Address::parse(&note_addr).unwrap(),
@@ -1999,9 +1997,9 @@ mod tests {
         let note_addr = format!("0:{}", "1c".repeat(32));
         let token_contract = format!("0:{}", "2".repeat(64));
         let secret = "2a".repeat(32);
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": [{
                     "address": note_addr,
@@ -2010,8 +2008,7 @@ mod tests {
                 }]
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
 
         let keys = dexdo_core::KeyPair::from_secret_hex(&secret).unwrap();
         let chain = PoolRecoverChain {
@@ -2356,15 +2353,14 @@ mod tests {
 
     fn write_reclaim_pool(dir: &std::path::Path, notes: serde_json::Value) -> std::path::PathBuf {
         let pool_path = dir.join("pn_pool.json");
-        std::fs::write(
+        crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
                 "notes": notes,
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
         pool_path
     }
 
@@ -2999,7 +2995,7 @@ mod tests {
             ]),
         );
         let key_path = dir.join("note.key");
-        std::fs::write(&key_path, &secret_a).unwrap();
+        crate::cli::support::write_owner_only_key_fixture(&key_path, &secret_a);
 
         // Not `expect_err`: a plan carries note secrets, and nothing on this path may render them.
         let error = match crate::cli::commands::resolve_pool_recovery_plan(

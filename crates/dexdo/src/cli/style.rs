@@ -73,6 +73,22 @@ pub(crate) const SPINNER: [&str; 10] = [
 const VALUE_COLUMN: usize = 12;
 const INDENT: usize = 2;
 
+/// The gap between a label and its value, and it exists whatever the label's length.
+
+/// It is subtracted from the label's own field rather than added after it, so that the gap is part
+/// of the grid instead of whatever padding happens to be left over. That distinction is the whole
+/// defect in: the label used to be padded to `VALUE_COLUMN - INDENT` and nothing separated it
+/// from the value, so a name that filled the field exactly consumed the separator with it and
+/// `dexdo doctor` printed `generationmanifest 4.0.36, chain 4.0.36`. A name LONGER than the field
+/// collided the same way, which is why the fix cannot be "make the field wide enough for today's
+/// longest name": the contract names in that block come from the manifest and are not this code's
+/// to bound.
+
+/// Values whose label fits the narrowed field keep the column they have always started in, so
+/// every row that reads correctly today is unchanged; only the rows that collided move, and they
+/// move right by exactly the overflow.
+const LABEL_GAP: usize = 1;
+
 /// How much colour this destination can take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Palette {
@@ -145,14 +161,16 @@ pub(crate) fn field(palette: Palette, label: &str, value: &str, value_role: Role
     if label.is_empty() {
         return field_continued(&paint(palette, value_role, value));
     }
-    let pad = VALUE_COLUMN - INDENT;
+    let pad = VALUE_COLUMN - INDENT - LABEL_GAP;
     format!(
-        "{:INDENT$}{:<pad$}{}",
+        "{:INDENT$}{:<pad$}{:LABEL_GAP$}{}",
         "",
         paint(palette, Role::Label, label),
+        "",
         paint(palette, value_role, value),
         INDENT = INDENT,
         pad = pad + painted_overhead(palette, Role::Label),
+        LABEL_GAP = LABEL_GAP,
     )
 }
 
@@ -399,3 +417,7 @@ mod tests {
         assert_eq!(short_id(&address), "\u{2026}ababab");
     }
 }
+
+/// the gap after a label exists whatever the label's length.
+#[cfg(test)]
+mod issue_1905_label_gap;

@@ -38,7 +38,59 @@ pub(crate) const NOTE_BALANCE_SCHEMA: &str = "dexdo.note_balance.v1";
 
 /// Kept beside the other schema constants so the pin and document-drift gates cover it.
 pub(crate) const MODEL_REGISTRY_SCHEMA: &str = "dexdo.model_registry.v1";
+pub(crate) const DOCTOR_SCHEMA: &str = "dexdo.doctor.v1";
 pub(crate) const ERROR_SCHEMA: &str = "dexdo.error.v1";
+
+#[derive(Serialize)]
+pub(crate) struct DoctorVersion {
+    pub(crate) contract: String,
+    pub(crate) version: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DoctorCheck {
+    pub(crate) name: String,
+    pub(crate) verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) actual: Option<String>,
+    pub(crate) message: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DoctorPolicy {
+    pub(crate) status: &'static str,
+    pub(crate) problems: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DoctorSummary {
+    pub(crate) checked: usize,
+    pub(crate) passed: usize,
+    pub(crate) failed: usize,
+    pub(crate) skipped: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DoctorResponse {
+    pub(crate) schema: &'static str,
+    pub(crate) network: String,
+    pub(crate) endpoint: String,
+    pub(crate) manifest_generation: Option<String>,
+    pub(crate) chain_generation: Option<String>,
+    pub(crate) versions: Vec<DoctorVersion>,
+    pub(crate) checks: Vec<DoctorCheck>,
+    /// Positive means the local clock is ahead of the chain; negative means it is behind.
+    pub(crate) clock_skew_seconds: i64,
+    pub(crate) policy: DoctorPolicy,
+    pub(crate) summary: DoctorSummary,
+    pub(crate) verdict: &'static str,
+}
 
 /// The structured form of the Hot-funding outcome carried inside a command's ONE success object.
 
@@ -191,6 +243,7 @@ pub(crate) const OP_DEALS: &str = "deals";
 pub(crate) const OP_NOTE_LIST: &str = "note_list";
 pub(crate) const OP_NOTE_BALANCE: &str = "note_balance";
 pub(crate) const OP_MODEL_REGISTRY: &str = "model_registry";
+pub(crate) const OP_DOCTOR: &str = "doctor";
 pub(crate) const OP_SUBSCRIPTION_PLACE: &str = "subscription_place";
 pub(crate) const OP_SUBSCRIPTION_STATUS: &str = "subscription_status";
 pub(crate) const OP_SUBSCRIPTION_CANCEL: &str = "subscription_cancel";
@@ -1263,7 +1316,9 @@ mod tests {
         assert_eq!(CLOSE_SCHEMA, "dexdo.close.v1");
         assert_eq!(SUBSCRIPTION_SCHEMA, "dexdo.subscription.v2");
         assert_eq!(MODEL_REGISTRY_SCHEMA, "dexdo.model_registry.v1");
+        assert_eq!(DOCTOR_SCHEMA, "dexdo.doctor.v1");
         assert_eq!(ERROR_SCHEMA, "dexdo.error.v1");
+        assert_eq!(OP_DOCTOR, "doctor");
         assert_eq!(OP_SUBSCRIPTION_PLACE, "subscription_place");
         assert_eq!(OP_SUBSCRIPTION_STATUS, "subscription_status");
         assert_eq!(OP_SUBSCRIPTION_CANCEL, "subscription_cancel");

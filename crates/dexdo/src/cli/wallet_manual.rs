@@ -1088,6 +1088,15 @@ mod live {
                 "a secret file path",
             )?),
         };
+        // THE CHECK COMES BEFORE THE READ, and here that is the whole fix.
+
+        // This is not a missing call, it was a wrong ORDER. The guarded read at
+        // `multisig_secret_hex` further down did run -- but this classification had already pulled
+        // the operator's secret into memory to decide whether it was a hex key or a seed phrase.
+        // `support.rs` names that failure in its own words: "a refusal that has already loaded the
+        // secret has done the thing it refuses." A guard that fires after the read is a report, not
+        // a protection.
+        crate::cli::support::refuse_exposed_secret_file(&path, "the wallet secret file")?;
         let contents = std::fs::read_to_string(&path)
             .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
         let kind = classify_manual_secret_file(&contents)?;

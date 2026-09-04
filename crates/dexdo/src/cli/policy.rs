@@ -1218,10 +1218,38 @@ pub(crate) fn run_policy(args: PolicyArgs) -> Result<()> {
     }
 }
 
-pub(crate) fn doctor_policy_line(explicit: Option<&Path>) -> Result<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoctorPolicyStatus {
+    Ready,
+    Missing,
+    Incomplete,
+}
+
+impl DoctorPolicyStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Missing => "missing",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DoctorPolicyAssessment {
+    pub(crate) status: DoctorPolicyStatus,
+    pub(crate) problems: Vec<String>,
+}
+
+pub(crate) fn doctor_policy_assessment(
+    explicit: Option<&Path>,
+) -> Result<DoctorPolicyAssessment> {
     let path = resolve_policy_path(explicit)?;
     if !path.exists() {
-        return Ok(format!("policy: missing ({})", path.display()));
+        return Ok(DoctorPolicyAssessment {
+            status: DoctorPolicyStatus::Missing,
+            problems: Vec::new(),
+        });
     }
     let value = read_policy(&path)?;
     let mut problems = validate_value(&value, RuntimeRole::Buyer);
@@ -1229,17 +1257,30 @@ pub(crate) fn doctor_policy_line(explicit: Option<&Path>) -> Result<String> {
     problems.sort_by(|a, b| a.key.cmp(&b.key));
     problems.dedup_by(|a, b| a.key == b.key);
     if problems.is_empty() {
-        Ok(format!("policy: OK ({})", path.display()))
+        Ok(DoctorPolicyAssessment {
+            status: DoctorPolicyStatus::Ready,
+            problems: Vec::new(),
+        })
     } else {
-        Ok(format!(
-            "policy: incomplete ({}) keys={}",
-            path.display(),
-            problems
+        Ok(DoctorPolicyAssessment {
+            status: DoctorPolicyStatus::Incomplete,
+            problems: problems
                 .iter()
                 .map(|p| p.key.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ))
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+}
+
+pub(crate) fn doctor_policy_line(assessment: &DoctorPolicyAssessment) -> String {
+    match assessment.status {
+        DoctorPolicyStatus::Ready => "ready".to_string(),
+        DoctorPolicyStatus::Missing => "not configured (optional for doctor)".to_string(),
+        DoctorPolicyStatus::Incomplete => format!(
+            "incomplete: {}",
+            assessment.problems.join(", ")
+        ),
     }
 }
 

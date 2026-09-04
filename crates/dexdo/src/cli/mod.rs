@@ -114,6 +114,10 @@ pub(crate) mod qr_display;
 pub(crate) mod refusal;
 pub(crate) mod recover;
 pub(crate) mod reports;
+// Where a key lives: the operating system's store where the machine has one that keeps a secret
+// until it is deleted, and an owner-only file where it does not. Both branches are ordinary -- a
+// seller runs headless, and a headless server has no keychain.
+pub(crate) mod secret_store;
 pub(crate) mod seller;
 pub(crate) mod seller_policy;
 pub(crate) mod settlement_receipt;
