@@ -582,6 +582,7 @@ mod tests {
             price_per_tick: 1,
             capabilities: Capabilities {
                 max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
             vocab_size: None,
@@ -678,6 +679,7 @@ mod tests {
             tokenizer_family: "exact".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: None,
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
         });
@@ -793,6 +795,7 @@ mod tests {
             api_key_env: KEY_ENV.into(),
             capabilities: Capabilities {
                 max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                ..Default::default()
             },
             ..openai::OpenAiConfig::default()
         });
@@ -864,6 +867,7 @@ mod tests {
                 api_key_env: "PATH".to_string(),
                 capabilities: Capabilities {
                     max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                    ..Default::default()
                 },
                 ..openai::OpenAiConfig::default()
             });
@@ -946,6 +950,7 @@ mod tests {
                 api_key_env: "PATH".to_string(),
                 capabilities: Capabilities {
                     max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                    ..Default::default()
                 },
                 ..openai::OpenAiConfig::default()
             });

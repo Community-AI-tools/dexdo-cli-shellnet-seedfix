@@ -3328,6 +3328,7 @@ mod tests {
             tokenizer_family: "exact".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: Some(1024),
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
         })

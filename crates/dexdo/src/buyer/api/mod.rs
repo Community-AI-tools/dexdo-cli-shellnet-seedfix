@@ -6868,6 +6868,7 @@ mod tests {
                 tokenizer_family: "mock".to_string(),
                 capabilities: crate::seller::Capabilities {
                     max_output_tokens: Some(1024),
+                    ..Default::default()
                 },
                 identity_aliases: Vec::new(),
             }),
@@ -8204,6 +8205,7 @@ mod tests {
             tokenizer_family: "mock".to_string(),
             capabilities: crate::seller::Capabilities {
                 max_output_tokens: Some(64),
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
         });

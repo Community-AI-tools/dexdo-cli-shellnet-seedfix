@@ -16,7 +16,7 @@ use std::path::Path;
 /// Unlike the rest of the config this struct does NOT deny unknown fields: the retired `logprobs` /
 /// `top_logprobs` keys are still present in already-deployed `models.json` files, and rejecting them
 /// would take every such seller off the market on upgrade. They are ignored, not honoured.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Capabilities {
     /// The model's **own** maximum output length (completion tokens) at this endpoint. The outbound
     /// generation limit is clamped to it in addition to the deal budget: a deal budget is
@@ -26,6 +26,27 @@ pub struct Capabilities {
     /// error BEFORE the provider is contacted, rather than sending an unbounded value.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Whether this OpenAI-compatible upstream accepts the optional `seed` request field.
+    ///
+    /// The original adapter predates providers such as the Grok OAuth endpoint that reject
+    /// `seed` outright.  Keep the historical behaviour when this is absent so existing
+    /// configurations are wire-compatible, while allowing an explicitly attested profile to
+    /// omit only that unsupported optional field.
+    #[serde(default = "default_supports_seed")]
+    pub supports_seed: bool,
+}
+
+fn default_supports_seed() -> bool {
+    true
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: None,
+            supports_seed: default_supports_seed(),
+        }
+    }
 }
 
 /// One behavioral-probe fingerprint declared for a model in config: a deterministic
@@ -247,6 +268,19 @@ mod tests {
         let m = cfg.get("m").unwrap();
         // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
         assert_eq!(m.capabilities.max_output_tokens, None);
+        assert!(
+            m.capabilities.supports_seed,
+            "an existing profile must keep the historical seed behaviour"
+        );
+    }
+
+    #[test]
+    fn capabilities_can_explicitly_disable_seed_for_an_upstream_that_rejects_it() {
+        let json = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
+          "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
+          "capabilities":{"max_output_tokens":64,"supports_seed":false}}}}"#;
+        let cfg = ModelsConfig::from_json(json).unwrap();
+        assert!(!cfg.get("m").unwrap().capabilities.supports_seed);
     }
 
     #[test]

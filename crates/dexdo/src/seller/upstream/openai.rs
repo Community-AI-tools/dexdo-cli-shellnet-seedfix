@@ -88,6 +88,7 @@ impl Default for OpenAiConfig {
             tokenizer_family: "qwen".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
         }
@@ -276,8 +277,9 @@ fn build_request_with_startup_capabilities<'a>(
             (p.max_tokens != 0).then_some(p.max_tokens),
             p.stop.clone(),
             // Groq exposes a random seed even at temperature=0 for some models (notably gpt-oss). Pin the
-            // sampled B7 greedy probe so the seller stream and the reference endpoint compare the same run.
-            p.greedy.then_some(0),
+            // sampled B7 greedy probe only where the profile has attested that the upstream accepts it.
+            // Some otherwise OpenAI-compatible providers reject the optional request field with 400.
+            (p.greedy && cfg.capabilities.supports_seed).then_some(0),
         ),
         None => (None, None, Vec::new(), None),
     };
@@ -2012,6 +2014,7 @@ mod tests {
     fn no_logprobs() -> Capabilities {
         Capabilities {
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            ..Default::default()
         }
     }
 
@@ -3691,6 +3694,29 @@ mod tests {
         };
         let body = build_request(&cfg, &regular, 32, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.temperature, Some(0.9));
+        assert_eq!(body.seed, None);
+    }
+
+    #[test]
+    fn greedy_probe_omits_seed_when_the_profile_declares_it_unsupported() {
+        let cfg = OpenAiConfig {
+            capabilities: Capabilities {
+                max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                supports_seed: false,
+            },
+            ..OpenAiConfig::default()
+        };
+        let request = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.0,
+                max_tokens: 16,
+                stop: vec![],
+                greedy: true,
+            }),
+        };
+        let body = build_request(&cfg, &request, 16, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(body.temperature, Some(0.0));
         assert_eq!(body.seed, None);
     }
 

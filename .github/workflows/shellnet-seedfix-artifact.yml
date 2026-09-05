@@ -1,0 +1,36 @@
+name: shellnet-seedfix-artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools clang cmake nasm perl binutils
+      - name: Build isolated seller binary
+        run: cargo build --release --locked -p dexdo --target x86_64-unknown-linux-musl
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/dexdo
+          "$bin" --version
+          "$bin" --help >/dev/null
+          sha256sum "$bin" > dexdo-shellnet-seedfix.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dexdo-x86_64-linux-musl-shellnet-seedfix
+          path: |
+            target/x86_64-unknown-linux-musl/release/dexdo
+            dexdo-shellnet-seedfix.sha256
