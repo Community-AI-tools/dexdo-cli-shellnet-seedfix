@@ -21,6 +21,11 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+crt-static
           CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Exercise seed capability tests
+        run: cargo test --release --locked -p dexdo --target x86_64-unknown-linux-musl seed --lib
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          CC_x86_64_unknown_linux_musl: musl-gcc
       - name: Smoke test
         run: |
           set -euo pipefail
